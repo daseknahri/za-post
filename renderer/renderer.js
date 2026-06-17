@@ -810,14 +810,41 @@ function renderAccounts() {
     } else if (account.status === 'error') {
       statusClass = 'error';
       statusText = 'Error';
+    } else if (account.status === 'checking') {
+      statusClass = 'checking';
+      statusText = 'Checking…';
+    } else if (account.status === 'logging_in') {
+      statusClass = 'logging-in';
+      statusText = 'Logging In…';
     }
 
-    // Prepare error message if exists and relevant
-    let errorMessageHtml = '';
-    if (account.lastMessage && (account.status === 'error' || account.status === 'not_logged_in')) {
-      const msg = account.lastMessage.length > 60 ? account.lastMessage.substring(0, 60) + '...' : account.lastMessage;
-      errorMessageHtml = `<div title="${escapeHtml(account.lastMessage)}" style="color: #dc2626; font-size: 11px; margin-top: 4px; font-weight: 500;">⚠️ ${escapeHtml(msg)}</div>`;
+    // Show lastMessage for ALL statuses (not just error/not_logged_in)
+    let statusMessageHtml = '';
+    if (account.lastMessage) {
+      const msg = account.lastMessage.length > 80 ? account.lastMessage.substring(0, 80) + '...' : account.lastMessage;
+      const msgColor = (account.status === 'error' || account.status === 'not_logged_in') ? '#dc2626'
+        : (account.status === 'logged_in') ? '#22c55e'
+        : (account.status === 'checking' || account.status === 'logging_in') ? '#f59e0b'
+        : '#9ca3af';
+      const msgIcon = (account.status === 'error' || account.status === 'not_logged_in') ? '⚠️'
+        : (account.status === 'logged_in') ? '✅'
+        : (account.status === 'checking') ? '🔍'
+        : (account.status === 'logging_in') ? '🔐'
+        : 'ℹ️';
+      statusMessageHtml = `<div title="${escapeHtml(account.lastMessage)}" style="color: ${msgColor}; font-size: 11px; margin-top: 4px; font-weight: 500;">${msgIcon} ${escapeHtml(msg)}</div>`;
     }
+
+    // Show relative "checked X min ago" if lastChecked is set
+    let lastCheckedHtml = '';
+    if (account.lastChecked) {
+      const diffMs = Date.now() - account.lastChecked;
+      const diffMin = Math.round(diffMs / 60000);
+      const checkedText = diffMin < 1 ? 'just now' : diffMin === 1 ? '1m ago' : `${diffMin}m ago`;
+      lastCheckedHtml = `<div style="color: #6b7280; font-size: 10px; margin-top: 2px;">checked ${escapeHtml(checkedText)}</div>`;
+    }
+
+    // Backward-compat: keep errorMessageHtml alias pointing to new var
+    const errorMessageHtml = statusMessageHtml;
 
     // Display alias if exists
     const displayName = account.alias ? account.alias : account.name;
@@ -858,10 +885,11 @@ function renderAccounts() {
             ${subName ? `<div style="color: #9ca3af; font-size: 12px; margin-top: 2px;">${escapeHtml(subName)}</div>` : ''}
             ${!isEnabled ? `<div style="color:#f59e0b;font-size:11px;font-weight:600;margin-top:2px;">Disabled — will be skipped by automation</div>` : ''}
             <div class="account-status">
-              <span class="status-dot ${statusClass}" style="${account.status === 'error' ? 'background-color: #dc2626;' : ''}"></span>
+              <span class="status-dot ${statusClass}" style="${account.status === 'error' ? 'background-color: #dc2626;' : account.status === 'checking' ? 'background-color: #f59e0b;' : account.status === 'logging_in' ? 'background-color: #3b82f6;' : ''}"></span>
               <span>${statusText}</span>
             </div>
             ${errorMessageHtml}
+            ${lastCheckedHtml}
           </div>
         </div>
         

@@ -286,7 +286,7 @@ async function addFirstComment(page, gid, post, commentImg, name, log) {
         const c = el.closest('[role="article"], form, [data-pagelet]') || document;
         return c.querySelector('input[type="file"]');
       }).then((h) => h.asElement()).catch(() => null);
-      if (cInput) { try { await cInput.uploadFile(commentImg); log(`🖼 [${name}] comment image attached`); await sleep(2500); } catch {} }
+      if (cInput) { try { await cInput.uploadFile(commentImg); log(`🖼 [${name}] comment image attached`); await sleep(2500); } catch (imgErr) { log(`⚠️ [${name}] comment image upload failed: ${imgErr.message}`); } }
       else log(`ℹ️ [${name}] comment image input not found — skipping comment image`);
     }
     await humanType(page, post.comment);
@@ -341,8 +341,15 @@ async function focusEditable(page) {
  * @param {()=>boolean} o.shouldStop
  */
 async function runAccount(o) {
-  const { account, post, groups, settings, useProxies, proxies, log, shouldStop } = o;
+  const { account, post, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen } = o;
   const name = account.name;
+
+  // Fix #4: profile-lock guard — two Chromium instances can't share a userDataDir.
+  if (isLoginOpen && isLoginOpen(name)) {
+    log(`🚫 [${name}] login browser is open for this account — skipping`);
+    return { posted: 0, errors: 1, pendingApproval: 0, postedIds: [] };
+  }
+
   // An account with NO assigned groups is SKIPPED (it must NOT fall back to posting to
   // every group — that would spam all groups from unconfigured accounts).
   const assigned = (account.assignedGroups && account.assignedGroups.length)
@@ -391,6 +398,8 @@ async function runAccount(o) {
     const _pages = await browser.pages();
     for (let i = 1; i < _pages.length; i++) { try { await _pages[i].close(); } catch {} }
     const page = _pages[0] || (await browser.newPage());
+    // Allow clipboard access so captions can be PASTED (fast + reliable, like the original agent).
+    try { await browser.defaultBrowserContext().overridePermissions('https://www.facebook.com', ['clipboard-read', 'clipboard-write']); } catch {}
     // Watchdog: hard cap on this account's run so one stuck account can never block the
     // whole queue. Generous (a full post+comment is ~3-4 min) so it only fires on a real
     // hang, not normal slow posts. Closing the browser makes in-flight ops reject → cleanup.
@@ -425,6 +434,7 @@ async function runAccount(o) {
     if (!resolvedImages.length && post.imageUrl) {
       const dl = await downloadImage(post.imageUrl);
       if (dl) { resolvedImages = [dl]; tempImages.push(dl); log(`⬇️ [${name}] image downloaded from URL`); }
+      else log(`⚠️ [${name}] image URL set but download failed — posting without image`);
     }
     // Comment image: explicit comment image, remote URL, or the post image when commentWithImage is on.
     let commentImg = null;
@@ -437,12 +447,15 @@ async function runAccount(o) {
       const g = targetGroups[i];
       const gid = g.groupId || g.id;
       try {
-        log(`➡️ [${name}] group ${g.name || gid} (${i + 1}/${targetGroups.length})`);
+        log(`➡️ [${name}] navigating to group ${g.name || gid} (${i + 1}/${targetGroups.length})`);
         const gotoGroup = () => page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
         let navOk = await gotoGroup();
-        if (!navOk) { await sleep(3000); navOk = await gotoGroup(); } // one retry on slow www->web redirect
-        if (!navOk) { log(`⚠️ [${name}] navigation failed for ${gid} — skipping group`); errors++; continue; }
+        if (!navOk) { log(`⚠️ [${name}] first navigation attempt failed — retrying…`); await sleep(3000); navOk = await gotoGroup(); }
+        if (!navOk) { log(`❌ [${name}] navigation failed for ${g.name || gid} — skipping group`); errors++; continue; }
         await sleep(3000);
+
+        // Per-group START banner — fired only after nav succeeds and before the auth checks.
+        log(`📂 [${name}] GROUP: ${g.name || gid}`);
 
         if (/login|checkpoint/.test(page.url())) { log(`🚫 [${name}] not logged in / checkpoint`); errors++; break; }
         // Expired sessions don't redirect — they show the "Continue as <name>" picker
@@ -463,38 +476,64 @@ async function runAccount(o) {
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
         const opened = await openComposer(page, log, name);
-        if (!opened) { log(`⚠️ [${name}] composer did not open in ${g.name || gid}`); errors++; continue; }
+        if (!opened) { log(`❌ [${name}] could not open the post composer in ${g.name || gid}`); errors++; continue; }
         await sleep(1500);
         await dismissPopups(page);
 
-        // Caption FIRST — typing into the fresh composer before attaching the image
-        // avoids the image re-render clobbering focus. Verify it landed; retry up to 2×.
-        const captionText = () => page.evaluate(() => { const d = document.querySelector('div[role="dialog"]'); const e = d && d.querySelector('[contenteditable="true"]'); return e ? (e.textContent || '').trim().length : 0; }).catch(() => 0);
-        if (post.caption) {
-          await focusEditable(page); await humanType(page, post.caption); await sleep(1000);
-          let got = await captionText();
-          for (let r = 0; !got && r < 2; r++) {
-            log(`↻ [${name}] caption empty — retrying`);
-            await focusEditable(page);
-            await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
-            await page.keyboard.press('Backspace'); await sleep(200);
-            await focusEditable(page); await humanType(page, post.caption); await sleep(1000);
-            got = await captionText();
-          }
-          if (!got) log(`⚠️ [${name}] caption could not be entered (posting anyway)`);
+        const captionLen = () => page.evaluate(() => { const d = document.querySelector('div[role="dialog"]'); const e = d && d.querySelector('[contenteditable="true"]'); return e ? (e.textContent || '').trim().length : 0; }).catch(() => 0);
+
+        // Image FIRST, then caption — mirrors the original agent. Paste is atomic so the
+        // image's re-render can't clobber the caption. Scope the file input to the DIALOG.
+        if (resolvedImages.length) {
+          log(`📷 [${name}] uploading ${resolvedImages.length} image(s)...`);
+          const input = (await page.$('div[role="dialog"] input[type="file"]')) || (await page.$(SEL.fileInput));
+          if (input) { await input.uploadFile(...resolvedImages); log(`✅ [${name}] image attached`); await sleep(3500); }
+          else log(`⚠️ [${name}] image input not found in composer`);
         }
 
-        // Image upload — scope the file input to the composer DIALOG (not a comment input).
-        if (resolvedImages.length) {
-          const input = (await page.$('div[role="dialog"] input[type="file"]')) || (await page.$(SEL.fileInput));
-          if (input) { await input.uploadFile(...resolvedImages); log(`🖼 [${name}] ${resolvedImages.length} image(s) attached`); await sleep(3500); }
+        // Caption — PASTE it (clipboard + Ctrl+V, like the original "Caption pasted"); fast and
+        // reliable. Verify it landed; if not, fall back to typing so the post still goes out.
+        if (post.caption) {
+          log(`✍️ [${name}] entering caption...`);
+          await focusEditable(page);
+          try {
+            await page.evaluate((t) => navigator.clipboard.writeText(t), post.caption);
+            await page.keyboard.down('Control'); await page.keyboard.press('v'); await page.keyboard.up('Control');
+            await sleep(600);
+          } catch {}
+          if (!(await captionLen())) { // paste blocked → clear + type
+            log(`⌨️ [${name}] paste blocked — typing caption instead`);
+            await focusEditable(page);
+            await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
+            await page.keyboard.press('Backspace'); await sleep(150);
+            await humanType(page, post.caption); await sleep(600);
+          }
+          log((await captionLen()) ? `✅ [${name}] caption pasted` : `⚠️ [${name}] caption could not be entered (posting anyway)`);
         }
 
         // Publish — then CONFIRM it actually published (dialog closed / Post button gone).
         await sleep(1500);
+        log(`⏳ [${name}] waiting for Post button…`);
         const dialogCountBefore = await page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length).catch(() => 1);
+        // Log what the Post-button scan sees (dialogs open, found label) — mirrors original's "🔍 Dialogs: N".
+        const postBtnInfo = await page.evaluate(() => {
+          const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
+          const scope = dialogs.length ? dialogs : [document];
+          for (const root of scope) {
+            const btn = Array.from(root.querySelectorAll('[role="button"]')).find((b) => {
+              const label = (b.getAttribute('aria-label') || b.textContent || '').trim().toLowerCase();
+              return label === 'post' && b.getAttribute('aria-disabled') !== 'true';
+            });
+            if (btn) return { found: true, dialogs: dialogs.length, label: (btn.getAttribute('aria-label') || btn.textContent || '').trim() };
+          }
+          return { found: false, dialogs: dialogs.length };
+        }).catch(() => null);
+        if (postBtnInfo) {
+          if (postBtnInfo.found) log(`🔍 [${name}] Post button: found (dialogs=${postBtnInfo.dialogs}, label="${postBtnInfo.label}")`);
+          else log(`🔍 [${name}] Post button NOT found (${postBtnInfo.dialogs} dialog(s) scanned)`);
+        }
         const clicked = await clickPostButton(page);
-        if (!clicked) { log(`⚠️ [${name}] Post button not found in ${gid}`); errors++; continue; }
+        if (!clicked) { log(`⚠️ [${name}] Post button not found in ${g.name || gid}`); errors++; continue; }
         const publishResult = await waitForPublish(page, dialogCountBefore);
         if (publishResult !== 'published') { log(`⚠️ [${name}] Post clicked but publish NOT confirmed in ${g.name || gid} — skipping`); errors++; continue; }
         await sleep(3000);
@@ -512,11 +551,12 @@ async function runAccount(o) {
         }
 
         // Success log includes the caption so the renderer's auto-delete tracker matches it.
-        log(`✅ [${name}] Successfully posted to ${g.name || gid}: ${(post.caption || '').slice(0, 50)}`);
+        log(`✅ [${name}] Posted! → ${g.name || gid}: ${(post.caption || '').slice(0, 50)}`);
         posted++;
 
         // First comment (the link) — reload, find OUR post, comment in its box.
         if (post.comment) {
+          log(`💬 [${name}] adding comment...`);
           const done = await addFirstComment(page, gid, post, commentImg, name, log);
           if (!done) log(`ℹ️ [${name}] comment box not found (post still published)`);
         }
@@ -529,9 +569,11 @@ async function runAccount(o) {
       // Interruptible delay between groups (respects Stop + configurable groupDelay).
       if (i < targetGroups.length - 1) {
         let w = 0; const d = Math.max(15000, (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000);
+        log(`⏱️ [${name}] waiting ${Math.round(d / 1000)}s before next group`);
         while (w < d && !shouldStop()) { await sleep(Math.min(1000, d - w)); w += 1000; }
       }
     }
+    log(`✅ [${name}] done — ${posted} posted, ${pendingApproval} pending, ${errors} errors`);
 
     // Persist refreshed cookies for next run.
     try { store.writeCookies(name, await page.cookies()); } catch {}

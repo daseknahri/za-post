@@ -39,8 +39,11 @@ function chunk(arr, size) {
 }
 
 class Orchestrator {
-  constructor(emit) {
+  // Fix #4: accept options object with isLoginOpen predicate.
+  constructor(emit, options) {
     this.emit = emit;
+    this.options = options || {};
+    this.isLoginOpen = (this.options && typeof this.options.isLoginOpen === 'function') ? this.options.isLoginOpen : () => false;
     this.running = false;
     this._stop = false;
   }
@@ -94,6 +97,9 @@ class Orchestrator {
     const data = this._data;
     const posts = this._postsForAccount(account, cycle);
     if (!posts.length) { this.log(`↪️ [${account.name}] no eligible posts`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [] }; }
+    const order = account.postingOrder || 'post-centric';
+    const label = posts.length === 1 ? `Post #${data.posts.findIndex((p) => p.id === posts[0].id) + 1}` : `${posts.length} posts`;
+    this.log(`📋 [${account.name}] ${order} → ${label} to ${(account.assignedGroups || []).length} group(s)`);
     let progressed = false, posted = 0, pendingApproval = 0, errors = 0;
     const postedIds = [];
     for (const post of posts) {
@@ -108,6 +114,7 @@ class Orchestrator {
             useProxies: !!data.useProxies, proxies: data.proxies || [],
             log: (m) => this.log(m),
             shouldStop: () => this._shouldStop(),
+            isLoginOpen: this.isLoginOpen,
           });
           posted += (r && r.posted) || 0; pendingApproval += (r && r.pendingApproval) || 0; errors += (r && r.errors) || 0;
           if (r && ((r.posted || 0) > 0 || (r.pendingApproval || 0) > 0)) { progressed = true; if (post.id) postedIds.push(post.id); }
@@ -144,12 +151,15 @@ class Orchestrator {
       for (let b = 0; b < batches.length; b++) {
         if (this._shouldStop()) break;
         const batch = batches[b];
-        this.log(`👥 Batch ${b + 1}/${batches.length}: ${batch.map((a) => a.name).join(', ')}`);
+        this.log(`═══ Batch ${b + 1}/${batches.length} — ${new Date().toLocaleTimeString()} — ${batch.map((a) => a.name).join(', ')} ═══`);
         const results = await Promise.all(batch.map(async (account) => {
           const r = await this._runAccount(account, cycle)
-            .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, postedIds: [] }; });
-          return { account, progressed: !!(r && r.progressed), postedIds: (r && r.postedIds) || [] };
+            .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [] }; });
+          this.log(`✓ [${account.name}] completed`);
+          return { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [] };
         }));
+        const batchOk = results.filter((r) => r.progressed).length;
+        this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) ---`);
         for (const r of results) cyclePostedIds.push(...r.postedIds);
         // Advance + persist rotation for THIS batch's unique/sequence accounts that made
         // progress (mid-cycle durable). SKIPPED when autoDeletePosted is on: deletion shrinks

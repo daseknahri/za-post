@@ -107,7 +107,7 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   store.init(app.getPath('userData'));
-  orchestrator = new Orchestrator(emit);
+  orchestrator = new Orchestrator(emit, { isLoginOpen: (name) => loginBrowsers.has(name) });
 
   // Remote control server + tunnel (best effort). Hooks delegate all mutations
   // back here so the data store stays the single source of truth.
@@ -272,14 +272,19 @@ ipcMain.handle('import-cookies', async (_e, accountName, cookies) => {
     const arr = typeof cookies === 'string' ? JSON.parse(cookies) : cookies;
     if (!Array.isArray(arr) || !arr.every((c) => c && c.name && 'value' in c)) return fail('Invalid cookies format');
     store.writeCookies(accountName, arr);
+    setAccountStatus(accountName, 'checking', 'Verifying…');
+    send('data-updated');
     const status = await checkStatus(accountName);
+    setAccountStatus(accountName, status.status, status.message, status);
     return ok({ status: status.status, message: status.message });
   } catch (e) { return fail(e); }
 });
 
 ipcMain.handle('check-account-status', async (_e, accountName) => {
+  setAccountStatus(accountName, 'checking', 'Verifying…');
+  send('data-updated');
   const res = await checkStatus(accountName);
-  setAccountStatus(accountName, res.status, res.message);
+  setAccountStatus(accountName, res.status, res.message, res);
   return res;
 });
 
@@ -293,8 +298,8 @@ ipcMain.handle('close-login-browser', (_e, accountName) => {
 });
 
 // Launch a headless browser with the account's cookies/profile and see if FB
-// considers it logged in. Uses a DOM probe (not just the URL) because an expired
-// session lands on the "Continue as <name>" picker WITHOUT redirecting to /login.
+// considers it logged in. Primary auth gate is the c_user cookie; DOM probe is
+// used only for picker/checkpoint detection.
 async function checkStatus(accountName) {
   let browser;
   try {
@@ -310,28 +315,51 @@ async function checkStatus(accountName) {
     const cookies = store.readCookies(accountName);
     if (cookies.length) { try { await page.setCookie(...cookies.map(normalizeCookie)); } catch {} }
     await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await new Promise((r) => setTimeout(r, 3000));
+
+    // Fix #2: real render wait instead of fixed 3s
+    await page.waitForSelector('[role="navigation"], [data-pagelet="FeedUnit_0"], [aria-label="Your profile"]', { timeout: 12000 }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 1500));
+
     if (/login|checkpoint/.test(page.url())) return { status: 'not_logged_in', message: 'Redirected to login/checkpoint' };
+
+    // Fix #1: gate on c_user cookie as PRIMARY auth check
+    const pageCookies = await page.cookies();
+    const cUser = pageCookies.find((c) => c.name === 'c_user' && c.value);
+    if (!cUser) return { status: 'not_logged_in', message: 'No c_user cookie — not authenticated' };
+
+    // Still detect picker/checkpoint even when c_user present (stale session edge case)
     const probe = await page.evaluate(() => {
       const t = (document.body.innerText || '');
-      const loggedIn = !!document.querySelector('[aria-label="Create a post"], [aria-label*="What\'s on your mind"], div[role="navigation"] a[href*="/me"], [aria-label="Your profile"]');
       const picker = /continue as|use another profile|log into facebook/i.test(t)
         || !!Array.from(document.querySelectorAll('a,div[role="button"],button')).find((e) => /^continue$|continue as|use another profile/i.test((e.textContent || '').trim()));
-      return { loggedIn, picker };
+      const checkpoint = /checkpoint/.test(location.href);
+      return { picker, checkpoint };
     });
-    if (probe.loggedIn) return { status: 'logged_in', message: 'Active' };
+    if (probe.checkpoint) return { status: 'not_logged_in', message: 'Session expired — checkpoint' };
     if (probe.picker) return { status: 'not_logged_in', message: 'Session expired — re-login required (account picker shown)' };
-    return { status: 'not_logged_in', message: 'Not authenticated' };
+
+    // Fix #3: capture FB display name
+    const fbUserId = cUser.value;
+    const fbName = await page.evaluate(() => {
+      const e = document.querySelector('[aria-label="Your profile"]');
+      return e ? (e.textContent || '').trim().slice(0, 40) : '';
+    }).catch(() => '');
+    return { status: 'logged_in', message: `Active — c_user=${fbUserId}${fbName ? ' (' + fbName + ')' : ''}`, fbUserId, fbName };
   } catch (e) {
     return { status: 'error', message: e.message };
   } finally { if (browser) await browser.close().catch(() => {}); }
 }
 
-function setAccountStatus(name, status, message) {
+// Fix #3: accept full result object to persist fbUserId, fbName, lastChecked.
+// Backward-compatible: extra arg is optional.
+function setAccountStatus(name, status, message, result) {
   const data = getData();
   const a = data.accounts.find((x) => x.name === name);
   if (a) {
     a.status = status; a.lastMessage = message || '';
+    if (result && result.fbUserId) a.fbUserId = result.fbUserId;
+    if (result && result.fbName !== undefined) a.fbName = result.fbName;
+    if (result && result.status === 'logged_in') a.lastChecked = Date.now();
     // Opportunistically prune any assignedGroups that no longer exist in data.groups.
     const valid = new Set(data.groups.map((g) => g.id));
     a.assignedGroups = (a.assignedGroups || []).filter((id) => valid.has(id));
@@ -341,7 +369,20 @@ function setAccountStatus(name, status, message) {
 
 // Open a VISIBLE browser for manual login; persist cookies while open; notify on close.
 async function openLoginBrowser(accountName) {
-  if (loginBrowsers.has(accountName)) return;
+  // Fix #6: already open guard
+  if (loginBrowsers.has(accountName)) {
+    emit('automation-log', `🔐 [${accountName}] login browser already open`);
+    return;
+  }
+
+  // Fix #4: block login if automation is using this profile
+  if (orchestrator && orchestrator.isRunning()) {
+    emit('automation-log', `🔐 [${accountName}] cannot open login — automation is using this profile; stop automation first`);
+    return;
+  }
+
+  emit('automation-log', `🔐 [${accountName}] opening login browser...`);
+
   store.sanitizeProfile(accountName); // wipe any saved tabs so it won't reopen 40 old pages
   const browser = await puppeteer.launch({
     headless: false, userDataDir: store.profileDir(accountName),
@@ -355,19 +396,49 @@ async function openLoginBrowser(accountName) {
   for (let i = 1; i < pages.length; i++) { try { await pages[i].close(); } catch {} }
   const page = pages[0] || (await browser.newPage());
   await page.goto('https://www.facebook.com/login', { waitUntil: 'domcontentloaded' }).catch(() => {});
+  emit('automation-log', `🔐 [${accountName}] navigated to ${page.url()} — waiting for you to log in`);
+
+  // Fix #7: set logging_in intermediate status
+  setAccountStatus(accountName, 'logging_in', 'Login window open — waiting for manual login');
+
   send('login-browser-opened', accountName);
 
-  const interval = setInterval(async () => {
+  let sessionDetectedLogged = false; // Fix #6: emit c_user detection only once
+
+  // Fix #5: flush cookies on page close event
+  page.on('close', async () => {
     try { store.writeCookies(accountName, await page.cookies()); } catch {}
+  });
+
+  const interval = setInterval(async () => {
+    try {
+      const pageCookies = await page.cookies();
+      store.writeCookies(accountName, pageCookies);
+      // Fix #6: emit once when c_user first appears
+      if (!sessionDetectedLogged) {
+        const cUser = pageCookies.find((c) => c.name === 'c_user' && c.value);
+        if (cUser) {
+          sessionDetectedLogged = true;
+          emit('automation-log', `🔑 [${accountName}] session detected (c_user=${cUser.value}) — keep going / you can close when done`);
+        }
+      }
+    } catch {}
   }, 5000);
   loginBrowsers.set(accountName, { browser, interval });
 
   browser.on('disconnected', async () => {
     clearInterval(interval);
     loginBrowsers.delete(accountName);
+    emit('automation-log', `🔐 [${accountName}] login window closed — verifying session...`);
     send('login-browser-closed', accountName);
     const res = await checkStatus(accountName);
-    setAccountStatus(accountName, res.status, res.message);
+    setAccountStatus(accountName, res.status, res.message, res);
+    // Fix #6: final status log
+    if (res.status === 'logged_in') {
+      emit('automation-log', `✅ [${accountName}] logged in as ${res.fbName || '(unknown)'} (c_user=${res.fbUserId || '?'})`);
+    } else {
+      emit('automation-log', `❌ [${accountName}] not logged in: ${res.message}`);
+    }
   });
 }
 
