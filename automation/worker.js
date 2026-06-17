@@ -379,13 +379,15 @@ async function runAccount(o) {
       proxyAuth = p;
       if (p.username && proxyChain) {
         try { anonLocal = await proxyChain.anonymizeProxy(p.upstream); launchArgs.push(`--proxy-server=${anonLocal}`); log(`🌐 [${name}] proxy ${p.server} (auth via proxy-chain)`); }
-        catch (e) { launchArgs.push(`--proxy-server=${p.server}`); log(`🌐 [${name}] proxy ${p.server} (proxy-chain failed: ${e.message})`); }
+        catch (e) { launchArgs.push(`--proxy-server=${p.server}`); log(`⚠️ [${name}] proxy-chain failed (${e.message}) — auth credentials may be dropped, expect 407s`); }
       } else { launchArgs.push(`--proxy-server=${p.server}`); log(`🌐 [${name}] proxy ${p.server}`); }
+    } else {
+      log(`⚠️ [${name}] proxies enabled but the proxy string is invalid — running WITHOUT proxy`);
     }
   }
 
   let browser;
-  let posted = 0, errors = 0, pendingApproval = 0;
+  let posted = 0, errors = 0, pendingApproval = 0, noRetry = false;
   try {
     browser = await puppeteer.launch({
       headless: true, // new headless (Chrome 148): renders like real Chrome but NO visible window / taskbar entry
@@ -457,7 +459,7 @@ async function runAccount(o) {
         // Per-group START banner — fired only after nav succeeds and before the auth checks.
         log(`📂 [${name}] GROUP: ${g.name || gid}`);
 
-        if (/login|checkpoint/.test(page.url())) { log(`🚫 [${name}] not logged in / checkpoint`); errors++; break; }
+        if (/login|checkpoint/.test(page.url())) { log(`🚫 [${name}] not logged in / checkpoint`); errors++; noRetry = true; break; }
         // Expired sessions don't redirect — they show the "Continue as <name>" picker
         // or a non-member "Join Group / Log in" wall. Detect and abort early & clearly.
         const authBad = await page.evaluate(() => {
@@ -467,11 +469,11 @@ async function runAccount(o) {
           if (hasBtn(/^join group$/i) && hasBtn(/^log in$/i)) return 'not-authenticated';
           return null;
         });
-        if (authBad) { log(`🚫 [${name}] ${authBad === 'session-expired' ? 'session expired — re-login required' : 'not logged in / not a member'} (${g.name || gid})`); errors++; break; }
+        if (authBad) { log(`🚫 [${name}] ${authBad === 'session-expired' ? 'session expired — re-login required' : 'not logged in / not a member'} (${g.name || gid})`); errors++; noRetry = true; break; }
 
         // Clear cookie/notification banners, then bail out of this account if rate-limited.
         await dismissPopups(page);
-        if (await checkRateLimit(page)) { log(`⏸ [${name}] rate-limited by Facebook — backing off this account`); errors++; break; }
+        if (await checkRateLimit(page)) { log(`⏸ [${name}] rate-limited by Facebook — backing off this account`); errors++; noRetry = true; break; }
 
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
@@ -588,7 +590,7 @@ async function runAccount(o) {
     if (anonLocal && proxyChain) { try { await proxyChain.closeAnonymizedProxy(anonLocal, true); } catch {} }
     for (const t of tempImages) { try { fs.unlinkSync(t); } catch {} }
   }
-  return { posted, errors, pendingApproval };
+  return { posted, errors, pendingApproval, noRetry };
 }
 
 // Strip fields Puppeteer's setCookie rejects; coerce sameSite.

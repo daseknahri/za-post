@@ -14,6 +14,14 @@ const fs = require('fs');
 const PROFILE = (process.argv.find((a) => a.startsWith('--profile=')) || '').split('=')[1] || process.env.ZA_PROFILE;
 if (PROFILE) app.setName('za-post-restored-' + PROFILE);
 
+// Single-instance lock — scoped per profile (app.setName above changes userData, so each
+// profile gets its own lock and can coexist with the default instance).
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) { app.quit(); }
+app.on('second-instance', () => {
+  if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); }
+});
+
 const store = require('./lib/store');
 const remote = require('./server');
 const { Orchestrator } = require('./automation/orchestrator');
@@ -146,13 +154,22 @@ app.whenReady().then(async () => {
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
-app.on('window-all-closed', () => { remote.stopServer(); if (process.platform !== 'darwin') app.quit(); });
+app.on('window-all-closed', () => {
+  if (orchestrator) orchestrator.stop();
+  for (const [, entry] of loginBrowsers) { try { entry.browser.close(); } catch {} }
+  remote.stopServer();
+  if (process.platform !== 'darwin') app.quit();
+});
 
 // =======================================================================
 // IPC: DATA
 // =======================================================================
 ipcMain.handle('get-data', () => getData());
-ipcMain.handle('save-data', (_e, data) => { store.save(data); return ok(); });
+ipcMain.handle('save-data', (_e, data) => {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return fail('Invalid data');
+  if (!Array.isArray(data.posts) || !Array.isArray(data.groups) || !Array.isArray(data.accounts)) return fail('Invalid data');
+  store.save(data); return ok();
+});
 
 // =======================================================================
 // IPC: POSTS
@@ -247,6 +264,8 @@ ipcMain.handle('toggle-account', (_e, accountName, enabled) => {
 });
 
 ipcMain.handle('delete-account', (_e, accountName) => {
+  if (orchestrator && orchestrator.isRunning()) return fail('Stop automation before deleting an account');
+  if (loginBrowsers.has(accountName)) return fail('Close the login browser for this account first');
   const data = getData();
   data.accounts = data.accounts.filter((a) => a.name !== accountName);
   store.save(data);
@@ -255,6 +274,8 @@ ipcMain.handle('delete-account', (_e, accountName) => {
 });
 
 ipcMain.handle('rename-account', (_e, oldName, newName) => {
+  if (orchestrator && orchestrator.isRunning()) return fail('Stop automation before renaming an account');
+  if (loginBrowsers.has(oldName)) return fail('Close the login browser for this account first');
   const data = getData();
   const a = data.accounts.find((x) => x.name === oldName);
   if (!a) return fail('Account not found');

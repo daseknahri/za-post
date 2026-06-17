@@ -42,7 +42,7 @@ function startServer(port, injected) {
   // read-only asar, so main.js injects userData/uploads. Falls back to public/uploads in dev.
   const UPLOAD_DIR = hooks.uploadDir || path.join(__dirname, 'public', 'uploads');
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  const upload = multer({ dest: UPLOAD_DIR });
+  const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB cap
 
   const app = express();
   app.use(cors());
@@ -119,8 +119,11 @@ function startServer(port, injected) {
     catch (e) { res.json({ success: false, error: e.message }); }
   });
 
+  // Bind localhost-only by default (no LAN exposure). The Cloudflare tunnel still
+  // works — it connects to localhost. Set host:'0.0.0.0' via hooks only if LAN access is wanted.
+  const host = hooks.host || '127.0.0.1';
   return new Promise((resolve) => {
-    httpServer = app.listen(port, () => { addLog(`Remote server on :${port}`); resolve(port); });
+    httpServer = app.listen(port, host, () => { addLog(`Remote server on ${host}:${port}`); resolve(port); });
     httpServer.on('error', (e) => { addLog(`Server error: ${e.message}`); resolve(null); });
   });
 }

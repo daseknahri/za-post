@@ -102,6 +102,7 @@ class Orchestrator {
     this.log(`📋 [${account.name}] ${order} → ${label} to ${(account.assignedGroups || []).length} group(s)`);
     let progressed = false, posted = 0, pendingApproval = 0, errors = 0;
     const postedIds = [];
+    postsLoop:
     for (const post of posts) {
       if (this._shouldStop()) break;
       // Per-account crash isolation + restart (approximates the old supervisor that
@@ -118,6 +119,8 @@ class Orchestrator {
           });
           posted += (r && r.posted) || 0; pendingApproval += (r && r.pendingApproval) || 0; errors += (r && r.errors) || 0;
           if (r && ((r.posted || 0) > 0 || (r.pendingApproval || 0) > 0)) { progressed = true; if (post.id) postedIds.push(post.id); }
+          // Logged-out / rate-limited — don't launch a browser for this account's remaining posts this cycle.
+          if (r && r.noRetry) { this.log(`⏭️ [${account.name}] skipping remaining posts this cycle (session/rate-limit)`); break postsLoop; }
           break;
         }
         catch (e) {

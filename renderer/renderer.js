@@ -976,25 +976,22 @@ function toggleGroupDropdown(accountName) {
 
 // Toggle group assignment for an account
 async function toggleGroupAssignment(accountName, groupId) {
-  const account = appData.accounts.find(a => a.name === accountName);
+  // Work against FRESH backend data so we don't overwrite backend changes (e.g. auto-delete
+  // during a running campaign) with a stale local appData.
+  const fresh = await window.electronAPI.getData();
+  if (!fresh || !Array.isArray(fresh.accounts)) return;
+  const account = fresh.accounts.find(a => a.name === accountName);
   if (!account) return;
 
-  // Initialize assignedGroups if not exists
-  if (!account.assignedGroups) {
-    account.assignedGroups = [];
-  }
-
+  if (!account.assignedGroups) account.assignedGroups = [];
   const index = account.assignedGroups.indexOf(groupId);
-  if (index === -1) {
-    // Add group
-    account.assignedGroups.push(groupId);
-  } else {
-    // Remove group
-    account.assignedGroups.splice(index, 1);
-  }
+  if (index === -1) account.assignedGroups.push(groupId);
+  else account.assignedGroups.splice(index, 1);
 
-  // Save to backend
-  await saveData();
+  // Save to backend, then sync local state
+  const res = await window.electronAPI.saveData(fresh);
+  if (res && res.success === false) { showNotification('Failed to save assignment: ' + res.error, 'error'); return; }
+  appData = fresh;
 
   // Update just the count display without re-rendering (keeps dropdown open)
   const assignedCount = account.assignedGroups.length;
@@ -1423,6 +1420,12 @@ async function startAutomation() {
     if (!confirm(`${notLoggedIn.length} of ${total} account(s) are not logged in and will be skipped. Continue?`)) return;
   }
 
+  // Pre-flight: warn if any ENABLED account has no assigned groups (it will post nothing)
+  const noGroups = appData.accounts.filter(a => a.enabled !== false && (!a.assignedGroups || a.assignedGroups.length === 0));
+  if (noGroups.length > 0) {
+    if (!confirm(`${noGroups.length} enabled account(s) have NO assigned groups and will post nothing:\n${noGroups.map(a => a.name).join(', ')}\n\nContinue anyway?`)) return;
+  }
+
   clearLogs();
   addLog('🚀 Starting automation...\n');
 
@@ -1585,23 +1588,24 @@ async function saveProxies() {
   const rows = document.querySelectorAll('#proxies-table-body tr');
   const proxies = [];
 
+  let invalid = 0;
   rows.forEach(row => {
     const cols = row.querySelectorAll('td');
     // 0: ID, 1: IP, 2: Port, 3: User, 4: Pass
-    const ip = cols[1].textContent;
-    const port = cols[2].textContent;
-    const user = cols[3].textContent;
-    const pass = cols[4].textContent;
+    const ip = (cols[1].textContent || '').trim();
+    const port = (cols[2].textContent || '').trim();
+    const user = (cols[3].textContent || '').trim();
+    const pass = (cols[4].textContent || '').trim();
 
-    if (ip && port) {
-      // Reconstruct SOCKS5 string
-      let str = `socks5://${ip}:${port}`;
-      if (user && pass) {
-        str += `:${user}:${pass}`;
-      }
-      proxies.push(str);
-    }
+    if (!ip && !port && !user && !pass) return; // blank row — skip
+    const portNum = parseInt(port, 10);
+    if (!ip || !Number.isFinite(portNum) || portNum < 1 || portNum > 65535) { invalid++; return; }
+    // Reconstruct SOCKS5 string
+    let str = `socks5://${ip}:${portNum}`;
+    if (user && pass) str += `:${user}:${pass}`;
+    proxies.push(str);
   });
+  if (invalid > 0) showNotification(`${invalid} proxy row(s) invalid (need host + port 1-65535) — skipped`, 'error');
 
   // Save list
   const saveList = await window.electronAPI.invoke('save-proxies', proxies);
