@@ -93,8 +93,9 @@ class Orchestrator {
   async _runAccount(account, cycle) {
     const data = this._data;
     const posts = this._postsForAccount(account, cycle);
-    if (!posts.length) { this.log(`↪️ [${account.name}] no eligible posts`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 0 }; }
+    if (!posts.length) { this.log(`↪️ [${account.name}] no eligible posts`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [] }; }
     let progressed = false, posted = 0, pendingApproval = 0, errors = 0;
+    const postedIds = [];
     for (const post of posts) {
       if (this._shouldStop()) break;
       // Per-account crash isolation + restart (approximates the old supervisor that
@@ -109,7 +110,7 @@ class Orchestrator {
             shouldStop: () => this._shouldStop(),
           });
           posted += (r && r.posted) || 0; pendingApproval += (r && r.pendingApproval) || 0; errors += (r && r.errors) || 0;
-          if (r && ((r.posted || 0) > 0 || (r.pendingApproval || 0) > 0)) progressed = true;
+          if (r && ((r.posted || 0) > 0 || (r.pendingApproval || 0) > 0)) { progressed = true; if (post.id) postedIds.push(post.id); }
           break;
         }
         catch (e) {
@@ -122,7 +123,7 @@ class Orchestrator {
     }
     // Surface the outcome so the operator sees pending/error counts in the log pane.
     this.log(`📊 [${account.name}] posted=${posted} pending=${pendingApproval} errors=${errors}`);
-    return { progressed, posted, pendingApproval, errors };
+    return { progressed, posted, pendingApproval, errors, postedIds };
   }
 
   async _loop(getData) {
@@ -139,31 +140,49 @@ class Orchestrator {
       this.log(`🔄 Cycle ${cycle}: ${active.length} account(s), ${settings.parallelAccounts || 3} in parallel`);
 
       const batches = chunk(active, settings.parallelAccounts || 3);
+      const cyclePostedIds = [];
       for (let b = 0; b < batches.length; b++) {
         if (this._shouldStop()) break;
         const batch = batches[b];
         this.log(`👥 Batch ${b + 1}/${batches.length}: ${batch.map((a) => a.name).join(', ')}`);
         const results = await Promise.all(batch.map(async (account) => {
           const r = await this._runAccount(account, cycle)
-            .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false }; });
-          return { account, progressed: !!(r && r.progressed) };
+            .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, postedIds: [] }; });
+          return { account, progressed: !!(r && r.progressed), postedIds: (r && r.postedIds) || [] };
         }));
-        // Advance + persist rotation for THIS batch's unique/sequence accounts that
-        // actually made progress — right after the batch (mid-cycle durable). Non-unique
-        // accounts don't consume rotation slots; crashed accounts retry the same post.
-        let rotationDirty = false;
-        for (const { account, progressed } of results) {
-          const ord = account.postingOrder || 'post-centric';
-          if (progressed && (ord.includes('unique') || ord === 'sequence')) {
-            this._rotation[account.name] = (this._rotation[account.name] || 0) + 1;
-            rotationDirty = true;
+        for (const r of results) cyclePostedIds.push(...r.postedIds);
+        // Advance + persist rotation for THIS batch's unique/sequence accounts that made
+        // progress (mid-cycle durable). SKIPPED when autoDeletePosted is on: deletion shrinks
+        // the library each cycle, which already advances the window — advancing the base too
+        // would skip posts. Non-unique accounts don't consume rotation slots.
+        if (!settings.autoDeletePosted) {
+          let rotationDirty = false;
+          for (const { account, progressed } of results) {
+            const ord = account.postingOrder || 'post-centric';
+            if (progressed && (ord.includes('unique') || ord === 'sequence')) {
+              this._rotation[account.name] = (this._rotation[account.name] || 0) + 1;
+              rotationDirty = true;
+            }
           }
+          if (rotationDirty) store.saveRotation(this._rotation);
         }
-        if (rotationDirty) store.saveRotation(this._rotation);
         if (b < batches.length - 1 && !this._shouldStop()) {
           this.log(`⏳ Waiting ${settings.accountDelay || 1} min before next batch…`);
           await this._interruptibleSleep((settings.accountDelay || 1) * 60000);
         }
+      }
+
+      // One-time campaign: remove the posts published this cycle so each post is used
+      // exactly once (and the run ends when the library empties). Backend-owned so it's
+      // reliable regardless of the UI; replaces the old renderer log-parsing on stop.
+      if (settings.autoDeletePosted && cyclePostedIds.length) {
+        const del = new Set(cyclePostedIds);
+        const data = getData();
+        const before = data.posts.length;
+        data.posts = data.posts.filter((p) => !del.has(p.id));
+        store.save(data);
+        this.emit('data-updated');
+        this.log(`🗑️ Auto-deleted ${before - data.posts.length} posted post(s) — ${data.posts.length} remaining`);
       }
 
       if (this._shouldStop()) break;

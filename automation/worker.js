@@ -13,6 +13,7 @@ let axios; try { axios = require('axios'); } catch {}
 let proxyChain; try { proxyChain = require('proxy-chain'); } catch {}
 
 const store = require('../lib/store');
+const { chromiumPath } = require('../lib/chromium');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -180,7 +181,15 @@ async function humanType(page, text) {
   if (!text) return;
   const chunks = String(text).match(/.{1,6}/gs) || [];
   for (const c of chunks) {
-    await page.keyboard.type(c, { delay: 15 + Math.floor(Math.random() * 35) });
+    // Cap each chunk at 15s: a hung CDP connection otherwise blocks for the full
+    // protocolTimeout (90s) PER chunk, stalling the worker slot for many minutes. On
+    // timeout the group-level catch skips this group instead of freezing the queue.
+    // The timer is always cleared so it can't fire a stray rejection after success.
+    let timer;
+    const cap = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('keyboard.type timeout')), 15000); });
+    try {
+      await Promise.race([page.keyboard.type(c, { delay: 15 + Math.floor(Math.random() * 35) }), cap]);
+    } finally { clearTimeout(timer); }
     await sleep(120 + Math.floor(Math.random() * 380));
   }
 }
@@ -363,6 +372,7 @@ async function runAccount(o) {
   try {
     browser = await puppeteer.launch({
       headless: false,
+      executablePath: chromiumPath(),
       userDataDir: store.profileDir(name),
       args: launchArgs,
       defaultViewport: { width: 1280, height: 900 },
@@ -487,7 +497,7 @@ async function runAccount(o) {
         if (isPending) {
           log(`⏳ [${name}] Post submitted but PENDING ADMIN APPROVAL in ${g.name || gid} — not counted, comment skipped`);
           pendingApproval++;
-          if (i < targetGroups.length - 1) { let w = 0, d = Math.max(15000, (settings.groupDelay != null ? settings.groupDelay : 60) * 1000); while (w < d && !shouldStop()) { await sleep(Math.min(1000, d - w)); w += 1000; } }
+          if (i < targetGroups.length - 1) { let w = 0, d = Math.max(15000, (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000); while (w < d && !shouldStop()) { await sleep(Math.min(1000, d - w)); w += 1000; } }
           continue;
         }
 
@@ -508,7 +518,7 @@ async function runAccount(o) {
 
       // Interruptible delay between groups (respects Stop + configurable groupDelay).
       if (i < targetGroups.length - 1) {
-        let w = 0; const d = Math.max(15000, (settings.groupDelay != null ? settings.groupDelay : 60) * 1000);
+        let w = 0; const d = Math.max(15000, (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000);
         while (w < d && !shouldStop()) { await sleep(Math.min(1000, d - w)); w += 1000; }
       }
     }

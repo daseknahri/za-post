@@ -11,7 +11,8 @@
     "dev": "electron . --dev",
     "migrate": "node scripts/migrate.js king",
     "migrate:base": "node scripts/migrate.js base",
-    "pack": "electron-builder --win nsis",
+    "bundle:chromium": "node scripts/bundle-chromium.js",
+    "pack": "node scripts/bundle-chromium.js && electron-builder --win nsis",
     "compile": "node -e \"require('bytenode').compileFile('main.js','main.jsc')\""
   },
   "dependencies": {
@@ -45,8 +46,18 @@
     "files": [
       "**/*",
       "!**/*.bak-*",
-      "!scripts/fb-recon/**",
+      "!scripts/**",
+      "!vps-server/**",
+      "!.claude/**",
+      "!.git/**",
+      "!.gitignore",
+      "!chrome-bin/**",
+      "!**/*.jsc",
+      "!**/*.log",
       "!**/.cache/**"
+    ],
+    "extraResources": [
+      { "from": "chrome-bin", "to": "chrome" }
     ],
     "asarUnpack": [
       "node_modules/bytenode/**",

@@ -381,6 +381,20 @@
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+            <label for="setting-group-delay" class="block text-sm font-semibold text-gray-300 mb-2">Delay Between Groups (seconds)</label>
+            <input type="number" id="setting-group-delay" min="0" value="60"
+              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+            <small class="block mt-2 text-xs text-gray-500">Seconds to wait between posting to each group</small>
+          </div>
+
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+            <label for="setting-max-cycles" class="block text-sm font-semibold text-gray-300 mb-2">Max Cycles (0 = unlimited)</label>
+            <input type="number" id="setting-max-cycles" min="0" value="0"
+              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+            <small class="block mt-2 text-xs text-gray-500">Number of full posting cycles to run; 0 means run indefinitely</small>
+          </div>
+
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
             <label class="checkbox-label flex items-center gap-3 cursor-pointer">
               <input type="checkbox" id="setting-comment-with-image" class="w-5 h-5 rounded-md accent-accent">
               <span class="text-sm font-semibold text-gray-300">🖼️ Comment with Post Image</span>

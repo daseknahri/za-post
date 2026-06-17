@@ -18,6 +18,7 @@ const store = require('./lib/store');
 const remote = require('./server');
 const { Orchestrator } = require('./automation/orchestrator');
 const license = require('./lib/license');
+const { chromiumPath } = require('./lib/chromium');
 
 // Puppeteer (stealth) — used for interactive login + status checks.
 const puppeteer = require('puppeteer-extra');
@@ -121,6 +122,7 @@ app.whenReady().then(async () => {
     loginAccount: (name) => openLoginBrowser(name),
     closeLogin: (name) => closeLoginBrowser(name),
     getTunnelUrl: () => tunnelUrl || '',
+    uploadDir: path.join(app.getPath('userData'), 'uploads'),
   });
   // Cloudflare tunnel is OPT-IN: its spawned binary can destabilize the app on some
   // systems, so it's off by default. Enable with ENABLE_TUNNEL=1 (or settings.enableTunnel).
@@ -229,7 +231,7 @@ ipcMain.handle('create-account', (_e, accountName, alias) => {
   if (data.accounts.some((a) => a.name === accountName)) return fail('Account already exists');
   data.accounts.push({
     name: accountName, alias: alias || '', status: 'not_logged_in', lastMessage: '',
-    assignedGroups: [], postFilter: 'all', postingOrder: 'post-centric', enabled: true,
+    assignedGroups: [], postFilter: 'all', postingOrder: 'post-centric-unique', enabled: true,
   });
   store.profileDir(accountName); // create profile dir
   store.save(data); send('data-updated'); return ok();
@@ -299,6 +301,7 @@ async function checkStatus(accountName) {
     store.sanitizeProfile(accountName); // don't restore old tabs
     browser = await puppeteer.launch({
       headless: true, userDataDir: store.profileDir(accountName),
+      executablePath: chromiumPath(),
       args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check'],
     });
     const allPages = await browser.pages();
@@ -342,6 +345,7 @@ async function openLoginBrowser(accountName) {
   store.sanitizeProfile(accountName); // wipe any saved tabs so it won't reopen 40 old pages
   const browser = await puppeteer.launch({
     headless: false, userDataDir: store.profileDir(accountName),
+    executablePath: chromiumPath(),
     defaultViewport: null,
     args: ['--no-sandbox', '--disable-blink-features=AutomationControlled',
       '--no-first-run', '--no-default-browser-check', '--hide-crash-restore-bubble'],

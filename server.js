@@ -25,8 +25,6 @@ let hooks = {
   getTunnelUrl: () => '',            // () => string
 };
 
-const UPLOAD_DIR = path.join(__dirname, 'public', 'uploads');
-
 function shapeLog(l) {
   const msg = l.msg || '';
   const type = /error|fail|❌|🚫/i.test(msg) ? 'error' : /success|✅|posted|published|complete/i.test(msg) ? 'success' : 'info';
@@ -40,6 +38,9 @@ function addLog(msg) {
 
 function startServer(port, injected) {
   hooks = { ...hooks, ...injected };
+  // Uploads must go to a WRITABLE dir. In a packaged app __dirname is inside the
+  // read-only asar, so main.js injects userData/uploads. Falls back to public/uploads in dev.
+  const UPLOAD_DIR = hooks.uploadDir || path.join(__dirname, 'public', 'uploads');
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   const upload = multer({ dest: UPLOAD_DIR });
 

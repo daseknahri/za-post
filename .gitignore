@@ -16,6 +16,8 @@ pcu-state.json
 dist/
 out/
 build/
+# bundled Chromium for packaging (copied from the puppeteer cache at build time, ~300MB)
+chrome-bin/
 
 # OS / editor
 .DS_Store

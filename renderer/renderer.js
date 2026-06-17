@@ -120,42 +120,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Set up event listeners from main process
   window.electronAPI.onAutomationLog((log) => {
     addLog(log);
-
-    // Track posted posts for auto-delete feature
-    if (appData.settings.autoDeletePosted && log) {
-      const logLower = log.toLowerCase();
-      // Detect successful posting patterns in logs
-      if (logLower.includes('successfully posted') || logLower.includes('post published') || logLower.includes('✅') && (logLower.includes('posted') || logLower.includes('published'))) {
-        // Try to match which post was posted by caption
-        for (const post of appData.posts) {
-          if (post.caption && log.includes(post.caption.substring(0, 30))) {
-            postedPostIds.add(post.id);
-          }
-        }
-      }
-    }
+    // Auto-delete of posted items is handled in the backend (orchestrator), per cycle.
   });
 
   window.electronAPI.onAutomationStopped(async (code) => {
     isAutomationRunning = false;
     updateAutomationControls();
     addLog(`\n✅ Automation stopped with exit code ${code}\n`);
-
-    // Auto-delete posted posts if enabled
-    if (appData.settings.autoDeletePosted && postedPostIds.size > 0) {
-      addLog(`\n🗑️ Auto-deleting ${postedPostIds.size} posted post(s)...\n`);
-      for (const postId of postedPostIds) {
-        try {
-          await window.electronAPI.deletePost(postId);
-          addLog(`  ✅ Deleted post ${postId}\n`);
-        } catch (e) {
-          addLog(`  ❌ Failed to delete post ${postId}\n`);
-        }
-      }
-      postedPostIds.clear();
-      await loadData();
-      showNotification(`Auto-deleted posted posts.`, 'info');
-    }
+    await loadData(); // refresh — the backend may have auto-deleted posted items during the run
   });
 
   window.electronAPI.onLoginBrowserOpened((accountName) => {
@@ -717,8 +689,7 @@ async function saveEditPost() {
   }
 }
 
-// Auto-delete tracking
-let postedPostIds = new Set();
+// (auto-delete of posted items is handled in the backend orchestrator, per cycle)
 
 // Groups Management
 function renderGroups() {
@@ -1480,16 +1451,23 @@ function loadSettings() {
   document.getElementById('setting-posts-per-group').value = appData.settings.postsPerGroup;
   document.getElementById('setting-comment-with-image').checked = appData.settings.commentWithImage || false;
   document.getElementById('setting-auto-delete-posted').checked = appData.settings.autoDeletePosted || false;
+  document.getElementById('setting-group-delay').value = appData.settings.groupDelay !== undefined ? appData.settings.groupDelay : 60;
+  document.getElementById('setting-max-cycles').value = appData.settings.maxCycles !== undefined ? appData.settings.maxCycles : 0;
 }
 
 async function saveSettings() {
+  // Blank/invalid numeric inputs parse to NaN; fall back to sane defaults so a stray
+  // NaN can't, e.g., silently disable the inter-group delay and trigger rate-limits.
+  const intOr = (id, def) => { const v = parseInt(document.getElementById(id).value, 10); return Number.isFinite(v) ? v : def; };
   const settings = {
-    parallelAccounts: parseInt(document.getElementById('setting-parallel-accounts').value),
-    waitInterval: parseInt(document.getElementById('setting-wait-interval').value),
-    accountDelay: parseInt(document.getElementById('setting-account-delay').value),
-    postsPerGroup: parseInt(document.getElementById('setting-posts-per-group').value),
+    parallelAccounts: intOr('setting-parallel-accounts', 3),
+    waitInterval: intOr('setting-wait-interval', 60),
+    accountDelay: intOr('setting-account-delay', 1),
+    postsPerGroup: intOr('setting-posts-per-group', 15),
     commentWithImage: document.getElementById('setting-comment-with-image').checked,
-    autoDeletePosted: document.getElementById('setting-auto-delete-posted').checked
+    autoDeletePosted: document.getElementById('setting-auto-delete-posted').checked,
+    groupDelay: intOr('setting-group-delay', 60),
+    maxCycles: intOr('setting-max-cycles', 0)
   };
 
   const result = await window.electronAPI.saveSettings(settings);
