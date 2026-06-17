@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Za Post Comment Tool King</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap"
+    rel="stylesheet">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'sans-serif'] },
+          colors: {
+            dark: { 900: '#0a0e1a', 800: '#0f1425', 700: '#151b30', 600: '#1c2440', 500: '#232d4f' },
+            accent: { DEFAULT: '#6366f1', light: '#818cf8', dark: '#4f46e5', glow: 'rgba(99, 102, 241, 0.3)' },
+            cyber: { blue: '#38bdf8', purple: '#a78bfa', pink: '#f472b6', green: '#34d399', amber: '#fbbf24' }
+          },
+          boxShadow: {
+            'glow': '0 0 20px rgba(99, 102, 241, 0.15)',
+            'glow-lg': '0 0 40px rgba(99, 102, 241, 0.2)',
+            'inner-glow': 'inset 0 1px 0 rgba(255,255,255,0.05)'
+          },
+          animation: {
+            'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+            'gradient': 'gradient 6s ease infinite',
+            'float': 'float 6s ease-in-out infinite',
+            'slide-in': 'slideIn 0.3s ease-out',
+          },
+          keyframes: {
+            gradient: {
+              '0%, 100%': { backgroundPosition: '0% 50%' },
+              '50%': { backgroundPosition: '100% 50%' },
+            },
+            float: {
+              '0%, 100%': { transform: 'translateY(0px)' },
+              '50%': { transform: 'translateY(-5px)' },
+            },
+            slideIn: {
+              '0%': { opacity: '0', transform: 'translateY(10px)' },
+              '100%': { opacity: '1', transform: 'translateY(0)' },
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+
+<body class="bg-dark-900 text-gray-200 font-sans antialiased overflow-hidden h-screen">
+  <div class="app-container flex h-screen">
+
+    <!-- Sidebar -->
+    <aside
+      class="sidebar w-64 bg-dark-800/80 backdrop-blur-xl border-r border-white/5 flex flex-col shrink-0 relative overflow-hidden">
+      <!-- Decorative gradient orb -->
+      <div class="absolute -top-20 -left-20 w-40 h-40 bg-accent/10 rounded-full blur-3xl pointer-events-none"></div>
+
+      <div class="logo p-5 pb-4 relative z-10">
+        <div class="flex items-center gap-3 mb-1">
+          <div
+            class="w-9 h-9 rounded-xl bg-gradient-to-br from-accent to-cyber-purple flex items-center justify-center text-white text-lg shadow-glow">
+            🚀
+          </div>
+          <div>
+            <h1 class="text-base font-bold text-white tracking-tight leading-tight">Za Post Comment</h1>
+            <p class="text-[10px] font-medium text-accent-light tracking-wider uppercase">v2.0 • Pro</p>
+          </div>
+        </div>
+        <p id="license-expiry-display" class="text-[10px] text-cyber-blue mt-2 pl-12">Checking license...</p>
+      </div>
+
+      <nav class="nav-menu flex-1 px-3 space-y-1 overflow-y-auto">
+        <button
+          class="nav-item active w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 group"
+          data-view="dashboard">
+          <span
+            class="icon w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-base group-hover:scale-110 transition-transform">📊</span>
+          <span>Dashboard</span>
+        </button>
+        <button
+          class="nav-item w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 group"
+          data-view="posts">
+          <span
+            class="icon w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-base group-hover:scale-110 transition-transform">📝</span>
+          <span>Posts</span>
+        </button>
+        <button
+          class="nav-item w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 group"
+          data-view="groups">
+          <span
+            class="icon w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-base group-hover:scale-110 transition-transform">👥</span>
+          <span>Groups</span>
+        </button>
+        <button
+          class="nav-item w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 group"
+          data-view="accounts">
+          <span
+            class="icon w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-base group-hover:scale-110 transition-transform">🔐</span>
+          <span>Accounts</span>
+        </button>
+        <button
+          class="nav-item w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 group"
+          data-view="automation">
+          <span
+            class="icon w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-base group-hover:scale-110 transition-transform">⚙️</span>
+          <span>Automation</span>
+        </button>
+        <button
+          class="nav-item w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 group"
+          data-view="settings">
+          <span
+            class="icon w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-base group-hover:scale-110 transition-transform">🎛️</span>
+          <span>Settings</span>
+        </button>
+        <button
+          class="nav-item w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 group"
+          data-view="proxies">
+          <span
+            class="icon w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-base group-hover:scale-110 transition-transform">🌐</span>
+          <span>Proxies</span>
+        </button>
+      </nav>
+
+      <!-- Sidebar footer -->
+      <div class="p-4 border-t border-white/5">
+        <div class="text-[10px] text-gray-600 text-center">Made with ❤️ by Abdelilah</div>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content flex-1 overflow-y-auto relative">
+      <!-- Background decorations -->
+      <div class="fixed top-0 right-0 w-96 h-96 bg-accent/5 rounded-full blur-[100px] pointer-events-none"></div>
+      <div class="fixed bottom-0 left-1/2 w-96 h-96 bg-cyber-purple/5 rounded-full blur-[100px] pointer-events-none">
+      </div>
+
+      <!-- Dashboard View -->
+      <div id="dashboard-view" class="view active p-6 animate-slide-in">
+        <div class="view-header flex justify-between items-center mb-6">
+          <div>
+            <h2 class="text-2xl font-bold text-white">Dashboard</h2>
+            <p class="text-sm text-gray-500 mt-1">Overview of your automation</p>
+          </div>
+        </div>
+
+        <div class="stats-grid grid grid-cols-4 gap-4 mb-6">
+          <div
+            class="stat-card group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 hover:border-accent/30 hover:shadow-glow transition-all duration-300 cursor-default">
+            <div class="flex items-center gap-4">
+              <div
+                class="stat-icon w-12 h-12 rounded-xl bg-gradient-to-br from-blue-500/20 to-blue-600/10 flex items-center justify-center text-xl">
+                📝</div>
+              <div class="stat-content">
+                <div class="stat-value text-2xl font-bold text-white" id="stat-posts">0</div>
+                <div class="stat-label text-xs text-gray-500 font-medium uppercase tracking-wider">Total Posts</div>
+              </div>
+            </div>
+          </div>
+          <div
+            class="stat-card group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 hover:border-cyber-purple/30 hover:shadow-glow transition-all duration-300 cursor-default">
+            <div class="flex items-center gap-4">
+              <div
+                class="stat-icon w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500/20 to-purple-600/10 flex items-center justify-center text-xl">
+                👥</div>
+              <div class="stat-content">
+                <div class="stat-value text-2xl font-bold text-white" id="stat-groups">0</div>
+                <div class="stat-label text-xs text-gray-500 font-medium uppercase tracking-wider">Total Groups</div>
+              </div>
+            </div>
+          </div>
+          <div
+            class="stat-card group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 hover:border-cyber-green/30 hover:shadow-glow transition-all duration-300 cursor-default">
+            <div class="flex items-center gap-4">
+              <div
+                class="stat-icon w-12 h-12 rounded-xl bg-gradient-to-br from-emerald-500/20 to-emerald-600/10 flex items-center justify-center text-xl">
+                🔐</div>
+              <div class="stat-content">
+                <div class="stat-value text-2xl font-bold text-white" id="stat-accounts">0</div>
+                <div class="stat-label text-xs text-gray-500 font-medium uppercase tracking-wider">Total Accounts</div>
+              </div>
+            </div>
+          </div>
+          <div
+            class="stat-card group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 hover:border-cyber-amber/30 hover:shadow-glow transition-all duration-300 cursor-default">
+            <div class="flex items-center gap-4">
+              <div
+                class="stat-icon w-12 h-12 rounded-xl bg-gradient-to-br from-amber-500/20 to-amber-600/10 flex items-center justify-center text-xl"
+                id="stat-status-icon">⏸️</div>
+              <div class="stat-content">
+                <div class="stat-value text-2xl font-bold text-white" id="stat-status">Stopped</div>
+                <div class="stat-label text-xs text-gray-500 font-medium uppercase tracking-wider">Automation Status
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Remote Access Card -->
+        <div
+          class="remote-access-card bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 mb-6 hover:border-cyber-blue/20 transition-all duration-300">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="text-cyber-blue text-lg">🌐</span>
+            <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider">Remote Access Dashboard</h3>
+          </div>
+          <p class="text-sm text-gray-400 mb-4">Monitor and manage your posts from any device using this secure link:
+          </p>
+          <div class="flex gap-3 bg-dark-900/60 p-3 rounded-xl items-center border border-white/5">
+            <input type="text" id="remote-url-display" readonly value="Initializing..."
+              class="flex-1 bg-transparent border-none text-cyber-blue font-mono text-sm outline-none">
+            <button id="btn-copy-url"
+              class="px-4 py-1.5 bg-accent/20 text-accent-light rounded-lg text-xs font-semibold hover:bg-accent/30 transition-colors border border-accent/20">Copy</button>
+          </div>
+          <small class="block mt-2 text-gray-600 text-xs">Link changes every time the app restarts.</small>
+        </div>
+
+        <div class="quick-actions">
+          <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">Quick Actions</h3>
+          <div class="action-buttons grid grid-cols-4 gap-3">
+            <button
+              class="action-btn group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-xl p-4 text-center hover:border-accent/30 hover:shadow-glow transition-all duration-300"
+              data-action="add-post">
+              <span class="icon text-2xl block mb-2 group-hover:scale-110 transition-transform">➕</span>
+              <span class="text-sm font-medium text-gray-300">Add Post</span>
+            </button>
+            <button
+              class="action-btn group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-xl p-4 text-center hover:border-cyber-purple/30 hover:shadow-glow transition-all duration-300"
+              data-action="add-group">
+              <span class="icon text-2xl block mb-2 group-hover:scale-110 transition-transform">➕</span>
+              <span class="text-sm font-medium text-gray-300">Add Group</span>
+            </button>
+            <button
+              class="action-btn group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-xl p-4 text-center hover:border-cyber-green/30 hover:shadow-glow transition-all duration-300"
+              data-action="add-account">
+              <span class="icon text-2xl block mb-2 group-hover:scale-110 transition-transform">➕</span>
+              <span class="text-sm font-medium text-gray-300">Add Account</span>
+            </button>
+            <button
+              class="action-btn primary group bg-gradient-to-r from-accent to-cyber-purple border-0 rounded-xl p-4 text-center shadow-glow hover:shadow-glow-lg hover:scale-[1.02] transition-all duration-300"
+              data-action="start-automation">
+              <span class="icon text-2xl block mb-2 group-hover:scale-110 transition-transform">▶️</span>
+              <span class="text-sm font-semibold text-white">Start Automation</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Posts View -->
+      <div id="posts-view" class="view p-6">
+        <div class="view-header flex justify-between items-center mb-6">
+          <div>
+            <h2 class="text-2xl font-bold text-white">Posts Management</h2>
+            <p class="text-sm text-gray-500 mt-1">Create and manage your posts</p>
+          </div>
+          <button
+            class="btn-primary flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all duration-300"
+            id="btn-add-post">
+            <span>➕</span> Add Post
+          </button>
+        </div>
+        <div class="posts-grid grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" id="posts-container">
+          <!-- Posts will be dynamically added here -->
+        </div>
+      </div>
+
+      <!-- Groups View -->
+      <div id="groups-view" class="view p-6">
+        <div class="view-header flex justify-between items-center mb-6">
+          <div>
+            <h2 class="text-2xl font-bold text-white">Groups Management</h2>
+            <p class="text-sm text-gray-500 mt-1">Manage your Facebook groups</p>
+          </div>
+          <button
+            class="btn-primary flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all duration-300"
+            id="btn-add-group">
+            <span>➕</span> Add Group
+          </button>
+        </div>
+        <div class="groups-list space-y-3" id="groups-container">
+          <!-- Groups will be dynamically added here -->
+        </div>
+      </div>
+
+      <!-- Accounts View -->
+      <div id="accounts-view" class="view p-6">
+        <div class="view-header flex justify-between items-center mb-6">
+          <div>
+            <h2 class="text-2xl font-bold text-white">Accounts Management</h2>
+            <p class="text-sm text-gray-500 mt-1">Manage your Facebook accounts</p>
+          </div>
+          <button
+            class="btn-primary flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all duration-300"
+            id="btn-add-account">
+            <span>➕</span> Add Account
+          </button>
+        </div>
+        <div class="accounts-grid grid grid-cols-1 md:grid-cols-2 gap-4" id="accounts-container">
+          <!-- Accounts will be dynamically added here -->
+        </div>
+      </div>
+
+      <!-- Automation View -->
+      <div id="automation-view" class="view p-6">
+        <div class="view-header flex justify-between items-center mb-6">
+          <div>
+            <h2 class="text-2xl font-bold text-white">Automation Control</h2>
+            <p class="text-sm text-gray-500 mt-1">Start and monitor automation</p>
+          </div>
+          <div class="automation-controls flex gap-3">
+            <button
+              class="btn-success flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-emerald-500 to-emerald-600 rounded-xl text-white text-sm font-semibold hover:shadow-lg hover:shadow-emerald-500/20 transition-all duration-300"
+              id="btn-start-automation">
+              <span>▶️</span> Start
+            </button>
+            <button
+              class="btn-danger flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-red-500 to-red-600 rounded-xl text-white text-sm font-semibold hover:shadow-lg hover:shadow-red-500/20 transition-all duration-300 opacity-50 cursor-not-allowed"
+              id="btn-stop-automation" disabled>
+              <span>⏹️</span> Stop
+            </button>
+          </div>
+        </div>
+
+        <div class="automation-logs">
+          <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Live Logs</h3>
+          <div
+            class="logs-container bg-dark-900/80 backdrop-blur-sm border border-white/5 rounded-2xl p-4 h-[500px] overflow-y-auto font-mono text-xs"
+            id="logs-container">
+            <div class="log-entry text-gray-500">Waiting for automation to start...</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Settings View -->
+      <div id="settings-view" class="view p-6">
+        <div class="view-header flex justify-between items-center mb-6">
+          <div>
+            <h2 class="text-2xl font-bold text-white">Settings</h2>
+            <p class="text-sm text-gray-500 mt-1">Configure automation behavior</p>
+          </div>
+          <button
+            class="btn-primary flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all duration-300"
+            id="btn-save-settings">
+            <span>💾</span> Save Settings
+          </button>
+        </div>
+
+        <div class="settings-form max-w-xl space-y-5">
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+            <label for="setting-parallel-accounts" class="block text-sm font-semibold text-gray-300 mb-2">Parallel
+              Accounts</label>
+            <input type="number" id="setting-parallel-accounts" min="1" max="10" value="3"
+              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+            <small class="block mt-2 text-xs text-gray-500">Number of accounts to run simultaneously (1-10)</small>
+          </div>
+
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+            <label for="setting-wait-interval" class="block text-sm font-semibold text-gray-300 mb-2">Wait Interval
+              (minutes)</label>
+            <input type="number" id="setting-wait-interval" min="1" max="1440" value="60"
+              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+            <small class="block mt-2 text-xs text-gray-500">Minutes to wait between automation cycles</small>
+          </div>
+
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+            <label for="setting-account-delay" class="block text-sm font-semibold text-gray-300 mb-2">Delay Between
+              Accounts (minutes)</label>
+            <input type="number" id="setting-account-delay" min="0" value="1"
+              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+            <small class="block mt-2 text-xs text-gray-500">Minutes to wait between switching accounts</small>
+          </div>
+
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+            <label for="setting-posts-per-group" class="block text-sm font-semibold text-gray-300 mb-2">Max Groups per Account (per cycle)</label>
+            <input type="number" id="setting-posts-per-group" min="1" max="50" value="15"
+              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+            <small class="block mt-2 text-xs text-gray-500">How many groups each account posts to in one cycle</small>
+          </div>
+
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+            <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+              <input type="checkbox" id="setting-comment-with-image" class="w-5 h-5 rounded-md accent-accent">
+              <span class="text-sm font-semibold text-gray-300">🖼️ Comment with Post Image</span>
+            </label>
+            <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, the same image from the post will also be
+              attached to the comment. Only applies to posts that have a comment.</small>
+          </div>
+
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+            <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+              <input type="checkbox" id="setting-auto-delete-posted" class="w-5 h-5 rounded-md accent-accent">
+              <span class="text-sm font-semibold text-gray-300">🗑️ Auto-Delete Posted Posts</span>
+            </label>
+            <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, posts will be automatically deleted from
+              the app after they have been successfully posted during automation.</small>
+          </div>
+        </div>
+      </div>
+
+      <!-- Proxies View -->
+      <div id="proxies-view" class="view p-6">
+        <div class="view-header flex justify-between items-center mb-6">
+          <div>
+            <h2 class="text-2xl font-bold text-white">Proxy Management</h2>
+            <p class="text-sm text-gray-500 mt-1">Configure SOCKS5 proxies</p>
+          </div>
+          <button
+            class="btn-primary flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all duration-300"
+            id="btn-save-proxies">
+            <span>💾</span> Save Proxies
+          </button>
+        </div>
+
+        <div class="settings-form max-w-4xl">
+          <!-- Global Toggle -->
+          <div
+            class="form-group checkbox-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 mb-6">
+            <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+              <input type="checkbox" id="proxies-enabled" class="w-5 h-5 rounded-md accent-accent">
+              <span class="text-base font-semibold text-gray-200">Enable SOCKS5 Proxy Rotation</span>
+            </label>
+            <p class="text-xs text-gray-500 mt-2 ml-8">When enabled, each account will be assigned a sticky SOCKS5 proxy
+              from the list below.</p>
+          </div>
+
+          <!-- Add Proxy Form -->
+          <div
+            class="add-proxy-form grid gap-3 mb-6 bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5"
+            style="grid-template-columns: 80px 1.5fr 0.8fr 1fr 1fr auto; align-items: end;">
+            <div class="form-group" style="margin-bottom: 0;">
+              <small class="block mb-1 text-xs text-gray-500">No.</small>
+              <input type="text" id="proxy-id" placeholder="#"
+                class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+              <small class="block mb-1 text-xs text-gray-500">IP Address</small>
+              <input type="text" id="proxy-ip" placeholder="1.2.3.4"
+                class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+              <small class="block mb-1 text-xs text-gray-500">Port</small>
+              <input type="text" id="proxy-port" placeholder="1080"
+                class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+              <small class="block mb-1 text-xs text-gray-500">Username</small>
+              <input type="text" id="proxy-user" placeholder="user"
+                class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+              <small class="block mb-1 text-xs text-gray-500">Password</small>
+              <input type="text" id="proxy-pass" placeholder="pass"
+                class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+            </div>
+            <div style="padding-bottom: 2px;">
+              <button
+                class="btn-success px-4 py-2 bg-gradient-to-r from-emerald-500 to-emerald-600 rounded-lg text-white text-sm font-semibold hover:shadow-emerald-500/20 transition-all"
+                id="btn-add-proxy-row">
+                <span>➕</span> Add
+              </button>
+            </div>
+          </div>
+
+          <!-- Proxies Table -->
+          <div
+            class="proxies-table-container bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl overflow-hidden">
+            <table class="w-full border-collapse text-sm">
+              <thead class="bg-dark-600/50 text-gray-400 font-semibold text-left text-xs uppercase tracking-wider">
+                <tr>
+                  <th class="px-5 py-3 w-16">No.</th>
+                  <th class="px-5 py-3">IP Address</th>
+                  <th class="px-5 py-3 w-24">Port</th>
+                  <th class="px-5 py-3">Username</th>
+                  <th class="px-5 py-3">Password</th>
+                  <th class="px-5 py-3 w-20">Action</th>
+                </tr>
+              </thead>
+              <tbody id="proxies-table-body" class="text-gray-300">
+                <!-- Rows added dynamically -->
+              </tbody>
+            </table>
+            <div id="proxies-empty-state" class="px-8 py-10 text-center text-gray-500 text-sm" style="display: none;">
+              No proxies added yet.
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Modal for Adding Post -->
+  <div id="modal-add-post" class="modal">
+    <div
+      class="modal-content large bg-dark-700/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl max-w-xl w-full">
+      <div class="modal-header flex justify-between items-center p-5 border-b border-white/5">
+        <h3 class="text-lg font-bold text-white">Add New Post</h3>
+        <button
+          class="modal-close w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-500/20 transition-all">&times;</button>
+      </div>
+      <div class="modal-body p-5 space-y-4 max-h-[60vh] overflow-y-auto">
+        <div class="form-group">
+          <label class="block text-sm font-semibold text-gray-300 mb-2">Images <span
+              class="text-xs text-gray-500 font-normal">(optional — text-only posts are supported)</span></label>
+          <div
+            class="image-upload-area border-2 border-dashed border-white/10 rounded-xl p-8 text-center cursor-pointer hover:border-accent/40 transition-all"
+            id="image-upload-area">
+            <div class="upload-placeholder">
+              <span class="icon text-4xl block mb-2">📷</span>
+              <p class="text-sm text-gray-400">Click to select images or drag & drop</p>
+            </div>
+            <div id="images-preview-container"
+              style="display: none; flex-wrap: wrap; gap: 8px; justify-content: center;"></div>
+          </div>
+          <input type="file" id="image-input" accept="image/*" multiple style="display: none;">
+          <div style="margin-top: 10px;">
+              <label class="block text-sm font-semibold text-gray-300 mb-2">🔗 Or paste image URL</label>
+              <input type="text" id="image-url-input" placeholder="https://example.com/image.jpg"
+                  class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="post-caption" class="block text-sm font-semibold text-gray-300 mb-2">Caption *</label>
+          <textarea id="post-caption" rows="4" placeholder="Enter your post caption..."
+            class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all resize-y"></textarea>
+        </div>
+
+        <div class="form-group">
+          <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+            <input type="checkbox" id="post-comment-enabled" class="w-5 h-5 rounded-md accent-accent">
+            <span class="text-sm font-medium text-gray-300">Add Comment After Posting</span>
+          </label>
+        </div>
+
+        <div class="form-group" id="comment-group" style="display: none;">
+          <label for="post-comment" class="block text-sm font-semibold text-gray-300 mb-2">Comment</label>
+          <textarea id="post-comment" rows="3" placeholder="Enter your comment..."
+            class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all resize-y"></textarea>
+        </div>
+
+        <!-- Comment Image (only visible for text-only posts when comment is enabled) -->
+        <div class="form-group" id="comment-image-group" style="display: none;">
+          <label class="block text-sm font-semibold text-gray-300 mb-2">Comment Image <span
+              class="text-xs text-gray-500 font-normal">(optional — attach a custom image to the comment)</span></label>
+          <div
+            class="image-upload-area border-2 border-dashed border-white/10 rounded-xl p-6 text-center cursor-pointer hover:border-accent/40 transition-all"
+            id="comment-image-upload-area">
+            <div class="comment-upload-placeholder">
+              <span class="icon text-3xl block mb-2">💬🖼️</span>
+              <p class="text-sm text-gray-400">Click to select an image for the comment</p>
+            </div>
+            <div id="comment-image-preview" style="display: none;">
+              <img id="comment-image-preview-img" style="max-height:80px; border-radius:8px; object-fit:cover; margin:0 auto;">
+              <button type="button" id="comment-image-remove-btn"
+                style="margin-top:6px; background:#ef4444; color:white; border:none; border-radius:8px; padding:4px 12px; font-size:12px; cursor:pointer;">Remove</button>
+            </div>
+          </div>
+          <input type="file" id="comment-image-input" accept="image/*" style="display: none;">
+          <div style="margin-top: 10px;">
+              <label class="block text-sm font-semibold text-gray-300 mb-2">🔗 Or paste comment image URL</label>
+              <input type="text" id="comment-image-url-input" placeholder="https://example.com/comment-image.jpg"
+                  class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
+        <button
+          class="btn-secondary px-5 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all"
+          data-dismiss="modal">Cancel</button>
+        <button
+          class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all"
+          id="btn-save-post">Save Post</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal for Adding Group -->
+  <div id="modal-add-group" class="modal">
+    <div
+      class="modal-content bg-dark-700/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl max-w-md w-full">
+      <div class="modal-header flex justify-between items-center p-5 border-b border-white/5">
+        <h3 class="text-lg font-bold text-white">Add New Group</h3>
+        <button
+          class="modal-close w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-500/20 transition-all">&times;</button>
+      </div>
+      <div class="modal-body p-5 space-y-4">
+        <div class="form-group">
+          <label for="group-id" class="block text-sm font-semibold text-gray-300 mb-2">Group ID *</label>
+          <input type="text" id="group-id" placeholder="e.g., 123456789012345"
+            class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+          <small class="block mt-2 text-xs text-gray-500">Enter the Facebook group ID or paste the group URL</small>
+        </div>
+        <div class="form-group">
+          <label for="group-name" class="block text-sm font-semibold text-gray-300 mb-2">Group Name</label>
+          <input type="text" id="group-name" placeholder="e.g., My Marketing Group"
+            class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+          <small class="block mt-2 text-xs text-gray-500">Optional: friendly name for easy identification</small>
+        </div>
+      </div>
+      <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
+        <button
+          class="btn-secondary px-5 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all"
+          data-dismiss="modal">Cancel</button>
+        <button
+          class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all"
+          id="btn-save-group">Save Group</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal for Adding Account -->
+  <div id="modal-add-account" class="modal">
+    <div
+      class="modal-content bg-dark-700/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl max-w-md w-full">
+      <div class="modal-header flex justify-between items-center p-5 border-b border-white/5">
+        <h3 class="text-lg font-bold text-white">Add New Account</h3>
+        <button
+          class="modal-close w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-500/20 transition-all">&times;</button>
+      </div>
+      <div class="modal-body p-5 space-y-4">
+        <div class="form-group">
+          <label for="account-name" class="block text-sm font-semibold text-gray-300 mb-2">Account Name *</label>
+          <input type="text" id="account-name" placeholder="e.g., account1" autofocus
+            class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+          <small class="block mt-2 text-xs text-gray-500">Use simple names like: account1, account2, etc.</small>
+        </div>
+        <div class="form-group">
+          <label for="account-alias" class="block text-sm font-semibold text-gray-300 mb-2">Alias (Display Name)</label>
+          <input type="text" id="account-alias" placeholder="e.g., Frank Jane"
+            class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+          <small class="block mt-2 text-xs text-gray-500">Optional: The Facebook name or friendly name for easy
+            identification</small>
+        </div>
+        <div class="info-box bg-accent/5 border border-accent/10 rounded-xl p-4">
+          <p class="text-xs text-gray-400">ℹ️ After creating the account, use <strong class="text-accent-light">🔐 Login</strong> to open Chrome or <strong class="text-accent-light">🍪 Cookies</strong> to import cookies.</p>
+        </div>
+      </div>
+      <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
+        <button
+          class="btn-secondary px-5 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all"
+          data-dismiss="modal">Cancel</button>
+        <button
+          class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all"
+          id="btn-save-account">Create Account</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal for Login Instructions -->
+  <div id="modal-login-instructions" class="modal">
+    <div
+      class="modal-content bg-dark-700/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl max-w-md w-full">
+      <div class="modal-header flex justify-between items-center p-5 border-b border-white/5">
+        <h3 class="text-lg font-bold text-white">🔐 Login to Facebook</h3>
+      </div>
+      <div class="modal-body p-5">
+        <div class="login-instructions">
+          <h4 class="text-sm font-semibold text-gray-300 mb-4">Chrome browser opened for: <span id="login-account-name"
+              class="text-accent-light"></span></h4>
+          <div class="instruction-steps space-y-3">
+            <div class="step flex items-center gap-4 p-3 bg-dark-600/50 rounded-xl">
+              <div
+                class="step-number w-8 h-8 rounded-full bg-accent/20 text-accent-light flex items-center justify-center text-sm font-bold shrink-0">
+                1</div>
+              <div class="step-text text-sm text-gray-300">Go to the Chrome window that just opened</div>
+            </div>
+            <div class="step flex items-center gap-4 p-3 bg-dark-600/50 rounded-xl">
+              <div
+                class="step-number w-8 h-8 rounded-full bg-accent/20 text-accent-light flex items-center justify-center text-sm font-bold shrink-0">
+                2</div>
+              <div class="step-text text-sm text-gray-300">Log in to your Facebook account</div>
+            </div>
+            <div class="step flex items-center gap-4 p-3 bg-dark-600/50 rounded-xl">
+              <div
+                class="step-number w-8 h-8 rounded-full bg-accent/20 text-accent-light flex items-center justify-center text-sm font-bold shrink-0">
+                3</div>
+              <div class="step-text text-sm text-gray-300">Once logged in, close the Chrome window</div>
+            </div>
+            <div class="step flex items-center gap-4 p-3 bg-dark-600/50 rounded-xl">
+              <div
+                class="step-number w-8 h-8 rounded-full bg-accent/20 text-accent-light flex items-center justify-center text-sm font-bold shrink-0">
+                4</div>
+              <div class="step-text text-sm text-gray-300">Click "I'm Done" below</div>
+            </div>
+          </div>
+          <div class="info-box bg-accent/5 border border-accent/10 rounded-xl p-4 mt-5">
+            <p class="text-xs text-gray-400">💡 Your login will be saved automatically. You only need to do this once
+              per account.</p>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
+        <button
+          class="btn-secondary px-5 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all"
+          id="btn-cancel-login">Cancel</button>
+        <button
+          class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all"
+          id="btn-check-login">🔍 Check Login Status</button>
+        <button
+          class="btn-success px-5 py-2.5 bg-gradient-to-r from-emerald-500 to-emerald-600 rounded-xl text-white text-sm font-semibold hover:shadow-emerald-500/20 transition-all"
+          id="btn-login-done" style="display: none;">✓ Close & Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal for Editing Account -->
+  <div id="modal-edit-account" class="modal">
+    <div
+      class="modal-content bg-dark-700/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl max-w-md w-full">
+      <div class="modal-header flex justify-between items-center p-5 border-b border-white/5">
+        <h3 class="text-lg font-bold text-white">✏️ Edit Account</h3>
+        <button class="text-gray-400 hover:text-white text-xl" data-dismiss="modal">&times;</button>
+      </div>
+      <div class="modal-body p-5 space-y-4">
+        <div class="form-group">
+          <label for="edit-account-alias" class="block text-sm font-semibold text-gray-300 mb-2">Display Alias</label>
+          <input type="text" id="edit-account-alias" placeholder="e.g. My Main Account"
+            class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+          <small class="block mt-1 text-xs text-gray-500">Optional display name shown in the UI</small>
+        </div>
+        <div class="form-group">
+          <label for="edit-account-name" class="block text-sm font-semibold text-gray-300 mb-2">Account Name</label>
+          <input type="text" id="edit-account-name" placeholder="account1"
+            class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+          <small class="block mt-1 text-xs text-amber-400/70">⚠️ Changing this will rename the profile folder. You may
+            need to re-login.</small>
+        </div>
+      </div>
+      <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
+        <button
+          class="btn-secondary px-5 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all"
+          data-dismiss="modal">Cancel</button>
+        <button
+          class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all"
+          id="btn-save-edit-account">Save Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal for Importing Cookies -->
+
+  <!-- Modal for Editing Post -->
+  <div id="modal-edit-post" class="modal">
+    <div
+      class="modal-content bg-dark-700/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl max-w-xl w-full">
+      <div class="modal-header flex justify-between items-center p-5 border-b border-white/5">
+        <h3 class="text-lg font-bold text-white">✏️ Edit Post</h3>
+        <button
+          class="modal-close w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-500/20 transition-all">&times;</button>
+      </div>
+      <div class="modal-body p-5 space-y-4">
+        <div class="form-group">
+          <label for="edit-post-caption" class="block text-sm font-semibold text-gray-300 mb-2">Caption *</label>
+          <textarea id="edit-post-caption" rows="5" placeholder="Edit your caption..."
+            class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all resize-y"></textarea>
+        </div>
+        <div class="form-group">
+          <label for="edit-post-comment" class="block text-sm font-semibold text-gray-300 mb-2">Comment</label>
+          <textarea id="edit-post-comment" rows="3" placeholder="Edit your comment (leave empty for no comment)..."
+            class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all resize-y"></textarea>
+          <small class="block mt-1 text-xs text-gray-500">Leave empty to remove the comment.</small>
+        </div>
+      </div>
+      <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
+        <button
+          class="btn-secondary px-5 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all"
+          data-dismiss="modal">Cancel</button>
+        <button
+          class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all"
+          id="btn-save-edit-post" onclick="saveEditPost()">Save Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal for Importing Cookies -->
+  <div id="modal-import-cookies" class="modal">
+    <div
+      class="modal-content bg-dark-700/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl max-w-xl w-full">
+      <div class="modal-header flex justify-between items-center p-5 border-b border-white/5">
+        <h3 class="text-lg font-bold text-white">🍪 Import Cookies</h3>
+        <button
+          class="modal-close w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-500/20 transition-all">&times;</button>
+      </div>
+      <div class="modal-body p-5 space-y-4">
+        <div class="info-box bg-accent/5 border border-accent/10 rounded-xl p-4">
+          <p class="text-xs text-gray-400">ℹ️ Import cookies for account: <strong id="cookie-import-account-name" class="text-accent-light"></strong></p>
+          <p class="text-xs text-gray-500 mt-2">Export cookies from your browser using extensions like <strong class="text-gray-400">Cookie-Editor</strong> or <strong class="text-gray-400">EditThisCookie</strong>, then paste the JSON below.</p>
+        </div>
+        <div class="form-group">
+          <label for="cookie-json-input" class="block text-sm font-semibold text-gray-300 mb-2">Cookies JSON *</label>
+          <textarea id="cookie-json-input" rows="10" placeholder='Paste your cookies JSON array here...
+
+Example format:
+[
+  {
+    "name": "c_user",
+    "value": "100...",
+    "domain": ".facebook.com",
+    ...
+  }
+]'
+            class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all resize-y font-mono"
+            style="min-height: 200px;"></textarea>
+        </div>
+        <div id="cookie-import-status" class="text-sm font-medium px-4 py-3 rounded-xl bg-dark-900/40" style="display: none;"></div>
+      </div>
+      <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
+        <button
+          class="btn-secondary px-5 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all"
+          data-dismiss="modal">Cancel</button>
+        <button
+          class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all"
+          id="btn-submit-cookies" onclick="submitCookieImport()">🍪 Import & Validate</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+
+</html>

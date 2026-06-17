@@ -1,0 +1,1115 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Facebook Pilot - Remote</title>
+    <style>
+        :root {
+            --bg-dark: #0f1014;
+            --bg-card: rgba(30, 32, 40, 0.7);
+            --primary: #3b82f6;
+            --primary-grad: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+            --success: #10b981;
+            --danger: #ef4444;
+            --text-main: #f8fafc;
+            --text-sub: #94a3b8;
+            --border: rgba(255, 255, 255, 0.08);
+            --glass-blur: blur(12px);
+        }
+
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-dark);
+            background-image:
+                radial-gradient(circle at 15% 50%, rgba(59, 130, 246, 0.08), transparent 25%),
+                radial-gradient(circle at 85% 30%, rgba(16, 185, 129, 0.06), transparent 25%);
+            color: var(--text-main);
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 700px;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        /* HEADER */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 5px;
+            margin-bottom: 10px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 1.25rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .brand-icon {
+            font-size: 1.5rem;
+        }
+
+        .status-badge {
+            padding: 6px 14px;
+            border-radius: 99px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #64748b;
+        }
+
+        .running .status-dot {
+            background: var(--success);
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.4);
+        }
+
+        .stopped .status-dot {
+            background: var(--danger);
+        }
+
+        .status-badge.running {
+            color: var(--success);
+            border-color: rgba(16, 185, 129, 0.2);
+            background: rgba(16, 185, 129, 0.05);
+        }
+
+        .status-badge.stopped {
+            color: var(--danger);
+            border-color: rgba(239, 68, 68, 0.2);
+            background: rgba(239, 68, 68, 0.05);
+        }
+
+        /* CARDS */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 24px;
+            backdrop-filter: var(--glass-blur);
+            box-shadow: 0 4px 20px -5px rgba(0, 0, 0, 0.2);
+            transition: transform 0.2s;
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .card h2 {
+            margin: 0;
+            font-size: 0.95rem;
+            color: var(--text-sub);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-weight: 700;
+        }
+
+        /* INPUTS */
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: var(--text-sub);
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        input[type="text"],
+        input[type="number"],
+        textarea {
+            width: 100%;
+            padding: 12px 16px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: white;
+            box-sizing: border-box;
+            font-family: inherit;
+            font-size: 0.95rem;
+            transition: all 0.2s;
+        }
+
+        input[type="text"]:focus,
+        input[type="number"]:focus,
+        textarea:focus {
+            outline: none;
+            border-color: var(--primary);
+            background: rgba(0, 0, 0, 0.5);
+        }
+
+        /* CUSTOM FILE INPUT */
+        .file-upload {
+            position: relative;
+            display: inline-block;
+            width: 100%;
+        }
+
+        .file-upload-label {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            padding: 12px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px dashed var(--border);
+            border-radius: 10px;
+            cursor: pointer;
+            color: var(--text-sub);
+            transition: all 0.2s;
+        }
+
+        .file-upload-label:hover {
+            border-color: var(--primary);
+            color: var(--text-main);
+        }
+
+        .file-upload-label.has-file {
+            border-style: solid;
+            border-color: var(--success);
+            color: var(--success);
+            background: rgba(16, 185, 129, 0.05);
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        /* BUTTONS */
+        button {
+            padding: 12px 20px;
+            border-radius: 10px;
+            border: none;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            color: white;
+            font-size: 0.9rem;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            filter: grayscale(1);
+        }
+
+        button:active {
+            transform: scale(0.98);
+        }
+
+        .btn-primary {
+            background: var(--primary-grad);
+            width: 100%;
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            filter: brightness(1.1);
+        }
+
+        .btn-start {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            flex: 1;
+        }
+
+        .btn-stop {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            flex: 1;
+        }
+
+        .controls {
+            display: flex;
+            gap: 12px;
+        }
+
+        /* LOGS */
+        #logs-container {
+            background: rgba(0, 0, 0, 0.4);
+            color: #10b981;
+            font-family: 'JetBrains Mono', 'Courier New', monospace;
+            padding: 16px;
+            border-radius: 10px;
+            height: 120px;
+            overflow-y: auto;
+            font-size: 0.8rem;
+            white-space: pre-wrap;
+            border: 1px solid var(--border);
+        }
+
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 3px;
+        }
+
+        /* POST LIST */
+        .post-list {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .post-item {
+            background: rgba(255, 255, 255, 0.03);
+            padding: 16px;
+            border-radius: 12px;
+            display: flex;
+            align-items: flex-start;
+            gap: 16px;
+            border: 1px solid transparent;
+            transition: background 0.2s;
+        }
+
+        .post-item:hover {
+            background: rgba(255, 255, 255, 0.05);
+            border-color: var(--border);
+        }
+
+        .post-img-container {
+            position: relative;
+            width: 80px;
+            height: 80px;
+            flex-shrink: 0;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #000;
+        }
+
+        .post-img-container img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .post-content {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .post-caption {
+            font-size: 0.95rem;
+            margin: 0 0 8px 0;
+            color: #fff;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .post-comment {
+            font-size: 0.85rem;
+            color: var(--text-sub);
+            background: rgba(255, 255, 255, 0.05);
+            padding: 8px 12px;
+            border-radius: 6px;
+            display: flex;
+            gap: 8px;
+            align-items: flex-start;
+        }
+
+        .comment-icon {
+            color: var(--primary);
+            font-size: 0.9rem;
+            margin-top: 1px;
+        }
+
+        .btn-delete {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--danger);
+            padding: 8px;
+            border-radius: 8px;
+            width: 32px;
+            height: 32px;
+        }
+
+        .btn-delete:hover {
+            background: var(--danger);
+            color: white;
+        }
+
+        /* Empty State */
+        .empty-state {
+            text-align: center;
+            color: var(--text-sub);
+            padding: 40px 0;
+            opacity: 0.7;
+        }
+
+        /* REMOTE URL ROW */
+        .remote-url-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 16px;
+            padding: 10px 14px;
+            background: rgba(0, 0, 0, 0.25);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            font-size: 0.85rem;
+        }
+
+        .remote-url-label {
+            color: var(--text-sub);
+            font-weight: 600;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        #remote-url-value {
+            color: var(--primary);
+            word-break: break-all;
+            flex: 1;
+        }
+
+        .btn-copy {
+            background: rgba(59, 130, 246, 0.15);
+            color: var(--primary);
+            border: 1px solid rgba(59, 130, 246, 0.3);
+            padding: 5px 12px;
+            border-radius: 7px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .btn-copy:hover {
+            background: rgba(59, 130, 246, 0.3);
+        }
+
+        /* INTERVAL ROW */
+        .interval-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        .interval-row label {
+            margin: 0;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        #interval-input {
+            width: 90px;
+            flex-shrink: 0;
+            padding: 9px 12px;
+        }
+
+        .btn-interval-save {
+            background: var(--primary-grad);
+            padding: 9px 18px;
+            border-radius: 10px;
+            font-size: 0.85rem;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        #interval-msg {
+            font-size: 0.8rem;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .interval-msg-ok {
+            color: var(--success);
+        }
+
+        .interval-msg-err {
+            color: var(--danger);
+        }
+
+        /* ACCOUNTS LIST */
+        .account-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .account-item {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .account-status-dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .account-status-dot.status-logged-in {
+            background: var(--success);
+            box-shadow: 0 0 6px rgba(16, 185, 129, 0.5);
+        }
+
+        .account-status-dot.status-error {
+            background: var(--danger);
+        }
+
+        .account-status-dot.status-other {
+            background: #64748b;
+        }
+
+        .account-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .account-name {
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--text-main);
+        }
+
+        .account-last-msg {
+            font-size: 0.78rem;
+            color: var(--text-sub);
+            margin-top: 2px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .account-status-text {
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 3px 9px;
+            border-radius: 99px;
+            flex-shrink: 0;
+        }
+
+        .account-status-text.status-logged-in {
+            color: var(--success);
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+        }
+
+        .account-status-text.status-error {
+            color: var(--danger);
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+
+        .account-status-text.status-other {
+            color: var(--text-sub);
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border);
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <header>
+            <div class="brand">
+                <span class="brand-icon">🚀</span>
+                <h1>Facebook Pilot</h1>
+            </div>
+            <div id="status-badge" class="status-badge stopped">
+                <span class="status-dot"></span>
+                <span id="status-text">OFFLINE</span>
+            </div>
+        </header>
+
+        <!-- AUTOMATION CARD -->
+        <div class="card">
+            <div class="card-header">
+                <h2>Automation Control</h2>
+            </div>
+
+            <div class="controls">
+                <button id="btn-start" class="btn-start" onclick="startAutomation()">
+                    <span>▶ Start System</span>
+                </button>
+                <button id="btn-stop" class="btn-stop" onclick="stopAutomation()" disabled>
+                    <span>⏹ Stop System</span>
+                </button>
+            </div>
+
+            <!-- REMOTE URL -->
+            <div class="remote-url-row">
+                <span class="remote-url-label">🌐 Remote URL:</span>
+                <span id="remote-url-value">(loading…)</span>
+                <button id="btn-copy-url" class="btn-copy" onclick="copyRemoteUrl()" style="display:none;">Copy</button>
+            </div>
+
+            <!-- INTERVAL CONTROL -->
+            <div class="interval-row">
+                <label for="interval-input">⏱ Interval (min):</label>
+                <input type="number" id="interval-input" min="1" max="1440" placeholder="e.g. 30">
+                <button class="btn-interval-save" onclick="saveInterval()">Save</button>
+                <span id="interval-msg"></span>
+            </div>
+
+            <div style="margin-top: 16px;">
+                <div id="logs-container">Connecting to server...</div>
+            </div>
+        </div>
+
+        <!-- ADD POST CARD -->
+        <div class="card">
+            <div class="card-header">
+                <h2>Compose New Post</h2>
+            </div>
+
+            <div class="form-group">
+                <label>Upload Media</label>
+                <div class="file-upload">
+                    <label for="image-file" class="file-upload-label" id="file-label">
+                        <span>📷 Select Image File</span>
+                    </label>
+                    <input type="file" id="image-file" accept="image/*" onchange="updateFileLabel()">
+                </div>
+                <div style="margin-top: 10px;">
+                    <label style="display:block; margin-bottom:8px; color:var(--text-sub); font-size:0.85rem; font-weight:500;">🔗 Or paste image URL</label>
+                    <input type="text" id="image-url" placeholder="https://example.com/image.jpg" style="width:100%; padding:12px 16px; background:rgba(0,0,0,0.3); border:1px solid var(--border); border-radius:10px; color:white; box-sizing:border-box; font-family:inherit; font-size:0.95rem;">
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>Caption</label>
+                <textarea id="caption" rows="3" placeholder="Write something engaging..."></textarea>
+            </div>
+
+            <div class="form-group">
+                <label>First Comment (Optional)</label>
+                <textarea id="comment" rows="2" placeholder="Add a link or extra info..."></textarea>
+            </div>
+
+            <div class="form-group">
+                <label>Comment Image (Optional)</label>
+                <div class="file-upload">
+                    <div id="comment-image-drop-area" class="file-upload-label" style="flex-direction:column; gap:6px; padding:16px; min-height:60px;">
+                        <div id="comment-img-placeholder">
+                            <span>💬🖼️ Drop image here, click to browse, or paste URL</span>
+                        </div>
+                        <div id="comment-img-preview" style="display:none; text-align:center;">
+                            <img id="comment-img-preview-img" style="max-height:80px; border-radius:8px; object-fit:cover;">
+                            <br>
+                            <button type="button" onclick="clearCommentImage()" style="margin-top:6px; background:#ef4444; color:white; border:none; border-radius:8px; padding:4px 14px; font-size:12px; cursor:pointer;">Remove</button>
+                        </div>
+                    </div>
+                    <input type="file" id="comment-image-file" accept="image/*" style="display:none;">
+                </div>
+                <div style="margin-top: 10px;">
+                    <label style="display:block; margin-bottom:8px; color:var(--text-sub); font-size:0.85rem; font-weight:500;">🔗 Or paste comment image URL</label>
+                    <input type="text" id="comment-image-url" placeholder="https://example.com/comment-image.jpg">
+                </div>
+            </div>
+
+            <button class="btn-primary" onclick="addPost()">
+                <span>+ Add to Queue</span>
+            </button>
+        </div>
+
+        <!-- QUEUE CARD -->
+        <div class="card">
+            <div class="card-header">
+                <h2>Queue (<span id="post-count">0</span>)</h2>
+                <button onclick="loadPosts()"
+                    style="background:transparent; color:var(--primary); padding:0; width:auto; font-size:0.8rem;">↻</button>
+            </div>
+            <div id="post-list" class="post-list">
+                <!-- Posts injected here -->
+            </div>
+        </div>
+
+        <!-- ACCOUNTS CARD -->
+        <div class="card">
+            <div class="card-header">
+                <h2>Accounts</h2>
+                <button onclick="loadAccounts()"
+                    style="background:transparent; color:var(--primary); padding:0; width:auto; font-size:0.8rem;">↻</button>
+            </div>
+            <div id="account-list" class="account-list">
+                <div class="empty-state">Loading accounts…</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const LOGS_DIV = document.getElementById('logs-container');
+
+        // --- XSS HELPER ---
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, function (c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        }
+
+        // --- REMOTE URL ---
+        async function loadTunnelUrl() {
+            try {
+                const res = await fetch('/api/tunnel-url');
+                const data = await res.json();
+                const urlSpan = document.getElementById('remote-url-value');
+                const copyBtn = document.getElementById('btn-copy-url');
+                if (data.url) {
+                    urlSpan.textContent = data.url;
+                    copyBtn.style.display = '';
+                } else {
+                    urlSpan.textContent = '(local only)';
+                    copyBtn.style.display = 'none';
+                }
+            } catch (e) {
+                document.getElementById('remote-url-value').textContent = '(unavailable)';
+            }
+        }
+
+        function copyRemoteUrl() {
+            const url = document.getElementById('remote-url-value').textContent;
+            if (!url || url === '(local only)' || url === '(unavailable)') return;
+            navigator.clipboard.writeText(url).then(function () {
+                const btn = document.getElementById('btn-copy-url');
+                const prev = btn.textContent;
+                btn.textContent = 'Copied!';
+                setTimeout(function () { btn.textContent = prev; }, 1500);
+            }).catch(function () {
+                prompt('Copy this URL:', url);
+            });
+        }
+
+        // --- INTERVAL CONTROL ---
+        async function saveInterval() {
+            const input = document.getElementById('interval-input');
+            const msgEl = document.getElementById('interval-msg');
+            const minutes = parseInt(input.value, 10);
+            msgEl.textContent = '';
+            msgEl.className = '';
+            if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
+                msgEl.textContent = 'Enter a value between 1 and 1440.';
+                msgEl.className = 'interval-msg-err';
+                return;
+            }
+            try {
+                const res = await fetch('/api/automation/interval', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ minutes: minutes })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    msgEl.textContent = data.message || 'Saved.';
+                    msgEl.className = 'interval-msg-ok';
+                } else {
+                    msgEl.textContent = data.error || 'Error saving interval.';
+                    msgEl.className = 'interval-msg-err';
+                }
+            } catch (e) {
+                msgEl.textContent = 'Request failed: ' + e.message;
+                msgEl.className = 'interval-msg-err';
+            }
+        }
+
+        // --- ACCOUNTS ---
+        async function loadAccounts() {
+            try {
+                const res = await fetch('/api/accounts');
+                const data = await res.json();
+                renderAccounts(data.accounts || []);
+            } catch (e) {
+                document.getElementById('account-list').innerHTML =
+                    '<div class="empty-state">Failed to load accounts.</div>';
+            }
+        }
+
+        function renderAccounts(accounts) {
+            const container = document.getElementById('account-list');
+            if (!accounts.length) {
+                container.innerHTML = '<div class="empty-state">No accounts configured.</div>';
+                return;
+            }
+            container.innerHTML = accounts.map(function (acc) {
+                var rawStatus = String(acc.status || '');
+                var dotClass, badgeClass, badgeLabel;
+                if (rawStatus === 'logged_in') {
+                    dotClass = 'status-logged-in';
+                    badgeClass = 'status-logged-in';
+                    badgeLabel = 'Logged In';
+                } else if (rawStatus === 'error' || rawStatus === 'not_logged_in') {
+                    dotClass = 'status-error';
+                    badgeClass = 'status-error';
+                    badgeLabel = rawStatus === 'error' ? 'Error' : 'Not Logged In';
+                } else {
+                    dotClass = 'status-other';
+                    badgeClass = 'status-other';
+                    badgeLabel = rawStatus || 'Unknown';
+                }
+                var displayName = escapeHtml(acc.alias || acc.name || '');
+                var lastMsg = escapeHtml(acc.lastMessage || '');
+                return '<div class="account-item">' +
+                    '<span class="account-status-dot ' + dotClass + '"></span>' +
+                    '<div class="account-info">' +
+                        '<div class="account-name">' + displayName + '</div>' +
+                        (lastMsg ? '<div class="account-last-msg">' + lastMsg + '</div>' : '') +
+                    '</div>' +
+                    '<span class="account-status-text ' + badgeClass + '">' + escapeHtml(badgeLabel) + '</span>' +
+                    '</div>';
+            }).join('');
+        }
+
+        // --- API CALLS ---
+
+        async function fetchStatus() {
+            try {
+                const res = await fetch('/api/automation/status');
+                const data = await res.json();
+                updateStatusUI(data);
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function startAutomation() {
+            if (!confirm('Start the automation on the remote server?')) return;
+            const res = await fetch('/api/automation/start', { method: 'POST' });
+            const data = await res.json();
+            if (data.success) {
+                fetchStatus();
+            } else {
+                alert('Error: ' + data.error);
+            }
+        }
+
+        async function stopAutomation() {
+            if (!confirm('Stop the automation?')) return;
+            await fetch('/api/automation/stop', { method: 'POST' });
+            fetchStatus();
+        }
+
+        async function loadPosts() {
+            const res = await fetch('/api/posts');
+            const data = await res.json();
+            renderPosts(data.posts);
+        }
+
+        async function addPost() {
+            const caption = document.getElementById('caption').value;
+            const comment = document.getElementById('comment').value;
+            const fileInput = document.getElementById('image-file');
+            const imageUrl = document.getElementById('image-url').value.trim();
+            const commentImageUrl = document.getElementById('comment-image-url').value.trim();
+            const commentImageFile = document.getElementById('comment-image-file');
+            const btn = document.querySelector('.btn-primary');
+
+            if (!caption) {
+                return alert('Please provide a caption.');
+            }
+
+            btn.disabled = true;
+            btn.innerHTML = 'Uploading...';
+
+            try {
+                var res;
+                const hasPostFile = fileInput.files.length > 0;
+                const hasCommentFile = commentImageFile && commentImageFile.files.length > 0;
+
+                if (hasPostFile || hasCommentFile) {
+                    // File upload mode (FormData)
+                    const formData = new FormData();
+                    formData.append('caption', caption);
+                    if (comment) formData.append('comment', comment);
+                    if (hasPostFile) formData.append('image', fileInput.files[0]);
+                    if (!hasPostFile && imageUrl) formData.append('imageUrl', imageUrl);
+                    if (hasCommentFile) formData.append('commentImage', commentImageFile.files[0]);
+                    if (!hasCommentFile && commentImageUrl) formData.append('commentImageUrl', commentImageUrl);
+                    res = await fetch('/api/posts/add', { method: 'POST', body: formData });
+                } else {
+                    // JSON mode (URL-based or text-only)
+                    const body = { caption: caption };
+                    if (comment) body.comment = comment;
+                    if (imageUrl) body.imageUrl = imageUrl;
+                    if (commentImageUrl) body.commentImageUrl = commentImageUrl;
+                    res = await fetch('/api/posts/add', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body)
+                    });
+                }
+
+                const data = await res.json();
+                if (data.success) {
+                    document.getElementById('caption').value = '';
+                    document.getElementById('comment').value = '';
+                    document.getElementById('image-url').value = '';
+                    document.getElementById('comment-image-url').value = '';
+                    fileInput.value = '';
+                    if (commentImageFile) commentImageFile.value = '';
+                    updateFileLabel();
+                    clearCommentImage();
+                    loadPosts();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            } catch (e) {
+                alert('Upload failed: ' + e.message);
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<span>+ Add to Queue</span>';
+            }
+        }
+
+        async function deletePost(index) {
+            if (!confirm('Delete this post?')) return;
+            await fetch('/api/posts/' + index, { method: 'DELETE' });
+            loadPosts();
+        }
+
+        function updateFileLabel() {
+            const input = document.getElementById('image-file');
+            const label = document.getElementById('file-label');
+            if (input.files && input.files.length > 0) {
+                label.innerHTML = '<span>✅ ' + escapeHtml(input.files[0].name) + '</span>';
+                label.classList.add('has-file');
+            } else {
+                label.innerHTML = '<span>📷 Select Image File</span>';
+                label.classList.remove('has-file');
+            }
+        }
+
+        // --- UI UPDATERS ---
+
+        function updateStatusUI(data) {
+            const badge = document.getElementById('status-badge');
+            const statusText = document.getElementById('status-text');
+            const btnStart = document.getElementById('btn-start');
+            const btnStop = document.getElementById('btn-stop');
+
+            if (data.isRunning) {
+                statusText.textContent = 'RUNNING (PID: ' + data.pid + ')';
+                badge.className = 'status-badge running';
+                btnStart.disabled = true;
+                btnStop.disabled = false;
+            } else {
+                statusText.textContent = 'OFFLINE';
+                badge.className = 'status-badge stopped';
+                btnStart.disabled = false;
+                btnStop.disabled = true;
+            }
+
+            if (data.logs && data.logs.length > 0) {
+                LOGS_DIV.textContent = data.logs.map(function (l) {
+                    return '[' + new Date(l.timestamp).toLocaleTimeString() + '] ' +
+                        (l.type === 'error' ? '🔴' : '🟢') + ' ' + l.message;
+                }).join('\n');
+                LOGS_DIV.scrollTop = LOGS_DIV.scrollHeight;
+            }
+        }
+
+        function renderPosts(posts) {
+            const container = document.getElementById('post-list');
+            document.getElementById('post-count').textContent = posts.length;
+
+            if (posts.length === 0) {
+                container.innerHTML = '<div class="empty-state">No posts in queue.<br>time to create some magic! ✨</div>';
+                return;
+            }
+
+            container.innerHTML = posts.map(function (post, index) {
+                var imageHtml;
+                if (post.imagePath) {
+                    const filename = escapeHtml(post.imagePath.split(/[/\\]/).pop());
+                    const webPath = '/uploads/' + filename;
+                    imageHtml = '<div class="post-img-container"><img src="' + webPath + '" alt="Post Image" onerror="this.parentElement.innerHTML=\'<div style=\\\'display:flex;align-items:center;justify-content:center;height:100%;color:#64748b;font-size:1.5rem\\\'>📷</div>\'"></div>';
+                } else {
+                    imageHtml = '<div class="post-img-container" style="display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#1e293b,#334155);"><span style="font-size:1.8rem;">📝</span></div>';
+                }
+
+                var commentHtml = post.comment
+                    ? '<div class="post-comment"><span class="comment-icon">💬</span> ' + escapeHtml(post.comment) + '</div>'
+                    : '';
+                var commentImgHtml = post.commentImagePath
+                    ? '<div style="margin-top:6px;display:flex;align-items:center;gap:6px;"><span style="font-size:0.75rem;color:#94a3b8;">🖼️ Comment image attached</span></div>'
+                    : '';
+
+                return '<div class="post-item">' +
+                    imageHtml +
+                    '<div class="post-content">' +
+                        '<div class="post-caption" title="' + escapeHtml(post.caption) + '">' + escapeHtml(post.caption) + '</div>' +
+                        commentHtml +
+                        commentImgHtml +
+                    '</div>' +
+                    '<button class="btn-delete" onclick="deletePost(' + index + ')">🗑</button>' +
+                    '</div>';
+            }).join('');
+        }
+
+        // --- COMMENT IMAGE DRAG & DROP ---
+        function clearCommentImage() {
+            document.getElementById('comment-img-preview').style.display = 'none';
+            document.getElementById('comment-img-placeholder').style.display = 'block';
+            const dropArea = document.getElementById('comment-image-drop-area');
+            dropArea.classList.remove('has-file');
+            document.getElementById('comment-image-file').value = '';
+            document.getElementById('comment-image-url').value = '';
+        }
+
+        (function initCommentImageDragDrop() {
+            const dropArea = document.getElementById('comment-image-drop-area');
+            const fileInput = document.getElementById('comment-image-file');
+            if (!dropArea || !fileInput) return;
+
+            // Click to browse
+            dropArea.addEventListener('click', function () { fileInput.click(); });
+
+            // File selected via browse
+            fileInput.addEventListener('change', function () {
+                if (fileInput.files.length > 0) {
+                    showCommentImagePreview(fileInput.files[0]);
+                }
+            });
+
+            // Drag over
+            dropArea.addEventListener('dragover', function (e) {
+                e.preventDefault();
+                dropArea.style.borderColor = 'var(--primary)';
+            });
+            dropArea.addEventListener('dragleave', function () {
+                dropArea.style.borderColor = '';
+            });
+
+            // Drop
+            dropArea.addEventListener('drop', function (e) {
+                e.preventDefault();
+                dropArea.style.borderColor = '';
+
+                // Check for files first
+                if (e.dataTransfer.files.length > 0 && e.dataTransfer.files[0].type.startsWith('image/')) {
+                    // Create a new DataTransfer to set the file input
+                    const dt = new DataTransfer();
+                    dt.items.add(e.dataTransfer.files[0]);
+                    fileInput.files = dt.files;
+                    showCommentImagePreview(e.dataTransfer.files[0]);
+                    return;
+                }
+
+                // Check for URL (dragged from web page)
+                const url = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain') || '';
+                if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
+                    const cleanUrl = url.split('\n')[0].trim();
+                    document.getElementById('comment-image-url').value = cleanUrl;
+                    // Show URL preview (src is a URL the user explicitly dragged in, not server data)
+                    document.getElementById('comment-img-preview-img').src = cleanUrl;
+                    document.getElementById('comment-img-preview').style.display = 'block';
+                    document.getElementById('comment-img-placeholder').style.display = 'none';
+                    dropArea.classList.add('has-file');
+                }
+            });
+        })();
+
+        function showCommentImagePreview(file) {
+            const reader = new FileReader();
+            reader.onload = function (e) {
+                document.getElementById('comment-img-preview-img').src = e.target.result;
+                document.getElementById('comment-img-preview').style.display = 'block';
+                document.getElementById('comment-img-placeholder').style.display = 'none';
+                document.getElementById('comment-image-drop-area').classList.add('has-file');
+            };
+            reader.readAsDataURL(file);
+        }
+
+        // --- POST IMAGE: also handle URL drops from web ---
+        (function initPostImageDragDrop() {
+            const uploadArea = document.querySelector('.file-upload-label');
+            if (!uploadArea) return;
+
+            uploadArea.addEventListener('dragover', function (e) {
+                e.preventDefault();
+                uploadArea.style.borderColor = 'var(--primary)';
+            });
+            uploadArea.addEventListener('dragleave', function () {
+                uploadArea.style.borderColor = '';
+            });
+            uploadArea.addEventListener('drop', function (e) {
+                e.preventDefault();
+                uploadArea.style.borderColor = '';
+
+                // If files, let the native file input handle it
+                if (e.dataTransfer.files.length > 0 && e.dataTransfer.files[0].type.startsWith('image/')) {
+                    const dt = new DataTransfer();
+                    dt.items.add(e.dataTransfer.files[0]);
+                    document.getElementById('image-file').files = dt.files;
+                    updateFileLabel();
+                    return;
+                }
+
+                // URL from web page
+                const url = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain') || '';
+                if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
+                    document.getElementById('image-url').value = url.split('\n')[0].trim();
+                    document.getElementById('image-url').style.borderColor = 'var(--success)';
+                    setTimeout(function () { document.getElementById('image-url').style.borderColor = ''; }, 2000);
+                }
+            });
+        })();
+
+        // --- INIT ---
+        function pollAll() {
+            fetchStatus();
+            loadAccounts();
+        }
+
+        setInterval(pollAll, 2000);
+        pollAll();
+        loadPosts();
+        loadTunnelUrl();
+
+    </script>
+</body>
+
+</html>

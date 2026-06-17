@@ -1,0 +1,23 @@
+# dependencies (re-installed via npm; 400MB+)
+node_modules/
+
+# personal/live artifacts — MUST NOT be published
+scripts/fb-recon/
+# real license keys + machine bindings (owner key lives here) — seed on server via OWNER_KEY env
+vps-server/keys.json
+*.log
+*.bak-*
+data.json.bak-*
+license.json
+license-config.json
+pcu-state.json
+
+# build output
+dist/
+out/
+build/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.cache/

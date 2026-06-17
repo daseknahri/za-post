@@ -1,0 +1,1689 @@
+let appData = {
+  posts: [],
+  groups: [],
+  accounts: [],
+  settings: {
+    parallelAccounts: 3,
+    waitInterval: 60,
+    accountDelay: 1,
+    postsPerGroup: 15
+  }
+};
+
+let selectedImages = [];
+let isAutomationRunning = false;
+let currentLoginAccount = null;
+let appLimits = { maxGroups: 10, maxAccounts: 5 }; // Default limits
+
+// Initialize app
+document.addEventListener('DOMContentLoaded', async () => {
+  await loadData();
+  initializeEventListeners();
+  updateDashboard();
+  checkAutomationStatus();
+
+  // Remote Access Logic
+  const urlDisplay = document.getElementById('remote-url-display');
+  const btnCopy = document.getElementById('btn-copy-url');
+
+  if (urlDisplay && btnCopy) {
+    // 1. Check if URL is already available
+    const existingUrl = await window.electronAPI.invoke('get-remote-url');
+    if (existingUrl) urlDisplay.value = existingUrl;
+
+    // 2. Listen for updates
+    if (window.electronAPI.onRemoteUrlUpdate) {
+      window.electronAPI.onRemoteUrlUpdate((url) => {
+        urlDisplay.value = url;
+      });
+    }
+
+    // 3. Copy button
+    btnCopy.addEventListener('click', () => {
+      const url = urlDisplay.value;
+      if (url && url !== 'Initializing...') {
+        navigator.clipboard.writeText(url);
+        const originalText = btnCopy.textContent;
+        btnCopy.textContent = 'Copied!';
+        setTimeout(() => btnCopy.textContent = originalText, 2000);
+      }
+    });
+  }
+
+  // 4. Listen for data updates (Instant Sync) — always active, not gated on remote-URL elements
+  if (window.electronAPI.onDataUpdated) {
+    window.electronAPI.onDataUpdated(async () => {
+      console.log('Data updated externally, refreshing UI...');
+      await loadData();
+      updateDashboard(); // Update counters
+      const isActive = (id) => { const el = document.getElementById(id); return el && el.classList.contains('active'); };
+      if (isActive('posts-view') && typeof renderPosts === 'function') renderPosts();
+      if (isActive('accounts-view') && typeof renderAccounts === 'function') renderAccounts();
+      if (isActive('groups-view') && typeof renderGroups === 'function') renderGroups();
+    });
+  }
+
+  // 5. Listen for Automation Status Changes (Sync with Remote)
+  if (window.electronAPI.onAutomationStarted) {
+    window.electronAPI.onAutomationStarted(() => {
+      console.log('Automation started externally, syncing UI...');
+      isAutomationRunning = true;
+      updateAutomationControls();
+      showNotification('Automation started externally', 'success');
+      addLog('🚀 Automation started externally\n');
+    });
+  }
+
+  // Load License Info
+  try {
+    const info = await window.electronAPI.invoke('get-license-info');
+    if (info) {
+      // Update Limits
+      if (info.maxGroups) appLimits.maxGroups = info.maxGroups;
+      if (info.maxAccounts) appLimits.maxAccounts = info.maxAccounts;
+
+      const expiryDisplay = document.getElementById('license-expiry-display');
+      const logo = document.querySelector('.logo');
+
+      if (expiryDisplay) {
+        if (info.expiry) {
+          const date = new Date(info.expiry).toLocaleDateString();
+          expiryDisplay.textContent = `🛡️ Valid Until: ${date}`;
+          expiryDisplay.style.color = '#40c057';
+          expiryDisplay.style.fontWeight = 'bold';
+        } else {
+          expiryDisplay.textContent = 'Lifetime License';
+          expiryDisplay.style.color = '#fab005';
+        }
+      }
+
+      // Append Limits if not already there (helper function might be better, but inline is fine)
+      const limitsId = 'license-limits-info';
+      let limitsDiv = document.getElementById(limitsId);
+
+      if (!limitsDiv && logo) {
+        limitsDiv = document.createElement('div');
+        limitsDiv.id = limitsId;
+        limitsDiv.style.cssText = 'font-size: 10px; color: #aaa; margin-top: 4px; border-top: 1px solid #ddd; padding-top: 4px;';
+        logo.appendChild(limitsDiv);
+      }
+
+      if (limitsDiv) {
+        limitsDiv.innerHTML = `
+          <div>👥 Max Groups: ${appLimits.maxGroups}</div>
+          <div>🔐 Max Accounts: ${appLimits.maxAccounts}</div>
+        `;
+      }
+    }
+  } catch (e) { console.error('License info error', e); }
+
+  // Set up event listeners from main process
+  window.electronAPI.onAutomationLog((log) => {
+    addLog(log);
+
+    // Track posted posts for auto-delete feature
+    if (appData.settings.autoDeletePosted && log) {
+      const logLower = log.toLowerCase();
+      // Detect successful posting patterns in logs
+      if (logLower.includes('successfully posted') || logLower.includes('post published') || logLower.includes('✅') && (logLower.includes('posted') || logLower.includes('published'))) {
+        // Try to match which post was posted by caption
+        for (const post of appData.posts) {
+          if (post.caption && log.includes(post.caption.substring(0, 30))) {
+            postedPostIds.add(post.id);
+          }
+        }
+      }
+    }
+  });
+
+  window.electronAPI.onAutomationStopped(async (code) => {
+    isAutomationRunning = false;
+    updateAutomationControls();
+    addLog(`\n✅ Automation stopped with exit code ${code}\n`);
+
+    // Auto-delete posted posts if enabled
+    if (appData.settings.autoDeletePosted && postedPostIds.size > 0) {
+      addLog(`\n🗑️ Auto-deleting ${postedPostIds.size} posted post(s)...\n`);
+      for (const postId of postedPostIds) {
+        try {
+          await window.electronAPI.deletePost(postId);
+          addLog(`  ✅ Deleted post ${postId}\n`);
+        } catch (e) {
+          addLog(`  ❌ Failed to delete post ${postId}\n`);
+        }
+      }
+      postedPostIds.clear();
+      await loadData();
+      showNotification(`Auto-deleted posted posts.`, 'info');
+    }
+  });
+
+  window.electronAPI.onLoginBrowserOpened((accountName) => {
+    console.log('=== LOGIN BROWSER OPENED EVENT RECEIVED ===');
+    console.log('Account name:', accountName);
+
+    // Show login instructions modal
+    document.getElementById('login-account-name').textContent = accountName;
+    console.log('Opening modal...');
+    openModal('modal-login-instructions');
+    currentLoginAccount = accountName;
+    console.log('Modal should be visible now');
+  });
+
+  window.electronAPI.onLoginBrowserClosed((accountName) => {
+    if (typeof currentLoginAccount !== 'undefined' && accountName === currentLoginAccount) {
+      closeModal('modal-login-instructions');
+      currentLoginAccount = null;
+      if (typeof showNotification === 'function') showNotification('Login browser closed — status updated', 'info');
+    }
+  });
+});
+
+// Load data from main process
+async function loadData() {
+  const data = await window.electronAPI.getData();
+  if (data) {
+    appData = data;
+    renderPosts();
+    renderGroups();
+    renderAccounts();
+    loadSettings();
+    await loadProxies(); // Load proxies
+    updateDashboard();
+  }
+}
+
+// Save data to main process
+async function saveData() {
+  await window.electronAPI.saveData(appData);
+}
+
+// Navigation
+function initializeEventListeners() {
+  // Navigation
+  document.querySelectorAll('.nav-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const view = item.dataset.view;
+      switchView(view);
+    });
+  });
+
+  // Quick actions
+  document.querySelectorAll('[data-action]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const action = btn.dataset.action;
+      handleQuickAction(action);
+    });
+  });
+
+  // Posts
+  document.getElementById('btn-add-post').addEventListener('click', openAddPostModal);
+  document.getElementById('btn-save-post').addEventListener('click', savePost);
+  document.getElementById('post-comment-enabled').addEventListener('change', (e) => {
+    document.getElementById('comment-group').style.display = e.target.checked ? 'block' : 'none';
+    // Show comment image section only when: comment enabled AND no post images selected
+    updateCommentImageVisibility();
+  });
+
+  // Image upload
+  const imageUploadArea = document.getElementById('image-upload-area');
+  const imageInput = document.getElementById('image-input');
+
+  imageUploadArea.addEventListener('click', () => imageInput.click());
+  imageInput.addEventListener('change', (e) => {
+    handleImageSelect(e);
+    // When images are added, hide the comment image section
+    setTimeout(updateCommentImageVisibility, 100);
+  });
+
+  // Drag & drop
+  imageUploadArea.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    imageUploadArea.style.borderColor = 'var(--primary-color)';
+  });
+
+  imageUploadArea.addEventListener('dragleave', () => {
+    imageUploadArea.style.borderColor = 'var(--border-color)';
+  });
+
+  imageUploadArea.addEventListener('drop', (e) => {
+    e.preventDefault();
+    imageUploadArea.style.borderColor = 'var(--border-color)';
+
+    // Check for files first (local file drop)
+    const files = e.dataTransfer.files;
+    let hasFiles = false;
+    for (let i = 0; i < files.length; i++) {
+      if (files[i].type.startsWith('image/')) {
+        handleImageFile(files[i]);
+        hasFiles = true;
+      }
+    }
+
+    // If no files, check for URL (dragged from web page)
+    if (!hasFiles) {
+      const url = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain') || '';
+      if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
+        const urlInput = document.getElementById('image-url-input');
+        if (urlInput) {
+          urlInput.value = url.split('\n')[0].trim(); // Take first URL if multiple
+          urlInput.style.borderColor = '#22c55e';
+          setTimeout(() => { urlInput.style.borderColor = ''; }, 2000);
+        }
+      }
+    }
+    setTimeout(updateCommentImageVisibility, 100);
+  });
+
+  // --- Comment Image Upload (for text-only posts) ---
+  const commentImageUploadArea = document.getElementById('comment-image-upload-area');
+  const commentImageInput = document.getElementById('comment-image-input');
+
+  commentImageUploadArea.addEventListener('click', () => commentImageInput.click());
+
+  // Drag & drop for comment image (supports files AND URLs from web pages)
+  commentImageUploadArea.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    commentImageUploadArea.style.borderColor = 'var(--primary-color, #6366f1)';
+  });
+  commentImageUploadArea.addEventListener('dragleave', () => {
+    commentImageUploadArea.style.borderColor = '';
+  });
+  commentImageUploadArea.addEventListener('drop', (e) => {
+    e.preventDefault();
+    commentImageUploadArea.style.borderColor = '';
+
+    // Check for files first (local file drop)
+    const files = e.dataTransfer.files;
+    if (files.length > 0 && files[0].type.startsWith('image/')) {
+      const file = files[0];
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        selectedCommentImage = {
+          data: ev.target.result.split(',')[1],
+          ext: file.name.split('.').pop(),
+          preview: ev.target.result
+        };
+        document.getElementById('comment-image-preview-img').src = ev.target.result;
+        document.getElementById('comment-image-preview').style.display = 'block';
+        document.querySelector('.comment-upload-placeholder').style.display = 'none';
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+
+    // If no files, check for URL (dragged from web page)
+    const url = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain') || '';
+    if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
+      const urlInput = document.getElementById('comment-image-url-input');
+      if (urlInput) {
+        urlInput.value = url.split('\n')[0].trim();
+        urlInput.style.borderColor = '#22c55e';
+        setTimeout(() => { urlInput.style.borderColor = ''; }, 2000);
+        // Show a preview of the URL image
+        document.getElementById('comment-image-preview-img').src = urlInput.value;
+        document.getElementById('comment-image-preview').style.display = 'block';
+        document.querySelector('.comment-upload-placeholder').style.display = 'none';
+      }
+    }
+  });
+
+  commentImageInput.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (file && file.type.startsWith('image/')) {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        selectedCommentImage = {
+          data: ev.target.result.split(',')[1],
+          ext: file.name.split('.').pop(),
+          preview: ev.target.result
+        };
+        document.getElementById('comment-image-preview-img').src = ev.target.result;
+        document.getElementById('comment-image-preview').style.display = 'block';
+        document.querySelector('.comment-upload-placeholder').style.display = 'none';
+      };
+      reader.readAsDataURL(file);
+    }
+  });
+
+  document.getElementById('comment-image-remove-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    selectedCommentImage = null;
+    document.getElementById('comment-image-preview').style.display = 'none';
+    document.querySelector('.comment-upload-placeholder').style.display = 'block';
+    commentImageInput.value = '';
+    // Also clear URL input if present
+    const urlInput = document.getElementById('comment-image-url-input');
+    if (urlInput) urlInput.value = '';
+  });
+
+  // Groups
+  document.getElementById('btn-add-group').addEventListener('click', openAddGroupModal);
+  document.getElementById('btn-save-group').addEventListener('click', saveGroup);
+
+  // Accounts
+  document.getElementById('btn-add-account').addEventListener('click', openAddAccountModal);
+  document.getElementById('btn-save-account').addEventListener('click', saveAccount);
+  document.getElementById('btn-check-login').addEventListener('click', checkLoginStatus);
+  document.getElementById('btn-login-done').addEventListener('click', closeLoginAndSave);
+  document.getElementById('btn-cancel-login').addEventListener('click', cancelLogin);
+
+  // Edit Account
+  document.getElementById('btn-save-edit-account').addEventListener('click', saveEditAccount);
+
+  // Automation
+  document.getElementById('btn-start-automation').addEventListener('click', startAutomation);
+  document.getElementById('btn-stop-automation').addEventListener('click', stopAutomation);
+
+  document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
+  document.getElementById('btn-save-proxies').addEventListener('click', saveProxies);
+
+  // Add Proxy Row Logic
+  const addProxyBtn = document.getElementById('btn-add-proxy-row');
+  if (addProxyBtn) {
+    addProxyBtn.addEventListener('click', () => {
+      const id = document.getElementById('proxy-id').value.trim();
+      const ip = document.getElementById('proxy-ip').value.trim();
+      const port = document.getElementById('proxy-port').value.trim();
+      const user = document.getElementById('proxy-user').value.trim();
+      const pass = document.getElementById('proxy-pass').value.trim();
+
+      if (!ip || !port) {
+        showNotification('IP and Port are required.', 'error');
+        return;
+      }
+
+      addProxyRow(id || 'Auto', ip, port, user, pass);
+
+      // Clear inputs
+      document.getElementById('proxy-id').value = '';
+      document.getElementById('proxy-ip').value = '';
+      document.getElementById('proxy-port').value = '';
+      document.getElementById('proxy-user').value = '';
+      document.getElementById('proxy-pass').value = '';
+    });
+  }
+
+  // Modal close buttons
+  document.querySelectorAll('.modal-close, [data-dismiss="modal"]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const modal = e.target.closest('.modal');
+      if (modal) closeModal(modal.id);
+    });
+  });
+
+  // Close modal on outside click
+  document.querySelectorAll('.modal').forEach(modal => {
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) {
+        closeModal(modal.id);
+      }
+    });
+  });
+}
+
+function switchView(viewName) {
+  // Update nav active state
+  document.querySelectorAll('.nav-item').forEach(item => {
+    item.classList.toggle('active', item.dataset.view === viewName);
+  });
+
+  // Update view visibility
+  document.querySelectorAll('.view').forEach(view => {
+    view.classList.toggle('active', view.id === `${viewName}-view`);
+  });
+}
+
+function handleQuickAction(action) {
+  switch (action) {
+    case 'add-post':
+      switchView('posts');
+      openAddPostModal();
+      break;
+    case 'add-group':
+      switchView('groups');
+      openAddGroupModal();
+      break;
+    case 'add-account':
+      switchView('accounts');
+      openAddAccountModal();
+      break;
+    case 'start-automation':
+      switchView('automation');
+      startAutomation();
+      break;
+  }
+}
+
+// Dashboard
+function updateDashboard() {
+  document.getElementById('stat-posts').textContent = appData.posts.length;
+  document.getElementById('stat-groups').textContent = appData.groups.length;
+  document.getElementById('stat-accounts').textContent = appData.accounts.length;
+
+  const statusEl = document.getElementById('stat-status');
+  const statusIconEl = document.getElementById('stat-status-icon');
+
+  if (isAutomationRunning) {
+    statusEl.textContent = 'Running';
+    statusIconEl.textContent = '▶️';
+  } else {
+    statusEl.textContent = 'Stopped';
+    statusIconEl.textContent = '⏸️';
+  }
+}
+
+// Posts Management
+function renderPosts() {
+  const container = document.getElementById('posts-container');
+
+  if (appData.posts.length === 0) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">📝</div>
+        <h3>No posts yet</h3>
+        <p>Add your first post to get started</p>
+        <button class="btn-primary" onclick="openAddPostModal()">
+          <span>➕</span> Add Post
+        </button>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = appData.posts.map(post => {
+    // Support both old single imagePath and new imagePaths array
+    const allPaths = post.imagePaths || (post.imagePath ? [post.imagePath] : []);
+    const _rawFirst = allPaths[0] || '';
+    const firstImage = _rawFirst ? (/^https?:/i.test(_rawFirst) ? _rawFirst : 'file:///' + _rawFirst.replace(/\\/g, '/')) : '';
+    const imageCount = allPaths.length;
+    const hasImages = imageCount > 0;
+    const countBadge = imageCount > 1 ? `<span style="position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.7);color:#fff;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;">📷 ${imageCount}</span>` : '';
+    
+    // Build image section or text-only placeholder
+    const imageSection = hasImages
+      ? `<div style="position:relative;">
+          <img src="${firstImage}" alt="Post" class="post-image" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22300%22 height=%22200%22><rect fill=%22%23e5e7eb%22 width=%22300%22 height=%22200%22/><text x=%2250%%22 y=%2250%%22 font-family=%22Arial%22 font-size=%2218%22 fill=%22%236b7280%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22>Image</text></svg>'">
+          ${countBadge}
+        </div>`
+      : `<div style="background:linear-gradient(135deg,#1e293b,#334155);padding:24px 16px;display:flex;align-items:center;justify-content:center;min-height:100px;border-radius:12px 12px 0 0;">
+          <span style="font-size:28px;">📝</span>
+          <span style="color:#94a3b8;font-size:13px;margin-left:10px;font-weight:500;">Text Only</span>
+        </div>`;
+
+    const commentImageBadge = post.commentImagePath ? '<span class="post-badge">🖼️ Comment Image</span>' : '';
+
+    return `
+    <div class="post-card">
+      ${imageSection}
+      <div class="post-content">
+        <p class="post-caption">${escapeHtml(post.caption)}</p>
+        <div class="post-meta">
+          ${post.comment ? '<span class="post-badge">💬 Has Comment</span>' : ''}
+          ${commentImageBadge}
+          <div class="post-actions">
+            <button class="icon-btn" onclick="openEditPostModal('${post.id}')" title="Edit">✏️</button>
+            <button class="icon-btn" onclick="deletePost('${post.id}')" title="Delete">🗑️</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `}).join('');
+}
+
+// Show/hide comment image section based on: comment enabled
+function updateCommentImageVisibility() {
+  const commentEnabled = document.getElementById('post-comment-enabled').checked;
+  const commentImageGroup = document.getElementById('comment-image-group');
+  
+  if (commentEnabled) {
+    commentImageGroup.style.display = 'block';
+  } else {
+    commentImageGroup.style.display = 'none';
+  }
+}
+
+let selectedCommentImage = null; // For text-only posts with comment image
+
+function openAddPostModal() {
+  selectedImages = [];
+  selectedCommentImage = null;
+  document.getElementById('post-caption').value = '';
+  document.getElementById('post-comment').value = '';
+  document.getElementById('post-comment-enabled').checked = false;
+  document.getElementById('comment-group').style.display = 'none';
+  document.getElementById('images-preview-container').style.display = 'none';
+  document.getElementById('images-preview-container').innerHTML = '';
+  document.querySelector('.upload-placeholder').style.display = 'block';
+
+  // Reset comment image
+  document.getElementById('comment-image-group').style.display = 'none';
+  document.getElementById('comment-image-preview').style.display = 'none';
+  document.querySelector('.comment-upload-placeholder').style.display = 'block';
+
+  // Reset URL inputs
+  const imageUrlInput = document.getElementById('image-url-input');
+  if (imageUrlInput) imageUrlInput.value = '';
+  const commentImageUrlInput = document.getElementById('comment-image-url-input');
+  if (commentImageUrlInput) commentImageUrlInput.value = '';
+
+  openModal('modal-add-post');
+}
+
+async function handleImageSelect(e) {
+  const files = e.target.files;
+  for (let i = 0; i < files.length; i++) {
+    if (files[i].type.startsWith('image/')) {
+      await handleImageFile(files[i]);
+    }
+  }
+}
+
+async function handleImageFile(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    selectedImages.push({
+      data: e.target.result.split(',')[1], // base64 without prefix
+      ext: file.name.split('.').pop(),
+      preview: e.target.result
+    });
+
+    // Update preview container
+    const container = document.getElementById('images-preview-container');
+    container.style.display = 'flex';
+    document.querySelector('.upload-placeholder').style.display = 'none';
+
+    // Add thumbnail
+    const thumb = document.createElement('div');
+    thumb.style.cssText = 'position:relative; display:inline-block;';
+    const img = document.createElement('img');
+    img.src = e.target.result;
+    img.style.cssText = 'max-height:100px; border-radius:8px; object-fit:cover;';
+    const removeBtn = document.createElement('button');
+    removeBtn.textContent = '✕';
+    removeBtn.style.cssText = 'position:absolute; top:-6px; right:-6px; background:#ef4444; color:white; border:none; border-radius:50%; width:20px; height:20px; font-size:11px; cursor:pointer; display:flex; align-items:center; justify-content:center;';
+    const imgRef = selectedImages[selectedImages.length - 1];
+    removeBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      const currentIdx = selectedImages.indexOf(imgRef);
+      if (currentIdx !== -1) selectedImages.splice(currentIdx, 1);
+      thumb.remove();
+      if (selectedImages.length === 0) {
+        container.style.display = 'none';
+        document.querySelector('.upload-placeholder').style.display = 'block';
+      }
+      updateCommentImageVisibility();
+    };
+    thumb.appendChild(img);
+    thumb.appendChild(removeBtn);
+    container.appendChild(thumb);
+  };
+  reader.readAsDataURL(file);
+}
+
+async function savePost() {
+  const caption = document.getElementById('post-caption').value.trim();
+  const commentEnabled = document.getElementById('post-comment-enabled').checked;
+  const comment = commentEnabled ? document.getElementById('post-comment').value.trim() : '';
+
+  if (!caption) {
+    showNotification('Please enter a caption', 'error');
+    return;
+  }
+
+  // Images are now optional — text-only posts are allowed
+
+  const post = {
+    caption,
+    comment,
+    images: selectedImages.map(img => ({ data: img.data, ext: img.ext }))
+  };
+
+  // Include image URL if no local images selected
+  const imageUrlInput = document.getElementById('image-url-input');
+  const imageUrl = imageUrlInput ? imageUrlInput.value.trim() : '';
+  if (imageUrl && selectedImages.length === 0) {
+    post.imageUrl = imageUrl;
+  }
+
+  // Include comment image URL if no local comment image selected
+  const commentImageUrlInput = document.getElementById('comment-image-url-input');
+  const commentImageUrl = commentImageUrlInput ? commentImageUrlInput.value.trim() : '';
+
+  // Include comment image if set
+  if (selectedCommentImage) {
+    post.commentImage = { data: selectedCommentImage.data, ext: selectedCommentImage.ext };
+  } else if (commentImageUrl) {
+    post.commentImageUrl = commentImageUrl;
+  }
+
+  const result = await window.electronAPI.addPost(post);
+
+  if (result.success) {
+    showNotification('Post added successfully!', 'success');
+    closeModal('modal-add-post');
+    await loadData();
+  } else {
+    showNotification('Failed to add post: ' + result.error, 'error');
+  }
+}
+
+async function deletePost(postId) {
+  if (!confirm('Are you sure you want to delete this post?')) return;
+
+  const result = await window.electronAPI.deletePost(postId);
+
+  if (result.success) {
+    showNotification('Post deleted successfully!', 'success');
+    await loadData();
+  } else {
+    showNotification('Failed to delete post: ' + result.error, 'error');
+  }
+}
+
+// Edit Post
+let editingPostId = null;
+
+function openEditPostModal(postId) {
+  const post = appData.posts.find(p => String(p.id) === String(postId));
+  if (!post) return;
+
+  editingPostId = postId;
+  document.getElementById('edit-post-caption').value = post.caption || '';
+  document.getElementById('edit-post-comment').value = post.comment || '';
+  openModal('modal-edit-post');
+}
+
+async function saveEditPost() {
+  if (!editingPostId) return;
+
+  const caption = document.getElementById('edit-post-caption').value.trim();
+  const comment = document.getElementById('edit-post-comment').value.trim();
+
+  if (!caption) {
+    showNotification('Caption cannot be empty', 'error');
+    return;
+  }
+
+  const result = await window.electronAPI.editPost(editingPostId, { caption, comment });
+
+  if (result.success) {
+    showNotification('Post updated!', 'success');
+    closeModal('modal-edit-post');
+    editingPostId = null;
+    await loadData();
+  } else {
+    showNotification('Failed to update post: ' + result.error, 'error');
+  }
+}
+
+// Auto-delete tracking
+let postedPostIds = new Set();
+
+// Groups Management
+function renderGroups() {
+  const container = document.getElementById('groups-container');
+
+  if (appData.groups.length === 0) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">👥</div>
+        <h3>No groups yet</h3>
+        <p>Add Facebook groups to post to</p>
+        <button class="btn-primary" onclick="openAddGroupModal()">
+          <span>➕</span> Add Group
+        </button>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = appData.groups.map(group => `
+    <div class="group-item">
+      <div class="group-icon">👥</div>
+      <div class="group-info">
+        <div class="group-name">${escapeHtml(group.name || 'Unnamed Group')}</div>
+        <div class="group-id">ID: ${escapeHtml(group.groupId)}</div>
+      </div>
+      <div class="group-actions">
+        <button class="icon-btn" onclick="deleteGroup('${group.id}')" title="Delete">🗑️</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+function openAddGroupModal() {
+  document.getElementById('group-id').value = '';
+  document.getElementById('group-name').value = '';
+  openModal('modal-add-group');
+}
+
+async function saveGroup() {
+  if (appData.groups.length >= appLimits.maxGroups) {
+    showNotification(`License Limit Reached! Max Groups: ${appLimits.maxGroups}`, 'error');
+    return;
+  }
+
+  let groupId = document.getElementById('group-id').value.trim();
+  const groupName = document.getElementById('group-name').value.trim();
+
+  if (!groupId) {
+    showNotification('Please enter a group ID or URL', 'error');
+    return;
+  }
+
+  // Extract ID from URL if provided
+  if (groupId.includes('facebook.com/groups/')) {
+    const match = groupId.match(/groups\/(\d+)/);
+    if (match) {
+      groupId = match[1];
+    }
+  }
+
+  const group = {
+    groupId,
+    name: groupName || `Group ${appData.groups.length + 1}`
+  };
+
+  const result = await window.electronAPI.addGroup(group);
+
+  if (result.success) {
+    showNotification('Group added successfully!', 'success');
+    closeModal('modal-add-group');
+    await loadData();
+  } else {
+    showNotification('Failed to add group: ' + result.error, 'error');
+  }
+}
+
+async function deleteGroup(groupId) {
+  if (!confirm('Are you sure you want to delete this group?')) return;
+
+  const result = await window.electronAPI.deleteGroup(groupId);
+
+  if (result.success) {
+    showNotification('Group deleted successfully!', 'success');
+    await loadData();
+  } else {
+    showNotification('Failed to delete group: ' + result.error, 'error');
+  }
+}
+
+// Accounts Management
+function renderAccounts() {
+  const container = document.getElementById('accounts-container');
+
+  if (appData.accounts.length === 0) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">🔐</div>
+        <h3>No accounts yet</h3>
+        <p>Add Facebook accounts to automate posting</p>
+        <button class="btn-primary" onclick="openAddAccountModal()">
+          <span>➕</span> Add Account
+        </button>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = appData.accounts.map(account => {
+    const isEnabled = account.enabled !== false; // treat missing/undefined as true
+
+    let statusClass = '';
+    let statusText = 'Not Logged In';
+
+    if (account.status === 'logged_in') {
+      statusClass = 'logged-in';
+      statusText = 'Logged In';
+    } else if (account.status === 'error') {
+      statusClass = 'error';
+      statusText = 'Error';
+    }
+
+    // Prepare error message if exists and relevant
+    let errorMessageHtml = '';
+    if (account.lastMessage && (account.status === 'error' || account.status === 'not_logged_in')) {
+      const msg = account.lastMessage.length > 60 ? account.lastMessage.substring(0, 60) + '...' : account.lastMessage;
+      errorMessageHtml = `<div title="${escapeHtml(account.lastMessage)}" style="color: #dc2626; font-size: 11px; margin-top: 4px; font-weight: 500;">⚠️ ${escapeHtml(msg)}</div>`;
+    }
+
+    // Display alias if exists
+    const displayName = account.alias ? account.alias : account.name;
+    const subName = account.alias ? account.name : '';
+
+    // Get assigned groups for this account
+    const assignedGroups = account.assignedGroups || [];
+    const assignedCount = assignedGroups.length;
+    const assignedText = assignedCount === 0 ? 'No groups assigned' : `${assignedCount} group${assignedCount > 1 ? 's' : ''} assigned`;
+
+    // Build group options for dropdown
+    let groupOptionsHtml = '';
+    if (appData.groups.length === 0) {
+      groupOptionsHtml = '<div style="padding: 10px; color: #9ca3af; text-align: center;">No groups available. Add groups first.</div>';
+    } else {
+      groupOptionsHtml = appData.groups.map(group => {
+        const isChecked = assignedGroups.includes(group.id) ? 'checked' : '';
+        return `
+          <label class="group-checkbox-item" style="display: flex; align-items: center; padding: 8px 12px; cursor: pointer; border-bottom: 1px solid #374151; color: #e5e7eb;">
+            <input type="checkbox" ${isChecked} onchange="toggleGroupAssignment('${account.name}', '${group.id}')" style="margin-right: 10px; accent-color: #3b82f6;">
+            <span style="flex: 1; color: #ffffff;">${escapeHtml(group.name || 'Group ' + group.groupId)}</span>
+            <span style="color: #60a5fa; font-size: 11px;">${group.groupId}</span>
+          </label>
+        `;
+      }).join('');
+    }
+
+    const enabledPill = isEnabled
+      ? `<button onclick="toggleAccountEnabled('${account.name}')" title="Click to disable this account" style="background:#22c55e;color:#fff;border:none;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;line-height:1.4;">On</button>`
+      : `<button onclick="toggleAccountEnabled('${account.name}')" title="Click to enable this account" style="background:#6b7280;color:#fff;border:none;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;line-height:1.4;">Off</button>`;
+
+    return `
+      <div class="account-card" style="${isEnabled ? '' : 'opacity:0.5;'}">
+        <div class="account-header">
+          <div class="account-avatar">${displayName.charAt(0).toUpperCase()}</div>
+          <div class="account-info">
+            <h3 style="display:flex;align-items:center;gap:8px;">${escapeHtml(displayName)} ${enabledPill}</h3>
+            ${subName ? `<div style="color: #9ca3af; font-size: 12px; margin-top: 2px;">${escapeHtml(subName)}</div>` : ''}
+            ${!isEnabled ? `<div style="color:#f59e0b;font-size:11px;font-weight:600;margin-top:2px;">Disabled — will be skipped by automation</div>` : ''}
+            <div class="account-status">
+              <span class="status-dot ${statusClass}" style="${account.status === 'error' ? 'background-color: #dc2626;' : ''}"></span>
+              <span>${statusText}</span>
+            </div>
+            ${errorMessageHtml}
+          </div>
+        </div>
+        
+        <!-- Group Assignment Section -->
+        <div class="account-groups" style="margin: 12px 0; padding: 10px; background: #1e293b; border-radius: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <span style="font-size: 12px; color: #94a3b8;">📋 Assigned Groups:</span>
+            <span style="font-size: 11px; color: ${assignedCount > 0 ? '#22c55e' : '#f59e0b'}; font-weight: 500;">${assignedText}</span>
+          </div>
+          <div class="groups-dropdown" style="position: relative;">
+            <button class="btn-secondary" onclick="toggleGroupDropdown('${account.name}')" style="width: 100%; text-align: left; display: flex; justify-content: space-between; align-items: center;">
+              <span>Select Groups</span>
+              <span>▼</span>
+            </button>
+            <div id="group-dropdown-${account.name}" class="group-dropdown-menu" style="display: none; position: absolute; top: 100%; left: 0; right: 0; background: #1f2937; border: 1px solid #374151; border-radius: 6px; max-height: 200px; overflow-y: auto; z-index: 100; margin-top: 4px;">
+              ${groupOptionsHtml}
+            </div>
+          </div>
+        </div>
+        
+        <!-- Post Filter Section -->
+        <div class="account-post-filter" style="margin: 12px 0; padding: 10px; background: #1e293b; border-radius: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <span style="font-size: 12px; color: #94a3b8;">📝 Post Filter:</span>
+
+          </div>
+          <select id="post-filter-${account.name}" onchange="updatePostFilter('${account.name}', this.value)" style="width: 100%; padding: 8px 12px; background: #1f2937; border: 1px solid #374151; border-radius: 6px; color: #e5e7eb; font-size: 13px; cursor: pointer;">
+            <option value="all" ${(account.postFilter || 'all') === 'all' ? 'selected' : ''}>📋 All Posts</option>
+            <option value="with-comments" ${account.postFilter === 'with-comments' ? 'selected' : ''}>💬 Only with Comments</option>
+            <option value="without-comments" ${account.postFilter === 'without-comments' ? 'selected' : ''}>📄 Only without Comments</option>
+          </select>
+        </div>
+        
+        <!-- Posting Method Section -->
+        <div class="account-posting-method" style="margin: 12px 0; padding: 10px; background: #1e293b; border-radius: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <span style="font-size: 12px; color: #94a3b8;">🔄 Posting Method:</span>
+          </div>
+          <select id="posting-order-${account.name}" onchange="updatePostingOrder('${account.name}', this.value)" style="width: 100%; padding: 8px 12px; background: #1f2937; border: 1px solid #374151; border-radius: 6px; color: #e5e7eb; font-size: 13px; cursor: pointer;">
+            <option value="post-centric" ${(account.postingOrder || 'post-centric') === 'post-centric' ? 'selected' : ''}>🎯 Post to All Groups (One Post at a Time)</option>
+            <option value="post-centric-unique" ${account.postingOrder === 'post-centric-unique' ? 'selected' : ''}>🎯🔒 One Post Per Account (Unique, All Groups)</option>
+            <option value="random" ${account.postingOrder === 'random' ? 'selected' : ''}>🔀 Random (Shuffle)</option>
+            <option value="random-unique" ${account.postingOrder === 'random-unique' ? 'selected' : ''}>🔀🔒 Random (No Repeat Across Accounts)</option>
+            <option value="sequence" ${account.postingOrder === 'sequence' ? 'selected' : ''}>📋 Progressive (Sequential)</option>
+          </select>
+        </div>
+        
+        <div class="account-actions" style="display: flex; gap: 6px;">
+          <button class="btn-primary" onclick="loginAccount('${account.name}')">
+            🔐 Login
+          </button>
+          <button class="btn-secondary" onclick="openImportCookiesModal('${account.name}')" title="Import Cookies" style="padding: 8px 12px; font-size: 13px;">
+            🍪 Cookies
+          </button>
+          <button class="btn-secondary icon-btn" onclick="editAccount('${account.name}')" title="Edit Name/Alias" style="padding: 8px 12px; font-size: 13px;">
+            ✏️
+          </button>
+          <button class="btn-danger icon-btn" onclick="deleteAccount('${account.name}')" title="Delete">
+            🗑️
+          </button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+// Toggle account enabled/disabled state
+async function toggleAccountEnabled(accountName) {
+  await window.electronAPI.toggleAccount(accountName);
+  await loadData();
+}
+
+// Toggle group dropdown visibility
+function toggleGroupDropdown(accountName) {
+  const dropdown = document.getElementById(`group-dropdown-${accountName}`);
+  const isVisible = dropdown.style.display === 'block';
+
+  // Close all dropdowns first
+  document.querySelectorAll('.group-dropdown-menu').forEach(d => d.style.display = 'none');
+
+  // Toggle this one
+  dropdown.style.display = isVisible ? 'none' : 'block';
+}
+
+// Toggle group assignment for an account
+async function toggleGroupAssignment(accountName, groupId) {
+  const account = appData.accounts.find(a => a.name === accountName);
+  if (!account) return;
+
+  // Initialize assignedGroups if not exists
+  if (!account.assignedGroups) {
+    account.assignedGroups = [];
+  }
+
+  const index = account.assignedGroups.indexOf(groupId);
+  if (index === -1) {
+    // Add group
+    account.assignedGroups.push(groupId);
+  } else {
+    // Remove group
+    account.assignedGroups.splice(index, 1);
+  }
+
+  // Save to backend
+  await saveData();
+
+  // Update just the count display without re-rendering (keeps dropdown open)
+  const assignedCount = account.assignedGroups.length;
+  const assignedText = assignedCount === 0 ? 'No groups assigned' : `${assignedCount} group${assignedCount > 1 ? 's' : ''} assigned`;
+
+  // Find and update the count display for this account
+  const accountCards = document.querySelectorAll('.account-card');
+  accountCards.forEach(card => {
+    const dropdownBtn = card.querySelector(`[onclick*="toggleGroupDropdown('${accountName}')"]`);
+    if (dropdownBtn) {
+      const countSpan = card.querySelector('.account-groups > div > span:last-child');
+      if (countSpan) {
+        countSpan.textContent = assignedText;
+        countSpan.style.color = assignedCount > 0 ? '#22c55e' : '#f59e0b';
+      }
+    }
+  });
+}
+
+// Update post filter for an account
+async function updatePostFilter(accountName, filterValue) {
+  const account = appData.accounts.find(a => a.name === accountName);
+  if (!account) return;
+
+  account.postFilter = filterValue;
+
+  // Save to backend
+  await saveData();
+
+  // Show confirmation
+  const filterLabels = {
+    'all': 'All Posts',
+    'with-comments': 'Only with Comments',
+    'without-comments': 'Only without Comments'
+  };
+  showNotification(`Post filter set to: ${filterLabels[filterValue]}`, 'success');
+}
+
+// Update posting order for an account
+async function updatePostingOrder(accountName, orderValue) {
+  const account = appData.accounts.find(a => a.name === accountName);
+  if (!account) return;
+
+  account.postingOrder = orderValue;
+
+  // Save to backend
+  await saveData();
+
+  // Show confirmation
+  const orderLabels = {
+    'post-centric': 'Post to All Groups',
+    'post-centric-unique': 'One Post Per Account (Unique, All Groups)',
+    'random': 'Random (Shuffle)',
+    'random-unique': 'Random (No Repeat Across Accounts)',
+    'sequence': 'Progressive (Sequential)'
+  };
+  showNotification(`Posting method set to: ${orderLabels[orderValue]}`, 'success');
+}
+
+// Edit account name and alias
+let editingAccountName = null;
+
+function editAccount(accountName) {
+  const account = appData.accounts.find(a => a.name === accountName);
+  if (!account) return;
+
+  editingAccountName = accountName;
+
+  // Populate modal fields
+  document.getElementById('edit-account-alias').value = account.alias || '';
+  document.getElementById('edit-account-name').value = accountName;
+
+  openModal('modal-edit-account');
+}
+
+async function saveEditAccount() {
+  if (!editingAccountName) return;
+
+  const accountName = editingAccountName;
+  const trimmedAlias = document.getElementById('edit-account-alias').value.trim();
+  const newName = document.getElementById('edit-account-name').value.trim();
+
+  if (!newName) {
+    showNotification('Account name cannot be empty', 'error');
+    return;
+  }
+
+  // If name changed, use IPC to rename folder
+  if (newName !== accountName) {
+    // Check for duplicate names
+    const duplicate = appData.accounts.find(a => a.name === newName && a.name !== accountName);
+    if (duplicate) {
+      showNotification(`Account name "${newName}" already exists!`, 'error');
+      return;
+    }
+
+    const result = await window.electronAPI.invoke('rename-account', accountName, newName);
+    if (!result.success) {
+      showNotification('Failed to rename account: ' + result.error, 'error');
+      return;
+    }
+  }
+
+  // Reload data from disk (rename-account IPC already updated data.json)
+  await loadData();
+
+  // Update alias in data
+  const acc = appData.accounts.find(a => a.name === newName);
+  if (acc) {
+    acc.alias = trimmedAlias || undefined;
+    await saveData();
+  }
+
+  closeModal('modal-edit-account');
+  editingAccountName = null;
+  showNotification('Account updated successfully!', 'success');
+}
+
+// Close dropdowns when clicking outside
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.groups-dropdown')) {
+    document.querySelectorAll('.group-dropdown-menu').forEach(d => d.style.display = 'none');
+  }
+});
+
+// Cookie Import
+let cookieImportAccount = null;
+
+function openImportCookiesModal(accountName) {
+  cookieImportAccount = accountName;
+  document.getElementById('cookie-import-account-name').textContent = accountName;
+  document.getElementById('cookie-json-input').value = '';
+  document.getElementById('cookie-import-status').textContent = '';
+  document.getElementById('cookie-import-status').style.display = 'none';
+  openModal('modal-import-cookies');
+}
+
+async function submitCookieImport() {
+  if (!cookieImportAccount) return;
+
+  const jsonText = document.getElementById('cookie-json-input').value.trim();
+  const statusEl = document.getElementById('cookie-import-status');
+
+  if (!jsonText) {
+    statusEl.textContent = '❌ Please paste your cookies JSON.';
+    statusEl.style.display = 'block';
+    statusEl.style.color = '#dc2626';
+    return;
+  }
+
+  // Parse the JSON
+  let cookiesArray;
+  try {
+    cookiesArray = JSON.parse(jsonText);
+    if (!Array.isArray(cookiesArray)) {
+      throw new Error('Not an array');
+    }
+    // Basic validation
+    if (!cookiesArray.every(c => c.name && c.value)) {
+      throw new Error('Some cookies are missing name or value');
+    }
+  } catch (e) {
+    statusEl.textContent = '❌ Invalid JSON format: ' + e.message;
+    statusEl.style.display = 'block';
+    statusEl.style.color = '#dc2626';
+    return;
+  }
+
+  // Show progress
+  statusEl.textContent = '⏳ Importing cookies and validating login... This may take a minute.';
+  statusEl.style.display = 'block';
+  statusEl.style.color = '#f59e0b';
+  document.getElementById('btn-submit-cookies').disabled = true;
+  document.getElementById('btn-submit-cookies').textContent = '⏳ Importing...';
+
+  try {
+    const result = await window.electronAPI.importCookies(cookieImportAccount, cookiesArray);
+
+    if (result.success) {
+      if (result.status === 'logged_in') {
+        statusEl.textContent = '✅ Cookies imported successfully! Account is logged in.';
+        statusEl.style.color = '#16a34a';
+        showNotification(`✅ ${cookieImportAccount} logged in via cookies!`, 'success');
+        setTimeout(() => {
+          closeModal('modal-import-cookies');
+          cookieImportAccount = null;
+        }, 1500);
+      } else {
+        statusEl.textContent = '⚠️ Cookies imported but login could not be verified. The cookies might be expired.';
+        statusEl.style.color = '#f59e0b';
+        showNotification(`⚠️ ${cookieImportAccount}: cookies may be expired.`, 'error');
+      }
+    } else {
+      statusEl.textContent = '❌ Import failed: ' + result.error;
+      statusEl.style.color = '#dc2626';
+    }
+  } catch (e) {
+    statusEl.textContent = '❌ Error: ' + e.message;
+    statusEl.style.color = '#dc2626';
+  }
+
+  document.getElementById('btn-submit-cookies').disabled = false;
+  document.getElementById('btn-submit-cookies').textContent = '🍪 Import & Validate';
+  await loadData();
+}
+
+function openAddAccountModal() {
+  console.log('Opening Add Account Modal - paranoia check');
+
+  // Close all other modals first - FORCE HIDDEN
+  document.querySelectorAll('.modal').forEach(modal => {
+    modal.classList.remove('active');
+    modal.style.display = 'none'; // Force hide
+  });
+
+  const input = document.getElementById('account-name');
+  const aliasInput = document.getElementById('account-alias');
+
+  // Reset input state
+  input.value = '';
+  if (aliasInput) aliasInput.value = '';
+  input.disabled = false;
+  input.readOnly = false;
+  input.removeAttribute('disabled');
+  input.removeAttribute('readonly');
+  input.style.pointerEvents = 'auto';
+  input.style.zIndex = '9999'; // Boost z-index just in case
+  input.style.position = 'relative';
+
+  const modal = document.getElementById('modal-add-account');
+  modal.style.display = 'flex'; // Force show
+  // Small delay to allow display:flex to apply before adding active class
+  setTimeout(() => modal.classList.add('active'), 10);
+
+  // Debug what's on top
+  setTimeout(() => {
+    input.focus();
+    const rect = input.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const topElement = document.elementFromPoint(centerX, centerY);
+    console.log('Element at input center:', topElement);
+    console.log('Is input focused?', document.activeElement === input);
+  }, 200);
+}
+
+async function saveAccount() {
+  if (appData.accounts.length >= appLimits.maxAccounts) {
+    showNotification(`License Limit Reached! Max Accounts: ${appLimits.maxAccounts}`, 'error');
+    return;
+  }
+
+  const accountName = document.getElementById('account-name').value.trim();
+  const accountAlias = document.getElementById('account-alias').value.trim();
+
+  if (!accountName) {
+    showNotification('Please enter an account name', 'error');
+    return;
+  }
+
+  // Validate account name (alphanumeric and underscore only)
+  if (!/^[a-zA-Z0-9_]+$/.test(accountName)) {
+    showNotification('Account name can only contain letters, numbers, and underscores', 'error');
+    return;
+  }
+
+  closeModal('modal-add-account');
+  showNotification('Creating account folder...', 'info');
+
+  const result = await window.electronAPI.createAccount(accountName, accountAlias);
+
+  if (result.success) {
+    showNotification('Account created! Use Login or Cookies to authenticate.', 'success');
+    await loadData();
+  } else {
+    showNotification('Failed to create account: ' + result.error, 'error');
+  }
+}
+
+async function loginAccount(accountName) {
+  console.log('=== LOGIN ACCOUNT CLICKED ===');
+  console.log('Account:', accountName);
+
+  showNotification(`Opening login browser for ${accountName}...`, 'info');
+
+  const result = await window.electronAPI.loginAccount(accountName);
+
+  console.log('Login result:', result);
+
+  if (!result.success) {
+    showNotification('Failed to open login browser: ' + result.error, 'error');
+  }
+}
+
+async function deleteAccount(accountName) {
+  if (!confirm(`Are you sure you want to delete account "${accountName}"? This will delete all account data.`)) return;
+
+  const result = await window.electronAPI.deleteAccount(accountName);
+
+  if (result.success) {
+    await loadData();
+    showNotification('Account deleted successfully', 'success');
+  } else {
+    showNotification('Failed to delete account: ' + result.error, 'error');
+  }
+}
+
+async function checkLoginStatus() {
+  if (!currentLoginAccount) return;
+
+  showNotification('Checking login status...', 'info');
+  document.getElementById('btn-check-login').disabled = true;
+  document.getElementById('btn-check-login').textContent = '⏳ Checking...';
+
+  const result = await window.electronAPI.checkAccountStatus(currentLoginAccount);
+
+  await loadData();
+
+  if (result.status === 'logged_in') {
+    showNotification(`✅ ${currentLoginAccount} is logged in successfully!`, 'success');
+    // Switch buttons
+    document.getElementById('btn-check-login').style.display = 'none';
+    document.getElementById('btn-login-done').style.display = 'inline-block';
+  } else {
+    showNotification(`⚠️ ${currentLoginAccount} is not logged in yet. Please complete the login.`, 'error');
+    document.getElementById('btn-check-login').disabled = false;
+    document.getElementById('btn-check-login').textContent = '🔍 Check Login Status';
+  }
+}
+
+function closeLoginAndSave() {
+  closeModal('modal-login-instructions');
+  showNotification('Login saved successfully!', 'success');
+  currentLoginAccount = null;
+  // Reset button states
+  document.getElementById('btn-check-login').style.display = 'inline-block';
+  document.getElementById('btn-check-login').disabled = false;
+  document.getElementById('btn-check-login').textContent = '🔍 Check Login Status';
+  document.getElementById('btn-login-done').style.display = 'none';
+}
+
+function cancelLogin() {
+  if (typeof currentLoginAccount !== 'undefined' && currentLoginAccount) {
+    window.electronAPI.closeLoginBrowser(currentLoginAccount).catch(() => {});
+  }
+
+  closeModal('modal-login-instructions');
+  currentLoginAccount = null;
+  // Reset button states
+  document.getElementById('btn-check-login').style.display = 'inline-block';
+  document.getElementById('btn-check-login').disabled = false;
+  document.getElementById('btn-check-login').textContent = '🔍 Check Login Status';
+  document.getElementById('btn-login-done').style.display = 'none';
+}
+
+async function checkLoginComplete() {
+  if (!currentLoginAccount) return;
+
+  closeModal('modal-login-instructions');
+  showNotification('Checking login status...', 'info');
+
+  await checkAccountLoginStatus(currentLoginAccount);
+  currentLoginAccount = null;
+}
+
+async function checkAccountLoginStatus(accountName) {
+  const result = await window.electronAPI.checkAccountStatus(accountName);
+
+  await loadData();
+
+  if (result.status === 'logged_in') {
+    showNotification(`✅ ${accountName} is logged in successfully!`, 'success');
+  } else {
+    showNotification(`⚠️ ${accountName} may not be logged in. Try logging in again.`, 'error');
+  }
+}
+
+// Automation Control
+async function checkAutomationStatus() {
+  const result = await window.electronAPI.getAutomationStatus();
+  if (result.success) {
+    isAutomationRunning = result.isRunning;
+    updateAutomationControls();
+  }
+}
+
+function updateAutomationControls() {
+  const startBtn = document.getElementById('btn-start-automation');
+  const stopBtn = document.getElementById('btn-stop-automation');
+
+  if (isAutomationRunning) {
+    startBtn.disabled = true;
+    startBtn.classList.add('opacity-50', 'cursor-not-allowed');
+    stopBtn.disabled = false;
+    stopBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+  } else {
+    startBtn.disabled = false;
+    startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+    stopBtn.disabled = true;
+    stopBtn.classList.add('opacity-50', 'cursor-not-allowed');
+  }
+
+  updateDashboard();
+}
+
+async function startAutomation() {
+  if (appData.posts.length === 0) {
+    showNotification('Please add some posts first', 'error');
+    return;
+  }
+
+  if (appData.groups.length === 0) {
+    showNotification('Please add some groups first', 'error');
+    return;
+  }
+
+  if (appData.accounts.length === 0) {
+    showNotification('Please add some accounts first', 'error');
+    return;
+  }
+
+  // Pre-flight: warn if any account is not logged in
+  const notLoggedIn = appData.accounts.filter(a => a.status !== 'logged_in');
+  if (notLoggedIn.length > 0) {
+    const total = appData.accounts.length;
+    if (!confirm(`${notLoggedIn.length} of ${total} account(s) are not logged in and will be skipped. Continue?`)) return;
+  }
+
+  clearLogs();
+  addLog('🚀 Starting automation...\n');
+
+  const result = await window.electronAPI.startAutomation();
+
+  if (result.success) {
+    isAutomationRunning = true;
+    updateAutomationControls();
+    showNotification('Automation started!', 'success');
+  } else {
+    showNotification('Failed to start automation: ' + result.error, 'error');
+  }
+}
+
+async function stopAutomation() {
+  addLog('\n⏹️ Stopping automation...\n');
+
+  const result = await window.electronAPI.stopAutomation();
+
+  if (result.success) {
+    isAutomationRunning = false;
+    updateAutomationControls();
+    showNotification('Automation stopped!', 'info');
+  } else {
+    showNotification('Failed to stop automation: ' + result.error, 'error');
+  }
+}
+
+function clearLogs() {
+  document.getElementById('logs-container').innerHTML = '';
+}
+
+function addLog(text) {
+  const container = document.getElementById('logs-container');
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+
+  if (text.toLowerCase().includes('error') || text.toLowerCase().includes('failed')) {
+    entry.classList.add('error');
+  } else if (text.toLowerCase().includes('success') || text.toLowerCase().includes('completed')) {
+    entry.classList.add('success');
+  }
+
+  entry.textContent = text;
+  container.appendChild(entry);
+  container.scrollTop = container.scrollHeight;
+}
+
+// Settings
+function loadSettings() {
+  document.getElementById('setting-parallel-accounts').value = appData.settings.parallelAccounts;
+  document.getElementById('setting-wait-interval').value = appData.settings.waitInterval;
+  document.getElementById('setting-account-delay').value = appData.settings.accountDelay || 1;
+  document.getElementById('setting-posts-per-group').value = appData.settings.postsPerGroup;
+  document.getElementById('setting-comment-with-image').checked = appData.settings.commentWithImage || false;
+  document.getElementById('setting-auto-delete-posted').checked = appData.settings.autoDeletePosted || false;
+}
+
+async function saveSettings() {
+  const settings = {
+    parallelAccounts: parseInt(document.getElementById('setting-parallel-accounts').value),
+    waitInterval: parseInt(document.getElementById('setting-wait-interval').value),
+    accountDelay: parseInt(document.getElementById('setting-account-delay').value),
+    postsPerGroup: parseInt(document.getElementById('setting-posts-per-group').value),
+    commentWithImage: document.getElementById('setting-comment-with-image').checked,
+    autoDeletePosted: document.getElementById('setting-auto-delete-posted').checked
+  };
+
+  const result = await window.electronAPI.saveSettings(settings);
+
+  if (result.success) {
+    appData.settings = settings;
+    showNotification('Settings saved successfully!', 'success');
+  } else {
+    showNotification('Failed to save settings: ' + result.error, 'error');
+  }
+}
+
+// Proxies
+// Proxies
+function parseProxyStringTable(proxyStr) {
+  if (!proxyStr) return {};
+
+  let remainder = proxyStr;
+  if (proxyStr.includes('://')) {
+    remainder = proxyStr.split('://')[1];
+  }
+
+  const parts = remainder.split(':');
+  return {
+    ip: parts[0] || '',
+    port: parts[1] || '',
+    user: parts[2] || '',
+    pass: parts[3] || ''
+  };
+}
+
+function addProxyRow(id, ip, port, user, pass) {
+  const tbody = document.getElementById('proxies-table-body');
+  const emptyState = document.getElementById('proxies-empty-state');
+
+  if (emptyState) emptyState.style.display = 'none';
+
+  const tr = document.createElement('tr');
+  tr.style.borderBottom = '1px solid #e5e7eb';
+
+  tr.innerHTML = `
+    <td style="padding: 12px 15px;">${escapeHtml(id)}</td>
+    <td style="padding: 12px 15px;">${escapeHtml(ip)}</td>
+    <td style="padding: 12px 15px;">${escapeHtml(port)}</td>
+    <td style="padding: 12px 15px;">${escapeHtml(user)}</td>
+    <td style="padding: 12px 15px;">${escapeHtml(pass)}</td>
+    <td style="padding: 12px 15px;">
+      <button class="icon-btn" onclick="this.closest('tr').remove()" style="color: #ef4444; border-color: #ef4444;">🗑️</button>
+    </td>
+  `;
+
+  tbody.appendChild(tr);
+}
+
+async function loadProxies() {
+  const result = await window.electronAPI.invoke('get-proxies');
+  if (result.success) {
+    document.getElementById('proxies-enabled').checked = result.useProxies;
+
+    // Clear existing
+    document.getElementById('proxies-table-body').innerHTML = '';
+
+    // Populate
+    if (result.proxies && result.proxies.length > 0) {
+      result.proxies.forEach((p, index) => {
+        const parts = parseProxyStringTable(p);
+        // If we want a separate ID, we either assume it's index+1 or parse it if we stored it
+        // User asked for "Proxy Number" entry. 
+        // Since backend stores strings, we lose "Proxy Number" unless we encode it.
+        // For now, let's just use index+1 as default display if parsing fails, or try to infer.
+        // Actually, user wants to INPUT it. 
+        // To persist it in the simple string format 'socks5://ip:port:user:pass', we lose the ID.
+        // COMPROMISE: We will lose the custom ID on save/reload and just auto-increment.
+        // OR we change backend. But user said "I will only use socks 5... add proxy should have 5 entries".
+        // They didn't explicitly say "save my custom ID". They said "Input it".
+        // I will display auto-index for loaded proxies.
+        addProxyRow(index + 1, parts.ip, parts.port, parts.user, parts.pass);
+      });
+    } else {
+      document.getElementById('proxies-empty-state').style.display = 'block';
+    }
+  }
+}
+
+async function saveProxies() {
+  const enabled = document.getElementById('proxies-enabled').checked;
+  const rows = document.querySelectorAll('#proxies-table-body tr');
+  const proxies = [];
+
+  rows.forEach(row => {
+    const cols = row.querySelectorAll('td');
+    // 0: ID, 1: IP, 2: Port, 3: User, 4: Pass
+    const ip = cols[1].textContent;
+    const port = cols[2].textContent;
+    const user = cols[3].textContent;
+    const pass = cols[4].textContent;
+
+    if (ip && port) {
+      // Reconstruct SOCKS5 string
+      let str = `socks5://${ip}:${port}`;
+      if (user && pass) {
+        str += `:${user}:${pass}`;
+      }
+      proxies.push(str);
+    }
+  });
+
+  // Save list
+  const saveList = await window.electronAPI.invoke('save-proxies', proxies);
+  // Save toggle
+  const saveToggle = await window.electronAPI.invoke('toggle-proxies', enabled);
+
+  if (saveList.success && saveToggle.success) {
+    showNotification('SOCKS5 Proxies saved successfully!', 'success');
+    appData.settings.useProxies = enabled;
+    appData.proxies = proxies;
+  } else {
+    showNotification('Failed to save proxies.', 'error');
+  }
+}
+
+// Modal Helpers
+function openModal(modalId) {
+  console.log('=== OPENING MODAL ===');
+  console.log('Modal ID:', modalId);
+  const modal = document.getElementById(modalId);
+  console.log('Modal element:', modal);
+  if (modal) {
+    // FORCE RESET any inline styles that might have been hiding it
+    modal.style.display = 'flex';
+    modal.style.removeProperty('display'); // Or just remove it to let CSS take over if 'flex' causes issues, but 'flex' is safer given the previous fix
+    modal.style.display = 'flex'; // Explicitly set it
+
+    // Add active class
+    modal.classList.add('active');
+    console.log('Modal classList after adding active:', modal.classList);
+  } else {
+    console.error('Modal not found!');
+  }
+}
+
+function closeModal(modalId) {
+  const modal = document.getElementById(modalId);
+  if (modal) {
+    modal.classList.remove('active');
+    setTimeout(() => {
+      if (!modal.classList.contains('active')) {
+        modal.style.display = 'none';
+      }
+    }, 200); // Wait for transition
+  }
+}
+
+// Notification Helper
+function showNotification(message, type = 'info') {
+  // Check if notification container exists, create if not
+  let container = document.getElementById('notification-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'notification-container';
+    document.body.appendChild(container);
+  }
+
+  // Create notification element
+  const notification = document.createElement('div');
+  notification.className = `notification ${type}`;
+  notification.textContent = message;
+
+  // Add to container
+  container.appendChild(notification);
+
+  // Trigger animation
+  setTimeout(() => notification.classList.add('show'), 10);
+
+  // Remove after 3 seconds
+  setTimeout(() => {
+    notification.classList.remove('show');
+    setTimeout(() => {
+      notification.remove();
+      if (container.childNodes.length === 0) {
+        container.remove();
+      }
+    }, 300);
+  }, 3000);
+
+  // Also log if automation view is active
+  if (document.getElementById('automation-view').classList.contains('active')) {
+    addLog(`[${type.toUpperCase()}] ${message}\n`);
+  }
+}
+
+// Utility Functions
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}

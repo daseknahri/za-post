@@ -1,0 +1,9 @@
+{
+  "XXXX-XXXX-XXXX-XXXX": {
+    "hwid": null,
+    "revoked": false,
+    "expires": null,
+    "note": "EXAMPLE ONLY — do not use. Real keys live in keys.json on the server's /data volume.",
+    "createdAt": 0
+  }
+}

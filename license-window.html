@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <title>License Verification</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background-color: #1a1b1e;
+      color: #e1e3e5;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+      user-select: none;
+    }
+
+    .container {
+      background: #25262b;
+      padding: 2rem;
+      border-radius: 8px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+      width: 100%;
+      max-width: 400px;
+      text-align: center;
+    }
+
+    h2 {
+      margin-top: 0;
+      margin-bottom: 1.5rem;
+      color: #fff;
+    }
+
+    input {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 1rem;
+      border-radius: 4px;
+      border: 1px solid #373a40;
+      background: #2c2e33;
+      color: #fff;
+      font-family: monospace;
+      text-align: center;
+      font-size: 1.1em;
+      box-sizing: border-box;
+    }
+
+    input:focus {
+      outline: none;
+      border-color: #228be6;
+    }
+
+    button {
+      background: #228be6;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 1em;
+      width: 100%;
+      transition: background 0.2s;
+    }
+
+    button:hover {
+      background: #1c7ed6;
+    }
+
+    button:disabled {
+      background: #373a40;
+      cursor: not-allowed;
+    }
+
+    .status {
+      margin-top: 1rem;
+      font-size: 0.9em;
+      min-height: 20px;
+    }
+
+    .error {
+      color: #fa5252;
+    }
+
+    .success {
+      color: #40c057;
+    }
+
+    .loading-spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid rgba(255, 255, 255, .3);
+      border-radius: 50%;
+      border-top-color: #fff;
+      animation: spin 1s ease-in-out infinite;
+      margin-right: 5px;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <h2>Za Post Comment Tool King</h2>
+    <p style="color: #909296; margin-bottom: 1.5rem; font-size: 0.9em;">Please enter your serial key to continue.</p>
+
+    <input type="text" id="licenseKey" placeholder="XXXX-XXXX-XXXX-XXXX" spellcheck="false" autocomplete="off">
+    <button id="verifyBtn">Activate</button>
+
+    <div id="status-message"></div>
+  </div>
+
+  <script src="license-renderer.js"></script>
+</body>
+
+</html>

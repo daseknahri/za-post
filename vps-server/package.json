@@ -1,0 +1,13 @@
+{
+  "name": "za-post-license-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "License validation server for Za Post Comment Tool",
+  "main": "license-server.js",
+  "scripts": {
+    "start": "node license-server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
