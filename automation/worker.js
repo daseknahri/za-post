@@ -175,11 +175,12 @@ async function checkPendingApproval(page) {
   } catch { return false; }
 }
 
-// Human-like typing: type in small chunks with a per-char delay and randomized
-// pauses between chunks (mirrors the original worker's typeTextChunk anti-detection).
+// Human-like typing: type in chunks with a per-char delay and small randomized pauses
+// between chunks. Tuned for speed while staying human-plausible (FB doesn't scrutinize
+// keystroke timing in the composer the way it does navigation/IP/account signals).
 async function humanType(page, text) {
   if (!text) return;
-  const chunks = String(text).match(/.{1,6}/gs) || [];
+  const chunks = String(text).match(/.{1,12}/gs) || [];
   for (const c of chunks) {
     // Cap each chunk at 15s: a hung CDP connection otherwise blocks for the full
     // protocolTimeout (90s) PER chunk, stalling the worker slot for many minutes. On
@@ -188,9 +189,9 @@ async function humanType(page, text) {
     let timer;
     const cap = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('keyboard.type timeout')), 15000); });
     try {
-      await Promise.race([page.keyboard.type(c, { delay: 15 + Math.floor(Math.random() * 35) }), cap]);
+      await Promise.race([page.keyboard.type(c, { delay: 5 + Math.floor(Math.random() * 12) }), cap]);
     } finally { clearTimeout(timer); }
-    await sleep(120 + Math.floor(Math.random() * 380));
+    await sleep(30 + Math.floor(Math.random() * 90));
   }
 }
 
@@ -223,6 +224,18 @@ async function checkRateLimit(page) {
   } catch { return false; }
 }
 
+// Run a page.evaluate that can NEVER hang to the protocolTimeout — bail after `ms`.
+// FB feed scans (over many article nodes) can otherwise block for the full 90s and
+// fail the whole comment step (the "Runtime.callFunctionOn timed out" symptom).
+async function evalTimed(page, fn, arg, ms = 12000) {
+  let t;
+  const p = page.evaluate(fn, arg);
+  p.catch(() => {}); // swallow a late rejection if the cap wins the race
+  const cap = new Promise((_, rej) => { t = setTimeout(() => rej(new Error('evaluate timeout')), ms); });
+  try { return await Promise.race([p, cap]); }
+  finally { clearTimeout(t); }
+}
+
 // Add the "first comment" (the link) to the JUST-published post. Reloads the group
 // so the new post renders, finds the article containing our caption, and types into
 // ITS "Write a public comment…" box. Returns true on success.
@@ -231,11 +244,11 @@ async function addFirstComment(page, gid, post, commentImg, name, log) {
     // Plain group URL (the chronological param renders a feed WITHOUT inline comment
     // affordances). Let the feed render; do NOT scroll (FB virtualizes the top post).
     await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-    await sleep(8000);
+    await sleep(5000);
     await dismissPopups(page);
 
     const commentBoxes = async () => {
-      const all = await page.$$('[contenteditable="true"], [role="textbox"]');
+      const all = (await page.$$('[contenteditable="true"], [role="textbox"]')).slice(0, 30);
       const out = [];
       for (const h of all) {
         const isC = await h.evaluate((el) => /comment/i.test((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('aria-placeholder') || ''))).catch(() => false);
@@ -248,15 +261,15 @@ async function addFirstComment(page, gid, post, commentImg, name, log) {
     let boxes = await commentBoxes();
     if (!boxes.length) {
       // State 2: click the "Leave a comment" button — prefer the one in OUR post's article.
-      const clicked = await page.evaluate((s) => {
-        const arts = Array.from(document.querySelectorAll('div[role="article"]'));
-        const mine = s && arts.find((a) => (a.innerText || '').includes(s));
-        const scope = mine || document;
+      const clicked = await evalTimed(page, (s) => {
+        const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 15);
+        const mine = s && arts.find((a) => (a.textContent || '').includes(s));
+        const scope = mine || arts[0] || document;
         const b = Array.from(scope.querySelectorAll('[role="button"]'))
           .find((e) => /leave a comment|^comment$/i.test((e.getAttribute('aria-label') || e.textContent || '').trim()));
         if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return true; }
         return false;
-      }, snip);
+      }, snip, 12000).catch(() => false);
       if (clicked) { await sleep(3500); boxes = await commentBoxes(); }
     }
     log(`🔎 [${name}] ${boxes.length} comment box(es) found`);
@@ -281,21 +294,18 @@ async function addFirstComment(page, gid, post, commentImg, name, log) {
     await page.keyboard.press('Enter');
     // Confirm submission: OUR post's comment box (scoped to the article with our caption,
     // not every box on the feed) should empty once the text is consumed.
+    // Confirm by watching the box we ACTUALLY typed into: FB clears it (or re-renders it
+    // away) once it accepts the comment. Tracking the real target box is far more reliable
+    // than re-scanning the feed by caption (which gave false "not confirmed" negatives).
     let confirmed = false;
-    const cdl = Date.now() + 8000;
+    const cdl = Date.now() + 6000;
     while (Date.now() < cdl) {
-      await sleep(1500);
-      const empty = await page.evaluate((s) => {
-        const arts = Array.from(document.querySelectorAll('div[role="article"]'));
-        const mine = s && arts.find((a) => (a.innerText || '').includes(s));
-        const scope = mine || document;
-        const box = scope.querySelector('[contenteditable="true"][aria-label*="omment"], [role="textbox"][aria-label*="omment"]');
-        return box ? (box.textContent || '').trim() === '' : false;
-      }, snip).catch(() => false);
-      if (empty) { confirmed = true; break; }
+      await sleep(1000);
+      const state = await target.evaluate((el) => (el.textContent || '').trim()).catch(() => 'GONE');
+      if (state === '' || state === 'GONE') { confirmed = true; break; } // emptied or re-rendered = submitted
     }
-    log(confirmed ? `💬 [${name}] comment confirmed` : `⚠️ [${name}] comment sent but not confirmed`);
-    await sleep(1500);
+    log(confirmed ? `💬 [${name}] comment posted` : `⚠️ [${name}] comment sent (could not auto-verify)`);
+    await sleep(1000);
     return true;
   } catch (e) { log(`⚠️ [${name}] comment error: ${e.message}`); return false; }
 }
@@ -371,7 +381,7 @@ async function runAccount(o) {
   let posted = 0, errors = 0, pendingApproval = 0;
   try {
     browser = await puppeteer.launch({
-      headless: false,
+      headless: true, // new headless (Chrome 148): renders like real Chrome but NO visible window / taskbar entry
       executablePath: chromiumPath(),
       userDataDir: store.profileDir(name),
       args: launchArgs,
