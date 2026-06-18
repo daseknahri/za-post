@@ -419,7 +419,7 @@ async function runAccount(o) {
   const assigned = (account.assignedGroups && account.assignedGroups.length)
     ? groups.filter((g) => account.assignedGroups.includes(g.id) || account.assignedGroups.includes(g.groupId))
     : [];
-  const targetGroups = assigned.slice(0, settings.postsPerGroup || 15);
+  const targetGroups = assigned; // post to ALL the account's assigned groups (the user selects them per account)
 
   if (!targetGroups.length) { log(`⏭️ [${name}] no assigned groups — skipping`); return { posted: 0, errors: 0, pendingApproval: 0, noRetry: false, flag: null, postedIds: [] }; }
 
@@ -647,7 +647,7 @@ async function runAccount(o) {
         if (isPending) {
           log(`⏳ [${name}] Post submitted but PENDING ADMIN APPROVAL in ${g.name || gid} — not counted, comment skipped`);
           pendingApproval++;
-          if (i < targetGroups.length - 1) { let w = 0, d = Math.max(15000, (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000); while (w < d && !shouldStop()) { await sleep(Math.min(1000, d - w)); w += 1000; } }
+          if (i < targetGroups.length - 1) { let w = 0, d = (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000; while (w < d && !shouldStop()) { await sleep(Math.min(1000, d - w)); w += 1000; } }
           continue;
         }
 
@@ -669,7 +669,7 @@ async function runAccount(o) {
 
       // Interruptible delay between groups (respects Stop + configurable groupDelay).
       if (i < targetGroups.length - 1) {
-        let w = 0; const d = Math.max(15000, (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000);
+        let w = 0; const d = (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000;
         const dMin = Math.round(d / 60000);
         log(`[${name}] ⏱️ Wait ${dMin > 0 ? dMin + 'min' : Math.round(d / 1000) + 's'}`);
         while (w < d && !shouldStop()) { await sleep(Math.min(1000, d - w)); w += 1000; }

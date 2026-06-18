@@ -152,7 +152,11 @@ class Orchestrator {
 
     if (!unique) {
       // post-centric / random -> account posts ALL its eligible posts each cycle.
-      return order.includes('random') ? seededShuffle(filtered, (cycle + 1) * 7919) : filtered;
+      // "Posts Per Group" caps how many posts an account makes per cycle (each post goes to
+      // all of the account's groups). 0/blank = no cap (post all eligible).
+      const ppg = Number.isFinite(data.settings.postsPerGroup) && data.settings.postsPerGroup > 0 ? data.settings.postsPerGroup : filtered.length;
+      const list = order.includes('random') ? seededShuffle(filtered, (cycle + 1) * 7919) : filtered;
+      return list.slice(0, ppg);
     }
 
     // UNIQUE / SEQUENCE -> deal each post exactly ONCE across the active accounts, round-robin.
@@ -331,11 +335,11 @@ class Orchestrator {
           return res;
         }));
         const batchOk = results.filter((r) => r.progressed).length;
-        this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) --- Waiting ${settings.accountDelay || 1} minute(s) before next batch...`);
+        this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) --- Waiting ${Number.isFinite(settings.accountDelay) ? settings.accountDelay : 1} minute(s) before next batch...`);
         for (const r of results) cyclePostedIds.push(...r.postedIds);
         if (this._finish) break;
         if (b < batches.length - 1 && !this._shouldStop()) {
-          await this._waitWithCountdown((settings.accountDelay || 1) * 60000, 'Next batch');
+          await this._waitWithCountdown((Number.isFinite(settings.accountDelay) ? settings.accountDelay : 1) * 60000, 'Next batch');
         }
       }
       // Mark this cycle's published posts as DEALT (drives the round-robin: each post once;
@@ -363,8 +367,8 @@ class Orchestrator {
       if ((settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {
         this.log(`🏁 Reached maxCycles (${settings.maxCycles}) — finishing.`); break;
       }
-      this.log(`✅ Cycle ${cycle} complete. Waiting ${settings.waitInterval || 60} min before next cycle…`);
-      await this._waitWithCountdown((settings.waitInterval || 60) * 60000, 'Next cycle');
+      this.log(`✅ Cycle ${cycle} complete. Waiting ${Number.isFinite(settings.waitInterval) ? settings.waitInterval : 60} min before next cycle…`);
+      await this._waitWithCountdown((Number.isFinite(settings.waitInterval) ? settings.waitInterval : 60) * 60000, 'Next cycle');
     }
   }
 

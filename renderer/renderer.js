@@ -1757,7 +1757,7 @@ async function saveSettings() {
     parallelAccounts: intOr('setting-parallel-accounts', 3),
     waitInterval: intOr('setting-wait-interval', 60),
     accountDelay: intOr('setting-account-delay', 1),
-    postsPerGroup: intOr('setting-posts-per-group', 15),
+    postsPerGroup: intOr('setting-posts-per-group', 1),
     commentWithImage: document.getElementById('setting-comment-with-image').checked,
     autoDeletePosted: document.getElementById('setting-auto-delete-posted').checked,
     groupDelay: intOr('setting-group-delay', 60),
