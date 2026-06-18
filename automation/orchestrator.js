@@ -46,16 +46,39 @@ class Orchestrator {
     this.isLoginOpen = (this.options && typeof this.options.isLoginOpen === 'function') ? this.options.isLoginOpen : () => false;
     this.running = false;
     this._stop = false;
+    this._paused = false;
+    this._finish = false;
     this._progress = { running: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0 };
   }
   isRunning() { return this.running; }
-  stop() { this._stop = true; }
+  stop() { this._stop = true; this._paused = false; }
   _shouldStop() { return this._stop; }
+  pause() {
+    if (!this.running || this._paused) return;
+    this._paused = true;
+    this.log('⏸ Paused — holding after the current batch');
+    this.emit('automation-paused');
+    this.emit('automation-progress', { ...this._progress, paused: this._paused });
+  }
+  resume() {
+    if (!this._paused) return;
+    this._paused = false;
+    this.log('▶️ Resumed');
+    this.emit('automation-resumed');
+    this.emit('automation-progress', { ...this._progress, paused: this._paused });
+  }
+  finish() {
+    if (!this.running) return;
+    this._finish = true;
+    this.log('🏁 Finishing after the current batch — no new work will start');
+  }
+  isPaused() { return this._paused; }
+  async _waitWhilePaused() { while (this._paused && !this._stop) await sleep(500); }
   log(msg) { this.emit('automation-log', msg); }
 
   async start(getData) {
     if (this.running) return { success: false, error: 'Automation already running' };
-    this._stop = false; this.running = true;
+    this._stop = false; this._paused = false; this._finish = false; this.running = true;
     this._progress = { running: true, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0 };
     this.emit('automation-started');
     this.emit('automation-progress', { ...this._progress });
@@ -65,8 +88,9 @@ class Orchestrator {
         this.running = false;
         this._progress.running = false;
         this.emit('automation-progress', { ...this._progress });
-        this.emit('automation-stopped', this._stop ? 'stopped' : 'completed');
-        this.log(`⏹ Automation ${this._stop ? 'stopped' : 'finished'}.`);
+        const reason = this._stop ? 'stopped' : (this._finish ? 'finished' : 'completed');
+        this.emit('automation-stopped', reason);
+        this.log(`⏹ Automation ${reason}.`);
       });
     return { success: true };
   }
@@ -166,13 +190,16 @@ class Orchestrator {
       this._progress.cycle = cycle;
       this._progress.accountsTotal = active.length;
       this._progress.accountsDone = 0;
-      this.emit('automation-progress', { ...this._progress });
+      this.emit('automation-progress', { ...this._progress, paused: this._paused });
       this.log(`🔄 Cycle ${cycle}: ${active.length} account(s), ${settings.parallelAccounts || 3} in parallel`);
+
+      await this._waitWhilePaused(); if (this._shouldStop()) break;
 
       const batches = chunk(active, settings.parallelAccounts || 3);
       const cyclePostedIds = [];
       for (let b = 0; b < batches.length; b++) {
         if (this._shouldStop()) break;
+        await this._waitWhilePaused(); if (this._shouldStop()) break;
         const batch = batches[b];
         this.log(`═══ Batch ${b + 1}/${batches.length} — ${new Date().toLocaleTimeString()} — ${batch.map((a) => a.name).join(', ')} ═══`);
         const results = await Promise.all(batch.map(async (account) => {
@@ -184,7 +211,7 @@ class Orchestrator {
           this._progress.posted += res.posted;
           this._progress.errors += res.errors;
           this._progress.pending += res.pendingApproval;
-          this.emit('automation-progress', { ...this._progress });
+          this.emit('automation-progress', { ...this._progress, paused: this._paused });
           return res;
         }));
         const batchOk = results.filter((r) => r.progressed).length;
@@ -205,11 +232,13 @@ class Orchestrator {
           }
           if (rotationDirty) store.saveRotation(this._rotation);
         }
+        if (this._finish) break;
         if (b < batches.length - 1 && !this._shouldStop()) {
           this.log(`⏳ Waiting ${settings.accountDelay || 1} min before next batch…`);
           await this._interruptibleSleep((settings.accountDelay || 1) * 60000);
         }
       }
+      if (this._shouldStop()) break;
 
       // One-time campaign: remove the posts published this cycle so each post is used
       // exactly once (and the run ends when the library empties). Backend-owned so it's
@@ -224,7 +253,7 @@ class Orchestrator {
         this.log(`🗑️ Auto-deleted ${before - data.posts.length} posted post(s) — ${data.posts.length} remaining`);
       }
 
-      if (this._shouldStop()) break;
+      if (this._shouldStop() || this._finish) break;
       if ((settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {
         this.log(`🏁 Reached maxCycles (${settings.maxCycles}) — finishing.`); break;
       }

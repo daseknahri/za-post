@@ -18,6 +18,7 @@ let appData = {
 
 let selectedImages = [];
 let isAutomationRunning = false;
+let isPaused = false;
 let currentLoginAccount = null;
 let appLimits = { maxGroups: 10, maxAccounts: 5 }; // Default limits
 
@@ -86,8 +87,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
       const runEl = document.getElementById('dash-running');
       if (runEl) {
-        runEl.textContent = data.running ? 'Running' : 'Idle';
-        runEl.style.color = data.running ? '#34d399' : '#9ca3af';
+        runEl.textContent = data.running ? (data.paused ? 'Paused' : 'Running') : 'Idle';
+        runEl.style.color = data.running ? (data.paused ? '#f59e0b' : '#34d399') : '#9ca3af';
       }
       set('dash-cycle', data.cycle > 0 ? data.cycle : '—');
       set('dash-posted', data.posted);
@@ -95,6 +96,25 @@ document.addEventListener('DOMContentLoaded', async () => {
       set('dash-pending', data.pending);
       const totalStr = data.accountsTotal > 0 ? `${data.accountsDone}/${data.accountsTotal}` : '—';
       set('dash-accounts', totalStr);
+      // Sync paused state from backend
+      if (typeof data.paused === 'boolean' && data.paused !== isPaused) {
+        isPaused = data.paused;
+        updateAutomationControls();
+      }
+    });
+  }
+
+  // Paused / Resumed events
+  if (window.electronAPI.onAutomationPaused) {
+    window.electronAPI.onAutomationPaused(() => {
+      isPaused = true;
+      updateAutomationControls();
+    });
+  }
+  if (window.electronAPI.onAutomationResumed) {
+    window.electronAPI.onAutomationResumed(() => {
+      isPaused = false;
+      updateAutomationControls();
     });
   }
 
@@ -149,6 +169,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   window.electronAPI.onAutomationStopped(async (code) => {
     isAutomationRunning = false;
+    isPaused = false;
     updateAutomationControls();
     addLog(`\n✅ Automation stopped with exit code ${code}\n`);
     await loadData(); // refresh — the backend may have auto-deleted posted items during the run
@@ -421,6 +442,9 @@ function initializeEventListeners() {
   // Automation
   document.getElementById('btn-start-automation').addEventListener('click', startAutomation);
   document.getElementById('btn-stop-automation').addEventListener('click', stopAutomation);
+  document.getElementById('btn-pause-automation').addEventListener('click', pauseAutomation);
+  document.getElementById('btn-resume-automation').addEventListener('click', resumeAutomation);
+  document.getElementById('btn-finish-automation').addEventListener('click', finishAutomation);
 
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
   document.getElementById('btn-save-proxies').addEventListener('click', saveProxies);
@@ -1515,24 +1539,51 @@ async function checkAutomationStatus() {
   const result = await window.electronAPI.getAutomationStatus();
   if (result.success) {
     isAutomationRunning = result.isRunning;
+    isPaused = result.isPaused || false;
     updateAutomationControls();
   }
 }
 
 function updateAutomationControls() {
-  const startBtn = document.getElementById('btn-start-automation');
-  const stopBtn = document.getElementById('btn-stop-automation');
+  const startBtn   = document.getElementById('btn-start-automation');
+  const pauseBtn   = document.getElementById('btn-pause-automation');
+  const resumeBtn  = document.getElementById('btn-resume-automation');
+  const finishBtn  = document.getElementById('btn-finish-automation');
+  const stopBtn    = document.getElementById('btn-stop-automation');
+  const pausedInd  = document.getElementById('paused-indicator');
 
-  if (isAutomationRunning) {
-    startBtn.disabled = true;
-    startBtn.classList.add('opacity-50', 'cursor-not-allowed');
-    stopBtn.disabled = false;
-    stopBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+  const setEnabled = (btn, enabled) => {
+    if (!btn) return;
+    btn.disabled = !enabled;
+    btn.classList.toggle('opacity-50', !enabled);
+    btn.classList.toggle('cursor-not-allowed', !enabled);
+  };
+  const show = (btn, visible) => { if (btn) btn.style.display = visible ? '' : 'none'; };
+
+  if (!isAutomationRunning) {
+    // IDLE: only Start visible & enabled
+    show(startBtn,  true);  setEnabled(startBtn,  true);
+    show(pauseBtn,  false);
+    show(resumeBtn, false);
+    show(finishBtn, false);
+    show(stopBtn,   false);
+    if (pausedInd) pausedInd.style.display = 'none';
+  } else if (isPaused) {
+    // PAUSED: Resume + Finish + Stop
+    show(startBtn,  false);
+    show(pauseBtn,  false);
+    show(resumeBtn, true);  setEnabled(resumeBtn, true);
+    show(finishBtn, true);  setEnabled(finishBtn, true);
+    show(stopBtn,   true);  setEnabled(stopBtn,   true);
+    if (pausedInd) pausedInd.style.display = '';
   } else {
-    startBtn.disabled = false;
-    startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
-    stopBtn.disabled = true;
-    stopBtn.classList.add('opacity-50', 'cursor-not-allowed');
+    // RUNNING: Pause + Finish + Stop
+    show(startBtn,  false);
+    show(pauseBtn,  true);  setEnabled(pauseBtn,  true);
+    show(resumeBtn, false);
+    show(finishBtn, true);  setEnabled(finishBtn, true);
+    show(stopBtn,   true);  setEnabled(stopBtn,   true);
+    if (pausedInd) pausedInd.style.display = 'none';
   }
 
   updateDashboard();
@@ -1574,6 +1625,7 @@ async function startAutomation() {
 
   if (result.success) {
     isAutomationRunning = true;
+    isPaused = false;
     updateAutomationControls();
     showNotification('Automation started!', 'success');
   } else {
@@ -1588,10 +1640,45 @@ async function stopAutomation() {
 
   if (result.success) {
     isAutomationRunning = false;
+    isPaused = false;
     updateAutomationControls();
     showNotification('Automation stopped!', 'info');
   } else {
     showNotification('Failed to stop automation: ' + result.error, 'error');
+  }
+}
+
+async function pauseAutomation() {
+  const result = await window.electronAPI.pauseAutomation();
+  if (result.success) {
+    isPaused = true;
+    updateAutomationControls();
+    addLog('\n⏸ Automation pausing — current batch will finish first.\n');
+    showNotification('Automation pausing…', 'info');
+  } else {
+    showNotification('Failed to pause: ' + result.error, 'error');
+  }
+}
+
+async function resumeAutomation() {
+  const result = await window.electronAPI.resumeAutomation();
+  if (result.success) {
+    isPaused = false;
+    updateAutomationControls();
+    addLog('\n▶️ Automation resumed.\n');
+    showNotification('Automation resumed!', 'success');
+  } else {
+    showNotification('Failed to resume: ' + result.error, 'error');
+  }
+}
+
+async function finishAutomation() {
+  const result = await window.electronAPI.finishAutomation();
+  if (result.success) {
+    addLog('\n🏁 Finish requested — current batch will complete, then automation ends.\n');
+    showNotification('Automation will finish after current batch.', 'info');
+  } else {
+    showNotification('Failed to finish: ' + result.error, 'error');
   }
 }
 

@@ -31,6 +31,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Automation operations
   startAutomation: () => ipcRenderer.invoke('start-automation'),
   stopAutomation: () => ipcRenderer.invoke('stop-automation'),
+  pauseAutomation: () => ipcRenderer.invoke('pause-automation'),
+  resumeAutomation: () => ipcRenderer.invoke('resume-automation'),
+  finishAutomation: () => ipcRenderer.invoke('finish-automation'),
   getAutomationStatus: () => ipcRenderer.invoke('get-automation-status'),
 
   // File operations
@@ -63,6 +66,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   onAutomationProgress: (callback) => {
     ipcRenderer.on('automation-progress', (_e, data) => callback(data));
+  },
+  onAutomationPaused: (callback) => {
+    ipcRenderer.on('automation-paused', () => callback());
+  },
+  onAutomationResumed: (callback) => {
+    ipcRenderer.on('automation-resumed', () => callback());
   },
 
   // Open the logs folder in the OS file explorer

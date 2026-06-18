@@ -389,11 +389,27 @@
             <h2 class="text-2xl font-bold text-white">Automation Control</h2>
             <p class="text-sm text-gray-500 mt-1">Start and monitor automation</p>
           </div>
-          <div class="automation-controls flex gap-3">
+          <div class="automation-controls flex gap-3 items-center">
+            <span id="paused-indicator" style="display:none;background:#f59e0b;color:#1f2937;font-size:11px;font-weight:700;padding:3px 10px;border-radius:8px;letter-spacing:0.05em;">⏸ PAUSED</span>
             <button
               class="btn-success flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-emerald-500 to-emerald-600 rounded-xl text-white text-sm font-semibold hover:shadow-lg hover:shadow-emerald-500/20 transition-all duration-300"
               id="btn-start-automation">
               <span>▶️</span> Start
+            </button>
+            <button
+              class="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-yellow-500 to-yellow-600 rounded-xl text-white text-sm font-semibold hover:shadow-lg transition-all duration-300 opacity-50 cursor-not-allowed"
+              id="btn-pause-automation" style="display:none;" disabled>
+              <span>⏸</span> Pause
+            </button>
+            <button
+              class="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-emerald-500 to-emerald-600 rounded-xl text-white text-sm font-semibold hover:shadow-lg transition-all duration-300 opacity-50 cursor-not-allowed"
+              id="btn-resume-automation" style="display:none;" disabled>
+              <span>▶️</span> Resume
+            </button>
+            <button
+              class="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-blue-500 to-blue-600 rounded-xl text-white text-sm font-semibold hover:shadow-lg transition-all duration-300 opacity-50 cursor-not-allowed"
+              id="btn-finish-automation" style="display:none;" disabled>
+              <span>🏁</span> Finish
             </button>
             <button
               class="btn-danger flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-red-500 to-red-600 rounded-xl text-white text-sm font-semibold hover:shadow-lg hover:shadow-red-500/20 transition-all duration-300 opacity-50 cursor-not-allowed"

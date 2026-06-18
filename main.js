@@ -636,7 +636,21 @@ ipcMain.handle('stop-automation', () => {
   if (!orchestrator.isRunning()) return fail('Automation is not running');
   orchestrator.stop(); return ok();
 });
-ipcMain.handle('get-automation-status', () => ok({ isRunning: orchestrator.isRunning() }));
+ipcMain.handle('pause-automation', () => {
+  if (!orchestrator) return fail('Orchestrator not ready');
+  if (!orchestrator.isRunning()) return fail('Automation is not running');
+  orchestrator.pause(); return ok();
+});
+ipcMain.handle('resume-automation', () => {
+  if (!orchestrator) return fail('Orchestrator not ready');
+  orchestrator.resume(); return ok();
+});
+ipcMain.handle('finish-automation', () => {
+  if (!orchestrator) return fail('Orchestrator not ready');
+  if (!orchestrator.isRunning()) return fail('Automation is not running');
+  orchestrator.finish(); return ok();
+});
+ipcMain.handle('get-automation-status', () => ok({ isRunning: orchestrator.isRunning(), isPaused: orchestrator.isPaused() }));
 
 // =======================================================================
 // IPC: SETTINGS / PROXIES / FILES / LICENSE
