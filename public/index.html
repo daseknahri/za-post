@@ -5,6 +5,30 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Facebook Pilot - Remote</title>
+    <script>
+      // Forward the access token (from ?token=… in the URL) on every /api request, so the
+      // remote dashboard works against the token-gated server. Runs before any other script.
+      (function () {
+        try {
+          var t = new URLSearchParams(location.search).get('token');
+          if (t) sessionStorage.setItem('apiToken', t);
+          t = t || sessionStorage.getItem('apiToken');
+          if (!t) return;
+          var _fetch = window.fetch;
+          window.fetch = function (url, opts) {
+            try {
+              var u = String(url);
+              if (u.indexOf('/api/') !== -1 || u.charAt(0) === '/') {
+                opts = opts || {};
+                if (opts.headers instanceof Headers) opts.headers.set('X-Access-Token', t);
+                else { opts.headers = opts.headers || {}; opts.headers['X-Access-Token'] = t; }
+              }
+            } catch (e) {}
+            return _fetch(url, opts);
+          };
+        } catch (e) {}
+      })();
+    </script>
     <style>
         :root {
             --bg-dark: #0f1014;

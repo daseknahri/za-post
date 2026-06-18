@@ -51,9 +51,23 @@ function startServer(port, injected) {
   app.use(cors());
   app.use(express.json({ limit: '15mb' }));
   app.use(express.urlencoded({ extended: true }));
+  app.use((_req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
   app.use(express.static(path.join(__dirname, 'public')));
   app.use('/uploads', express.static(UPLOAD_DIR));
   app.use('/images', express.static(IMAGES_DIR));
+
+  // When a token is configured (set by main.js whenever the public tunnel is enabled),
+  // require it on every /api route. The dashboard is reached as `<url>/?token=…`; its
+  // bootstrap forwards the token as the X-Access-Token header. Without this, anyone with
+  // the tunnel URL could control automation and read account data.
+  const API_TOKEN = hooks.apiToken || null;
+  if (API_TOKEN) {
+    app.use('/api', (req, res, next) => {
+      const tok = req.get('X-Access-Token') || req.query.token;
+      if (tok === API_TOKEN) return next();
+      return res.status(401).json({ success: false, error: 'Unauthorized — open the dashboard with ?token=… (see the app).' });
+    });
+  }
 
   // ---- automation -----------------------------------------------------
   app.get('/api/automation/status', (_req, res) => {
@@ -112,7 +126,15 @@ function startServer(port, injected) {
   });
 
   // ---- accounts / groups (parity with original server) -----------------
-  app.get('/api/accounts', (_req, res) => res.json({ accounts: hooks.getData().accounts || [] }));
+  app.get('/api/accounts', (_req, res) => {
+    // Never expose credentials/cookies over the network — map to display-safe fields only.
+    const accounts = (hooks.getData().accounts || []).map((a) => ({
+      name: a.name, alias: a.alias, status: a.status, lastMessage: a.lastMessage,
+      enabled: a.enabled !== false, assignedGroups: a.assignedGroups || [],
+      fbName: a.fbName, lastChecked: a.lastChecked,
+    }));
+    res.json({ accounts });
+  });
   app.get('/api/groups', (_req, res) => res.json({ groups: hooks.getData().groups || [] }));
   app.post('/api/accounts/:name/login', async (req, res) => {
     try { await hooks.loginAccount(req.params.name); res.json({ success: true, message: `Login window opened for ${req.params.name}` }); }

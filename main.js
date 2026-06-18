@@ -91,6 +91,8 @@ process.on('unhandledRejection', (e) => {
 });
 
 const REMOTE_PORT = 3000;
+// Per-launch secret that gates the remote API whenever the public tunnel is enabled.
+const REMOTE_TOKEN = require('crypto').randomBytes(16).toString('hex');
 // RUN_STATE_FILE is assigned in whenReady (after app paths are available).
 // Declared here so setRunActive / isRunActive are accessible throughout the file.
 let RUN_STATE_FILE = null;
@@ -115,7 +117,7 @@ async function applyTunnelState(enabled) {
   if (enabled && !tunnelActive) {
     tunnelActive = true;
     emit('automation-log', '🌐 Starting remote-access tunnel...');
-    try { remote.startTunnel(REMOTE_PORT, (u) => { tunnelUrl = u; send('remote-url-update', u); }); }
+    try { remote.startTunnel(REMOTE_PORT, (u) => { tunnelUrl = u ? `${u}/?token=${REMOTE_TOKEN}` : u; send('remote-url-update', tunnelUrl); if (u) emit('automation-log', `🔐 Remote dashboard ready (keep this URL private): ${tunnelUrl}`); }); }
     catch (e) { tunnelActive = false; emit('automation-log', '🌐 Tunnel failed: ' + e.message); }
   } else if (!enabled && tunnelActive) {
     tunnelActive = false; tunnelUrl = '';
@@ -158,21 +160,23 @@ function persistTemp(tempPath, prefix) {
   } catch { return tempPath; }
 }
 
-// Used by the remote dashboard (server.js hooks).
+// Used by the remote dashboard (server.js hooks). Serialized via store.update so HTTP
+// writes can't clobber the orchestrator's concurrent post/auto-delete writes.
 function addPostFromRemote(fields) {
-  const data = getData();
   const imgPath = persistTemp(fields.imagePath, 'post');
   const commentImagePath = persistTemp(fields.commentImagePath, 'comment');
-  data.posts.push({
-    id: 'post-' + Date.now(), caption: fields.caption || '', comment: fields.comment || '',
-    imagePaths: imgPath ? [imgPath] : [], imageUrl: fields.imageUrl || '',
-    commentImagePath: commentImagePath || null, commentImageUrl: fields.commentImageUrl || '',
-  });
-  store.save(data); send('data-updated');
+  return store.update((data) => {
+    data.posts.push({
+      id: 'post-' + Date.now(), caption: fields.caption || '', comment: fields.comment || '',
+      imagePaths: imgPath ? [imgPath] : [], imageUrl: fields.imageUrl || '',
+      commentImagePath: commentImagePath || null, commentImageUrl: fields.commentImageUrl || '',
+    });
+  }).then(() => send('data-updated')).catch(() => {});
 }
 function deletePostByIndex(index) {
-  const data = getData();
-  if (index >= 0 && index < data.posts.length) { data.posts.splice(index, 1); store.save(data); send('data-updated'); }
+  return store.update((data) => {
+    if (index >= 0 && index < data.posts.length) data.posts.splice(index, 1);
+  }).then(() => send('data-updated')).catch(() => {});
 }
 
 function showLicenseWindow() {
@@ -206,7 +210,18 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   store.init(app.getPath('userData'));
-  clearInterruptedLoginStates();
+  clearInterruptedLoginStates(); // triggers the first load() — surfaces any recovery below
+
+  // If data.json was corrupt at startup, tell the operator clearly (data integrity matters
+  // for a real campaign). store.load() already recovered from backup / quarantined the bad file.
+  const dataIssue = store.consumeLoadIssue();
+  if (dataIssue) {
+    const detail = dataIssue === 'recovered-from-backup'
+      ? 'data.json was unreadable and was automatically restored from the backup (data.json.bak). Changes since the last successful save may be lost. The corrupt file was preserved as data.corrupt-*.json.'
+      : 'data.json was unreadable and no backup existed, so the app started with empty data. The unreadable file was preserved as data.corrupt-*.json for manual recovery.';
+    appendLogFile('DATA WARNING: ' + detail);
+    try { dialog.showMessageBox({ type: 'warning', title: 'Za Post — data recovery', message: 'Saved data was recovered after corruption', detail, buttons: ['OK'] }); } catch {}
+  }
 
   // Kill any Chromium left orphaned by a previous crash/force-kill so its locked
   // profile dir doesn't block this session's launches. Best-effort, non-blocking.
@@ -242,10 +257,11 @@ app.whenReady().then(async () => {
     onStop: () => { orchestrator.stop(); setRunActive(false); },
     addPost: (fields) => addPostFromRemote(fields),
     deletePost: (index) => deletePostByIndex(index),
-    setInterval: (minutes) => { const d = getData(); d.settings.waitInterval = minutes; store.save(d); send('data-updated'); },
+    setInterval: (minutes) => store.update((d) => { d.settings.waitInterval = clampSettings({ waitInterval: minutes }).waitInterval; }).then(() => send('data-updated')).catch(() => {}),
     loginAccount: (name) => openLoginBrowser(name),
     closeLogin: (name) => closeLoginBrowser(name),
     getTunnelUrl: () => tunnelUrl || '',
+    apiToken: REMOTE_TOKEN, // gate /api/* when reached over the public tunnel
     uploadDir: path.join(app.getPath('userData'), 'uploads'),
     imagesDir: store.paths.IMAGES_DIR,
   });
@@ -306,23 +322,23 @@ ipcMain.handle('save-data', (_e, data) => {
 // =======================================================================
 // IPC: POSTS
 // =======================================================================
-ipcMain.handle('add-post', (_e, post) => {
+ipcMain.handle('add-post', async (_e, post) => {
   try {
-    const data = getData();
     const imagePaths = [];
     for (const img of post.images || []) { const p = store.saveBase64Image(img, 'post'); if (p) imagePaths.push(p); }
     let commentImagePath = null;
     if (post.commentImage) commentImagePath = store.saveBase64Image(post.commentImage, 'comment');
-    data.posts.push({
-      id: 'post-' + Date.now(),
-      caption: post.caption || '',
-      comment: post.comment || '',
-      imagePaths,
-      imageUrl: post.imageUrl || '',
-      commentImagePath,
-      commentImageUrl: post.commentImageUrl || '',
+    await store.update((data) => {
+      data.posts.push({
+        id: 'post-' + Date.now(),
+        caption: post.caption || '',
+        comment: post.comment || '',
+        imagePaths,
+        imageUrl: post.imageUrl || '',
+        commentImagePath,
+        commentImageUrl: post.commentImageUrl || '',
+      });
     });
-    store.save(data);
     send('data-updated');
     return ok();
   } catch (e) { return fail(e); }
@@ -331,28 +347,28 @@ ipcMain.handle('add-post', (_e, post) => {
 // =======================================================================
 // IPC: BULK IMPORT
 // =======================================================================
-ipcMain.handle('add-posts-bulk', (_e, posts) => {
+ipcMain.handle('add-posts-bulk', async (_e, posts) => {
   try {
     if (!Array.isArray(posts)) return fail('Expected an array of posts');
-    const data = getData();
     let added = 0, skipped = 0;
     const now = Date.now();
-    for (let i = 0; i < posts.length; i++) {
-      const p = posts[i];
-      const caption = (p.caption || '').trim();
-      if (!caption) { skipped++; continue; }
-      data.posts.push({
-        id: `post-${now}-${i}`,
-        caption,
-        comment: p.comment || '',
-        imagePaths: [],
-        imageUrl: p.imageUrl || '',
-        commentImagePath: null,
-        commentImageUrl: p.commentImageUrl || '',
-      });
-      added++;
-    }
-    store.save(data);
+    await store.update((data) => {
+      for (let i = 0; i < posts.length; i++) {
+        const p = posts[i];
+        const caption = (p.caption || '').trim();
+        if (!caption) { skipped++; continue; }
+        data.posts.push({
+          id: `post-${now}-${i}`,
+          caption,
+          comment: p.comment || '',
+          imagePaths: [],
+          imageUrl: p.imageUrl || '',
+          commentImagePath: null,
+          commentImageUrl: p.commentImageUrl || '',
+        });
+        added++;
+      }
+    });
     send('data-updated');
     return ok({ added, skipped });
   } catch (e) { return fail(e); }
@@ -382,19 +398,25 @@ ipcMain.handle('add-groups-bulk', (_e, items) => {
   } catch (e) { return fail(e); }
 });
 
-ipcMain.handle('delete-post', (_e, postId) => {
-  const data = getData();
-  data.posts = data.posts.filter((p) => p.id !== postId);
-  store.save(data); send('data-updated'); return ok();
+ipcMain.handle('delete-post', async (_e, postId) => {
+  try {
+    await store.update((data) => { data.posts = data.posts.filter((p) => p.id !== postId); });
+    send('data-updated'); return ok();
+  } catch (e) { return fail(e); }
 });
 
-ipcMain.handle('edit-post', (_e, postId, updates) => {
-  const data = getData();
-  const p = data.posts.find((x) => x.id === postId);
-  if (!p) return fail('Post not found');
-  if (updates.caption !== undefined) p.caption = updates.caption;
-  if (updates.comment !== undefined) p.comment = updates.comment;
-  store.save(data); send('data-updated'); return ok();
+ipcMain.handle('edit-post', async (_e, postId, updates) => {
+  try {
+    const found = await store.update((data) => {
+      const p = data.posts.find((x) => x.id === postId);
+      if (!p) return false;
+      if (updates.caption !== undefined) p.caption = updates.caption;
+      if (updates.comment !== undefined) p.comment = updates.comment;
+      return true;
+    });
+    if (!found) return fail('Post not found');
+    send('data-updated'); return ok();
+  } catch (e) { return fail(e); }
 });
 
 // =======================================================================
@@ -593,9 +615,11 @@ async function checkStatus(accountName) {
 // Fix #3: accept full result object to persist fbUserId, fbName, lastChecked.
 // Backward-compatible: extra arg is optional.
 function setAccountStatus(name, status, message, result) {
-  const data = getData();
-  const a = data.accounts.find((x) => x.name === name);
-  if (a) {
+  // Serialized via store.update so account-status writes (which fire constantly during a
+  // run) can't clobber the orchestrator's concurrent post/auto-delete writes.
+  store.update((data) => {
+    const a = data.accounts.find((x) => x.name === name);
+    if (!a) return;
     a.status = status; a.lastMessage = message || '';
     if (result && result.fbUserId) a.fbUserId = result.fbUserId;
     if (result && result.fbName !== undefined) a.fbName = result.fbName;
@@ -603,8 +627,7 @@ function setAccountStatus(name, status, message, result) {
     // Opportunistically prune any assignedGroups that no longer exist in data.groups.
     const valid = new Set(data.groups.map((g) => g.id));
     a.assignedGroups = (a.assignedGroups || []).filter((id) => valid.has(id));
-    store.save(data); send('data-updated');
-  }
+  }).then(() => send('data-updated')).catch(() => {});
 }
 
 function clearInterruptedLoginStates() {
@@ -780,15 +803,34 @@ ipcMain.handle('get-automation-status', () => ok({ isRunning: orchestrator.isRun
 // =======================================================================
 // IPC: SETTINGS / PROXIES / FILES / LICENSE
 // =======================================================================
-ipcMain.handle('save-settings', (_e, settings) => {
-  const data = getData();
-  data.settings = { ...store.DEFAULT_SETTINGS, ...data.settings, ...settings };
-  store.save(data);
-  // Apply launchOnStartup immediately so toggling it takes effect without a restart.
-  try { app.setLoginItemSettings({ openAtLogin: !!data.settings.launchOnStartup }); } catch {}
-  // Apply the remote-access tunnel toggle live (start/stop without a restart).
-  applyTunnelState(!!data.settings.enableTunnel);
-  return ok();
+// Coerce + clamp numeric settings to sane ranges. Defense-in-depth: the UI guards on
+// save, but the remote HTTP path (or a hand-edited data.json) could inject a 0/NaN/negative
+// delay — a 0 inter-group/cycle delay hammers Facebook and gets accounts locked.
+function clampSettings(s) {
+  const n = (v, def, min, max) => { let x = Number(v); if (!Number.isFinite(x)) x = def; return Math.min(max, Math.max(min, Math.round(x * 1000) / 1000)); };
+  const out = { ...(s || {}) };
+  if ('parallelAccounts' in out) out.parallelAccounts = n(out.parallelAccounts, 3, 1, 20);
+  if ('waitInterval' in out)     out.waitInterval     = n(out.waitInterval, 60, 0, 1440);
+  if ('accountDelay' in out)     out.accountDelay     = n(out.accountDelay, 1, 0, 1440);
+  if ('groupDelay' in out)       out.groupDelay       = n(out.groupDelay, 60, 0, 3600);
+  if ('postsPerGroup' in out)    out.postsPerGroup    = n(out.postsPerGroup, 1, 0, 100000);
+  if ('maxCycles' in out)        out.maxCycles        = n(out.maxCycles, 0, 0, 100000);
+  return out;
+}
+
+ipcMain.handle('save-settings', async (_e, settings) => {
+  try {
+    const clean = clampSettings(settings);
+    const merged = await store.update((data) => {
+      data.settings = { ...store.DEFAULT_SETTINGS, ...data.settings, ...clean };
+      return data.settings;
+    });
+    // Apply launchOnStartup immediately so toggling it takes effect without a restart.
+    try { app.setLoginItemSettings({ openAtLogin: !!merged.launchOnStartup }); } catch {}
+    // Apply the remote-access tunnel toggle live (start/stop without a restart).
+    applyTunnelState(!!merged.enableTunnel);
+    return ok();
+  } catch (e) { return fail(e); }
 });
 
 ipcMain.handle('get-proxies', () => {
