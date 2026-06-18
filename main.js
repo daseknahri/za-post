@@ -449,6 +449,25 @@ async function openLoginBrowser(accountName) {
   const pages = await browser.pages();
   for (let i = 1; i < pages.length; i++) { try { await pages[i].close(); } catch {} }
   const page = pages[0] || (await browser.newPage());
+
+  // Auto-capture the email/phone + password the user types during manual login. FB's login
+  // box accepts a phone number too, so this works either way. Only SAVED on a successful
+  // login (in the disconnected handler) so the credential-login fallback can reuse it.
+  const captured = { id: '', pass: '' };
+  try {
+    await page.exposeFunction('__zaCaptureCreds', (id, pass) => { if (id) captured.id = String(id); if (pass) captured.pass = String(pass); });
+    await page.evaluateOnNewDocument(() => {
+      const grab = () => {
+        const em = document.querySelector('input[name="email"], #email');
+        const pw = document.querySelector('input[name="pass"], #pass');
+        if (em && pw && em.value && pw.value && window.__zaCaptureCreds) { try { window.__zaCaptureCreds(em.value, pw.value); } catch (e) {} }
+      };
+      document.addEventListener('submit', grab, true);
+      document.addEventListener('click', (e) => { try { if (e.target.closest('button[name="login"], [data-testid="royal_login_button"], button[type="submit"]')) grab(); } catch (er) {} }, true);
+      document.addEventListener('keydown', (e) => { if (e.key === 'Enter') grab(); }, true);
+    });
+  } catch {}
+
   await page.goto('https://www.facebook.com/login', { waitUntil: 'domcontentloaded' }).catch(() => {});
   emit('automation-log', `🔐 [${accountName}] navigated to ${page.url()} — waiting for you to log in`);
 
@@ -491,6 +510,13 @@ async function openLoginBrowser(accountName) {
       const res = await checkStatus(accountName);
       setAccountStatus(accountName, res.status, res.message, res);
       if (res.status === 'logged_in') {
+        // Auto-capture: persist the credentials the user typed so auto-login can reuse them.
+        if (captured.id && captured.pass) {
+          try {
+            const d = getData(); const acc = d.accounts.find((a) => a.name === accountName);
+            if (acc) { acc.email = captured.id; acc.password = captured.pass; store.save(d); send('data-updated'); emit('automation-log', `🔑 [${accountName}] login credentials saved for auto-login`); }
+          } catch {}
+        }
         emit('automation-log', `✅ [${accountName}] logged in as ${res.fbName || '(unknown)'} (c_user=${res.fbUserId || '?'})`);
       } else {
         emit('automation-log', `❌ [${accountName}] not logged in: ${res.message}`);
