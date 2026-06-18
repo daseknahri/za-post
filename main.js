@@ -7,6 +7,7 @@
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { execFile } = require('child_process');
 
 // ---- persistent log file (assigned in whenReady, guarded until then) --------
 let LOG_DIR = null;
@@ -17,6 +18,34 @@ function appendLogFile(line) {
     if (!LOG_FILE) return;
     fs.appendFile(LOG_FILE, '[' + new Date().toISOString() + '] ' + String(line) + '\n', () => {});
   } catch {}
+}
+
+// Orphaned-Chromium sweep. A crashed or force-killed run can leave headless
+// chrome.exe processes alive, each holding a lock on its per-account profile dir
+// (so the NEXT run for that account fails to launch). We match ONLY chrome.exe
+// whose command line points at one of OUR profile dirs (userData/accounts/...),
+// so the user's real Chrome is never touched. Run this at STARTUP only — at that
+// point no login/automation browser of ours is open yet, so every match is stale.
+// Windows-only; best-effort (resolves with the count killed).
+function killOrphanChromium() {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') return resolve(0);
+    const base = store.paths.ACCOUNTS_DIR;
+    if (!base) return resolve(0);
+    const psBase = base.replace(/'/g, "''"); // escape single quotes for the PS string literal
+    const ps = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*${psBase}*' } | Select-Object -ExpandProperty ProcessId`;
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 15000 }, (_err, stdout) => {
+      const pids = String(stdout || '').split(/\r?\n/).map((s) => s.trim()).filter((s) => /^\d+$/.test(s));
+      if (!pids.length) return resolve(0);
+      let pending = pids.length, killed = 0;
+      for (const pid of pids) {
+        execFile('taskkill', ['/F', '/T', '/PID', pid], { windowsHide: true, timeout: 10000 }, (e) => {
+          if (!e) killed++;
+          if (--pending === 0) resolve(killed);
+        });
+      }
+    });
+  });
 }
 
 // Multi-profile support: `electron . --profile=base` runs an isolated instance
@@ -178,6 +207,10 @@ function createWindow() {
 app.whenReady().then(async () => {
   store.init(app.getPath('userData'));
   clearInterruptedLoginStates();
+
+  // Kill any Chromium left orphaned by a previous crash/force-kill so its locked
+  // profile dir doesn't block this session's launches. Best-effort, non-blocking.
+  killOrphanChromium().then((n) => { if (n) { const m = `🧹 cleaned up ${n} orphaned browser process(es) from a previous run`; appendLogFile(m); emit('automation-log', m); } }).catch(() => {});
 
   // ---- run-state file (shutdown/crash resilience) ---------------------------
   RUN_STATE_FILE = path.join(app.getPath('userData'), 'run-state.json');

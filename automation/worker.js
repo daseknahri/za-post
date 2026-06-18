@@ -332,13 +332,19 @@ async function evalTimed(page, fn, arg, ms = 12000) {
 // Add the "first comment" (the link) to the JUST-published post. Reloads the group
 // so the new post renders, finds the article containing our caption, and types into
 // ITS "Write a public comment…" box. Returns true on success.
-async function addFirstComment(page, gid, post, commentImg, name, log) {
+async function addFirstComment(page, gid, post, commentImg, step) {
   try {
     // Plain group URL (the chronological param renders a feed WITHOUT inline comment
     // affordances). Let the feed render; do NOT scroll (FB virtualizes the top post).
+    step('Comment: reloading group to locate the post');
     await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
     await sleep(5000);
     await dismissPopups(page);
+
+    // If the session died between publishing and commenting, our post won't be in the
+    // feed — name that explicitly instead of reporting a vague "no comment box".
+    const authBad = await page.evaluate(() => /continue as|use another profile/i.test(document.body.innerText || '')).catch(() => false);
+    if (authBad) { step('Comment: session expired after posting — skipped (re-login needed)'); return false; }
 
     const commentBoxes = async () => {
       const all = (await page.$$('[contenteditable="true"], [role="textbox"]')).slice(0, 30);
@@ -354,6 +360,7 @@ async function addFirstComment(page, gid, post, commentImg, name, log) {
     let boxes = await commentBoxes();
     if (!boxes.length) {
       // State 2: click the "Leave a comment" button — prefer the one in OUR post's article.
+      step('Comment: no inline box yet — clicking "Leave a comment"');
       const clicked = await evalTimed(page, (s) => {
         const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 15);
         const mine = s && arts.find((a) => (a.textContent || '').includes(s));
@@ -363,13 +370,15 @@ async function addFirstComment(page, gid, post, commentImg, name, log) {
         if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return true; }
         return false;
       }, snip, 12000).catch(() => false);
-      if (clicked) { await sleep(3500); boxes = await commentBoxes(); }
+      if (clicked) { step('Comment: comment box opened'); await sleep(3500); boxes = await commentBoxes(); }
+      else step('Comment: "Leave a comment" button not found');
     }
-    log(`🔎 [${name}] ${boxes.length} comment box(es) found`);
-    if (!boxes.length) return false;
+    if (!boxes.length) { step('Comment: no comment box found — comment skipped'); return false; }
+    step(`Comment: ${boxes.length} comment box(es) found`);
 
     const target = boxes[0];
     // Focus via in-page scroll+focus (ElementHandle.click can hang on re-rendering feeds).
+    step('Comment: focusing the comment box');
     await target.evaluate((el) => { el.scrollIntoView({ block: 'center' }); el.focus(); }).catch(() => {});
     await sleep(1000);
     if (commentImg) {
@@ -379,14 +388,14 @@ async function addFirstComment(page, gid, post, commentImg, name, log) {
         const c = el.closest('[role="article"], form, [data-pagelet]') || document;
         return c.querySelector('input[type="file"]');
       }).then((h) => h.asElement()).catch(() => null);
-      if (cInput) { try { await cInput.uploadFile(commentImg); log(`🖼 [${name}] comment image attached`); await sleep(2500); } catch (imgErr) { log(`⚠️ [${name}] comment image upload failed: ${imgErr.message}`); } }
-      else log(`ℹ️ [${name}] comment image input not found — skipping comment image`);
+      if (cInput) { try { await cInput.uploadFile(commentImg); step('Comment: image attached'); await sleep(2500); } catch (imgErr) { step(`Comment: image upload failed (${imgErr.message}) — posting text only`); } }
+      else step('Comment: image input not found — posting text only');
     }
+    step('Comment: typing text');
     await humanType(page, post.comment);
     await sleep(800);
+    step('Comment: submitting (Enter)');
     await page.keyboard.press('Enter');
-    // Confirm submission: OUR post's comment box (scoped to the article with our caption,
-    // not every box on the feed) should empty once the text is consumed.
     // Confirm by watching the box we ACTUALLY typed into: FB clears it (or re-renders it
     // away) once it accepts the comment. Tracking the real target box is far more reliable
     // than re-scanning the feed by caption (which gave false "not confirmed" negatives).
@@ -397,10 +406,10 @@ async function addFirstComment(page, gid, post, commentImg, name, log) {
       const state = await target.evaluate((el) => (el.textContent || '').trim()).catch(() => 'GONE');
       if (state === '' || state === 'GONE') { confirmed = true; break; } // emptied or re-rendered = submitted
     }
-    log(confirmed ? `[${name}] ✅ Comment posted!` : `[${name}] ⚠️ Comment sent (could not auto-verify)`);
+    step(confirmed ? 'Comment: posted and verified ✅' : 'Comment: sent (could not auto-verify)');
     await sleep(1000);
     return true;
-  } catch (e) { log(`⚠️ [${name}] comment error: ${e.message}`); return false; }
+  } catch (e) { step(`Comment: error — ${e.message}`); return false; }
 }
 
 // Click into the composer's editable textbox so keystrokes land in the right place
@@ -846,15 +855,20 @@ async function runAccount(o) {
         posted++;
 
         // First comment (the link) — reload, find OUR post, comment in its box.
-        if (post.comment) {
-          step('Adding first comment');
-          const done = await addFirstComment(page, gid, post, commentImg, name, log);
-          if (!done) step('Could not find/verify comment box - skipped comment');
+        // addFirstComment logs every stage itself (via the same step() logger).
+        if (post.comment && post.comment.trim()) {
+          await addFirstComment(page, gid, post, commentImg, step);
         }
       } catch (e) {
         errors++;
         step(`Error: ${e.message}`);
         try { await page.screenshot({ path: require('path').join(store.accountDir(name), 'last-failure.png') }); } catch {}
+        // If the browser/page died, every remaining group would just throw the same way —
+        // abort this account cleanly instead of churning one error per remaining group.
+        if (!browser || !browser.isConnected() || /target closed|session closed|protocol error|detached/i.test(e.message || '')) {
+          step('Browser lost — aborting remaining groups for this account');
+          break;
+        }
       }
 
       // Interruptible delay between groups (respects Stop + configurable groupDelay).

@@ -23,7 +23,9 @@ const post = JSON.parse(fs.readFileSync(path.join(ROOT, 'data.json'), 'utf8')).p
   try { await page.setCookie(...cookies.map(normalizeCookie)); } catch {}
   await page.goto(`https://www.facebook.com/groups/${GID}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await new Promise(r => setTimeout(r, 4000));
-  const ok = await addFirstComment(page, GID, post, null, ACC, (m) => console.log(new Date().toISOString().slice(11, 19), m));
+  // step(message) logger — addFirstComment tags every stage itself.
+  const step = (m) => console.log(new Date().toISOString().slice(11, 19), `[${ACC}]`, m);
+  const ok = await addFirstComment(page, GID, post, null, step);
   console.log('comment result:', ok);
   await browser.close();
   process.exit(0);
