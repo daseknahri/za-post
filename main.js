@@ -273,6 +273,17 @@ ipcMain.handle('delete-account', (_e, accountName) => {
   send('data-updated'); return ok();
 });
 
+ipcMain.handle('set-account-credentials', (_e, accountName, email, password) => {
+  const data = getData();
+  const a = data.accounts.find((x) => x.name === accountName);
+  if (!a) return fail('Account not found');
+  a.email = email || '';
+  a.password = password || '';
+  store.save(data);
+  send('data-updated');
+  return ok();
+});
+
 ipcMain.handle('rename-account', (_e, oldName, newName) => {
   if (orchestrator && orchestrator.isRunning()) return fail('Stop automation before renaming an account');
   if (loginBrowsers.has(oldName)) return fail('Close the login browser for this account first');

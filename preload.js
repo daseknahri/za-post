@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   importCookies: (accountName, cookies) => ipcRenderer.invoke('import-cookies', accountName, cookies),
   closeLoginBrowser: (name) => ipcRenderer.invoke('close-login-browser', name),
   toggleAccount: (name, enabled) => ipcRenderer.invoke('toggle-account', name, enabled),
+  setAccountCredentials: (name, email, password) => ipcRenderer.invoke('set-account-credentials', name, email, password),
 
   // Automation operations
   startAutomation: () => ipcRenderer.invoke('start-automation'),

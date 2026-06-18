@@ -329,6 +329,70 @@ async function focusEditable(page) {
   return false;
 }
 
+// Attempt a real email+password login using the account's EXISTING page (profile is locked,
+// so we cannot launch a new browser). OPT-IN: only called when account.email && account.password.
+// Returns true (session recovered) or false (checkpoint/2FA/wrong-password/error).
+// Never throws; relies on timeouts so it can never hang the caller indefinitely.
+async function credentialLogin(page, email, password, log, name) {
+  try {
+    await page.goto('https://www.facebook.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await sleep(1500);
+
+    // Type email
+    const emailSel = 'input[name="email"], #email';
+    const emailFound = await page.waitForSelector(emailSel, { timeout: 8000 }).then(() => true).catch(() => false);
+    if (!emailFound) { log(`⚠️ [${name}] login form not found`); return false; }
+    await page.type(emailSel, email, { delay: 30 }).catch(() => {});
+
+    // Type password
+    const passSel = 'input[name="pass"], #pass';
+    const passFound = await page.waitForSelector(passSel, { timeout: 8000 }).then(() => true).catch(() => false);
+    if (!passFound) { log(`⚠️ [${name}] login form not found`); return false; }
+    await page.type(passSel, password, { delay: 30 }).catch(() => {});
+
+    // Submit: try selectors in order, use the first found
+    const submitSels = ['button[name="login"]', 'button[type="submit"][name="login"]', '[data-testid="royal_login_button"]'];
+    let submitted = false;
+    for (const sel of submitSels) {
+      const btn = await page.$(sel).catch(() => null);
+      if (btn) { await btn.click().catch(() => {}); submitted = true; break; }
+    }
+    if (!submitted) {
+      // fallback: press Enter
+      await page.keyboard.press('Enter').catch(() => {});
+    }
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    await sleep(2000);
+
+    const url = page.url();
+
+    // Checkpoint / 2FA detection
+    if (/checkpoint|two_step|two_factor|login\/device-based/i.test(url)) {
+      log(`🚧 [${name}] hit a Facebook security check (2FA/checkpoint) — needs manual login`);
+      return false;
+    }
+    const bodyText = await page.evaluate(() => (document.body.innerText || '').toLowerCase()).catch(() => '');
+    if (/two.factor|two.step|confirm it.?s you|enter the code/i.test(bodyText)) {
+      log(`🚧 [${name}] hit a Facebook security check (2FA/checkpoint) — needs manual login`);
+      return false;
+    }
+
+    // Success: check for c_user cookie
+    const pageCookies = await page.cookies().catch(() => []);
+    if (pageCookies.some((c) => c.name === 'c_user' && c.value)) {
+      log(`✅ [${name}] logged in with stored credentials`);
+      store.writeCookies(name, pageCookies);
+      return true;
+    }
+
+    log(`❌ [${name}] credential login failed (wrong password or blocked)`);
+    return false;
+  } catch (e) {
+    log(`⚠️ [${name}] credential login error: ${e.message}`);
+    return false;
+  }
+}
+
 /**
  * @param {object}   o
  * @param {object}   o.account   account entity { name, assignedGroups, ... }
@@ -441,9 +505,23 @@ async function runAccount(o) {
       if (cookieAuthed && hasCUser) {
         log(`🔄 [${name}] session recovered with saved cookies`);
       } else {
-        log(`❌ [${name}] re-login with saved cookies failed — flagging for manual login`);
-        flag = 'needs_login'; noRetry = true;
-        return { posted: 0, errors: 1, pendingApproval: 0, noRetry, flag, postedIds: [] };
+        // Cookie recovery failed — try stored credentials (OPT-IN) before flagging for manual login.
+        if (account.email && account.password) {
+          log(`🔐 [${name}] cookies failed — trying stored credentials...`);
+          const credOk = await credentialLogin(page, account.email, account.password, log, name);
+          if (credOk) {
+            log(`🔄 [${name}] session recovered via credential login`);
+            // fall through to the normal posting loop
+          } else {
+            log(`❌ [${name}] re-login with saved cookies failed — flagging for manual login`);
+            flag = 'needs_login'; noRetry = true;
+            return { posted: 0, errors: 1, pendingApproval: 0, noRetry, flag, postedIds: [] };
+          }
+        } else {
+          log(`❌ [${name}] re-login with saved cookies failed — flagging for manual login`);
+          flag = 'needs_login'; noRetry = true;
+          return { posted: 0, errors: 1, pendingApproval: 0, noRetry, flag, postedIds: [] };
+        }
       }
     } else if (profileAuthed) {
       log(`🔑 [${name}] using existing profile session`);

@@ -1075,7 +1075,34 @@ function editAccount(accountName) {
   document.getElementById('edit-account-alias').value = account.alias || '';
   document.getElementById('edit-account-name').value = accountName;
 
+  // Credential section: pre-fill email (not password), show badge if password is set
+  document.getElementById('edit-account-email').value = account.email || '';
+  document.getElementById('edit-account-password').value = ''; // never pre-fill password
+  const badge = document.getElementById('edit-account-cred-badge');
+  if (badge) badge.style.display = account.password ? 'block' : 'none';
+
   openModal('modal-edit-account');
+}
+
+async function saveAccountCredentials() {
+  if (!editingAccountName) return;
+  const emailVal = document.getElementById('edit-account-email').value.trim();
+  const passVal = document.getElementById('edit-account-password').value;
+  // If password field is blank, preserve the existing stored password (pass empty string
+  // signals "clear it"; blank input means "don't change" — we read existing from appData).
+  const account = appData.accounts.find(a => a.name === editingAccountName);
+  const finalPass = passVal !== '' ? passVal : (account ? (account.password || '') : '');
+  const result = await window.electronAPI.setAccountCredentials(editingAccountName, emailVal, finalPass);
+  if (result && result.success) {
+    // Update local cache so badge reflects new state without a full reload
+    if (account) { account.email = emailVal; account.password = finalPass; }
+    const badge = document.getElementById('edit-account-cred-badge');
+    if (badge) badge.style.display = finalPass ? 'block' : 'none';
+    document.getElementById('edit-account-password').value = '';
+    showNotification('Auto-login credentials saved!', 'success');
+  } else {
+    showNotification('Failed to save credentials: ' + (result && result.error ? result.error : 'unknown error'), 'error');
+  }
 }
 
 async function saveEditAccount() {
