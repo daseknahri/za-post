@@ -42,7 +42,9 @@ function startServer(port, injected) {
   // Uploads must go to a WRITABLE dir. In a packaged app __dirname is inside the
   // read-only asar, so main.js injects userData/uploads. Falls back to public/uploads in dev.
   const UPLOAD_DIR = hooks.uploadDir || path.join(__dirname, 'public', 'uploads');
+  const IMAGES_DIR = hooks.imagesDir || path.join(path.dirname(UPLOAD_DIR), 'storage', 'images');
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  fs.mkdirSync(IMAGES_DIR, { recursive: true });
   const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB cap
 
   const app = express();
@@ -51,6 +53,7 @@ function startServer(port, injected) {
   app.use(express.urlencoded({ extended: true }));
   app.use(express.static(path.join(__dirname, 'public')));
   app.use('/uploads', express.static(UPLOAD_DIR));
+  app.use('/images', express.static(IMAGES_DIR));
 
   // ---- automation -----------------------------------------------------
   app.get('/api/automation/status', (_req, res) => {

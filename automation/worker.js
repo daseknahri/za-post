@@ -17,6 +17,39 @@ const { chromiumPath } = require('../lib/chromium');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+async function sleepInterruptible(ms, shouldStop = () => false, step = 500) {
+  let waited = 0;
+  while (waited < ms && !shouldStop()) {
+    const chunk = Math.min(step, ms - waited);
+    await sleep(chunk);
+    waited += chunk;
+  }
+  return !shouldStop();
+}
+
+function shortText(text, max = 90) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function createStepLogger(log, accountName, groupName) {
+  let n = 0;
+  return (message) => {
+    n += 1;
+    log(`[${accountName}] [${displayName(groupName)}] ${String(n).padStart(2, '0')} ${message}`);
+  };
+}
+
+function displayName(value) {
+  const text = String(value || '');
+  if (!/[ÃÂ]/.test(text)) return text;
+  try {
+    const repaired = Buffer.from(text, 'latin1').toString('utf8');
+    return repaired && !repaired.includes('\uFFFD') ? repaired : text;
+  } catch {
+    return text;
+  }
+}
+
 // Download a remote image to a temp file; return its path (or null).
 async function downloadImage(url) {
   if (!axios || !url) return null;
@@ -86,7 +119,22 @@ const clickFirst = clickPoint; // back-compat alias
 async function openComposerByText(page) {
   // Real mouse click at the trigger's coordinates (synthetic click won't open FB's composer).
   const pt = await page.evaluate(() => {
-    const wanted = ['write something', 'write a public', 'create a public post', 'start a discussion'];
+    const wanted = [
+      'write something',
+      "what's on your mind",
+      'write a public',
+      'create a public post',
+      'start a discussion',
+      'write post',
+      'irj valamit',
+      'írj valamit',
+      'mi jar a fejedben',
+      'mi jár a fejedben',
+      'bejegyzes letrehozasa',
+      'bejegyzés létrehozása',
+      'beszelgetes inditasa',
+      'beszélgetés indítása',
+    ];
     const els = Array.from(document.querySelectorAll('div[role="button"], span, div'));
     const el = els.find((e) => wanted.some((w) => (e.textContent || '').toLowerCase().includes(w)));
     if (el) { el.scrollIntoView({ block: 'center' }); const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; }
@@ -102,23 +150,68 @@ async function openComposerByText(page) {
 // dialog's editable to actually appear. Retries — returns true only when it opened.
 async function openComposer(page, log, name) {
   for (let attempt = 1; attempt <= 4; attempt++) {
+    if (log) log(`🧭 [${name}] opening composer (attempt ${attempt}/4)`);
     // The composer lives at the TOP of the feed — make sure we're there and nothing covers it.
     await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
     await sleep(600);
     await dismissPopups(page);
     const pt = await page.evaluate(() => {
-      const wanted = ['write something', "what's on your mind", 'start a discussion', 'create a public post', 'write a public'];
-      const all = Array.from(document.querySelectorAll('span, div, [role="button"]'));
-      const el = all.find((e) => { const t = (e.textContent || '').trim().toLowerCase(); return wanted.some((w) => t.includes(w)) && t.length < 45; });
-      if (!el) return null;
-      const btn = el.closest('[role="button"]') || el;
+      const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+      const wanted = [
+        'write something',
+        "what's on your mind",
+        'start a discussion',
+        'create a public post',
+        'write a public',
+        'write post',
+        'irj valamit',
+        'mi jar a fejedben',
+        'bejegyzes letrehozasa',
+        'beszelgetes inditasa',
+      ];
+      const reject = ['search', 'comment', 'message', 'photo/video', 'live video', 'reels'];
+      const all = Array.from(document.querySelectorAll('[role="button"], span, div'));
+      const matches = [];
+      for (const el of all) {
+        const raw = [
+          el.getAttribute('aria-label'),
+          el.getAttribute('aria-placeholder'),
+          el.textContent,
+        ].filter(Boolean).join(' ');
+        const t = norm(raw).replace(/\s+/g, ' ').trim();
+        if (!t || t.length > 100) continue;
+        if (!wanted.some((w) => t.includes(w))) continue;
+        if (reject.some((w) => t.includes(w))) continue;
+        const btn = el.closest('[role="button"]') || el;
+        const r = btn.getBoundingClientRect();
+        if (!r.width || !r.height) continue;
+        matches.push({
+          btn,
+          score: (r.top < innerHeight * 0.75 ? 2 : 0) + (btn.getAttribute('role') === 'button' ? 1 : 0),
+        });
+      }
+      matches.sort((a, b) => b.score - a.score);
+      const btn = matches[0] && matches[0].btn;
+      if (!btn) return null;
       btn.scrollIntoView({ block: 'center' });
       const r = btn.getBoundingClientRect();
       return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
     }).catch(() => null);
     if (pt) await page.mouse.click(pt.x, pt.y, { delay: 50 }).catch(() => {});
+    else await openComposerByText(page).catch(() => false);
     const ok = await page.waitForSelector('div[role="dialog"] [contenteditable="true"], div[role="dialog"] [role="textbox"]', { timeout: 6000 }).then(() => true).catch(() => false);
     if (ok) { if (attempt > 1 && log) log(`📝 [${name}] composer opened (attempt ${attempt})`); return true; }
+    if (log) {
+      const hint = await page.evaluate(() => {
+        const body = (document.body.innerText || '').replace(/\s+/g, ' ').trim();
+        const buttons = Array.from(document.querySelectorAll('[role="button"], button, a')).slice(0, 12)
+          .map((b) => (b.getAttribute('aria-label') || b.textContent || '').replace(/\s+/g, ' ').trim())
+          .filter(Boolean)
+          .slice(0, 8);
+        return { buttons, body: body.slice(0, 180) };
+      }).catch(() => null);
+      if (hint) log(`🔎 [${name}] composer not open yet; visible buttons: ${hint.buttons.join(' | ') || '(none)'}`);
+    }
     await sleep(1500);
   }
   return false;
@@ -329,6 +422,62 @@ async function focusEditable(page) {
   return false;
 }
 
+function normalizeForCompare(text) {
+  return String(text || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, '')
+    .toLowerCase();
+}
+
+async function composerCaptionState(page, caption) {
+  const expected = normalizeForCompare(caption).slice(0, 20);
+  return page.evaluate((expectedPrefix) => {
+    const normalize = (text) => String(text || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, '')
+      .toLowerCase();
+    const dialog = document.querySelector('div[role="dialog"]') || document;
+    const nodes = Array.from(dialog.querySelectorAll('[contenteditable="true"], [role="textbox"]'));
+    const candidates = nodes.map((node, index) => {
+      const raw = [
+        node.innerText,
+        node.textContent,
+        node.getAttribute('aria-label'),
+        node.getAttribute('aria-placeholder'),
+      ].filter(Boolean).join('\n');
+      const text = raw.replace(/\s+/g, ' ').trim();
+      return {
+        index,
+        len: normalize(text).length,
+        matched: !!expectedPrefix && normalize(text).includes(expectedPrefix),
+        sample: text.slice(0, 120),
+      };
+    });
+    const dialogText = (dialog.innerText || dialog.textContent || '').replace(/\s+/g, ' ').trim();
+    candidates.push({
+      index: -1,
+      len: normalize(dialogText).length,
+      matched: !!expectedPrefix && normalize(dialogText).includes(expectedPrefix),
+      sample: dialogText.slice(0, 120),
+    });
+    candidates.sort((a, b) => Number(b.matched) - Number(a.matched) || b.len - a.len);
+    return candidates[0] || { index: null, len: 0, matched: false, sample: '' };
+  }, expected).catch(() => ({ index: null, len: 0, matched: false, sample: '' }));
+}
+
+async function waitForCaptionState(page, caption, timeout = 5000) {
+  const end = Date.now() + timeout;
+  let last = { index: null, len: 0, matched: false, sample: '' };
+  while (Date.now() < end) {
+    last = await composerCaptionState(page, caption);
+    if (last.matched) return last;
+    await sleep(350);
+  }
+  return last;
+}
+
 // Attempt a real email+password login using the account's EXISTING page (profile is locked,
 // so we cannot launch a new browser). OPT-IN: only called when account.email && account.password.
 // Returns true (session recovered) or false (checkpoint/2FA/wrong-password/error).
@@ -405,7 +554,7 @@ async function credentialLogin(page, email, password, log, name) {
  * @param {()=>boolean} o.shouldStop
  */
 async function runAccount(o) {
-  const { account, post, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen } = o;
+  const { account, post, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter } = o;
   const name = account.name;
 
   // Fix #4: profile-lock guard — two Chromium instances can't share a userDataDir.
@@ -451,16 +600,22 @@ async function runAccount(o) {
   }
 
   let browser;
+  let unregisterAborter = () => {};
   let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null;
   try {
     browser = await puppeteer.launch({
-      headless: true, // new headless (Chrome 148): renders like real Chrome but NO visible window / taskbar entry
+      headless: false, // Facebook composers/comments render more reliably in real headful Chromium.
       executablePath: chromiumPath(),
       userDataDir: store.profileDir(name),
       args: launchArgs,
       defaultViewport: { width: 1280, height: 900 },
       protocolTimeout: 90000, // cap CDP op hangs (90s allows slow www->web redirects; still << default 180s)
     });
+    if (typeof registerAborter === 'function') {
+      unregisterAborter = registerAborter(() => {
+        try { if (browser) browser.close(); } catch {}
+      });
+    }
     const _pages = await browser.pages();
     for (let i = 1; i < _pages.length; i++) { try { await _pages[i].close(); } catch {} }
     const page = _pages[0] || (await browser.newPage());
@@ -545,16 +700,18 @@ async function runAccount(o) {
       if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
       const g = targetGroups[i];
       const gid = g.groupId || g.id;
+      const groupName = g.name || gid;
+      const step = createStepLogger(log, name, groupName);
       try {
-        log(`➡️ [${name}] navigating to group ${g.name || gid} (${i + 1}/${targetGroups.length})`);
+        step(`Navigate to group (${i + 1}/${targetGroups.length})`);
         const gotoGroup = () => page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
         let navOk = await gotoGroup();
-        if (!navOk) { log(`⚠️ [${name}] first navigation attempt failed — retrying…`); await sleep(3000); navOk = await gotoGroup(); }
-        if (!navOk) { log(`❌ [${name}] navigation failed for ${g.name || gid} — skipping group`); errors++; continue; }
+        if (!navOk) { step('Navigation attempt failed; retrying'); await sleepInterruptible(3000, shouldStop); navOk = await gotoGroup(); }
+        if (!navOk) { step('Navigation failed; skipping group'); errors++; continue; }
         await sleep(3000);
 
         // Per-group START banner — fired only after nav succeeds and before the auth checks.
-        log(`📂 [${name}] GROUP: ${g.name || gid}`);
+        step('Group loaded');
 
         if (/login|checkpoint/.test(page.url())) { log(`🚫 [${name}] not logged in / checkpoint`); errors++; noRetry = true; flag = 'needs_login'; break; }
         // Expired sessions don't redirect — they show the "Continue as <name>" picker
@@ -566,84 +723,85 @@ async function runAccount(o) {
           if (hasBtn(/^join group$/i) && hasBtn(/^log in$/i)) return 'not-authenticated';
           return null;
         });
-        if (authBad) { log(`🚫 [${name}] ${authBad === 'session-expired' ? 'session expired — re-login required' : 'not logged in / not a member'} (${g.name || gid})`); errors++; noRetry = true; flag = 'needs_login'; break; }
+        if (authBad) { step(authBad === 'session-expired' ? 'Session expired - re-login required' : 'Not logged in / not a member'); errors++; noRetry = true; flag = 'needs_login'; break; }
 
         // Clear cookie/notification banners, then bail out of this account if rate-limited.
         await dismissPopups(page);
-        if (await checkRateLimit(page)) { log(`⏸ [${name}] rate-limited by Facebook — backing off this account`); errors++; noRetry = true; flag = 'rate_limited'; break; }
+        if (await checkRateLimit(page)) { step('Rate-limited by Facebook - backing off this account'); errors++; noRetry = true; flag = 'rate_limited'; break; }
 
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
         const opened = await openComposer(page, log, name);
-        if (!opened) { log(`[${name}] ❌ Could not open modal`); errors++; continue; }
+        if (!opened) { step('Could not open composer modal; skipping group'); errors++; continue; }
         await sleep(1500);
         await dismissPopups(page);
-        log(`[${name}] 📝 Post 1/1`);
+        step('Composer opened; preparing post');
 
         // Read the composer editable text length, with a settle delay for robustness.
         const captionLen = (extraDelay = 0) => sleep(extraDelay).then(() =>
-          page.evaluate(() => {
-            const d = document.querySelector('div[role="dialog"]');
-            const e = d && d.querySelector('[contenteditable="true"]');
-            return e ? (e.textContent || '').trim().length : 0;
-          }).catch(() => 0)
+          composerCaptionState(page, post.caption).then((state) => state.len || 0)
         );
         // Verify caption was entered: accept if the editable has meaningful length (> 0)
         // and contains at least the first ~15 non-space chars of the caption (handles emoji,
         // newline, and auto-formatting differences that break exact-match checks).
         const captionOk = async () => {
-          const len = await captionLen(300); // settle delay before reading
-          if (len === 0) return false;
-          const prefix = post.caption.replace(/\s+/g, '').slice(0, 15);
-          if (!prefix) return len > 0;
-          const boxText = await page.evaluate(() => {
-            const d = document.querySelector('div[role="dialog"]');
-            const e = d && d.querySelector('[contenteditable="true"]');
-            return e ? (e.textContent || '') : '';
-          }).catch(() => '');
-          return boxText.replace(/\s+/g, '').includes(prefix);
+          const state = await sleep(500).then(() => composerCaptionState(page, post.caption));
+          return !!state.matched || (!post.caption.trim() && state.len > 0);
         };
 
         // Image FIRST, then caption — mirrors the original agent. Paste is atomic so the
         // image's re-render can't clobber the caption. Scope the file input to the DIALOG.
         if (resolvedImages.length) {
-          log(`[${name}] 📷 Uploading ${resolvedImages.length} image(s)...`);
+          step(`Uploading ${resolvedImages.length} image(s)`);
           const input = (await page.$('div[role="dialog"] input[type="file"]')) || (await page.$(SEL.fileInput));
-          if (input) { await input.uploadFile(...resolvedImages); log(`[${name}] ✅ Image attached`); await sleep(3500); }
-          else log(`[${name}] ⚠️ Image input not found in composer`);
+          if (input) { await input.uploadFile(...resolvedImages); step('Image attached'); await sleepInterruptible(3500, shouldStop); }
+          else step('Image input not found in composer; posting without local image attach');
         }
 
         // Caption — PASTE it (clipboard + Ctrl+V, like the original "Caption pasted"); fast and
         // reliable. Verify it landed; if not, fall back to typing so the post still goes out.
         if (post.caption) {
-          log(`[${name}] ✍️ Entering caption...`);
+          step('Entering caption');
           await focusEditable(page);
+          let captionState = { matched: false, len: 0, sample: '' };
           try {
             await page.evaluate((t) => navigator.clipboard.writeText(t), post.caption);
             await page.keyboard.down('Control'); await page.keyboard.press('v'); await page.keyboard.up('Control');
-            await sleep(600);
-          } catch {}
-          if (!(await captionOk())) { // paste blocked or not detected → clear + type
-            log(`[${name}] ⌨️ Paste blocked — typing caption instead`);
+            captionState = await waitForCaptionState(page, post.caption, 5000);
+          } catch (e) {
+            step('Clipboard paste unavailable; typing caption');
+          }
+          if (captionState.matched) {
+            step(`Caption pasted and verified (${captionState.len} chars)`);
+          } else { // paste blocked or not detected → clear + type
+            step(`Caption paste not verified${captionState.len ? ` (${captionState.len} chars detected)` : ''}; typing caption`);
             await focusEditable(page);
             await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
             await page.keyboard.press('Backspace'); await sleep(150);
-            await humanType(page, post.caption); await sleep(600);
-            if (!(await captionOk())) {
+            await humanType(page, post.caption);
+            captionState = await waitForCaptionState(page, post.caption, 5000);
+            if (!captionState.matched) {
               // One retry: re-focus and type again
-              log(`[${name}] ⌨️ Caption not detected — retrying type...`);
+              step('Caption still not verified after typing; retrying once');
               await focusEditable(page);
               await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
               await page.keyboard.press('Backspace'); await sleep(150);
-              await humanType(page, post.caption); await sleep(600);
+              await humanType(page, post.caption);
+              captionState = await waitForCaptionState(page, post.caption, 5000);
             }
           }
-          log((await captionOk()) ? `[${name}] ✅ Caption entered` : `[${name}] ⚠️ Caption could not be entered (posting anyway)`);
+          if (captionState.matched || await captionOk()) {
+            const finalState = captionState.matched ? captionState : await composerCaptionState(page, post.caption);
+            step(`Caption verified in composer (${finalState.len} chars)`);
+          } else {
+            const finalState = await composerCaptionState(page, post.caption);
+            step(`Caption typed; Facebook editor text not directly readable (${finalState.len} chars detected). Publish confirmation will verify the post`);
+          }
         }
 
         // Publish — then CONFIRM it actually published (dialog closed / Post button gone).
-        await sleep(1500);
-        log(`[${name}] ⏳ Waiting for Post button to enable...`);
+        await sleepInterruptible(1500, shouldStop);
+        step('Waiting for Post button to enable');
         const dialogCountBefore = await page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length).catch(() => 1);
         // Log what the Post-button scan sees (dialogs open, found label) — mirrors original's "🔍 Dialogs: N".
         const postBtnInfo = await page.evaluate(() => {
@@ -659,15 +817,15 @@ async function runAccount(o) {
           return { found: false, dialogs: dialogs.length };
         }).catch(() => null);
         if (postBtnInfo) {
-          if (postBtnInfo.found) log(`[${name}] 🔍 Post button found (label="${postBtnInfo.label}")`);
-          else log(`[${name}] 🔍 Post button NOT found (${postBtnInfo.dialogs} dialog(s) scanned)`);
+          if (postBtnInfo.found) step(`Post button found (label="${postBtnInfo.label}")`);
+          else step(`Post button NOT found (${postBtnInfo.dialogs} dialog(s) scanned)`);
         }
         const clicked = await clickPostButton(page);
-        if (!clicked) { log(`[${name}] ⚠️ Post button not found in ${g.name || gid}`); errors++; continue; }
-        log(`[${name}] ✅ Post button clicked`);
+        if (!clicked) { step('Post button not found; skipping group'); errors++; continue; }
+        step('Post button clicked');
         const publishResult = await waitForPublish(page, dialogCountBefore);
-        if (publishResult !== 'published') { log(`[${name}] ⚠️ Post clicked but publish NOT confirmed in ${g.name || gid} — skipping`); errors++; continue; }
-        await sleep(3000);
+        if (publishResult !== 'published') { step('Post clicked but publish was NOT confirmed; skipping group'); errors++; continue; }
+        await sleepInterruptible(3000, shouldStop);
         // Check pending-approval BEFORE dismissing popups (a dismissible notice could be cleared).
         const isPending = await checkPendingApproval(page);
         await dismissPopups(page); // clear "Your post might be reviewed" etc.
@@ -675,38 +833,36 @@ async function runAccount(o) {
         // Moderated groups queue posts for admin approval — don't count as posted and
         // skip the comment (the post isn't in the feed yet).
         if (isPending) {
-          log(`⏳ [${name}] Post submitted but PENDING ADMIN APPROVAL in ${g.name || gid} — not counted, comment skipped`);
+          step('Post submitted but PENDING ADMIN APPROVAL - not counted, comment skipped');
           pendingApproval++;
-          if (i < targetGroups.length - 1) { let w = 0, d = (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000; while (w < d && !shouldStop()) { await sleep(Math.min(1000, d - w)); w += 1000; } }
+          if (i < targetGroups.length - 1) await sleepInterruptible((Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000, shouldStop, 1000);
           continue;
         }
 
         // Success log — keep caption snippet for the renderer's auto-delete tracker.
-        log(`[${name}] ✅ Posted!`);
+        step('Posted successfully');
         posted++;
 
         // First comment (the link) — reload, find OUR post, comment in its box.
         if (post.comment) {
-          log(`[${name}] 💬 Adding comment...`);
+          step('Adding first comment');
           const done = await addFirstComment(page, gid, post, commentImg, name, log);
-          if (!done) log(`[${name}] ⚠️ Could not find comment box - skipping comment`);
+          if (!done) step('Could not find/verify comment box - skipped comment');
         }
       } catch (e) {
         errors++;
-        log(`❌ [${name}] error in ${gid}: ${e.message}`);
+        step(`Error: ${e.message}`);
         try { await page.screenshot({ path: require('path').join(store.accountDir(name), 'last-failure.png') }); } catch {}
       }
 
       // Interruptible delay between groups (respects Stop + configurable groupDelay).
       if (i < targetGroups.length - 1) {
-        let w = 0; const d = (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000;
+        const d = (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000;
         const dMin = Math.round(d / 60000);
-        log(`[${name}] ⏱️ Wait ${dMin > 0 ? dMin + 'min' : Math.round(d / 1000) + 's'}`);
-        while (w < d && !shouldStop()) { await sleep(Math.min(1000, d - w)); w += 1000; }
+        step(`Wait ${dMin > 0 ? dMin + 'min' : Math.round(d / 1000) + 's'} before next group`);
+        await sleepInterruptible(d, shouldStop, 1000);
       }
     }
-    log(`[${name}] ✅ Done: ${posted} posts`);
-
     // Persist refreshed cookies for next run.
     try { store.writeCookies(name, await page.cookies()); } catch {}
     fs.writeFileSync(require('path').join(store.accountDir(name), 'last-run-success.txt'),
@@ -715,6 +871,7 @@ async function runAccount(o) {
     errors++;
     log(`❌ [${name}] fatal: ${e.message}`);
   } finally {
+    unregisterAborter();
     if (watchdog) clearTimeout(watchdog);
     if (browser) await browser.close().catch(() => {});
     if (anonLocal && proxyChain) { try { await proxyChain.closeAnonymizedProxy(anonLocal, true); } catch {} }

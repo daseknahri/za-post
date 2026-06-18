@@ -177,6 +177,7 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   store.init(app.getPath('userData'));
+  clearInterruptedLoginStates();
 
   // ---- run-state file (shutdown/crash resilience) ---------------------------
   RUN_STATE_FILE = path.join(app.getPath('userData'), 'run-state.json');
@@ -205,7 +206,7 @@ app.whenReady().then(async () => {
     getData,
     getStatus: () => orchestrator.isRunning(),
     onStart: () => { setRunActive(true); return orchestrator.start(getData); },
-    onStop: () => orchestrator.stop(),
+    onStop: () => { orchestrator.stop(); setRunActive(false); },
     addPost: (fields) => addPostFromRemote(fields),
     deletePost: (index) => deletePostByIndex(index),
     setInterval: (minutes) => { const d = getData(); d.settings.waitInterval = minutes; store.save(d); send('data-updated'); },
@@ -213,6 +214,7 @@ app.whenReady().then(async () => {
     closeLogin: (name) => closeLoginBrowser(name),
     getTunnelUrl: () => tunnelUrl || '',
     uploadDir: path.join(app.getPath('userData'), 'uploads'),
+    imagesDir: store.paths.IMAGES_DIR,
   });
   // Cloudflare tunnel is OPT-IN: its spawned binary can destabilize the app on some
   // systems, so it's off by default. Enable with ENABLE_TUNNEL=1 (or settings.enableTunnel).
@@ -572,6 +574,26 @@ function setAccountStatus(name, status, message, result) {
   }
 }
 
+function clearInterruptedLoginStates() {
+  const data = getData();
+  let changed = false;
+  for (const account of data.accounts || []) {
+    if (account.status !== 'logging_in') continue;
+    const cUser = store.readCookies(account.name).find((c) => c.name === 'c_user' && c.value);
+    if (cUser) {
+      account.status = 'logged_in';
+      account.lastMessage = `Active - c_user=${cUser.value}`;
+      account.fbUserId = cUser.value;
+      account.lastChecked = Date.now();
+    } else {
+      account.status = 'not_logged_in';
+      account.lastMessage = 'Login window was interrupted - check status or log in again';
+    }
+    changed = true;
+  }
+  if (changed) store.save(data);
+}
+
 // Open a VISIBLE browser for manual login; persist cookies while open; notify on close.
 async function openLoginBrowser(accountName) {
   // Fix #6: already open guard
@@ -709,6 +731,8 @@ ipcMain.handle('pause-automation', () => {
 });
 ipcMain.handle('resume-automation', () => {
   if (!orchestrator) return fail('Orchestrator not ready');
+  if (!orchestrator.isRunning()) return fail('Automation is not running');
+  if (!orchestrator.isPaused()) return fail('Automation is not paused');
   orchestrator.resume(); return ok();
 });
 ipcMain.handle('finish-automation', () => {

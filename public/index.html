@@ -964,7 +964,7 @@
                 var imageHtml;
                 if (post.imagePath) {
                     const filename = escapeHtml(post.imagePath.split(/[/\\]/).pop());
-                    const webPath = '/uploads/' + filename;
+                    const webPath = '/images/' + filename;
                     imageHtml = '<div class="post-img-container"><img src="' + webPath + '" alt="Post Image" onerror="this.parentElement.innerHTML=\'<div style=\\\'display:flex;align-items:center;justify-content:center;height:100%;color:#64748b;font-size:1.5rem\\\'>📷</div>\'"></div>';
                 } else {
                     imageHtml = '<div class="post-img-container" style="display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#1e293b,#334155);"><span style="font-size:1.8rem;">📝</span></div>';

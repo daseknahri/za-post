@@ -62,16 +62,30 @@ class Orchestrator {
     this._stop = false;
     this._paused = false;
     this._finish = false;
+    this._aborters = new Set();
     this._progress = { running: false, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0 };
   }
   isRunning() { return this.running; }
-  stop() { this._stop = true; this._paused = false; this._progress.paused = false; }
+  stop() {
+    this._stop = true;
+    this._paused = false;
+    this._progress.paused = false;
+    for (const abort of [...this._aborters]) {
+      try { abort(); } catch {}
+    }
+    this.emit('automation-progress', { ...this._progress });
+  }
+  _registerAborter(abort) {
+    if (typeof abort !== 'function') return () => {};
+    this._aborters.add(abort);
+    return () => this._aborters.delete(abort);
+  }
   _shouldStop() { return this._stop; }
   pause() {
     if (!this.running || this._paused) return;
     this._paused = true;
     this._progress.paused = true;
-    this.log('⏸ Paused — holding after the current batch');
+    this.log('⏸ Paused — holding before the next action');
     this.emit('automation-paused');
     this.emit('automation-progress', { ...this._progress });
   }
@@ -128,6 +142,7 @@ class Orchestrator {
   async start(getData) {
     if (this.running) return { success: false, error: 'Automation already running' };
     this._stop = false; this._paused = false; this._finish = false; this.running = true;
+    this._aborters.clear();
     this._progress = { running: true, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0, offline: false };
     this.emit('automation-started');
     this.emit('automation-progress', { ...this._progress });
@@ -135,6 +150,7 @@ class Orchestrator {
     this._loop(getData).catch((e) => this.log(`❌ Orchestrator crashed: ${e.message}`))
       .finally(() => {
         this.running = false;
+        this._aborters.clear();
         this._progress.running = false;
         this._progress.paused = false;
         this.emit('automation-progress', { ...this._progress });
@@ -221,6 +237,7 @@ class Orchestrator {
             log: (m) => this.log(m),
             shouldStop: () => this._shouldStop(),
             isLoginOpen: this.isLoginOpen,
+            registerAborter: (abort) => this._registerAborter(abort),
           });
           posted += (r && r.posted) || 0; pendingApproval += (r && r.pendingApproval) || 0; errors += (r && r.errors) || 0;
           if (r && ((r.posted || 0) > 0 || (r.pendingApproval || 0) > 0)) { progressed = true; if (post.id) postedIds.push(post.id); }
@@ -384,10 +401,17 @@ class Orchestrator {
   // cycles/batches) instead of going silent. Logs every 30s; interruptible by Stop.
   async _waitWithCountdown(ms, label) {
     if (!(ms > 0)) return;
-    const end = Date.now() + ms;
+    let end = Date.now() + ms;
     let lastLog = 0;
     const fmt = (sec) => { const m = Math.floor(sec / 60), s = sec % 60; return (m > 0 ? m + 'm ' : '') + s + 's'; };
     while (Date.now() < end && !this._shouldStop()) {
+      if (this._paused) {
+        const pausedAt = Date.now();
+        await this._waitWhilePaused();
+        end += Date.now() - pausedAt;
+        if (this._shouldStop()) break;
+        continue;
+      }
       if (lastLog === 0 || Date.now() - lastLog >= 30000) {
         lastLog = Date.now();
         const remaining = Math.ceil((end - Date.now()) / 1000);

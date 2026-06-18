@@ -19,6 +19,8 @@ let appData = {
 let selectedImages = [];
 let isAutomationRunning = false;
 let isPaused = false;
+let localStartInFlight = false;
+let isStopping = false;
 let currentLoginAccount = null;
 let appLimits = { maxGroups: 10, maxAccounts: 5 }; // Default limits
 
@@ -76,9 +78,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       console.log('Automation started externally, syncing UI...');
       isAutomationRunning = true;
       isPaused = false;
+      isStopping = false;
       updateAutomationControls();
+      if (!localStartInFlight) {
       showNotification('Automation started externally', 'success');
       addLog('🚀 Automation started externally\n');
+      }
     });
   }
 
@@ -173,6 +178,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   window.electronAPI.onAutomationStopped(async (code) => {
     isAutomationRunning = false;
     isPaused = false;
+    isStopping = false;
     updateAutomationControls();
     addLog(`\n✅ Automation stopped with exit code ${code}\n`);
     await loadData(); // refresh — the backend may have auto-deleted posted items during the run
@@ -445,7 +451,7 @@ function initializeEventListeners() {
   // Automation
   document.getElementById('btn-start-automation').addEventListener('click', startAutomation);
   document.getElementById('btn-stop-automation').addEventListener('click', stopAutomation);
-  document.getElementById('btn-pause-automation').addEventListener('click', pauseAutomation);
+  document.getElementById('btn-pause-automation').addEventListener('click', togglePauseAutomation);
   document.getElementById('btn-resume-automation').addEventListener('click', resumeAutomation);
   document.getElementById('btn-finish-automation').addEventListener('click', finishAutomation);
 
@@ -1572,20 +1578,24 @@ function updateAutomationControls() {
     show(stopBtn,   false);
     if (pausedInd) pausedInd.style.display = 'none';
   } else if (isPaused) {
-    // PAUSED: Resume + Finish + Stop
+    // PAUSED: Pause becomes Resume. Stop remains a hard interrupt.
     show(startBtn,  false);
-    show(pauseBtn,  false);
-    show(resumeBtn, true);  setEnabled(resumeBtn, true);
-    show(finishBtn, true);  setEnabled(finishBtn, true);
-    show(stopBtn,   true);  setEnabled(stopBtn,   true);
+    show(pauseBtn,  true);  setEnabled(pauseBtn, !isStopping);
+    show(resumeBtn, false);
+    show(finishBtn, false);
+    show(stopBtn,   true);  setEnabled(stopBtn, !isStopping);
+    if (pauseBtn) pauseBtn.innerHTML = '<span>▶️</span> Resume';
+    if (stopBtn) stopBtn.innerHTML = isStopping ? '<span>⏹️</span> Stopping…' : '<span>⏹️</span> Stop';
     if (pausedInd) pausedInd.style.display = '';
   } else {
-    // RUNNING: Pause + Finish + Stop
+    // RUNNING: Pause toggle + hard Stop.
     show(startBtn,  false);
-    show(pauseBtn,  true);  setEnabled(pauseBtn,  true);
+    show(pauseBtn,  true);  setEnabled(pauseBtn,  !isStopping);
     show(resumeBtn, false);
-    show(finishBtn, true);  setEnabled(finishBtn, true);
-    show(stopBtn,   true);  setEnabled(stopBtn,   true);
+    show(finishBtn, false);
+    show(stopBtn,   true);  setEnabled(stopBtn,   !isStopping);
+    if (pauseBtn) pauseBtn.innerHTML = '<span>⏸</span> Pause';
+    if (stopBtn) stopBtn.innerHTML = isStopping ? '<span>⏹️</span> Stopping…' : '<span>⏹️</span> Stop';
     if (pausedInd) pausedInd.style.display = 'none';
   }
 
@@ -1624,29 +1634,33 @@ async function startAutomation() {
   clearLogs();
   addLog('🚀 Starting automation...\n');
 
+  localStartInFlight = true;
   const result = await window.electronAPI.startAutomation();
 
   if (result.success) {
     isAutomationRunning = true;
     isPaused = false;
+    isStopping = false;
     updateAutomationControls();
     showNotification('Automation started!', 'success');
   } else {
     showNotification('Failed to start automation: ' + result.error, 'error');
   }
+  setTimeout(() => { localStartInFlight = false; }, 500);
 }
 
 async function stopAutomation() {
   addLog('\n⏹️ Stopping automation...\n');
 
+  isStopping = true;
+  updateAutomationControls();
   const result = await window.electronAPI.stopAutomation();
 
   if (result.success) {
-    isAutomationRunning = false;
-    isPaused = false;
-    updateAutomationControls();
-    showNotification('Automation stopped!', 'info');
+    showNotification('Stopping automation now...', 'info');
   } else {
+    isStopping = false;
+    updateAutomationControls();
     showNotification('Failed to stop automation: ' + result.error, 'error');
   }
 }
@@ -1656,11 +1670,16 @@ async function pauseAutomation() {
   if (result.success) {
     isPaused = true;
     updateAutomationControls();
-    addLog('\n⏸ Automation pausing — current batch will finish first.\n');
-    showNotification('Automation pausing…', 'info');
+    addLog('\n⏸ Automation paused. Click Resume to continue.\n');
+    showNotification('Automation paused', 'info');
   } else {
     showNotification('Failed to pause: ' + result.error, 'error');
   }
+}
+
+async function togglePauseAutomation() {
+  if (isPaused) return resumeAutomation();
+  return pauseAutomation();
 }
 
 async function resumeAutomation() {
@@ -1754,7 +1773,7 @@ function loadSettings() {
   document.getElementById('setting-max-cycles').value = appData.settings.maxCycles !== undefined ? appData.settings.maxCycles : 0;
   document.getElementById('setting-enable-tunnel').checked = appData.settings.enableTunnel || false;
   document.getElementById('setting-loop-campaign').checked = appData.settings.loopCampaign || false;
-  document.getElementById('setting-resume-on-startup').checked = appData.settings.resumeOnStartup !== false; // default true
+  document.getElementById('setting-resume-on-startup').checked = appData.settings.resumeOnStartup === true;
   document.getElementById('setting-launch-on-startup').checked = appData.settings.launchOnStartup || false;
 }
 
