@@ -580,7 +580,29 @@ async function runAccount(o) {
         await dismissPopups(page);
         log(`[${name}] 📝 Post 1/1`);
 
-        const captionLen = () => page.evaluate(() => { const d = document.querySelector('div[role="dialog"]'); const e = d && d.querySelector('[contenteditable="true"]'); return e ? (e.textContent || '').trim().length : 0; }).catch(() => 0);
+        // Read the composer editable text length, with a settle delay for robustness.
+        const captionLen = (extraDelay = 0) => sleep(extraDelay).then(() =>
+          page.evaluate(() => {
+            const d = document.querySelector('div[role="dialog"]');
+            const e = d && d.querySelector('[contenteditable="true"]');
+            return e ? (e.textContent || '').trim().length : 0;
+          }).catch(() => 0)
+        );
+        // Verify caption was entered: accept if the editable has meaningful length (> 0)
+        // and contains at least the first ~15 non-space chars of the caption (handles emoji,
+        // newline, and auto-formatting differences that break exact-match checks).
+        const captionOk = async () => {
+          const len = await captionLen(300); // settle delay before reading
+          if (len === 0) return false;
+          const prefix = post.caption.replace(/\s+/g, '').slice(0, 15);
+          if (!prefix) return len > 0;
+          const boxText = await page.evaluate(() => {
+            const d = document.querySelector('div[role="dialog"]');
+            const e = d && d.querySelector('[contenteditable="true"]');
+            return e ? (e.textContent || '') : '';
+          }).catch(() => '');
+          return boxText.replace(/\s+/g, '').includes(prefix);
+        };
 
         // Image FIRST, then caption — mirrors the original agent. Paste is atomic so the
         // image's re-render can't clobber the caption. Scope the file input to the DIALOG.
@@ -601,14 +623,22 @@ async function runAccount(o) {
             await page.keyboard.down('Control'); await page.keyboard.press('v'); await page.keyboard.up('Control');
             await sleep(600);
           } catch {}
-          if (!(await captionLen())) { // paste blocked → clear + type
+          if (!(await captionOk())) { // paste blocked or not detected → clear + type
             log(`[${name}] ⌨️ Paste blocked — typing caption instead`);
             await focusEditable(page);
             await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
             await page.keyboard.press('Backspace'); await sleep(150);
             await humanType(page, post.caption); await sleep(600);
+            if (!(await captionOk())) {
+              // One retry: re-focus and type again
+              log(`[${name}] ⌨️ Caption not detected — retrying type...`);
+              await focusEditable(page);
+              await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
+              await page.keyboard.press('Backspace'); await sleep(150);
+              await humanType(page, post.caption); await sleep(600);
+            }
           }
-          log((await captionLen()) ? `[${name}] ✅ Caption pasted` : `[${name}] ⚠️ Caption could not be entered (posting anyway)`);
+          log((await captionOk()) ? `[${name}] ✅ Caption entered` : `[${name}] ⚠️ Caption could not be entered (posting anyway)`);
         }
 
         // Publish — then CONFIRM it actually published (dialog closed / Post button gone).

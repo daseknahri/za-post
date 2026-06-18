@@ -62,24 +62,26 @@ class Orchestrator {
     this._stop = false;
     this._paused = false;
     this._finish = false;
-    this._progress = { running: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0 };
+    this._progress = { running: false, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0 };
   }
   isRunning() { return this.running; }
-  stop() { this._stop = true; this._paused = false; }
+  stop() { this._stop = true; this._paused = false; this._progress.paused = false; }
   _shouldStop() { return this._stop; }
   pause() {
     if (!this.running || this._paused) return;
     this._paused = true;
+    this._progress.paused = true;
     this.log('⏸ Paused — holding after the current batch');
     this.emit('automation-paused');
-    this.emit('automation-progress', { ...this._progress, paused: this._paused });
+    this.emit('automation-progress', { ...this._progress });
   }
   resume() {
     if (!this._paused) return;
     this._paused = false;
+    this._progress.paused = false;
     this.log('▶️ Resumed');
     this.emit('automation-resumed');
-    this.emit('automation-progress', { ...this._progress, paused: this._paused });
+    this.emit('automation-progress', { ...this._progress });
   }
   finish() {
     if (!this.running) return;
@@ -126,7 +128,7 @@ class Orchestrator {
   async start(getData) {
     if (this.running) return { success: false, error: 'Automation already running' };
     this._stop = false; this._paused = false; this._finish = false; this.running = true;
-    this._progress = { running: true, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0, offline: false };
+    this._progress = { running: true, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0, offline: false };
     this.emit('automation-started');
     this.emit('automation-progress', { ...this._progress });
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
@@ -134,6 +136,7 @@ class Orchestrator {
       .finally(() => {
         this.running = false;
         this._progress.running = false;
+        this._progress.paused = false;
         this.emit('automation-progress', { ...this._progress });
         const reason = this._stop ? 'stopped' : (this._finish ? 'finished' : 'completed');
         this.emit('automation-stopped', reason);
@@ -283,7 +286,7 @@ class Orchestrator {
       this._progress.cycle = cycle;
       this._progress.accountsTotal = active.length;
       this._progress.accountsDone = 0;
-      this.emit('automation-progress', { ...this._progress, paused: this._paused });
+      this.emit('automation-progress', { ...this._progress });
 
       // ── PLANNING HEADER ──────────────────────────────────────────────────────
       // Determine whether any account uses a unique/sequence mode (drives header style).
@@ -331,7 +334,7 @@ class Orchestrator {
           this._progress.posted += res.posted;
           this._progress.errors += res.errors;
           this._progress.pending += res.pendingApproval;
-          this.emit('automation-progress', { ...this._progress, paused: this._paused });
+          this.emit('automation-progress', { ...this._progress });
           return res;
         }));
         const batchOk = results.filter((r) => r.progressed).length;

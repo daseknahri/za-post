@@ -75,6 +75,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.electronAPI.onAutomationStarted(() => {
       console.log('Automation started externally, syncing UI...');
       isAutomationRunning = true;
+      isPaused = false;
       updateAutomationControls();
       showNotification('Automation started externally', 'success');
       addLog('🚀 Automation started externally\n');
@@ -96,11 +97,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       set('dash-pending', data.pending);
       const totalStr = data.accountsTotal > 0 ? `${data.accountsDone}/${data.accountsTotal}` : '—';
       set('dash-accounts', totalStr);
-      // Sync paused state from backend
-      if (typeof data.paused === 'boolean' && data.paused !== isPaused) {
-        isPaused = data.paused;
-        updateAutomationControls();
-      }
+      // Sync running + paused state from backend
+      isAutomationRunning = !!data.running;
+      isPaused = !!data.paused;
+      updateAutomationControls();
       // Offline indicator
       const offlineEl = document.getElementById('offline-indicator');
       if (offlineEl) offlineEl.style.display = data.offline ? 'inline-block' : 'none';
@@ -1680,6 +1680,15 @@ async function finishAutomation() {
   if (result.success) {
     addLog('\n🏁 Finish requested — current batch will complete, then automation ends.\n');
     showNotification('Automation will finish after current batch.', 'info');
+    // Show "finishing…" state: disable Pause/Resume/Finish, keep Stop active
+    const pauseBtn  = document.getElementById('btn-pause-automation');
+    const resumeBtn = document.getElementById('btn-resume-automation');
+    const finishBtn = document.getElementById('btn-finish-automation');
+    const stopBtn   = document.getElementById('btn-stop-automation');
+    if (pauseBtn)  { pauseBtn.disabled  = true;  pauseBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
+    if (resumeBtn) { resumeBtn.disabled = true;  resumeBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
+    if (finishBtn) { finishBtn.disabled = true;  finishBtn.textContent = '🏁 Finishing…'; finishBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
+    if (stopBtn)   { stopBtn.disabled   = false; stopBtn.classList.remove('opacity-50', 'cursor-not-allowed'); }
   } else {
     showNotification('Failed to finish: ' + result.error, 'error');
   }
