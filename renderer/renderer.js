@@ -11,6 +11,7 @@ let appData = {
     maxCycles: 0,
     commentWithImage: false,
     autoDeletePosted: false,
+    hideBrowser: true,
     useProxies: false,
     enableTunnel: false,
   }
@@ -1769,6 +1770,7 @@ function loadSettings() {
   document.getElementById('setting-posts-per-group').value = appData.settings.postsPerGroup;
   document.getElementById('setting-comment-with-image').checked = appData.settings.commentWithImage || false;
   document.getElementById('setting-auto-delete-posted').checked = appData.settings.autoDeletePosted || false;
+  document.getElementById('setting-hide-browser').checked = appData.settings.hideBrowser !== false;
   document.getElementById('setting-group-delay').value = appData.settings.groupDelay !== undefined ? appData.settings.groupDelay : 60;
   document.getElementById('setting-max-cycles').value = appData.settings.maxCycles !== undefined ? appData.settings.maxCycles : 0;
   document.getElementById('setting-enable-tunnel').checked = appData.settings.enableTunnel || false;
@@ -1788,6 +1790,7 @@ async function saveSettings() {
     postsPerGroup: intOr('setting-posts-per-group', 1),
     commentWithImage: document.getElementById('setting-comment-with-image').checked,
     autoDeletePosted: document.getElementById('setting-auto-delete-posted').checked,
+    hideBrowser: document.getElementById('setting-hide-browser').checked,
     groupDelay: intOr('setting-group-delay', 60),
     maxCycles: intOr('setting-max-cycles', 0),
     enableTunnel: document.getElementById('setting-enable-tunnel').checked,

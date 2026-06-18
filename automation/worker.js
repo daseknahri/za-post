@@ -603,8 +603,10 @@ async function runAccount(o) {
   let unregisterAborter = () => {};
   let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null;
   try {
+    const hidden = settings.hideBrowser !== false; // default: hidden (new headless renders FB fine)
+    log(`🖥️ [${name}] launching browser (${hidden ? 'hidden' : 'visible'})`);
     browser = await puppeteer.launch({
-      headless: false, // Facebook composers/comments render more reliably in real headful Chromium.
+      headless: hidden, // true = new headless (no window, no taskbar). false = visible for debugging.
       executablePath: chromiumPath(),
       userDataDir: store.profileDir(name),
       args: launchArgs,
