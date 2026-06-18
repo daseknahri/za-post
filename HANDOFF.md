@@ -199,6 +199,50 @@ All five passed after the latest changes.
 5. Add a small status dashboard in the UI for posts remaining, current group, current account, and next-cycle countdown.
 6. Consider a safe import/export feature for posts/groups/settings only, excluding account cookies by default.
 
+## Professional Hardening (2026-06-19, by Claude/Opus)
+
+A full audit (4 parallel subagents) + fixes were committed. All changes are on `main`
+(commits `9b104be`, `fee3ec8`, `8fe1615`, `bbc3717`) and the app was boot-verified.
+
+**Data integrity (`lib/store.js`)**
+- `save()` now does temp → write → **fsync** → backup current to `data.json.bak` → rename.
+  Eliminates the 0-byte corruption mode that hit this app before.
+- `load()` recovers from `.bak` and quarantines a corrupt primary as `data.corrupt-<ts>.json`
+  instead of silently blanking then overwriting. Startup shows a recovery dialog if this happens.
+- New `store.update(mutator)` serializes ALL read-modify-write cycles (async mutex). Every
+  data.json writer (orchestrator, IPC post/settings/status handlers, remote hooks) routes
+  through it — no more lost-update races. (Verified: 50 concurrent writes all land vs 1/50 before.)
+
+**Audit trail + summary (`worker.js`, `orchestrator.js`)**
+- Per-(account, group, post) outcome is written to **`<userData>/logs/run-report.jsonl`** and
+  **`run-report.csv`** (timestamp, account, group, postId, result=posted/pending/error, comment).
+- End-of-run **RUN SUMMARY** (posted/pending/errors/cycles/duration + per-account) is logged,
+  emitted as an `automation-summary` event, shown in the UI, and desktop-notified.
+- **Pending-approval posts are no longer auto-deleted** (split dealt-ids vs posted-ids) — a post
+  awaiting admin approval stays in the library instead of vanishing.
+- **Dead-fleet guard**: if a whole cycle posts nothing because accounts are logged out, the run
+  STOPS with a clear message instead of looping forever.
+
+**Operator safety (`renderer.js`, `main.js`)**
+- Start hard-blocks unless ≥1 account is enabled + logged-in + has ≥1 group (no more silent no-op runs).
+- All Start/Stop/Pause/Resume/Finish calls are try/caught (UI can't wedge on a rejected IPC).
+- `save-settings` clamps numeric ranges (parallel 1–20, delays ≥0, interval 0–1440) so a 0/NaN
+  delay can't trigger a ban-risk hot loop.
+- Orphaned Chromium from a crashed run is swept at startup (matches only our profile dirs).
+
+**Remote dashboard security (`server.js`, `main.js`, `public/index.html`)**
+- `/api/accounts` no longer leaks email/password/cookies.
+- When the public tunnel is on, a per-launch token gates every `/api/*` route; the tunnel URL
+  carries `?token=…` and the dashboard forwards it. (Verified: 401 without, 200 with.)
+
+### Updated status of the old "Remaining Work" list
+- #2 (run report) — ✅ DONE (run-report.jsonl/.csv + end-of-run summary).
+- #4 (stale Chromium cleanup) — ✅ DONE at startup (a stop-time sweep could still be added).
+- #5 (status dashboard) — ⚠️ PARTIAL: end-of-run summary added; a live "X of N / next-cycle
+  countdown" panel is still a nice-to-have (backend already emits `automation-progress`).
+- Still open: live progress denominator + countdown UI; per-proxy health-check/failover;
+  `waitForPublish` false-positive hardening (currently conservative); optional code-signing.
+
 ## Safety Notes
 
 - This app automates Facebook. Account risk depends heavily on account quality, group permissions, timing, IP/proxy setup, and Facebook changes.
