@@ -6,7 +6,13 @@ let appData = {
     parallelAccounts: 3,
     waitInterval: 60,
     accountDelay: 1,
-    postsPerGroup: 15
+    postsPerGroup: 15,
+    groupDelay: 60,
+    maxCycles: 0,
+    commentWithImage: false,
+    autoDeletePosted: false,
+    useProxies: false,
+    enableTunnel: false,
   }
 };
 
@@ -1484,6 +1490,7 @@ function loadSettings() {
   document.getElementById('setting-auto-delete-posted').checked = appData.settings.autoDeletePosted || false;
   document.getElementById('setting-group-delay').value = appData.settings.groupDelay !== undefined ? appData.settings.groupDelay : 60;
   document.getElementById('setting-max-cycles').value = appData.settings.maxCycles !== undefined ? appData.settings.maxCycles : 0;
+  document.getElementById('setting-enable-tunnel').checked = appData.settings.enableTunnel || false;
 }
 
 async function saveSettings() {
@@ -1498,7 +1505,8 @@ async function saveSettings() {
     commentWithImage: document.getElementById('setting-comment-with-image').checked,
     autoDeletePosted: document.getElementById('setting-auto-delete-posted').checked,
     groupDelay: intOr('setting-group-delay', 60),
-    maxCycles: intOr('setting-max-cycles', 0)
+    maxCycles: intOr('setting-max-cycles', 0),
+    enableTunnel: document.getElementById('setting-enable-tunnel').checked,
   };
 
   const result = await window.electronAPI.saveSettings(settings);
