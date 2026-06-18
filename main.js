@@ -56,6 +56,19 @@ process.on('unhandledRejection', (e) => {
 });
 
 const REMOTE_PORT = 3000;
+// RUN_STATE_FILE is assigned in whenReady (after app paths are available).
+// Declared here so setRunActive / isRunActive are accessible throughout the file.
+let RUN_STATE_FILE = null;
+
+/** Persist active=true/false atomically so a hard kill leaves the flag intact. */
+function setRunActive(active) {
+  try { fs.writeFileSync(RUN_STATE_FILE, JSON.stringify({ active: !!active, ts: Date.now() })); } catch {}
+}
+/** Returns true if the previous session left active=true (interrupted / shutdown). */
+function isRunActive() {
+  try { return !!JSON.parse(fs.readFileSync(RUN_STATE_FILE, 'utf8')).active; } catch { return false; }
+}
+
 let mainWindow = null;
 let licenseWindow = null;
 let revokedWindow = null;
@@ -72,6 +85,10 @@ function emit(channel, payload) {
     const line = typeof payload === 'string' ? payload : JSON.stringify(payload);
     remote.addLog(line);
     appendLogFile(line);
+  }
+  // Natural completion: clear the run-active flag so no unwanted resume on next launch.
+  if (channel === 'automation-stopped' && (payload === 'completed' || payload === 'finished')) {
+    setRunActive(false);
   }
 }
 const ok = (extra = {}) => ({ success: true, ...extra });
@@ -139,6 +156,12 @@ function createWindow() {
 app.whenReady().then(async () => {
   store.init(app.getPath('userData'));
 
+  // ---- run-state file (shutdown/crash resilience) ---------------------------
+  RUN_STATE_FILE = path.join(app.getPath('userData'), 'run-state.json');
+
+  // ---- Windows login-item (opt-in launchOnStartup) -------------------------
+  try { app.setLoginItemSettings({ openAtLogin: !!(store.load().settings.launchOnStartup) }); } catch {}
+
   // ---- log file setup & startup rotation ------------------------------------
   LOG_DIR = path.join(app.getPath('userData'), 'logs');
   fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -159,7 +182,7 @@ app.whenReady().then(async () => {
   await remote.startServer(REMOTE_PORT, {
     getData,
     getStatus: () => orchestrator.isRunning(),
-    onStart: () => orchestrator.start(getData),
+    onStart: () => { setRunActive(true); return orchestrator.start(getData); },
     onStop: () => orchestrator.stop(),
     addPost: (fields) => addPostFromRemote(fields),
     deletePost: (index) => deletePostByIndex(index),
@@ -187,6 +210,24 @@ app.whenReady().then(async () => {
     else if (r.revoked) showRevokedWindow();
     else showLicenseWindow();
   }
+
+  // ---- Auto-resume after shutdown / crash ------------------------------------
+  // Capture whether the previous session left the run-active flag set.
+  const wasInterrupted = isRunActive();
+  if (wasInterrupted && store.load().settings.resumeOnStartup !== false && mainWindow) {
+    let resumeFired = false; // guard: fire exactly once
+    mainWindow.webContents.once('did-finish-load', () => {
+      if (resumeFired || orchestrator.isRunning()) return;
+      resumeFired = true;
+      emit('automation-log', '🔁 Previous run was interrupted (shutdown/crash) — resuming the campaign...');
+      // orchestrator.start re-reads data.json + loads rotation, continuing from persisted state.
+      // Note: the in-flight post at shutdown may be re-attempted (acceptable; rotation/auto-delete
+      // prevent broad duplication).
+      orchestrator.start(getData);
+      setRunActive(true);
+    });
+  }
+  // ---------------------------------------------------------------------------
 
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
@@ -630,11 +671,17 @@ async function closeLoginBrowser(accountName) {
 // IPC: AUTOMATION
 // =======================================================================
 ipcMain.handle('start-automation', async () => {
-  try { return await orchestrator.start(getData); } catch (e) { return fail(e); }
+  try {
+    const r = await orchestrator.start(getData);
+    if (r && r.success !== false) setRunActive(true);
+    return r;
+  } catch (e) { return fail(e); }
 });
 ipcMain.handle('stop-automation', () => {
   if (!orchestrator.isRunning()) return fail('Automation is not running');
-  orchestrator.stop(); return ok();
+  orchestrator.stop();
+  setRunActive(false); // explicit Stop clears the flag — no auto-resume on next launch
+  return ok();
 });
 ipcMain.handle('pause-automation', () => {
   if (!orchestrator) return fail('Orchestrator not ready');
@@ -648,7 +695,9 @@ ipcMain.handle('resume-automation', () => {
 ipcMain.handle('finish-automation', () => {
   if (!orchestrator) return fail('Orchestrator not ready');
   if (!orchestrator.isRunning()) return fail('Automation is not running');
-  orchestrator.finish(); return ok();
+  orchestrator.finish();
+  setRunActive(false); // finish requested — clear flag so no resume on next launch
+  return ok();
 });
 ipcMain.handle('get-automation-status', () => ok({ isRunning: orchestrator.isRunning(), isPaused: orchestrator.isPaused() }));
 
@@ -658,7 +707,10 @@ ipcMain.handle('get-automation-status', () => ok({ isRunning: orchestrator.isRun
 ipcMain.handle('save-settings', (_e, settings) => {
   const data = getData();
   data.settings = { ...store.DEFAULT_SETTINGS, ...data.settings, ...settings };
-  store.save(data); return ok();
+  store.save(data);
+  // Apply launchOnStartup immediately so toggling it takes effect without a restart.
+  try { app.setLoginItemSettings({ openAtLogin: !!data.settings.launchOnStartup }); } catch {}
+  return ok();
 });
 
 ipcMain.handle('get-proxies', () => {
