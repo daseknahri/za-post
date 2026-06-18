@@ -563,8 +563,20 @@ async function credentialLogin(page, email, password, log, name) {
  * @param {()=>boolean} o.shouldStop
  */
 async function runAccount(o) {
-  const { account, post, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter } = o;
+  const { account, post, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult } = o;
   const name = account.name;
+
+  // Emit one audit record per (account, group, post) outcome for the persistent run report.
+  const report = (groupName, gid, result, detail, commentResult) => {
+    if (typeof onResult !== 'function') return;
+    try {
+      onResult({
+        ts: new Date().toISOString(), account: name, group: displayName(groupName), groupId: gid,
+        postId: post && post.id, caption: shortText((post && post.caption) || '', 60),
+        result, comment: commentResult || '', detail: detail || '',
+      });
+    } catch {}
+  };
 
   // Fix #4: profile-lock guard — two Chromium instances can't share a userDataDir.
   if (isLoginOpen && isLoginOpen(name)) {
@@ -718,13 +730,13 @@ async function runAccount(o) {
         const gotoGroup = () => page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
         let navOk = await gotoGroup();
         if (!navOk) { step('Navigation attempt failed; retrying'); await sleepInterruptible(3000, shouldStop); navOk = await gotoGroup(); }
-        if (!navOk) { step('Navigation failed; skipping group'); errors++; continue; }
+        if (!navOk) { step('Navigation failed; skipping group'); errors++; report(groupName, gid, 'error', 'navigation failed', ''); continue; }
         await sleep(3000);
 
         // Per-group START banner — fired only after nav succeeds and before the auth checks.
         step('Group loaded');
 
-        if (/login|checkpoint/.test(page.url())) { log(`🚫 [${name}] not logged in / checkpoint`); errors++; noRetry = true; flag = 'needs_login'; break; }
+        if (/login|checkpoint/.test(page.url())) { log(`🚫 [${name}] not logged in / checkpoint`); errors++; noRetry = true; flag = 'needs_login'; report(groupName, gid, 'error', 'not logged in / checkpoint', ''); break; }
         // Expired sessions don't redirect — they show the "Continue as <name>" picker
         // or a non-member "Join Group / Log in" wall. Detect and abort early & clearly.
         const authBad = await page.evaluate(() => {
@@ -734,16 +746,16 @@ async function runAccount(o) {
           if (hasBtn(/^join group$/i) && hasBtn(/^log in$/i)) return 'not-authenticated';
           return null;
         });
-        if (authBad) { step(authBad === 'session-expired' ? 'Session expired - re-login required' : 'Not logged in / not a member'); errors++; noRetry = true; flag = 'needs_login'; break; }
+        if (authBad) { step(authBad === 'session-expired' ? 'Session expired - re-login required' : 'Not logged in / not a member'); errors++; noRetry = true; flag = 'needs_login'; report(groupName, gid, 'error', authBad, ''); break; }
 
         // Clear cookie/notification banners, then bail out of this account if rate-limited.
         await dismissPopups(page);
-        if (await checkRateLimit(page)) { step('Rate-limited by Facebook - backing off this account'); errors++; noRetry = true; flag = 'rate_limited'; break; }
+        if (await checkRateLimit(page)) { step('Rate-limited by Facebook - backing off this account'); errors++; noRetry = true; flag = 'rate_limited'; report(groupName, gid, 'error', 'rate-limited by Facebook', ''); break; }
 
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
         const opened = await openComposer(page, log, name);
-        if (!opened) { step('Could not open composer modal; skipping group'); errors++; continue; }
+        if (!opened) { step('Could not open composer modal; skipping group'); errors++; report(groupName, gid, 'error', 'composer did not open', ''); continue; }
         await sleep(1500);
         await dismissPopups(page);
         step('Composer opened; preparing post');
@@ -832,10 +844,10 @@ async function runAccount(o) {
           else step(`Post button NOT found (${postBtnInfo.dialogs} dialog(s) scanned)`);
         }
         const clicked = await clickPostButton(page);
-        if (!clicked) { step('Post button not found; skipping group'); errors++; continue; }
+        if (!clicked) { step('Post button not found; skipping group'); errors++; report(groupName, gid, 'error', 'post button not found', ''); continue; }
         step('Post button clicked');
         const publishResult = await waitForPublish(page, dialogCountBefore);
-        if (publishResult !== 'published') { step('Post clicked but publish was NOT confirmed; skipping group'); errors++; continue; }
+        if (publishResult !== 'published') { step('Post clicked but publish was NOT confirmed; skipping group'); errors++; report(groupName, gid, 'error', 'publish not confirmed', ''); continue; }
         await sleepInterruptible(3000, shouldStop);
         // Check pending-approval BEFORE dismissing popups (a dismissible notice could be cleared).
         const isPending = await checkPendingApproval(page);
@@ -846,6 +858,7 @@ async function runAccount(o) {
         if (isPending) {
           step('Post submitted but PENDING ADMIN APPROVAL - not counted, comment skipped');
           pendingApproval++;
+          report(groupName, gid, 'pending', 'awaiting admin approval', 'skipped');
           if (i < targetGroups.length - 1) await sleepInterruptible((Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000, shouldStop, 1000);
           continue;
         }
@@ -856,12 +869,16 @@ async function runAccount(o) {
 
         // First comment (the link) — reload, find OUR post, comment in its box.
         // addFirstComment logs every stage itself (via the same step() logger).
+        let commentResult = (post.comment && post.comment.trim()) ? 'failed' : 'none';
         if (post.comment && post.comment.trim()) {
-          await addFirstComment(page, gid, post, commentImg, step);
+          const cok = await addFirstComment(page, gid, post, commentImg, step);
+          commentResult = cok ? 'posted' : 'failed';
         }
+        report(groupName, gid, 'posted', '', commentResult);
       } catch (e) {
         errors++;
         step(`Error: ${e.message}`);
+        report(groupName, gid, 'error', e.message, '');
         try { await page.screenshot({ path: require('path').join(store.accountDir(name), 'last-failure.png') }); } catch {}
         // If the browser/page died, every remaining group would just throw the same way —
         // abort this account cleanly instead of churning one error per remaining group.

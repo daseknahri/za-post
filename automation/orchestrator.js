@@ -144,6 +144,8 @@ class Orchestrator {
     this._stop = false; this._paused = false; this._finish = false; this.running = true;
     this._aborters.clear();
     this._progress = { running: true, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0, offline: false };
+    this._runStartedAt = Date.now();
+    this._runStats = {}; // per-account totals across the whole run (for the end-of-run summary)
     this.emit('automation-started');
     this.emit('automation-progress', { ...this._progress });
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
@@ -155,10 +157,36 @@ class Orchestrator {
         this._progress.paused = false;
         this.emit('automation-progress', { ...this._progress });
         const reason = this._stop ? 'stopped' : (this._finish ? 'finished' : 'completed');
+        this._emitSummary(reason);
         this.emit('automation-stopped', reason);
         this.log(`⏹ Automation ${reason}.`);
       });
     return { success: true };
+  }
+
+  // End-of-run roll-up: a single clear summary for the operator (logged + emitted as a
+  // structured event the UI can render + appended to the persistent run report).
+  _emitSummary(reason) {
+    const durationMs = Date.now() - (this._runStartedAt || Date.now());
+    const byAccount = this._runStats || {};
+    const summary = {
+      reason,
+      posted: this._progress.posted || 0,
+      pending: this._progress.pending || 0,
+      errors: this._progress.errors || 0,
+      cycles: this._progress.cycle || 0,
+      durationMs,
+      byAccount,
+      finishedAt: new Date().toISOString(),
+    };
+    const m = Math.floor(durationMs / 60000), s = Math.round((durationMs % 60000) / 1000);
+    this.log('📋 ═══ RUN SUMMARY ═══');
+    this.log(`📋 Posted: ${summary.posted}  |  Pending: ${summary.pending}  |  Errors: ${summary.errors}  |  Cycles: ${summary.cycles}  |  Duration: ${m}m ${s}s`);
+    for (const [acc, st] of Object.entries(byAccount)) {
+      this.log(`📋 [${acc}] posted=${st.posted} pending=${st.pending} errors=${st.errors}`);
+    }
+    this.emit('automation-summary', summary);
+    try { store.appendReport({ ts: summary.finishedAt, account: '(run summary)', group: '', groupId: '', postId: '', result: `summary:${reason}`, comment: '', detail: `posted=${summary.posted} pending=${summary.pending} errors=${summary.errors} cycles=${summary.cycles} duration=${m}m${s}s` }); } catch {}
   }
 
   // Choose the posts a given account publishes this cycle.
@@ -200,7 +228,7 @@ class Orchestrator {
   async _runAccount(account, cycle) {
     const data = this._data;
     const posts = this._postsForAccount(account, cycle);
-    if (!posts.length) { this.log(`↪️ [${account.name}] no eligible posts`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [] }; }
+    if (!posts.length) { this.log(`↪️ [${account.name}] no eligible posts`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [], dealtIds: [] }; }
     const order = account.postingOrder || 'post-centric';
     const isUnique = order.includes('unique') || order === 'sequence';
     const modeLabel = this._modeLabel(order);
@@ -221,8 +249,9 @@ class Orchestrator {
       this.log(`[${account.name}] 📋 Mode: ${modeLabel} → all ${kGroups} groups`);
     }
     this.log(`[${account.name}] 🚀 Starting...`);
-    let progressed = false, posted = 0, pendingApproval = 0, errors = 0;
-    const postedIds = [];
+    let progressed = false, posted = 0, pendingApproval = 0, errors = 0, accountFlag = null;
+    const postedIds = []; // posts confirmed PUBLISHED — safe to auto-delete
+    const dealtIds = [];  // posts dealt this cycle (published OR pending) — don't re-deal
     postsLoop:
     for (const post of posts) {
       if (this._shouldStop()) break;
@@ -238,18 +267,26 @@ class Orchestrator {
             shouldStop: () => this._shouldStop(),
             isLoginOpen: this.isLoginOpen,
             registerAborter: (abort) => this._registerAborter(abort),
+            // Per-(account,group,post) outcome → append to the persistent audit trail.
+            onResult: (rec) => { try { store.appendReport(rec); } catch {} },
           });
           posted += (r && r.posted) || 0; pendingApproval += (r && r.pendingApproval) || 0; errors += (r && r.errors) || 0;
-          if (r && ((r.posted || 0) > 0 || (r.pendingApproval || 0) > 0)) { progressed = true; if (post.id) postedIds.push(post.id); }
-          // Persist flag to account status so the UI shows it.
+          // A post is "dealt" (rotation advances, not re-posted next cycle) if it published OR
+          // went pending. But ONLY a confirmed publish is auto-deletable — a pending post an
+          // admin may later reject must stay in the library, so pending ids never enter postedIds.
+          if (r && (r.posted || 0) > 0) { progressed = true; if (post.id) { postedIds.push(post.id); dealtIds.push(post.id); } }
+          else if (r && (r.pendingApproval || 0) > 0) { progressed = true; if (post.id) dealtIds.push(post.id); }
+          // Persist flag to account status so the UI shows it (serialized via store.update).
           if (r && r.flag) {
+            accountFlag = r.flag;
             try {
-              const d = store.load(); const acc = d.accounts.find(a => a.name === account.name);
-              if (acc) {
+              await store.update((d) => {
+                const acc = d.accounts.find(a => a.name === account.name);
+                if (!acc) return;
                 if (r.flag === 'needs_login') { acc.status = 'not_logged_in'; acc.lastMessage = '⚠️ Logged out during run — re-login required'; }
                 else if (r.flag === 'rate_limited') { acc.status = 'rate_limited'; acc.lastMessage = '⏸ Rate-limited by Facebook — backed off this cycle'; }
-                store.save(d); this.emit('data-updated');
-              }
+              });
+              this.emit('data-updated');
             } catch {}
           }
           // Logged-out / rate-limited — don't launch a browser for this account's remaining posts this cycle.
@@ -267,7 +304,7 @@ class Orchestrator {
     // Surface the outcome so the operator sees pending/error counts in the log pane.
     this.log(`[${account.name}] ✅ Done: ${posted} posts`);
     this.log(`📊 [${account.name}] posted=${posted} pending=${pendingApproval} errors=${errors}`);
-    return { progressed, posted, pendingApproval, errors, postedIds };
+    return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag };
   }
 
   async _loop(getData) {
@@ -332,7 +369,9 @@ class Orchestrator {
       await this._waitForConnectivity(); if (this._shouldStop()) break;
 
       const batches = chunk(active, settings.parallelAccounts || 3);
-      const cyclePostedIds = [];
+      const cyclePostedIds = []; // published this cycle (auto-deletable)
+      const cycleDealtIds = [];  // dealt this cycle (published OR pending — rotation)
+      const cycleFlags = [];     // per-account flags (needs_login / rate_limited) seen this cycle
       for (let b = 0; b < batches.length; b++) {
         if (this._shouldStop()) break;
         await this._waitWhilePaused(); if (this._shouldStop()) break;
@@ -344,19 +383,22 @@ class Orchestrator {
         }
         const results = await Promise.all(batch.map(async (account) => {
           const r = await this._runAccount(account, cycle)
-            .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [] }; });
+            .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [] }; });
           this.log(`✓ [${account.name}] Completed`);
-          const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [] };
+          const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null };
           this._progress.accountsDone++;
           this._progress.posted += res.posted;
           this._progress.errors += res.errors;
           this._progress.pending += res.pendingApproval;
+          // Per-account run totals for the end-of-run summary.
+          const st = (this._runStats[account.name] = this._runStats[account.name] || { posted: 0, pending: 0, errors: 0 });
+          st.posted += res.posted; st.pending += res.pendingApproval; st.errors += res.errors;
           this.emit('automation-progress', { ...this._progress });
           return res;
         }));
         const batchOk = results.filter((r) => r.progressed).length;
         this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) --- Waiting ${Number.isFinite(settings.accountDelay) ? settings.accountDelay : 1} minute(s) before next batch...`);
-        for (const r of results) cyclePostedIds.push(...r.postedIds);
+        for (const r of results) { cyclePostedIds.push(...r.postedIds); cycleDealtIds.push(...r.dealtIds); if (r.flag) cycleFlags.push(r.flag); }
         if (this._finish) break;
         if (b < batches.length - 1 && !this._shouldStop()) {
           await this._waitWithCountdown((Number.isFinite(settings.accountDelay) ? settings.accountDelay : 1) * 60000, 'Next batch');
@@ -364,26 +406,35 @@ class Orchestrator {
       }
       // Mark this cycle's published posts as DEALT (drives the round-robin: each post once;
       // a failed account's post stays un-dealt and is re-dealt next cycle). Persisted for resume.
-      if (cyclePostedIds.length) {
-        for (const id of cyclePostedIds) this._dealt.add(id);
+      if (cycleDealtIds.length) {
+        for (const id of cycleDealtIds) this._dealt.add(id);
         try { store.saveRotation({ dealt: [...this._dealt], roundOffset: this._roundOffset || 0 }); } catch {}
       }
       if (this._shouldStop()) break;
 
-      // One-time campaign: remove the posts published this cycle so each post is used
-      // exactly once (and the run ends when the library empties). Backend-owned so it's
-      // reliable regardless of the UI; replaces the old renderer log-parsing on stop.
+      // One-time campaign: remove the posts PUBLISHED this cycle so each post is used
+      // exactly once (and the run ends when the library empties). Pending-approval posts
+      // are NOT in cyclePostedIds, so they survive. Serialized via store.update so a
+      // concurrent UI/remote edit can't be clobbered.
       if (settings.autoDeletePosted && cyclePostedIds.length) {
         const del = new Set(cyclePostedIds);
-        const data = getData();
-        const before = data.posts.length;
-        data.posts = data.posts.filter((p) => !del.has(p.id));
-        store.save(data);
+        const { removed, remaining } = await store.update((d) => {
+          const before = d.posts.length;
+          d.posts = d.posts.filter((p) => !del.has(p.id));
+          return { removed: before - d.posts.length, remaining: d.posts.length };
+        });
         this.emit('data-updated');
-        this.log(`🗑️ Auto-deleted ${before - data.posts.length} posted post(s) — ${data.posts.length} remaining`);
+        this.log(`🗑️ Auto-deleted ${removed} posted post(s) — ${remaining} remaining`);
       }
 
       if (this._shouldStop() || this._finish) break;
+      // All-sessions-invalid guard: if a whole cycle published/queued NOTHING and at least one
+      // account reported it was logged out, looping again would just relaunch browsers that all
+      // bail. Stop with a clear reason instead of spinning forever unattended.
+      if (cycleDealtIds.length === 0 && cycleFlags.includes('needs_login')) {
+        this.log('🛑 No account could post this cycle — sessions appear logged out. Stopping. Re-login the accounts, then Start again.');
+        break;
+      }
       if ((settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {
         this.log(`🏁 Reached maxCycles (${settings.maxCycles}) — finishing.`); break;
       }
