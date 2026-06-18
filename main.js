@@ -196,6 +196,60 @@ ipcMain.handle('add-post', (_e, post) => {
   } catch (e) { return fail(e); }
 });
 
+// =======================================================================
+// IPC: BULK IMPORT
+// =======================================================================
+ipcMain.handle('add-posts-bulk', (_e, posts) => {
+  try {
+    if (!Array.isArray(posts)) return fail('Expected an array of posts');
+    const data = getData();
+    let added = 0, skipped = 0;
+    const now = Date.now();
+    for (let i = 0; i < posts.length; i++) {
+      const p = posts[i];
+      const caption = (p.caption || '').trim();
+      if (!caption) { skipped++; continue; }
+      data.posts.push({
+        id: `post-${now}-${i}`,
+        caption,
+        comment: p.comment || '',
+        imagePaths: [],
+        imageUrl: p.imageUrl || '',
+        commentImagePath: null,
+        commentImageUrl: p.commentImageUrl || '',
+      });
+      added++;
+    }
+    store.save(data);
+    send('data-updated');
+    return ok({ added, skipped });
+  } catch (e) { return fail(e); }
+});
+
+ipcMain.handle('add-groups-bulk', (_e, items) => {
+  try {
+    if (!Array.isArray(items)) return fail('Expected an array of group URLs/IDs');
+    const data = getData();
+    const existingIds = new Set(data.groups.map((g) => g.groupId));
+    let added = 0, skipped = 0;
+    const now = Date.now();
+    for (let i = 0; i < items.length; i++) {
+      const groupId = extractGroupId(String(items[i] || ''));
+      if (!groupId || existingIds.has(groupId)) { skipped++; continue; }
+      existingIds.add(groupId);
+      data.groups.push({
+        id: `group-${now}-${i}`,
+        groupId,
+        name: `Group ${data.groups.length + 1}`,
+      });
+      added++;
+    }
+    store.save(data);
+    send('data-updated');
+    return ok({ added, skipped });
+  } catch (e) { return fail(e); }
+});
+
 ipcMain.handle('delete-post', (_e, postId) => {
   const data = getData();
   data.posts = data.posts.filter((p) => p.id !== postId);

@@ -176,6 +176,47 @@ async function saveData() {
   await window.electronAPI.saveData(appData);
 }
 
+// Bulk import posts — accepts a JSON array OR pipe-separated lines "caption | comment | imageUrl".
+async function bulkImportPosts() {
+  const raw = (document.getElementById('bulk-posts-input').value || '').trim();
+  if (!raw) { showNotification('Paste some posts first', 'error'); return; }
+  let arr = [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error('not array');
+    arr = parsed.map(p => ({ caption: String(p.caption || ''), comment: String(p.comment || ''), imageUrl: String(p.imageUrl || ''), commentImageUrl: String(p.commentImageUrl || '') }));
+  } catch {
+    arr = raw.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
+      const parts = line.split('|').map(s => s.trim());
+      return { caption: parts[0] || '', comment: parts[1] || '', imageUrl: parts[2] || '', commentImageUrl: '' };
+    });
+  }
+  arr = arr.filter(p => p.caption);
+  if (!arr.length) { showNotification('No valid posts found (each needs a caption)', 'error'); return; }
+  const res = await window.electronAPI.addPostsBulk(arr);
+  if (res && res.success) {
+    showNotification(`Imported ${res.added} post(s)${res.skipped ? `, ${res.skipped} skipped` : ''}`, 'success');
+    document.getElementById('bulk-posts-input').value = '';
+    closeModal('modal-bulk-posts');
+    await loadData();
+  } else showNotification('Import failed: ' + ((res && res.error) || 'unknown'), 'error');
+}
+
+// Bulk import groups — one group URL or ID per line.
+async function bulkImportGroups() {
+  const raw = (document.getElementById('bulk-groups-input').value || '').trim();
+  if (!raw) { showNotification('Paste some group URLs/IDs first', 'error'); return; }
+  const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) { showNotification('No groups found', 'error'); return; }
+  const res = await window.electronAPI.addGroupsBulk(lines);
+  if (res && res.success) {
+    showNotification(`Imported ${res.added} group(s)${res.skipped ? `, ${res.skipped} skipped/duplicate` : ''}`, 'success');
+    document.getElementById('bulk-groups-input').value = '';
+    closeModal('modal-bulk-groups');
+    await loadData();
+  } else showNotification('Import failed: ' + ((res && res.error) || 'unknown'), 'error');
+}
+
 // Navigation
 function initializeEventListeners() {
   // Navigation
@@ -333,6 +374,16 @@ function initializeEventListeners() {
     // Also clear URL input if present
     const urlInput = document.getElementById('comment-image-url-input');
     if (urlInput) urlInput.value = '';
+  });
+
+  // Bulk import buttons
+  document.getElementById('btn-bulk-import-posts').addEventListener('click', () => {
+    document.getElementById('bulk-posts-input').value = '';
+    openModal('modal-bulk-posts');
+  });
+  document.getElementById('btn-bulk-import-groups').addEventListener('click', () => {
+    document.getElementById('bulk-groups-input').value = '';
+    openModal('modal-bulk-groups');
   });
 
   // Groups
