@@ -79,6 +79,22 @@ let mainWindow = null;
 let licenseWindow = null;
 let revokedWindow = null;
 let tunnelUrl = '';
+let tunnelActive = false; // remote-access tunnel currently running?
+
+// Start/stop the Cloudflare remote-access tunnel live (no app restart needed).
+async function applyTunnelState(enabled) {
+  if (enabled && !tunnelActive) {
+    tunnelActive = true;
+    emit('automation-log', '🌐 Starting remote-access tunnel...');
+    try { remote.startTunnel(REMOTE_PORT, (u) => { tunnelUrl = u; send('remote-url-update', u); }); }
+    catch (e) { tunnelActive = false; emit('automation-log', '🌐 Tunnel failed: ' + e.message); }
+  } else if (!enabled && tunnelActive) {
+    tunnelActive = false; tunnelUrl = '';
+    try { remote.stopTunnel(); } catch {}
+    send('remote-url-update', '');
+    emit('automation-log', '🌐 Remote-access tunnel stopped');
+  }
+}
 let orchestrator = null;
 const loginBrowsers = new Map(); // accountName -> { browser, interval }
 
@@ -201,10 +217,7 @@ app.whenReady().then(async () => {
   // Cloudflare tunnel is OPT-IN: its spawned binary can destabilize the app on some
   // systems, so it's off by default. Enable with ENABLE_TUNNEL=1 (or settings.enableTunnel).
   const wantTunnel = process.env.ENABLE_TUNNEL || (getData().settings && getData().settings.enableTunnel);
-  if (wantTunnel) {
-    try { remote.startTunnel(REMOTE_PORT, (url) => { tunnelUrl = url; send('remote-url-update', url); }); }
-    catch (e) { console.error('[tunnel] disabled:', e.message); }
-  }
+  applyTunnelState(!!wantTunnel);
 
   // License gate — OPT-IN, off by default. When OFF, boot is identical to before.
   const LICENSE_ON = !!(process.env.ENABLE_LICENSE || (store.load().settings && store.load().settings.licenseEnabled));
@@ -716,6 +729,8 @@ ipcMain.handle('save-settings', (_e, settings) => {
   store.save(data);
   // Apply launchOnStartup immediately so toggling it takes effect without a restart.
   try { app.setLoginItemSettings({ openAtLogin: !!data.settings.launchOnStartup }); } catch {}
+  // Apply the remote-access tunnel toggle live (start/stop without a restart).
+  applyTunnelState(!!data.settings.enableTunnel);
   return ok();
 });
 
