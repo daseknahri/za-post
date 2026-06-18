@@ -304,7 +304,7 @@ async function addFirstComment(page, gid, post, commentImg, name, log) {
       const state = await target.evaluate((el) => (el.textContent || '').trim()).catch(() => 'GONE');
       if (state === '' || state === 'GONE') { confirmed = true; break; } // emptied or re-rendered = submitted
     }
-    log(confirmed ? `💬 [${name}] comment posted` : `⚠️ [${name}] comment sent (could not auto-verify)`);
+    log(confirmed ? `[${name}] ✅ Comment posted!` : `[${name}] ⚠️ Comment sent (could not auto-verify)`);
     await sleep(1000);
     return true;
   } catch (e) { log(`⚠️ [${name}] comment error: ${e.message}`); return false; }
@@ -575,25 +575,26 @@ async function runAccount(o) {
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
         const opened = await openComposer(page, log, name);
-        if (!opened) { log(`❌ [${name}] could not open the post composer in ${g.name || gid}`); errors++; continue; }
+        if (!opened) { log(`[${name}] ❌ Could not open modal`); errors++; continue; }
         await sleep(1500);
         await dismissPopups(page);
+        log(`[${name}] 📝 Post 1/1`);
 
         const captionLen = () => page.evaluate(() => { const d = document.querySelector('div[role="dialog"]'); const e = d && d.querySelector('[contenteditable="true"]'); return e ? (e.textContent || '').trim().length : 0; }).catch(() => 0);
 
         // Image FIRST, then caption — mirrors the original agent. Paste is atomic so the
         // image's re-render can't clobber the caption. Scope the file input to the DIALOG.
         if (resolvedImages.length) {
-          log(`📷 [${name}] uploading ${resolvedImages.length} image(s)...`);
+          log(`[${name}] 📷 Uploading ${resolvedImages.length} image(s)...`);
           const input = (await page.$('div[role="dialog"] input[type="file"]')) || (await page.$(SEL.fileInput));
-          if (input) { await input.uploadFile(...resolvedImages); log(`✅ [${name}] image attached`); await sleep(3500); }
-          else log(`⚠️ [${name}] image input not found in composer`);
+          if (input) { await input.uploadFile(...resolvedImages); log(`[${name}] ✅ Image attached`); await sleep(3500); }
+          else log(`[${name}] ⚠️ Image input not found in composer`);
         }
 
         // Caption — PASTE it (clipboard + Ctrl+V, like the original "Caption pasted"); fast and
         // reliable. Verify it landed; if not, fall back to typing so the post still goes out.
         if (post.caption) {
-          log(`✍️ [${name}] entering caption...`);
+          log(`[${name}] ✍️ Entering caption...`);
           await focusEditable(page);
           try {
             await page.evaluate((t) => navigator.clipboard.writeText(t), post.caption);
@@ -601,18 +602,18 @@ async function runAccount(o) {
             await sleep(600);
           } catch {}
           if (!(await captionLen())) { // paste blocked → clear + type
-            log(`⌨️ [${name}] paste blocked — typing caption instead`);
+            log(`[${name}] ⌨️ Paste blocked — typing caption instead`);
             await focusEditable(page);
             await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
             await page.keyboard.press('Backspace'); await sleep(150);
             await humanType(page, post.caption); await sleep(600);
           }
-          log((await captionLen()) ? `✅ [${name}] caption pasted` : `⚠️ [${name}] caption could not be entered (posting anyway)`);
+          log((await captionLen()) ? `[${name}] ✅ Caption pasted` : `[${name}] ⚠️ Caption could not be entered (posting anyway)`);
         }
 
         // Publish — then CONFIRM it actually published (dialog closed / Post button gone).
         await sleep(1500);
-        log(`⏳ [${name}] waiting for Post button…`);
+        log(`[${name}] ⏳ Waiting for Post button to enable...`);
         const dialogCountBefore = await page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length).catch(() => 1);
         // Log what the Post-button scan sees (dialogs open, found label) — mirrors original's "🔍 Dialogs: N".
         const postBtnInfo = await page.evaluate(() => {
@@ -628,13 +629,14 @@ async function runAccount(o) {
           return { found: false, dialogs: dialogs.length };
         }).catch(() => null);
         if (postBtnInfo) {
-          if (postBtnInfo.found) log(`🔍 [${name}] Post button: found (dialogs=${postBtnInfo.dialogs}, label="${postBtnInfo.label}")`);
-          else log(`🔍 [${name}] Post button NOT found (${postBtnInfo.dialogs} dialog(s) scanned)`);
+          if (postBtnInfo.found) log(`[${name}] 🔍 Post button found (label="${postBtnInfo.label}")`);
+          else log(`[${name}] 🔍 Post button NOT found (${postBtnInfo.dialogs} dialog(s) scanned)`);
         }
         const clicked = await clickPostButton(page);
-        if (!clicked) { log(`⚠️ [${name}] Post button not found in ${g.name || gid}`); errors++; continue; }
+        if (!clicked) { log(`[${name}] ⚠️ Post button not found in ${g.name || gid}`); errors++; continue; }
+        log(`[${name}] ✅ Post button clicked`);
         const publishResult = await waitForPublish(page, dialogCountBefore);
-        if (publishResult !== 'published') { log(`⚠️ [${name}] Post clicked but publish NOT confirmed in ${g.name || gid} — skipping`); errors++; continue; }
+        if (publishResult !== 'published') { log(`[${name}] ⚠️ Post clicked but publish NOT confirmed in ${g.name || gid} — skipping`); errors++; continue; }
         await sleep(3000);
         // Check pending-approval BEFORE dismissing popups (a dismissible notice could be cleared).
         const isPending = await checkPendingApproval(page);
@@ -649,15 +651,15 @@ async function runAccount(o) {
           continue;
         }
 
-        // Success log includes the caption so the renderer's auto-delete tracker matches it.
-        log(`✅ [${name}] Posted! → ${g.name || gid}: ${(post.caption || '').slice(0, 50)}`);
+        // Success log — keep caption snippet for the renderer's auto-delete tracker.
+        log(`[${name}] ✅ Posted!`);
         posted++;
 
         // First comment (the link) — reload, find OUR post, comment in its box.
         if (post.comment) {
-          log(`💬 [${name}] adding comment...`);
+          log(`[${name}] 💬 Adding comment...`);
           const done = await addFirstComment(page, gid, post, commentImg, name, log);
-          if (!done) log(`ℹ️ [${name}] comment box not found (post still published)`);
+          if (!done) log(`[${name}] ⚠️ Could not find comment box - skipping comment`);
         }
       } catch (e) {
         errors++;
@@ -668,11 +670,12 @@ async function runAccount(o) {
       // Interruptible delay between groups (respects Stop + configurable groupDelay).
       if (i < targetGroups.length - 1) {
         let w = 0; const d = Math.max(15000, (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000);
-        log(`⏱️ [${name}] waiting ${Math.round(d / 1000)}s before next group`);
+        const dMin = Math.round(d / 60000);
+        log(`[${name}] ⏱️ Wait ${dMin > 0 ? dMin + 'min' : Math.round(d / 1000) + 's'}`);
         while (w < d && !shouldStop()) { await sleep(Math.min(1000, d - w)); w += 1000; }
       }
     }
-    log(`✅ [${name}] done — ${posted} posted, ${pendingApproval} pending, ${errors} errors`);
+    log(`[${name}] ✅ Done: ${posted} posts`);
 
     // Persist refreshed cookies for next run.
     try { store.writeCookies(name, await page.cookies()); } catch {}

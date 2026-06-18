@@ -111,6 +111,18 @@ class Orchestrator {
 
   log(msg) { this.emit('automation-log', msg); }
 
+  // Human-readable label for a postingOrder value.
+  _modeLabel(order) {
+    const MAP = {
+      'post-centric': 'Post-Centric',
+      'random': 'Random',
+      'sequence': 'Sequence',
+      'post-centric-unique': 'Post-Centric-Unique',
+      'random-unique': 'Random-Unique',
+    };
+    return MAP[order] || order;
+  }
+
   async start(getData) {
     if (this.running) return { success: false, error: 'Automation already running' };
     this._stop = false; this._paused = false; this._finish = false; this.running = true;
@@ -167,8 +179,25 @@ class Orchestrator {
     const posts = this._postsForAccount(account, cycle);
     if (!posts.length) { this.log(`↪️ [${account.name}] no eligible posts`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [] }; }
     const order = account.postingOrder || 'post-centric';
-    const label = posts.length === 1 ? `Post #${data.posts.findIndex((p) => p.id === posts[0].id) + 1}` : `${posts.length} posts`;
-    this.log(`📋 [${account.name}] ${order} → ${label} to ${(account.assignedGroups || []).length} group(s)`);
+    const isUnique = order.includes('unique') || order === 'sequence';
+    const modeLabel = this._modeLabel(order);
+    const kGroups = (account.assignedGroups || []).length;
+    const filterVal = account.postFilter || 'all';
+    const filterLabel = filterVal === 'with-comments' ? 'With comments' : filterVal === 'without-comments' ? 'Without comments' : 'All posts';
+    const allFiltered = data.posts.filter((p) => matchesFilter(p, filterVal));
+
+    // Per-account intro lines (mirrors original format)
+    if (isUnique) {
+      this.log(`[${account.name}] 🔒 Pre-assigned 1 unique post`);
+    }
+    this.log(`[${account.name}] [FILTER] ${filterLabel} (${allFiltered.length})`);
+    if (isUnique && posts.length === 1) {
+      const postNum = data.posts.findIndex((p) => p.id === posts[0].id) + 1;
+      this.log(`[${account.name}] 📋 Mode: ${modeLabel} → Post #${postNum} to all ${kGroups} groups`);
+    } else {
+      this.log(`[${account.name}] 📋 Mode: ${modeLabel} → all ${kGroups} groups`);
+    }
+    this.log(`[${account.name}] 🚀 Starting...`);
     let progressed = false, posted = 0, pendingApproval = 0, errors = 0;
     const postedIds = [];
     postsLoop:
@@ -212,6 +241,7 @@ class Orchestrator {
       }
     }
     // Surface the outcome so the operator sees pending/error counts in the log pane.
+    this.log(`[${account.name}] ✅ Done: ${posted} posts`);
     this.log(`📊 [${account.name}] posted=${posted} pending=${pendingApproval} errors=${errors}`);
     return { progressed, posted, pendingApproval, errors, postedIds };
   }
@@ -250,7 +280,29 @@ class Orchestrator {
       this._progress.accountsTotal = active.length;
       this._progress.accountsDone = 0;
       this.emit('automation-progress', { ...this._progress, paused: this._paused });
-      this.log(`🔄 Cycle ${cycle}: ${active.length} account(s), ${settings.parallelAccounts || 3} in parallel`);
+
+      // ── PLANNING HEADER ──────────────────────────────────────────────────────
+      // Determine whether any account uses a unique/sequence mode (drives header style).
+      const anyUnique = active.some((a) => { const o = a.postingOrder || 'post-centric'; return o.includes('unique') || o === 'sequence'; });
+      // Use first active account's mode as the representative label (mixed-mode is rare).
+      const cycleOrder = (active[0] && active[0].postingOrder) || 'post-centric';
+      const cycleModeLabel = this._modeLabel(cycleOrder);
+      if (anyUnique) {
+        this.log(`🎯🔒 ${cycleModeLabel}: ${active.length} accounts, cycle ${cycle}`);
+        // Print the plan: one line listing all account → post assignments.
+        const planParts = active.map((a) => {
+          const ap = this._postsForAccount(a, cycle);
+          if (!ap.length) return `[${a.name}] → (waits this cycle)`;
+          const idx = this._data.posts.findIndex((p) => p.id === ap[0].id);
+          return `[${a.name}] → Post #${idx + 1}`;
+        });
+        // Print ~3 per line so the plan is readable but not excessively long.
+        for (let pi = 0; pi < planParts.length; pi += 3) {
+          this.log(planParts.slice(pi, pi + 3).join('   '));
+        }
+      } else {
+        this.log(`🎯 ${cycleModeLabel}: ${active.length} accounts — each posts all eligible posts`);
+      }
 
       await this._waitWhilePaused(); if (this._shouldStop()) break;
       await this._waitForConnectivity(); if (this._shouldStop()) break;
@@ -262,11 +314,14 @@ class Orchestrator {
         await this._waitWhilePaused(); if (this._shouldStop()) break;
         await this._waitForConnectivity(); if (this._shouldStop()) break;
         const batch = batches[b];
-        this.log(`═══ Batch ${b + 1}/${batches.length} — ${new Date().toLocaleTimeString()} — ${batch.map((a) => a.name).join(', ')} ═══`);
+        this.log(`═══ BATCH ${b + 1}: ${batch.map((a) => a.name).join(', ')} (${new Date().toLocaleTimeString()}) ═══`);
+        for (const ba of batch) {
+          this.log(`[${ba.name}] Starting with ${(ba.assignedGroups || []).length} groups`);
+        }
         const results = await Promise.all(batch.map(async (account) => {
           const r = await this._runAccount(account, cycle)
             .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [] }; });
-          this.log(`✓ [${account.name}] completed`);
+          this.log(`✓ [${account.name}] Completed`);
           const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [] };
           this._progress.accountsDone++;
           this._progress.posted += res.posted;
@@ -276,7 +331,7 @@ class Orchestrator {
           return res;
         }));
         const batchOk = results.filter((r) => r.progressed).length;
-        this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) ---`);
+        this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) --- Waiting ${settings.accountDelay || 1} minute(s) before next batch...`);
         for (const r of results) cyclePostedIds.push(...r.postedIds);
         if (this._finish) break;
         if (b < batches.length - 1 && !this._shouldStop()) {
