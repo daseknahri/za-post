@@ -138,21 +138,22 @@ class Orchestrator {
     const order = account.postingOrder || 'post-centric';
     const unique = order.includes('unique') || order === 'sequence';
 
-    // Stable per-account offset (its position in the account list) so unique-mode
-    // accounts pick DIFFERENT posts in the same cycle regardless of which accounts are
-    // enabled — independent of the volatile active-list index.
-    const offset = Math.max(0, data.accounts.findIndex((a) => a.name === account.name));
+    if (!unique) {
+      // post-centric / random -> account posts ALL its eligible posts each cycle.
+      return order.includes('random') ? seededShuffle(filtered, (cycle + 1) * 7919) : filtered;
+    }
 
-    let list = filtered;
-    if (order.includes('random')) list = seededShuffle(filtered, (cycle + 1) * 7919 + offset * 31);
-
-    if (!unique) return list; // post-centric / random -> all eligible posts
-
-    // unique / sequence -> one post: base (this account's own rotation) advances each
-    // cycle; offset gives cross-account diversity within a cycle.
-    const base = (this._rotation[account.name] || 0);
-    const pick = list[(((base + offset) % list.length) + list.length) % list.length];
-    return pick ? [pick] : [];
+    // UNIQUE / SEQUENCE -> deal each post exactly ONCE across the active accounts, round-robin.
+    // `remaining` = posts not yet dealt; the account at active-index k takes remaining[k].
+    // No wrap: if fewer posts remain than accounts, the higher-index accounts post nothing
+    // (so when posts < accounts, only that many accounts post and the campaign then completes).
+    let remaining = filtered.filter((p) => !this._dealt.has(p.id));
+    if (!remaining.length) return [];
+    if (order.includes('random')) remaining = seededShuffle(remaining, (cycle + 1) * 7919); // randomized deal order (consistent within the cycle)
+    const activeList = this._active || data.accounts.filter((a) => a.enabled !== false);
+    const k = activeList.findIndex((a) => a.name === account.name);
+    if (k < 0 || k >= remaining.length) return []; // this account's turn hasn't come up this cycle
+    return [remaining[k]];
   }
 
   // Returns { progressed, posted, pendingApproval, errors }. Rotation only advances
@@ -212,7 +213,8 @@ class Orchestrator {
   }
 
   async _loop(getData) {
-    this._rotation = store.loadRotation();
+    const _st = store.loadRotation();
+    this._dealt = new Set(Array.isArray(_st.dealt) ? _st.dealt : []); // post-ids already dealt (unique modes)
     let cycle = 0;
     while (!this._shouldStop()) {
       this._data = getData(); // re-read each cycle so mid-run edits take effect
@@ -220,8 +222,16 @@ class Orchestrator {
       if (!posts.length) { this.log('⚠️ No posts configured — stopping.'); break; }
       const active = accounts.filter((a) => a.enabled !== false);
       if (!active.length) { this.log('⚠️ No enabled accounts — stopping.'); break; }
+      this._active = active;
 
       cycle++;
+      // Unique modes deal each post once across accounts. When every active account is unique
+      // and no un-dealt posts remain, the campaign is complete — stop and reset for the next run.
+      if (active.reduce((s, a) => s + this._postsForAccount(a, cycle).length, 0) === 0) {
+        this.log('✅ All posts have been distributed — campaign complete.');
+        this._dealt.clear(); try { store.saveRotation({ dealt: [] }); } catch {}
+        break;
+      }
       this._progress.cycle = cycle;
       this._progress.accountsTotal = active.length;
       this._progress.accountsDone = 0;
@@ -254,26 +264,17 @@ class Orchestrator {
         const batchOk = results.filter((r) => r.progressed).length;
         this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) ---`);
         for (const r of results) cyclePostedIds.push(...r.postedIds);
-        // Advance + persist rotation for THIS batch's unique/sequence accounts that made
-        // progress (mid-cycle durable). SKIPPED when autoDeletePosted is on: deletion shrinks
-        // the library each cycle, which already advances the window — advancing the base too
-        // would skip posts. Non-unique accounts don't consume rotation slots.
-        if (!settings.autoDeletePosted) {
-          let rotationDirty = false;
-          for (const { account, progressed } of results) {
-            const ord = account.postingOrder || 'post-centric';
-            if (progressed && (ord.includes('unique') || ord === 'sequence')) {
-              this._rotation[account.name] = (this._rotation[account.name] || 0) + 1;
-              rotationDirty = true;
-            }
-          }
-          if (rotationDirty) store.saveRotation(this._rotation);
-        }
         if (this._finish) break;
         if (b < batches.length - 1 && !this._shouldStop()) {
           this.log(`⏳ Waiting ${settings.accountDelay || 1} min before next batch…`);
           await this._interruptibleSleep((settings.accountDelay || 1) * 60000);
         }
+      }
+      // Mark this cycle's published posts as DEALT (drives the round-robin: each post once;
+      // a failed account's post stays un-dealt and is re-dealt next cycle). Persisted for resume.
+      if (cyclePostedIds.length) {
+        for (const id of cyclePostedIds) this._dealt.add(id);
+        try { store.saveRotation({ dealt: [...this._dealt] }); } catch {}
       }
       if (this._shouldStop()) break;
 
