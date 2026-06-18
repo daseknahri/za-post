@@ -822,6 +822,9 @@ function renderAccounts() {
     } else if (account.status === 'logging_in') {
       statusClass = 'logging-in';
       statusText = 'Logging In…';
+    } else if (account.status === 'rate_limited') {
+      statusClass = 'rate-limited';
+      statusText = 'Rate-limited';
     }
 
     // Show lastMessage for ALL statuses (not just error/not_logged_in)
@@ -830,10 +833,12 @@ function renderAccounts() {
       const msg = account.lastMessage.length > 80 ? account.lastMessage.substring(0, 80) + '...' : account.lastMessage;
       const msgColor = (account.status === 'error' || account.status === 'not_logged_in') ? '#dc2626'
         : (account.status === 'logged_in') ? '#22c55e'
+        : (account.status === 'rate_limited') ? '#f59e0b'
         : (account.status === 'checking' || account.status === 'logging_in') ? '#f59e0b'
         : '#9ca3af';
       const msgIcon = (account.status === 'error' || account.status === 'not_logged_in') ? '⚠️'
         : (account.status === 'logged_in') ? '✅'
+        : (account.status === 'rate_limited') ? '⏸'
         : (account.status === 'checking') ? '🔍'
         : (account.status === 'logging_in') ? '🔐'
         : 'ℹ️';
@@ -891,7 +896,7 @@ function renderAccounts() {
             ${subName ? `<div style="color: #9ca3af; font-size: 12px; margin-top: 2px;">${escapeHtml(subName)}</div>` : ''}
             ${!isEnabled ? `<div style="color:#f59e0b;font-size:11px;font-weight:600;margin-top:2px;">Disabled — will be skipped by automation</div>` : ''}
             <div class="account-status">
-              <span class="status-dot ${statusClass}" style="${account.status === 'error' ? 'background-color: #dc2626;' : account.status === 'checking' ? 'background-color: #f59e0b;' : account.status === 'logging_in' ? 'background-color: #3b82f6;' : ''}"></span>
+              <span class="status-dot ${statusClass}" style="${account.status === 'error' ? 'background-color: #dc2626;' : account.status === 'checking' ? 'background-color: #f59e0b;' : account.status === 'logging_in' ? 'background-color: #3b82f6;' : account.status === 'rate_limited' ? 'background-color: #f59e0b;' : ''}"></span>
               <span>${statusText}</span>
             </div>
             ${errorMessageHtml}

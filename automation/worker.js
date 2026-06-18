@@ -347,7 +347,7 @@ async function runAccount(o) {
   // Fix #4: profile-lock guard — two Chromium instances can't share a userDataDir.
   if (isLoginOpen && isLoginOpen(name)) {
     log(`🚫 [${name}] login browser is open for this account — skipping`);
-    return { posted: 0, errors: 1, pendingApproval: 0, postedIds: [] };
+    return { posted: 0, errors: 1, pendingApproval: 0, noRetry: false, flag: null, postedIds: [] };
   }
 
   // An account with NO assigned groups is SKIPPED (it must NOT fall back to posting to
@@ -357,7 +357,7 @@ async function runAccount(o) {
     : [];
   const targetGroups = assigned.slice(0, settings.postsPerGroup || 15);
 
-  if (!targetGroups.length) { log(`⏭️ [${name}] no assigned groups — skipping`); return { posted: 0, errors: 0, pendingApproval: 0 }; }
+  if (!targetGroups.length) { log(`⏭️ [${name}] no assigned groups — skipping`); return { posted: 0, errors: 0, pendingApproval: 0, noRetry: false, flag: null, postedIds: [] }; }
 
   const launchArgs = [
     '--no-sandbox',
@@ -387,7 +387,7 @@ async function runAccount(o) {
   }
 
   let browser;
-  let posted = 0, errors = 0, pendingApproval = 0, noRetry = false;
+  let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null;
   try {
     browser = await puppeteer.launch({
       headless: true, // new headless (Chrome 148): renders like real Chrome but NO visible window / taskbar entry
@@ -433,7 +433,18 @@ async function runAccount(o) {
       }
       await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await sleep(2000);
-      log(`🔑 [${name}] used stored cookies (profile not pre-authed)`);
+      // Re-verify: confirm the cookie injection actually recovered the session.
+      const cookieAuthed = await page.evaluate(() =>
+        !/login|checkpoint/.test(location.href) && !/continue as|use another profile/i.test(document.body.innerText || '')
+      ).catch(() => false);
+      const hasCUser = cookieAuthed && (await page.cookies().catch(() => [])).some((c) => c.name === 'c_user' && c.value);
+      if (cookieAuthed && hasCUser) {
+        log(`🔄 [${name}] session recovered with saved cookies`);
+      } else {
+        log(`❌ [${name}] re-login with saved cookies failed — flagging for manual login`);
+        flag = 'needs_login'; noRetry = true;
+        return { posted: 0, errors: 1, pendingApproval: 0, noRetry, flag, postedIds: [] };
+      }
     } else if (profileAuthed) {
       log(`🔑 [${name}] using existing profile session`);
     }
@@ -467,7 +478,7 @@ async function runAccount(o) {
         // Per-group START banner — fired only after nav succeeds and before the auth checks.
         log(`📂 [${name}] GROUP: ${g.name || gid}`);
 
-        if (/login|checkpoint/.test(page.url())) { log(`🚫 [${name}] not logged in / checkpoint`); errors++; noRetry = true; break; }
+        if (/login|checkpoint/.test(page.url())) { log(`🚫 [${name}] not logged in / checkpoint`); errors++; noRetry = true; flag = 'needs_login'; break; }
         // Expired sessions don't redirect — they show the "Continue as <name>" picker
         // or a non-member "Join Group / Log in" wall. Detect and abort early & clearly.
         const authBad = await page.evaluate(() => {
@@ -477,11 +488,11 @@ async function runAccount(o) {
           if (hasBtn(/^join group$/i) && hasBtn(/^log in$/i)) return 'not-authenticated';
           return null;
         });
-        if (authBad) { log(`🚫 [${name}] ${authBad === 'session-expired' ? 'session expired — re-login required' : 'not logged in / not a member'} (${g.name || gid})`); errors++; noRetry = true; break; }
+        if (authBad) { log(`🚫 [${name}] ${authBad === 'session-expired' ? 'session expired — re-login required' : 'not logged in / not a member'} (${g.name || gid})`); errors++; noRetry = true; flag = 'needs_login'; break; }
 
         // Clear cookie/notification banners, then bail out of this account if rate-limited.
         await dismissPopups(page);
-        if (await checkRateLimit(page)) { log(`⏸ [${name}] rate-limited by Facebook — backing off this account`); errors++; noRetry = true; break; }
+        if (await checkRateLimit(page)) { log(`⏸ [${name}] rate-limited by Facebook — backing off this account`); errors++; noRetry = true; flag = 'rate_limited'; break; }
 
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
@@ -598,7 +609,7 @@ async function runAccount(o) {
     if (anonLocal && proxyChain) { try { await proxyChain.closeAnonymizedProxy(anonLocal, true); } catch {} }
     for (const t of tempImages) { try { fs.unlinkSync(t); } catch {} }
   }
-  return { posted, errors, pendingApproval, noRetry };
+  return { posted, errors, pendingApproval, noRetry, flag };
 }
 
 // Strip fields Puppeteer's setCookie rejects; coerce sameSite.
