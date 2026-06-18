@@ -33,6 +33,12 @@ app.on('second-instance', () => {
   if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); }
 });
 
+// Remote-access tunnel: in the packaged app the cloudflared binary is unpacked from the
+// asar (asarUnpack) — point the cloudflared package at that path (it reads CLOUDFLARED_BIN).
+if (app.isPackaged) {
+  process.env.CLOUDFLARED_BIN = path.join(process.resourcesPath, 'app.asar.unpacked', 'node_modules', 'cloudflared', 'bin', 'cloudflared.exe');
+}
+
 const store = require('./lib/store');
 const remote = require('./server');
 const { Orchestrator } = require('./automation/orchestrator');

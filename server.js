@@ -11,6 +11,7 @@ const cors = require('cors');
 const multer = require('multer');
 
 let httpServer = null;
+let activeTunnel = null;             // cloudflared Tunnel handle (for clean shutdown)
 let logs = [];                       // in-memory ring buffer (max 500)
 let hooks = {
   getData: () => ({ posts: [] }),
@@ -128,16 +129,38 @@ function startServer(port, injected) {
   });
 }
 
-function stopServer() { try { httpServer && httpServer.close(); } catch {} httpServer = null; }
+function stopServer() {
+  try { httpServer && httpServer.close(); } catch {} httpServer = null;
+  try { activeTunnel && activeTunnel.stop && activeTunnel.stop(); } catch {} activeTunnel = null;
+}
+function stopTunnel() { try { activeTunnel && activeTunnel.stop && activeTunnel.stop(); } catch {} activeTunnel = null; }
 
+// Start a Cloudflare quick tunnel (trycloudflare.com) for remote access to the dashboard.
+// We parse the URL from cloudflared's own output (the bundled cloudflared package's built-in
+// 'url' regex is outdated for newer cloudflared builds, so it never fires). Robust + isolated:
+// child errors/exit can't crash the app.
 async function startTunnel(port, onUrl) {
   try {
-    const { tunnel } = require('cloudflared');
-    const t = tunnel({ '--url': `http://localhost:${port}` });
-    const url = await new Promise((resolve) => { t.on('url', (u) => resolve(u)); t.on('error', () => resolve(null)); setTimeout(() => resolve(null), 15000); });
-    if (url) { addLog(`Tunnel: ${url}`); onUrl && onUrl(url); }
+    // Use Tunnel.quick() — it builds `cloudflared tunnel --url …` (a quick trycloudflare
+    // tunnel). NB: the package's tunnel({'--url':…}) builds `tunnel run --url …` which is
+    // for NAMED tunnels and exits immediately — that was the long-standing bug.
+    const { Tunnel } = require('cloudflared');
+    const t = Tunnel.quick(`http://localhost:${port}`);
+    activeTunnel = t;
+    const url = await new Promise((resolve) => {
+      let resolved = false;
+      const done = (u) => { if (!resolved) { resolved = true; resolve(u); } };
+      const scan = (chunk) => { const m = String(chunk).match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i); if (m) done(m[0]); };
+      try { t.on('url', (u) => { const m = String(u).match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i); done(m ? m[0] : u); }); } catch {}
+      try { t.on('stdout', scan); t.on('stderr', scan); } catch {}
+      try { t.on('error', (e) => addLog(`Tunnel error: ${e && e.message ? e.message : e}`)); } catch {}
+      try { t.on('exit', () => done(null)); } catch {}
+      setTimeout(() => done(null), 30000); // quick tunnels usually appear in ~5s; allow margin
+    });
+    if (url) { addLog(`🌐 Remote access ready: ${url}`); onUrl && onUrl(url); }
+    else { addLog('🌐 Tunnel started but no URL was captured (check connectivity).'); }
     return url;
-  } catch (e) { addLog(`Tunnel unavailable: ${e.message}`); return null; }
+  } catch (e) { addLog(`🌐 Tunnel unavailable: ${e && e.message ? e.message : e}`); return null; }
 }
 
-module.exports = { startServer, stopServer, startTunnel, addLog };
+module.exports = { startServer, stopServer, startTunnel, stopTunnel, addLog };
