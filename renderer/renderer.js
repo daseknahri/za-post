@@ -101,6 +101,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         isPaused = data.paused;
         updateAutomationControls();
       }
+      // Offline indicator
+      const offlineEl = document.getElementById('offline-indicator');
+      if (offlineEl) offlineEl.style.display = data.offline ? 'inline-block' : 'none';
     });
   }
 

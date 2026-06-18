@@ -17,6 +17,20 @@ const { runAccount } = require('./worker');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+let axios; try { axios = require('axios'); } catch {}
+
+async function isOnline() {
+  if (!axios) return true;
+  const urls = ['https://connectivitycheck.gstatic.com/generate_204', 'https://www.facebook.com'];
+  for (const url of urls) {
+    try {
+      await axios.get(url, { timeout: 8000, validateStatus: () => true, maxRedirects: 1 });
+      return true;
+    } catch {}
+  }
+  return false;
+}
+
 function matchesFilter(post, filter) {
   if (filter === 'with-comments') return !!(post.comment && post.comment.trim());
   if (filter === 'without-comments') return !(post.comment && post.comment.trim());
@@ -74,12 +88,33 @@ class Orchestrator {
   }
   isPaused() { return this._paused; }
   async _waitWhilePaused() { while (this._paused && !this._stop) await sleep(500); }
+
+  async _waitForConnectivity() {
+    let offlineLogged = false;
+    while (!this._shouldStop()) {
+      if (await isOnline()) {
+        if (offlineLogged) {
+          this.log('🌐 Connection restored — continuing');
+          if (this._progress) { this._progress.offline = false; this.emit('automation-progress', { ...this._progress }); }
+        }
+        return true;
+      }
+      if (!offlineLogged) {
+        offlineLogged = true;
+        this.log('🌐 No internet connection — holding until it returns...');
+        if (this._progress) { this._progress.offline = true; this.emit('automation-progress', { ...this._progress }); }
+      }
+      await this._interruptibleSleep(15000); // re-check every 15s, but break instantly on Stop
+    }
+    return false;
+  }
+
   log(msg) { this.emit('automation-log', msg); }
 
   async start(getData) {
     if (this.running) return { success: false, error: 'Automation already running' };
     this._stop = false; this._paused = false; this._finish = false; this.running = true;
-    this._progress = { running: true, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0 };
+    this._progress = { running: true, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0, offline: false };
     this.emit('automation-started');
     this.emit('automation-progress', { ...this._progress });
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
@@ -194,12 +229,14 @@ class Orchestrator {
       this.log(`🔄 Cycle ${cycle}: ${active.length} account(s), ${settings.parallelAccounts || 3} in parallel`);
 
       await this._waitWhilePaused(); if (this._shouldStop()) break;
+      await this._waitForConnectivity(); if (this._shouldStop()) break;
 
       const batches = chunk(active, settings.parallelAccounts || 3);
       const cyclePostedIds = [];
       for (let b = 0; b < batches.length; b++) {
         if (this._shouldStop()) break;
         await this._waitWhilePaused(); if (this._shouldStop()) break;
+        await this._waitForConnectivity(); if (this._shouldStop()) break;
         const batch = batches[b];
         this.log(`═══ Batch ${b + 1}/${batches.length} — ${new Date().toLocaleTimeString()} — ${batch.map((a) => a.name).join(', ')} ═══`);
         const results = await Promise.all(batch.map(async (account) => {
