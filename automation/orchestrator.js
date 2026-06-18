@@ -280,8 +280,7 @@ class Orchestrator {
         for (const r of results) cyclePostedIds.push(...r.postedIds);
         if (this._finish) break;
         if (b < batches.length - 1 && !this._shouldStop()) {
-          this.log(`⏳ Waiting ${settings.accountDelay || 1} min before next batch…`);
-          await this._interruptibleSleep((settings.accountDelay || 1) * 60000);
+          await this._waitWithCountdown((settings.accountDelay || 1) * 60000, 'Next batch');
         }
       }
       // Mark this cycle's published posts as DEALT (drives the round-robin: each post once;
@@ -310,13 +309,32 @@ class Orchestrator {
         this.log(`🏁 Reached maxCycles (${settings.maxCycles}) — finishing.`); break;
       }
       this.log(`✅ Cycle ${cycle} complete. Waiting ${settings.waitInterval || 60} min before next cycle…`);
-      await this._interruptibleSleep((settings.waitInterval || 60) * 60000);
+      await this._waitWithCountdown((settings.waitInterval || 60) * 60000, 'Next cycle');
     }
   }
 
   async _interruptibleSleep(ms) {
     const step = 1000; let waited = 0;
     while (waited < ms && !this._shouldStop()) { await sleep(Math.min(step, ms - waited)); waited += step; }
+  }
+
+  // Sleep with a live countdown so the log keeps updating during long waits (between
+  // cycles/batches) instead of going silent. Logs every 30s; interruptible by Stop.
+  async _waitWithCountdown(ms, label) {
+    if (!(ms > 0)) return;
+    const end = Date.now() + ms;
+    let lastLog = 0;
+    const fmt = (sec) => { const m = Math.floor(sec / 60), s = sec % 60; return (m > 0 ? m + 'm ' : '') + s + 's'; };
+    while (Date.now() < end && !this._shouldStop()) {
+      if (lastLog === 0 || Date.now() - lastLog >= 30000) {
+        lastLog = Date.now();
+        const remaining = Math.ceil((end - Date.now()) / 1000);
+        this.log(`⏳ ${label} in ${fmt(remaining)}…`);
+        if (this._progress) { this._progress.waitingLabel = label; this._progress.waitRemainingSec = remaining; this.emit('automation-progress', { ...this._progress }); }
+      }
+      await sleep(1000);
+    }
+    if (this._progress) { this._progress.waitingLabel = null; this._progress.waitRemainingSec = 0; this.emit('automation-progress', { ...this._progress }); }
   }
 }
 
