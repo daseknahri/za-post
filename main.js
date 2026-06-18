@@ -4,9 +4,20 @@
 // via lib/store, runs automation via automation/orchestrator + worker, exposes a
 // remote dashboard via server.js, and uses a permissive LOCAL license (no server).
 
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
+
+// ---- persistent log file (assigned in whenReady, guarded until then) --------
+let LOG_DIR = null;
+let LOG_FILE = null;
+
+function appendLogFile(line) {
+  try {
+    if (!LOG_FILE) return;
+    fs.appendFile(LOG_FILE, '[' + new Date().toISOString() + '] ' + String(line) + '\n', () => {});
+  } catch {}
+}
 
 // Multi-profile support: `electron . --profile=base` runs an isolated instance
 // (separate userData) so the two account sets (King + base) coexist, mirroring the
@@ -33,8 +44,16 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 
-process.on('uncaughtException', (e) => console.error('[FATAL] uncaughtException:', e));
-process.on('unhandledRejection', (e) => console.error('[FATAL] unhandledRejection:', e));
+process.on('uncaughtException', (e) => {
+  console.error('[FATAL] uncaughtException:', e);
+  appendLogFile('[FATAL] uncaughtException: ' + (e && e.stack || e));
+  if (mainWindow && !mainWindow.isDestroyed()) emit('automation-log', '❌ [FATAL] ' + (e && e.message || e));
+});
+process.on('unhandledRejection', (e) => {
+  console.error('[FATAL] unhandledRejection:', e);
+  appendLogFile('[FATAL] unhandledRejection: ' + (e && e.stack || e));
+  if (mainWindow && !mainWindow.isDestroyed()) emit('automation-log', '❌ [FATAL] ' + (e && e.message || e));
+});
 
 const REMOTE_PORT = 3000;
 let mainWindow = null;
@@ -49,7 +68,11 @@ function getData() { return store.load(); }
 function send(channel, payload) { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload); }
 function emit(channel, payload) {
   send(channel, payload);
-  if (channel === 'automation-log') remote.addLog(typeof payload === 'string' ? payload : JSON.stringify(payload));
+  if (channel === 'automation-log') {
+    const line = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    remote.addLog(line);
+    appendLogFile(line);
+  }
 }
 const ok = (extra = {}) => ({ success: true, ...extra });
 const fail = (error) => ({ success: false, error: String(error && error.message ? error.message : error) });
@@ -115,6 +138,20 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   store.init(app.getPath('userData'));
+
+  // ---- log file setup & startup rotation ------------------------------------
+  LOG_DIR = path.join(app.getPath('userData'), 'logs');
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  LOG_FILE = path.join(LOG_DIR, 'automation.log');
+  try {
+    const stat = fs.statSync(LOG_FILE);
+    if (stat.size > 5 * 1024 * 1024) {
+      fs.renameSync(LOG_FILE, path.join(LOG_DIR, 'automation.log.1'));
+    }
+  } catch {}
+  appendLogFile('--- session start ---');
+  // ---------------------------------------------------------------------------
+
   orchestrator = new Orchestrator(emit, { isLoginOpen: (name) => loginBrowsers.has(name) });
 
   // Remote control server + tunnel (best effort). Hooks delegate all mutations
@@ -631,6 +668,9 @@ ipcMain.handle('select-image', async () => {
 // Permissive LOCAL license — the app runs without a validation server.
 ipcMain.handle('get-license-info', () => ({ valid: true, lifetime: true, maxGroups: 9999, maxAccounts: 9999 }));
 ipcMain.handle('get-remote-url', () => tunnelUrl || '');
+ipcMain.handle('open-logs-folder', () => {
+  try { shell.openPath(LOG_DIR || app.getPath('userData')); return ok(); } catch (e) { return fail(e); }
+});
 ipcMain.on('validate-license-async', async (e, key) => {
   try {
     const r = await license.activate(app.getPath('userData'), key, licenseServerUrl());

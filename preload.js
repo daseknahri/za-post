@@ -63,5 +63,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   onAutomationProgress: (callback) => {
     ipcRenderer.on('automation-progress', (_e, data) => callback(data));
-  }
+  },
+
+  // Open the logs folder in the OS file explorer
+  openLogsFolder: () => ipcRenderer.invoke('open-logs-folder'),
 });

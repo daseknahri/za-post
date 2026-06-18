@@ -404,7 +404,15 @@
         </div>
 
         <div class="automation-logs">
-          <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Live Logs</h3>
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider">Live Logs</h3>
+            <button
+              onclick="openLogsFolder()"
+              class="flex items-center gap-1.5 px-3 py-1.5 bg-dark-600 rounded-lg text-gray-400 text-xs font-medium hover:bg-dark-500 hover:text-gray-200 transition-all duration-200 border border-white/5"
+              title="Open the logs folder in Explorer">
+              📁 Open Logs Folder
+            </button>
+          </div>
           <div
             class="logs-container bg-dark-900/80 backdrop-blur-sm border border-white/5 rounded-2xl p-4 h-[500px] overflow-y-auto font-mono text-xs"
             id="logs-container">

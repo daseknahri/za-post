@@ -1610,9 +1610,37 @@ function addLog(text) {
     entry.classList.add('success');
   }
 
-  entry.textContent = text;
+  // Monospace HH:MM:SS timestamp prefix in muted colour — does not change message text
+  const now = new Date();
+  const ts = now.toTimeString().slice(0, 8); // HH:MM:SS
+  const tsSpan = document.createElement('span');
+  tsSpan.textContent = ts + ' ';
+  tsSpan.style.cssText = 'color:#4b5563;font-size:10px;user-select:none;margin-right:4px;';
+  entry.appendChild(tsSpan);
+
+  const msgSpan = document.createElement('span');
+  msgSpan.textContent = text;
+  entry.appendChild(msgSpan);
+
   container.appendChild(entry);
+
+  // DOM cap: keep at most ~1000 entries; trim to ~800 when exceeded
+  const MAX_ENTRIES = 1000;
+  const TRIM_TO = 800;
+  if (container.childElementCount > MAX_ENTRIES) {
+    const toRemove = container.childElementCount - TRIM_TO;
+    for (let i = 0; i < toRemove; i++) {
+      if (container.firstChild) container.removeChild(container.firstChild);
+    }
+  }
+
   container.scrollTop = container.scrollHeight;
+}
+
+function openLogsFolder() {
+  if (window.electronAPI && window.electronAPI.openLogsFolder) {
+    window.electronAPI.openLogsFolder().catch(() => {});
+  }
 }
 
 // Settings
