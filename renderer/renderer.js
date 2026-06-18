@@ -1788,9 +1788,13 @@ function addLog(text) {
   const entry = document.createElement('div');
   entry.className = 'log-entry';
 
-  if (text.toLowerCase().includes('error') || text.toLowerCase().includes('failed')) {
+  // Colour by explicit emoji markers first (reliable), then words — but never let
+  // "errors=0" / "Errors: 0" (a success summary) get flagged red.
+  const low = text.toLowerCase();
+  const zeroErr = /errors?\s*[:=]\s*0\b/.test(low);
+  if (/❌|🚫|🛑/.test(text) || ((low.includes('error') || low.includes('failed')) && !zeroErr)) {
     entry.classList.add('error');
-  } else if (text.toLowerCase().includes('success') || text.toLowerCase().includes('completed')) {
+  } else if (/✅|🎉|🏁/.test(text) || low.includes('success') || low.includes('completed') || low.includes('posted successfully')) {
     entry.classList.add('success');
   }
 

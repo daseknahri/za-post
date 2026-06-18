@@ -150,7 +150,7 @@ async function openComposerByText(page) {
 // dialog's editable to actually appear. Retries — returns true only when it opened.
 async function openComposer(page, log, name) {
   for (let attempt = 1; attempt <= 4; attempt++) {
-    if (log) log(`🧭 [${name}] opening composer (attempt ${attempt}/4)`);
+    if (log) log(`Opening composer (attempt ${attempt}/4)`);
     // The composer lives at the TOP of the feed — make sure we're there and nothing covers it.
     await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
     await sleep(600);
@@ -200,7 +200,7 @@ async function openComposer(page, log, name) {
     if (pt) await page.mouse.click(pt.x, pt.y, { delay: 50 }).catch(() => {});
     else await openComposerByText(page).catch(() => false);
     const ok = await page.waitForSelector('div[role="dialog"] [contenteditable="true"], div[role="dialog"] [role="textbox"]', { timeout: 6000 }).then(() => true).catch(() => false);
-    if (ok) { if (attempt > 1 && log) log(`📝 [${name}] composer opened (attempt ${attempt})`); return true; }
+    if (ok) { if (attempt > 1 && log) log(`Composer opened (attempt ${attempt})`); return true; }
     if (log) {
       const hint = await page.evaluate(() => {
         const body = (document.body.innerText || '').replace(/\s+/g, ' ').trim();
@@ -210,7 +210,7 @@ async function openComposer(page, log, name) {
           .slice(0, 8);
         return { buttons, body: body.slice(0, 180) };
       }).catch(() => null);
-      if (hint) log(`🔎 [${name}] composer not open yet; visible buttons: ${hint.buttons.join(' | ') || '(none)'}`);
+      if (hint) log(`Composer not open yet; visible buttons: ${hint.buttons.join(' | ') || '(none)'}`);
     }
     await sleep(1500);
   }
@@ -581,6 +581,7 @@ async function runAccount(o) {
   // Fix #4: profile-lock guard — two Chromium instances can't share a userDataDir.
   if (isLoginOpen && isLoginOpen(name)) {
     log(`🚫 [${name}] login browser is open for this account — skipping`);
+    report('', '', 'skipped', 'login browser open for this account', '');
     return { posted: 0, errors: 1, pendingApproval: 0, noRetry: false, flag: null, postedIds: [] };
   }
 
@@ -591,7 +592,7 @@ async function runAccount(o) {
     : [];
   const targetGroups = assigned; // post to ALL the account's assigned groups (the user selects them per account)
 
-  if (!targetGroups.length) { log(`⏭️ [${name}] no assigned groups — skipping`); return { posted: 0, errors: 0, pendingApproval: 0, noRetry: false, flag: null, postedIds: [] }; }
+  if (!targetGroups.length) { log(`⏭️ [${name}] no assigned groups — skipping`); report('', '', 'skipped', 'no assigned groups', ''); return { posted: 0, errors: 0, pendingApproval: 0, noRetry: false, flag: null, postedIds: [] }; }
 
   const launchArgs = [
     '--no-sandbox',
@@ -736,7 +737,7 @@ async function runAccount(o) {
         // Per-group START banner — fired only after nav succeeds and before the auth checks.
         step('Group loaded');
 
-        if (/login|checkpoint/.test(page.url())) { log(`🚫 [${name}] not logged in / checkpoint`); errors++; noRetry = true; flag = 'needs_login'; report(groupName, gid, 'error', 'not logged in / checkpoint', ''); break; }
+        if (/login|checkpoint/.test(page.url())) { step('Not logged in / checkpoint — aborting account'); errors++; noRetry = true; flag = 'needs_login'; report(groupName, gid, 'error', 'not logged in / checkpoint', ''); break; }
         // Expired sessions don't redirect — they show the "Continue as <name>" picker
         // or a non-member "Join Group / Log in" wall. Detect and abort early & clearly.
         const authBad = await page.evaluate(() => {
@@ -754,7 +755,7 @@ async function runAccount(o) {
 
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
-        const opened = await openComposer(page, log, name);
+        const opened = await openComposer(page, step, name);
         if (!opened) { step('Could not open composer modal; skipping group'); errors++; report(groupName, gid, 'error', 'composer did not open', ''); continue; }
         await sleep(1500);
         await dismissPopups(page);
@@ -891,9 +892,11 @@ async function runAccount(o) {
       // Interruptible delay between groups (respects Stop + configurable groupDelay).
       if (i < targetGroups.length - 1) {
         const d = (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000;
-        const dMin = Math.round(d / 60000);
-        step(`Wait ${dMin > 0 ? dMin + 'min' : Math.round(d / 1000) + 's'} before next group`);
-        await sleepInterruptible(d, shouldStop, 1000);
+        if (d > 0) {
+          const dMin = Math.round(d / 60000);
+          step(`Wait ${dMin > 0 ? dMin + 'min' : Math.round(d / 1000) + 's'} before next group`);
+          await sleepInterruptible(d, shouldStop, 1000);
+        }
       }
     }
     // Persist refreshed cookies for next run.

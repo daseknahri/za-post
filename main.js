@@ -16,7 +16,7 @@ let LOG_FILE = null;
 function appendLogFile(line) {
   try {
     if (!LOG_FILE) return;
-    fs.appendFile(LOG_FILE, '[' + new Date().toISOString() + '] ' + String(line) + '\n', () => {});
+    fs.appendFile(LOG_FILE, '[' + new Date().toISOString() + '] ' + String(line) + '\n', { encoding: 'utf8' }, () => {});
   } catch {}
 }
 
@@ -225,7 +225,7 @@ app.whenReady().then(async () => {
 
   // Kill any Chromium left orphaned by a previous crash/force-kill so its locked
   // profile dir doesn't block this session's launches. Best-effort, non-blocking.
-  killOrphanChromium().then((n) => { if (n) { const m = `🧹 cleaned up ${n} orphaned browser process(es) from a previous run`; appendLogFile(m); emit('automation-log', m); } }).catch(() => {});
+  killOrphanChromium().then((n) => { if (n) emit('automation-log', `🧹 cleaned up ${n} orphaned browser process(es) from a previous run`); }).catch(() => {}); // emit() already writes to the log file
 
   // ---- run-state file (shutdown/crash resilience) ---------------------------
   RUN_STATE_FILE = path.join(app.getPath('userData'), 'run-state.json');

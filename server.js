@@ -28,7 +28,12 @@ let hooks = {
 
 function shapeLog(l) {
   const msg = l.msg || '';
-  const type = /error|fail|❌|🚫/i.test(msg) ? 'error' : /success|✅|posted|published|complete/i.test(msg) ? 'success' : 'info';
+  // Classify by explicit emoji markers first (most reliable), then fall back to words —
+  // but never let "errors=0" / "Errors: 0" (a success summary) read as an error.
+  const zeroErr = /errors?\s*[:=]\s*0\b/i.test(msg);
+  const type = (/❌|🚫|🛑/.test(msg) || (/\b(error|errors|failed|failure)\b/i.test(msg) && !zeroErr)) ? 'error'
+    : (/✅|🎉|🏁/.test(msg) || /\b(posted|published|complete|completed|success)\b/i.test(msg)) ? 'success'
+    : 'info';
   return { timestamp: l.t, type, message: msg };
 }
 
