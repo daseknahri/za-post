@@ -176,13 +176,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Auto-delete of posted items is handled in the backend (orchestrator), per cycle.
   });
 
-  window.electronAPI.onAutomationStopped(async (code) => {
+  window.electronAPI.onAutomationStopped(async (reason) => {
     isAutomationRunning = false;
     isPaused = false;
     isStopping = false;
     updateAutomationControls();
-    addLog(`\n✅ Automation stopped with exit code ${code}\n`);
+    addLog(`\n✅ Automation ${reason || 'stopped'}.\n`);
     await loadData(); // refresh — the backend may have auto-deleted posted items during the run
+  });
+
+  // End-of-run summary: render a persistent roll-up the operator can read at a glance.
+  window.electronAPI.onAutomationSummary((summary) => {
+    lastRunSummary = summary;
+    renderRunSummary(summary);
   });
 
   window.electronAPI.onLoginBrowserOpened((accountName) => {
@@ -1603,6 +1609,30 @@ function updateAutomationControls() {
   updateDashboard();
 }
 
+let lastRunSummary = null;
+
+// Render a persistent end-of-run summary into the log pane + notify the operator.
+function renderRunSummary(s) {
+  if (!s) return;
+  const mins = Math.floor((s.durationMs || 0) / 60000), secs = Math.round(((s.durationMs || 0) % 60000) / 1000);
+  const lines = ['', '📋 ═══════ RUN SUMMARY ═══════'];
+  lines.push(`   Result: ${s.reason}`);
+  lines.push(`   Posted: ${s.posted}   Pending approval: ${s.pending}   Errors: ${s.errors}`);
+  lines.push(`   Cycles: ${s.cycles}   Duration: ${mins}m ${secs}s`);
+  const byAcc = s.byAccount || {};
+  const names = Object.keys(byAcc);
+  if (names.length) {
+    lines.push('   Per account:');
+    for (const n of names) { const a = byAcc[n]; lines.push(`     • ${n}: posted=${a.posted} pending=${a.pending} errors=${a.errors}`); }
+  }
+  lines.push('   Full audit trail → Logs folder → run-report.csv');
+  lines.push('═══════════════════════════════');
+  addLog(lines.join('\n') + '\n');
+  try { showNotification(`Run ${s.reason}: ${s.posted} posted, ${s.pending} pending, ${s.errors} errors`, s.errors ? 'error' : 'success'); } catch {}
+  // Desktop notification so an operator who walked away still sees the result.
+  try { if (window.Notification && Notification.permission === 'granted') new Notification('Za Post — run ' + s.reason, { body: `${s.posted} posted, ${s.pending} pending, ${s.errors} errors` }); } catch {}
+}
+
 async function startAutomation() {
   if (appData.posts.length === 0) {
     showNotification('Please add some posts first', 'error');
@@ -1616,6 +1646,16 @@ async function startAutomation() {
 
   if (appData.accounts.length === 0) {
     showNotification('Please add some accounts first', 'error');
+    return;
+  }
+
+  // Effective-campaign preflight: an account can only post if it is ENABLED + LOGGED IN +
+  // has ≥1 assigned group. If none qualify, the run would post nothing for hours while
+  // showing "Running" — hard-block with a clear, actionable reason instead.
+  const eligible = appData.accounts.filter(a => a.enabled !== false && a.status === 'logged_in' && (a.assignedGroups || []).length > 0);
+  if (eligible.length === 0) {
+    showNotification('No account can post yet — each needs to be enabled, logged in, and assigned at least 1 group. Fix accounts, then Start.', 'error');
+    addLog('🛑 Start blocked: no eligible account (need enabled + logged-in + ≥1 assigned group).\n');
     return;
   }
 
@@ -1635,19 +1675,27 @@ async function startAutomation() {
   clearLogs();
   addLog('🚀 Starting automation...\n');
 
-  localStartInFlight = true;
-  const result = await window.electronAPI.startAutomation();
+  // Ask once for desktop-notification permission so the end-of-run summary can alert an
+  // operator who walked away during the (potentially hours-long) run.
+  try { if (window.Notification && Notification.permission === 'default') Notification.requestPermission(); } catch {}
 
-  if (result.success) {
-    isAutomationRunning = true;
-    isPaused = false;
-    isStopping = false;
-    updateAutomationControls();
-    showNotification('Automation started!', 'success');
-  } else {
-    showNotification('Failed to start automation: ' + result.error, 'error');
+  localStartInFlight = true;
+  try {
+    const result = await window.electronAPI.startAutomation();
+    if (result && result.success) {
+      isAutomationRunning = true;
+      isPaused = false;
+      isStopping = false;
+      updateAutomationControls();
+      showNotification('Automation started!', 'success');
+    } else {
+      showNotification('Failed to start automation: ' + ((result && result.error) || 'unknown error'), 'error');
+    }
+  } catch (e) {
+    showNotification('Failed to start automation: ' + e.message, 'error');
+  } finally {
+    setTimeout(() => { localStartInFlight = false; }, 500);
   }
-  setTimeout(() => { localStartInFlight = false; }, 500);
 }
 
 async function stopAutomation() {
@@ -1655,26 +1703,35 @@ async function stopAutomation() {
 
   isStopping = true;
   updateAutomationControls();
-  const result = await window.electronAPI.stopAutomation();
-
-  if (result.success) {
-    showNotification('Stopping automation now...', 'info');
-  } else {
+  try {
+    const result = await window.electronAPI.stopAutomation();
+    if (result && result.success) {
+      showNotification('Stopping automation now...', 'info');
+    } else {
+      isStopping = false;
+      updateAutomationControls();
+      showNotification('Failed to stop automation: ' + ((result && result.error) || 'unknown error'), 'error');
+    }
+  } catch (e) {
     isStopping = false;
     updateAutomationControls();
-    showNotification('Failed to stop automation: ' + result.error, 'error');
+    showNotification('Failed to stop automation: ' + e.message, 'error');
   }
 }
 
 async function pauseAutomation() {
-  const result = await window.electronAPI.pauseAutomation();
-  if (result.success) {
-    isPaused = true;
-    updateAutomationControls();
-    addLog('\n⏸ Automation paused. Click Resume to continue.\n');
-    showNotification('Automation paused', 'info');
-  } else {
-    showNotification('Failed to pause: ' + result.error, 'error');
+  try {
+    const result = await window.electronAPI.pauseAutomation();
+    if (result && result.success) {
+      isPaused = true;
+      updateAutomationControls();
+      addLog('\n⏸ Automation paused. Click Resume to continue.\n');
+      showNotification('Automation paused', 'info');
+    } else {
+      showNotification('Failed to pause: ' + ((result && result.error) || 'unknown error'), 'error');
+    }
+  } catch (e) {
+    showNotification('Failed to pause: ' + e.message, 'error');
   }
 }
 
@@ -1684,33 +1741,41 @@ async function togglePauseAutomation() {
 }
 
 async function resumeAutomation() {
-  const result = await window.electronAPI.resumeAutomation();
-  if (result.success) {
-    isPaused = false;
-    updateAutomationControls();
-    addLog('\n▶️ Automation resumed.\n');
-    showNotification('Automation resumed!', 'success');
-  } else {
-    showNotification('Failed to resume: ' + result.error, 'error');
+  try {
+    const result = await window.electronAPI.resumeAutomation();
+    if (result && result.success) {
+      isPaused = false;
+      updateAutomationControls();
+      addLog('\n▶️ Automation resumed.\n');
+      showNotification('Automation resumed!', 'success');
+    } else {
+      showNotification('Failed to resume: ' + ((result && result.error) || 'unknown error'), 'error');
+    }
+  } catch (e) {
+    showNotification('Failed to resume: ' + e.message, 'error');
   }
 }
 
 async function finishAutomation() {
-  const result = await window.electronAPI.finishAutomation();
-  if (result.success) {
-    addLog('\n🏁 Finish requested — current batch will complete, then automation ends.\n');
-    showNotification('Automation will finish after current batch.', 'info');
-    // Show "finishing…" state: disable Pause/Resume/Finish, keep Stop active
-    const pauseBtn  = document.getElementById('btn-pause-automation');
-    const resumeBtn = document.getElementById('btn-resume-automation');
-    const finishBtn = document.getElementById('btn-finish-automation');
-    const stopBtn   = document.getElementById('btn-stop-automation');
-    if (pauseBtn)  { pauseBtn.disabled  = true;  pauseBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
-    if (resumeBtn) { resumeBtn.disabled = true;  resumeBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
-    if (finishBtn) { finishBtn.disabled = true;  finishBtn.textContent = '🏁 Finishing…'; finishBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
-    if (stopBtn)   { stopBtn.disabled   = false; stopBtn.classList.remove('opacity-50', 'cursor-not-allowed'); }
-  } else {
-    showNotification('Failed to finish: ' + result.error, 'error');
+  try {
+    const result = await window.electronAPI.finishAutomation();
+    if (result && result.success) {
+      addLog('\n🏁 Finish requested — current batch will complete, then automation ends.\n');
+      showNotification('Automation will finish after current batch.', 'info');
+      // Show "finishing…" state: disable Pause/Resume/Finish, keep Stop active
+      const pauseBtn  = document.getElementById('btn-pause-automation');
+      const resumeBtn = document.getElementById('btn-resume-automation');
+      const finishBtn = document.getElementById('btn-finish-automation');
+      const stopBtn   = document.getElementById('btn-stop-automation');
+      if (pauseBtn)  { pauseBtn.disabled  = true;  pauseBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
+      if (resumeBtn) { resumeBtn.disabled = true;  resumeBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
+      if (finishBtn) { finishBtn.disabled = true;  finishBtn.textContent = '🏁 Finishing…'; finishBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
+      if (stopBtn)   { stopBtn.disabled   = false; stopBtn.classList.remove('opacity-50', 'cursor-not-allowed'); }
+    } else {
+      showNotification('Failed to finish: ' + ((result && result.error) || 'unknown error'), 'error');
+    }
+  } catch (e) {
+    showNotification('Failed to finish: ' + e.message, 'error');
   }
 }
 

@@ -49,6 +49,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onAutomationStopped: (callback) => {
     ipcRenderer.on('automation-stopped', (event, code) => callback(code));
   },
+  onAutomationSummary: (callback) => {
+    ipcRenderer.on('automation-summary', (_e, summary) => callback(summary));
+  },
   onAutomationStarted: (callback) => {
     ipcRenderer.on('automation-started', () => callback());
   },
