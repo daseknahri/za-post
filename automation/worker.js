@@ -422,7 +422,15 @@ async function runAccount(o) {
       !/login|checkpoint/.test(location.href) && !/continue as|use another profile/i.test(document.body.innerText || '')
     ).catch(() => false);
     if (!profileAuthed && cookies.length) {
-      try { await page.setCookie(...cookies.map(normalizeCookie)); } catch (e) { log(`⚠️ [${name}] cookie load: ${e.message}`); }
+      // A2: resilient injection — batch first, fall back to one-by-one so one bad
+      // cookie can't prevent all cookies from being set.
+      const normalized = cookies.map(normalizeCookie);
+      try {
+        await page.setCookie(...normalized);
+      } catch (batchErr) {
+        log(`⚠️ [${name}] batch cookie set failed (${batchErr.message}) — retrying one-by-one`);
+        for (const ck of normalized) { try { await page.setCookie(ck); } catch {} }
+      }
       await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await sleep(2000);
       log(`🔑 [${name}] used stored cookies (profile not pre-authed)`);
@@ -594,14 +602,24 @@ async function runAccount(o) {
 }
 
 // Strip fields Puppeteer's setCookie rejects; coerce sameSite.
+// A1: default domain to .facebook.com if missing; wrap so one bad cookie can't throw.
 function normalizeCookie(c) {
-  const out = { name: c.name, value: c.value, domain: c.domain, path: c.path || '/' };
-  if (typeof c.expires === 'number' && c.expires > 0) out.expires = c.expires;
-  if (typeof c.httpOnly === 'boolean') out.httpOnly = c.httpOnly;
-  if (typeof c.secure === 'boolean') out.secure = c.secure;
-  const ss = String(c.sameSite || '').toLowerCase();
-  out.sameSite = ss === 'lax' ? 'Lax' : ss === 'strict' ? 'Strict' : 'None';
-  return out;
+  try {
+    const out = {
+      name: c.name,
+      value: String(c.value ?? ''),
+      domain: c.domain || '.facebook.com',
+      path: c.path || '/',
+    };
+    if (typeof c.expires === 'number' && c.expires > 0) out.expires = c.expires;
+    if (typeof c.httpOnly === 'boolean') out.httpOnly = c.httpOnly;
+    if (typeof c.secure === 'boolean') out.secure = c.secure;
+    const ss = String(c.sameSite || '').toLowerCase();
+    out.sameSite = ss === 'lax' ? 'Lax' : ss === 'strict' ? 'Strict' : 'None';
+    return out;
+  } catch {
+    return { name: String(c && c.name || '__bad__'), value: '', domain: '.facebook.com', path: '/' };
+  }
 }
 
 module.exports = {

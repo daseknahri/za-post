@@ -290,14 +290,27 @@ ipcMain.handle('rename-account', (_e, oldName, newName) => {
 
 ipcMain.handle('import-cookies', async (_e, accountName, cookies) => {
   try {
-    const arr = typeof cookies === 'string' ? JSON.parse(cookies) : cookies;
-    if (!Array.isArray(arr) || !arr.every((c) => c && c.name && 'value' in c)) return fail('Invalid cookies format');
+    // A3: tolerate JSON string or array; accept common export shapes; filter junk entries
+    // instead of rejecting the whole import; log how many were imported.
+    let raw;
+    if (typeof cookies === 'string') {
+      try { raw = JSON.parse(cookies); } catch { return fail('Cookies must be a JSON array'); }
+    } else {
+      raw = cookies;
+    }
+    if (!Array.isArray(raw)) return fail('Cookies must be an array');
+    // Some exporters wrap in { cookies: [...] } or { cookie: [...] }
+    if (!raw.length && raw.cookies) raw = raw.cookies;
+    const arr = raw.filter((c) => c && typeof c === 'object' && c.name && 'value' in c);
+    const skipped = raw.length - arr.length;
+    if (!arr.length) return fail('No valid cookies found (each entry needs name + value)');
     store.writeCookies(accountName, arr);
+    console.log(`[import-cookies] ${accountName}: imported ${arr.length}, skipped ${skipped} junk entries`);
     setAccountStatus(accountName, 'checking', 'Verifying…');
     send('data-updated');
     const status = await checkStatus(accountName);
     setAccountStatus(accountName, status.status, status.message, status);
-    return ok({ status: status.status, message: status.message });
+    return ok({ status: status.status, message: status.message, imported: arr.length, skipped });
   } catch (e) { return fail(e); }
 });
 
@@ -334,7 +347,16 @@ async function checkStatus(accountName) {
     for (let i = 1; i < allPages.length; i++) { try { await allPages[i].close(); } catch {} }
     const page = allPages[0] || (await browser.newPage());
     const cookies = store.readCookies(accountName);
-    if (cookies.length) { try { await page.setCookie(...cookies.map(normalizeCookie)); } catch {} }
+    // A2: resilient injection — try batch first, fall back to one-by-one so one bad
+    // cookie can't prevent ALL cookies from being set.
+    if (cookies.length) {
+      const normalized = cookies.map(normalizeCookie);
+      try {
+        await page.setCookie(...normalized);
+      } catch {
+        for (const ck of normalized) { try { await page.setCookie(ck); } catch {} }
+      }
+    }
     await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
     // Fix #2: real render wait instead of fixed 3s
@@ -448,17 +470,24 @@ async function openLoginBrowser(accountName) {
   loginBrowsers.set(accountName, { browser, interval });
 
   browser.on('disconnected', async () => {
-    clearInterval(interval);
-    loginBrowsers.delete(accountName);
-    emit('automation-log', `🔐 [${accountName}] login window closed — verifying session...`);
-    send('login-browser-closed', accountName);
-    const res = await checkStatus(accountName);
-    setAccountStatus(accountName, res.status, res.message, res);
-    // Fix #6: final status log
-    if (res.status === 'logged_in') {
-      emit('automation-log', `✅ [${accountName}] logged in as ${res.fbName || '(unknown)'} (c_user=${res.fbUserId || '?'})`);
-    } else {
-      emit('automation-log', `❌ [${accountName}] not logged in: ${res.message}`);
+    // B6: wrap entire handler so a checkStatus failure can't crash the main process
+    // or leave the account stuck on 'logging_in'.
+    try {
+      clearInterval(interval);
+      loginBrowsers.delete(accountName);
+      emit('automation-log', `🔐 [${accountName}] login window closed — verifying session...`);
+      send('login-browser-closed', accountName);
+      const res = await checkStatus(accountName);
+      setAccountStatus(accountName, res.status, res.message, res);
+      if (res.status === 'logged_in') {
+        emit('automation-log', `✅ [${accountName}] logged in as ${res.fbName || '(unknown)'} (c_user=${res.fbUserId || '?'})`);
+      } else {
+        emit('automation-log', `❌ [${accountName}] not logged in: ${res.message}`);
+      }
+    } catch (e) {
+      console.error(`[disconnected] [${accountName}] verification error:`, e.message);
+      // Ensure status is never left as 'logging_in' even if checkStatus threw.
+      setAccountStatus(accountName, 'error', `Verification failed: ${e.message}`);
     }
   });
 }
@@ -541,12 +570,22 @@ ipcMain.handle('update-server-url', (_e, url) => {
 });
 
 // Shared cookie normalizer (kept identical to worker's).
+// A1: default domain to .facebook.com if missing; wrap in try so one bad cookie can't throw.
 function normalizeCookie(c) {
-  const out = { name: c.name, value: c.value, domain: c.domain, path: c.path || '/' };
-  if (typeof c.expires === 'number' && c.expires > 0) out.expires = c.expires;
-  if (typeof c.httpOnly === 'boolean') out.httpOnly = c.httpOnly;
-  if (typeof c.secure === 'boolean') out.secure = c.secure;
-  const ss = String(c.sameSite || '').toLowerCase();
-  out.sameSite = ss === 'lax' ? 'Lax' : ss === 'strict' ? 'Strict' : 'None';
-  return out;
+  try {
+    const out = {
+      name: c.name,
+      value: String(c.value ?? ''),
+      domain: c.domain || '.facebook.com',
+      path: c.path || '/',
+    };
+    if (typeof c.expires === 'number' && c.expires > 0) out.expires = c.expires;
+    if (typeof c.httpOnly === 'boolean') out.httpOnly = c.httpOnly;
+    if (typeof c.secure === 'boolean') out.secure = c.secure;
+    const ss = String(c.sameSite || '').toLowerCase();
+    out.sameSite = ss === 'lax' ? 'Lax' : ss === 'strict' ? 'Strict' : 'None';
+    return out;
+  } catch {
+    return { name: String(c && c.name || '__bad__'), value: '', domain: '.facebook.com', path: '/' };
+  }
 }
