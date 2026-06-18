@@ -80,6 +80,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // Live Run progress updates from orchestrator
+  if (window.electronAPI.onAutomationProgress) {
+    window.electronAPI.onAutomationProgress((data) => {
+      const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+      const runEl = document.getElementById('dash-running');
+      if (runEl) {
+        runEl.textContent = data.running ? 'Running' : 'Idle';
+        runEl.style.color = data.running ? '#34d399' : '#9ca3af';
+      }
+      set('dash-cycle', data.cycle > 0 ? data.cycle : '—');
+      set('dash-posted', data.posted);
+      set('dash-errors', data.errors);
+      set('dash-pending', data.pending);
+      const totalStr = data.accountsTotal > 0 ? `${data.accountsDone}/${data.accountsTotal}` : '—';
+      set('dash-accounts', totalStr);
+    });
+  }
+
   // Load License Info
   try {
     const info = await window.electronAPI.invoke('get-license-info');
@@ -486,20 +504,54 @@ function handleQuickAction(action) {
 
 // Dashboard
 function updateDashboard() {
-  document.getElementById('stat-posts').textContent = appData.posts.length;
-  document.getElementById('stat-groups').textContent = appData.groups.length;
-  document.getElementById('stat-accounts').textContent = appData.accounts.length;
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+  set('stat-posts', appData.posts.length);
+  set('stat-groups', appData.groups.length);
+  set('stat-accounts', appData.accounts.length);
 
   const statusEl = document.getElementById('stat-status');
   const statusIconEl = document.getElementById('stat-status-icon');
 
   if (isAutomationRunning) {
-    statusEl.textContent = 'Running';
-    statusIconEl.textContent = '▶️';
+    if (statusEl) statusEl.textContent = 'Running';
+    if (statusIconEl) statusIconEl.textContent = '▶️';
   } else {
-    statusEl.textContent = 'Stopped';
-    statusIconEl.textContent = '⏸️';
+    if (statusEl) statusEl.textContent = 'Stopped';
+    if (statusIconEl) statusIconEl.textContent = '⏸️';
   }
+
+  renderHealth();
+}
+
+// Render account health card from appData.accounts
+function renderHealth() {
+  const accounts = appData.accounts || [];
+  let loggedIn = 0, needsLogin = 0, rateLimited = 0, other = 0;
+  for (const a of accounts) {
+    if (a.status === 'logged_in') loggedIn++;
+    else if (a.status === 'not_logged_in') needsLogin++;
+    else if (a.status === 'rate_limited') rateLimited++;
+    else other++;
+  }
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+  set('health-loggedin', loggedIn);
+  set('health-needslogin', needsLogin);
+  set('health-ratelimited', rateLimited);
+  set('health-other', other);
+
+  const container = document.getElementById('health-accounts');
+  if (!container) return;
+  container.innerHTML = accounts.map(a => {
+    const dot = a.status === 'logged_in' ? '#34d399'
+      : a.status === 'not_logged_in' ? '#f87171'
+      : a.status === 'rate_limited' ? '#fbbf24'
+      : '#9ca3af';
+    const label = escapeHtml(a.alias || a.name);
+    const tip = escapeHtml(a.lastMessage || a.status || '');
+    return `<span title="${tip}" style="display:inline-flex;align-items:center;gap:4px;background:rgba(255,255,255,0.05);border-radius:8px;padding:3px 8px;font-size:11px;color:#d1d5db;white-space:nowrap;">
+      <span style="width:7px;height:7px;border-radius:50%;background:${dot};flex-shrink:0;"></span>${label}
+    </span>`;
+  }).join('');
 }
 
 // Posts Management

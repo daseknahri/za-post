@@ -218,6 +218,71 @@
           <small class="block mt-2 text-gray-600 text-xs">Link changes every time the app restarts.</small>
         </div>
 
+        <!-- Live Run Card -->
+        <div class="grid grid-cols-2 gap-4 mb-6">
+          <div class="bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 hover:border-accent/20 transition-all duration-300">
+            <div class="flex items-center gap-2 mb-4">
+              <span class="text-lg">📡</span>
+              <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider">Live Run</h3>
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+              <div class="bg-dark-900/60 rounded-xl p-3">
+                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Status</div>
+                <div id="dash-running" class="text-sm font-bold text-gray-400">Idle</div>
+              </div>
+              <div class="bg-dark-900/60 rounded-xl p-3">
+                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Cycle</div>
+                <div id="dash-cycle" class="text-sm font-bold text-white">—</div>
+              </div>
+              <div class="bg-dark-900/60 rounded-xl p-3">
+                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Posted</div>
+                <div id="dash-posted" class="text-sm font-bold text-cyber-green">0</div>
+              </div>
+              <div class="bg-dark-900/60 rounded-xl p-3">
+                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Errors</div>
+                <div id="dash-errors" class="text-sm font-bold text-red-400">0</div>
+              </div>
+              <div class="bg-dark-900/60 rounded-xl p-3">
+                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Pending</div>
+                <div id="dash-pending" class="text-sm font-bold text-cyber-amber">0</div>
+              </div>
+              <div class="bg-dark-900/60 rounded-xl p-3">
+                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Accounts</div>
+                <div id="dash-accounts" class="text-sm font-bold text-cyber-blue">—</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Account Health Card -->
+          <div class="bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 hover:border-accent/20 transition-all duration-300">
+            <div class="flex items-center gap-2 mb-4">
+              <span class="text-lg">🏥</span>
+              <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider">Account Health</h3>
+            </div>
+            <div class="grid grid-cols-2 gap-2 mb-3">
+              <div class="flex items-center gap-2 text-xs text-gray-300">
+                <span>✅</span><span class="text-gray-500">Logged in:</span>
+                <span id="health-loggedin" class="font-bold text-cyber-green ml-auto">0</span>
+              </div>
+              <div class="flex items-center gap-2 text-xs text-gray-300">
+                <span>🔴</span><span class="text-gray-500">Needs login:</span>
+                <span id="health-needslogin" class="font-bold text-red-400 ml-auto">0</span>
+              </div>
+              <div class="flex items-center gap-2 text-xs text-gray-300">
+                <span>🟠</span><span class="text-gray-500">Rate-limited:</span>
+                <span id="health-ratelimited" class="font-bold text-cyber-amber ml-auto">0</span>
+              </div>
+              <div class="flex items-center gap-2 text-xs text-gray-300">
+                <span>⚪</span><span class="text-gray-500">Other:</span>
+                <span id="health-other" class="font-bold text-gray-400 ml-auto">0</span>
+              </div>
+            </div>
+            <div id="health-accounts" class="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
+              <!-- chips rendered by JS -->
+            </div>
+          </div>
+        </div>
+
         <div class="quick-actions">
           <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">Quick Actions</h3>
           <div class="action-buttons grid grid-cols-4 gap-3">

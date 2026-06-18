@@ -46,6 +46,7 @@ class Orchestrator {
     this.isLoginOpen = (this.options && typeof this.options.isLoginOpen === 'function') ? this.options.isLoginOpen : () => false;
     this.running = false;
     this._stop = false;
+    this._progress = { running: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0 };
   }
   isRunning() { return this.running; }
   stop() { this._stop = true; }
@@ -55,11 +56,15 @@ class Orchestrator {
   async start(getData) {
     if (this.running) return { success: false, error: 'Automation already running' };
     this._stop = false; this.running = true;
+    this._progress = { running: true, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0 };
     this.emit('automation-started');
+    this.emit('automation-progress', { ...this._progress });
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
     this._loop(getData).catch((e) => this.log(`❌ Orchestrator crashed: ${e.message}`))
       .finally(() => {
         this.running = false;
+        this._progress.running = false;
+        this.emit('automation-progress', { ...this._progress });
         this.emit('automation-stopped', this._stop ? 'stopped' : 'completed');
         this.log(`⏹ Automation ${this._stop ? 'stopped' : 'finished'}.`);
       });
@@ -158,6 +163,10 @@ class Orchestrator {
       if (!active.length) { this.log('⚠️ No enabled accounts — stopping.'); break; }
 
       cycle++;
+      this._progress.cycle = cycle;
+      this._progress.accountsTotal = active.length;
+      this._progress.accountsDone = 0;
+      this.emit('automation-progress', { ...this._progress });
       this.log(`🔄 Cycle ${cycle}: ${active.length} account(s), ${settings.parallelAccounts || 3} in parallel`);
 
       const batches = chunk(active, settings.parallelAccounts || 3);
@@ -170,7 +179,13 @@ class Orchestrator {
           const r = await this._runAccount(account, cycle)
             .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [] }; });
           this.log(`✓ [${account.name}] completed`);
-          return { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [] };
+          const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [] };
+          this._progress.accountsDone++;
+          this._progress.posted += res.posted;
+          this._progress.errors += res.errors;
+          this._progress.pending += res.pendingApproval;
+          this.emit('automation-progress', { ...this._progress });
+          return res;
         }));
         const batchOk = results.filter((r) => r.progressed).length;
         this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) ---`);
