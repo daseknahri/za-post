@@ -151,8 +151,12 @@ class Orchestrator {
     if (!remaining.length) return [];
     if (order.includes('random')) remaining = seededShuffle(remaining, (cycle + 1) * 7919); // randomized deal order (consistent within the cycle)
     const activeList = this._active || data.accounts.filter((a) => a.enabled !== false);
-    const k = activeList.findIndex((a) => a.name === account.name);
-    if (k < 0 || k >= remaining.length) return []; // this account's turn hasn't come up this cycle
+    const i = activeList.findIndex((a) => a.name === account.name);
+    if (i < 0) return [];
+    // roundOffset rotates which account gets which post across Loop-campaign recycles, so an
+    // account posts different content over time. It's a rotation (permutation) -> no wrap/dup.
+    const k = (i + (this._roundOffset || 0)) % activeList.length;
+    if (k >= remaining.length) return []; // this account's turn hasn't come up this cycle
     return [remaining[k]];
   }
 
@@ -215,6 +219,7 @@ class Orchestrator {
   async _loop(getData) {
     const _st = store.loadRotation();
     this._dealt = new Set(Array.isArray(_st.dealt) ? _st.dealt : []); // post-ids already dealt (unique modes)
+    this._roundOffset = _st.roundOffset || 0; // rotates account↔post mapping across Loop-campaign recycles
     let cycle = 0;
     while (!this._shouldStop()) {
       this._data = getData(); // re-read each cycle so mid-run edits take effect
@@ -228,9 +233,18 @@ class Orchestrator {
       // Unique modes deal each post once across accounts. When every active account is unique
       // and no un-dealt posts remain, the campaign is complete — stop and reset for the next run.
       if (active.reduce((s, a) => s + this._postsForAccount(a, cycle).length, 0) === 0) {
-        this.log('✅ All posts have been distributed — campaign complete.');
-        this._dealt.clear(); try { store.saveRotation({ dealt: [] }); } catch {}
-        break;
+        if (settings.loopCampaign) {
+          // Loop campaign: re-distribute the whole library, rotating content across accounts.
+          this.log('🔁 All posts distributed — looping (recycling, rotating content across accounts)...');
+          this._dealt.clear();
+          this._roundOffset = (this._roundOffset || 0) + 1;
+          try { store.saveRotation({ dealt: [], roundOffset: this._roundOffset }); } catch {}
+          // fall through: this cycle now re-deals the full library
+        } else {
+          this.log('✅ All posts have been distributed — campaign complete.');
+          this._dealt.clear(); try { store.saveRotation({ dealt: [], roundOffset: 0 }); } catch {}
+          break;
+        }
       }
       this._progress.cycle = cycle;
       this._progress.accountsTotal = active.length;
@@ -274,7 +288,7 @@ class Orchestrator {
       // a failed account's post stays un-dealt and is re-dealt next cycle). Persisted for resume.
       if (cyclePostedIds.length) {
         for (const id of cyclePostedIds) this._dealt.add(id);
-        try { store.saveRotation({ dealt: [...this._dealt] }); } catch {}
+        try { store.saveRotation({ dealt: [...this._dealt], roundOffset: this._roundOffset || 0 }); } catch {}
       }
       if (this._shouldStop()) break;
 

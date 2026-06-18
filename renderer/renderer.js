@@ -1744,6 +1744,7 @@ function loadSettings() {
   document.getElementById('setting-group-delay').value = appData.settings.groupDelay !== undefined ? appData.settings.groupDelay : 60;
   document.getElementById('setting-max-cycles').value = appData.settings.maxCycles !== undefined ? appData.settings.maxCycles : 0;
   document.getElementById('setting-enable-tunnel').checked = appData.settings.enableTunnel || false;
+  document.getElementById('setting-loop-campaign').checked = appData.settings.loopCampaign || false;
   document.getElementById('setting-resume-on-startup').checked = appData.settings.resumeOnStartup !== false; // default true
   document.getElementById('setting-launch-on-startup').checked = appData.settings.launchOnStartup || false;
 }
@@ -1762,6 +1763,7 @@ async function saveSettings() {
     groupDelay: intOr('setting-group-delay', 60),
     maxCycles: intOr('setting-max-cycles', 0),
     enableTunnel: document.getElementById('setting-enable-tunnel').checked,
+    loopCampaign: document.getElementById('setting-loop-campaign').checked,
     resumeOnStartup: document.getElementById('setting-resume-on-startup').checked,
     launchOnStartup: document.getElementById('setting-launch-on-startup').checked,
   };
