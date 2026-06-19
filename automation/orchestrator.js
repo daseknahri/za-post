@@ -287,6 +287,7 @@ class Orchestrator {
     let progressed = false, posted = 0, pendingApproval = 0, errors = 0, accountFlag = null, accountOffline = false;
     const postedIds = []; // posts confirmed PUBLISHED — safe to auto-delete
     const dealtIds = [];  // posts dealt this cycle (published OR pending) — don't re-deal
+    try {
     postsLoop:
     for (const post of posts) {
       if (this._shouldStop()) break;
@@ -347,10 +348,12 @@ class Orchestrator {
     // Surface the outcome so the operator sees pending/error counts in the log pane.
     this.log(`[${account.name}] ✅ Done in ${Math.round((Date.now() - accountStart) / 1000)}s`);
     this.log(`📊 [${account.name}] posted=${posted} pending=${pendingApproval} errors=${errors}`);
-    // Release claims for posts this account did NOT publish (blocked / failed), so a healthy
-    // account can pick them up later this same run instead of the post sitting idle.
-    if (this._claimed) for (const pp of posts) { if (!dealtIds.includes(pp.id)) this._claimed.delete(pp.id); }
     return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag, offline: accountOffline };
+    } finally {
+      // Release claims for posts this account did NOT publish (blocked/failed), so a healthy
+      // account can pick them up this same run. In a finally so it runs even if the body throws.
+      if (this._claimed) for (const pp of posts) { if (!dealtIds.includes(pp.id)) this._claimed.delete(pp.id); }
+    }
   }
 
   async _loop(getData) {

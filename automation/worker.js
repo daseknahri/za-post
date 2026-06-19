@@ -817,15 +817,12 @@ async function runAccount(o) {
         if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
         armWatchdog();
       }
-      // Likely-blocked guard: if we've attempted ≥2 groups with ZERO posts, this account
-      // probably can't post at all (silent block / restriction). Skip the rest immediately
-      // instead of grinding through every group (mirrors the old app passing a blocked account).
+      // After ≥2 groups with ZERO posts, RE-CHECK for an ACCOUNT-LEVEL block and skip the rest
+      // only if one is CONFIRMED. Per-group failures (e.g. "not a member" of those groups) are
+      // NOT a reason to skip the account's other groups, so without a confirmed block we keep going.
       if (i >= 2 && posted === 0) {
-        if (await checkRateLimit(page)) flag = 'rate_limited';
-        else if (await checkVerification(page)) flag = 'needs_verification';
-        else if (!flag) flag = 'likely_blocked';
-        log(`🛑 [${name}] no posts after ${i} group(s) — skipping the rest (account looks blocked/restricted)`);
-        noRetry = true; break;
+        if (await checkRateLimit(page)) { flag = 'rate_limited'; log(`🛑 [${name}] rate-limited — skipping the rest of this account`); noRetry = true; break; }
+        if (await checkVerification(page)) { flag = 'needs_verification'; log(`🔐 [${name}] needs identity verification — skipping the rest of this account`); noRetry = true; break; }
       }
       const g = targetGroups[i];
       const gid = g.groupId || g.id;
@@ -1054,6 +1051,9 @@ async function runAccount(o) {
         }
       }
     }
+    // Posted NOTHING across all its groups (errors, no specific reason) → flag the account so the
+    // operator checks it, but we did NOT skip any group (avoids the per-group false positive).
+    if (posted === 0 && errors > 0 && !flag && !offline && !shouldStop()) flag = 'likely_blocked';
     // Persist refreshed cookies for next run.
     try { store.writeCookies(name, await page.cookies()); } catch {}
     fs.writeFileSync(require('path').join(store.accountDir(name), 'last-run-success.txt'),
