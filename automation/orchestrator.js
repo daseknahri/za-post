@@ -158,6 +158,7 @@ class Orchestrator {
     this._progress = { running: true, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0, offline: false };
     this._runStartedAt = Date.now();
     this._runStats = {}; // per-account totals across the whole run (for the end-of-run summary)
+    this._runFlags = {}; // accountName -> flag set THIS run (rate_limited/checkpoint/etc.)
     this.emit('automation-started');
     this.emit('automation-progress', { ...this._progress });
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
@@ -191,11 +192,28 @@ class Orchestrator {
       byAccount,
       finishedAt: new Date().toISOString(),
     };
+    // Accounts that hit a Facebook limit this run — list them with the EXACT action to take.
+    const ACTION = {
+      rate_limited: 'wait — Facebook is rate-limiting it (it retries automatically next cycle)',
+      checkpoint: 'OPEN this account and complete Facebook’s identity / “real person” check',
+      needs_verification: 'OPEN this account and complete Facebook’s identity / “real person” check',
+      not_logged_in: 'log in again (its session expired)',
+      needs_login: 'log in again (its session expired)',
+      account_disabled: 'check it on Facebook — the account is disabled/restricted',
+      likely_blocked: 'check it on Facebook — it posted nothing (likely blocked/restricted)',
+    };
+    const flagged = Object.entries(this._runFlags || {}).map(([name, flag]) => ({ name, flag, action: ACTION[flag] || 'check this account on Facebook' }));
+    summary.flagged = flagged;
+
     const m = Math.floor(durationMs / 60000), s = Math.round((durationMs % 60000) / 1000);
     this.log('📋 ═══ RUN SUMMARY ═══');
     this.log(`📋 Posted: ${summary.posted}  |  Pending: ${summary.pending}  |  Errors: ${summary.errors}  |  Cycles: ${summary.cycles}  |  Duration: ${m}m ${s}s`);
     for (const [acc, st] of Object.entries(byAccount)) {
       this.log(`📋 [${acc}] posted=${st.posted} pending=${st.pending} errors=${st.errors}`);
+    }
+    if (flagged.length) {
+      this.log('📋 ⚠️ ACCOUNTS NEEDING ATTENTION:');
+      for (const f of flagged) this.log(`📋   • ${f.name} → ${f.action}`);
     }
     this.emit('automation-summary', summary);
     try { store.appendReport({ ts: summary.finishedAt, account: '(run summary)', group: '', groupId: '', postId: '', result: `summary:${reason}`, comment: '', detail: `posted=${summary.posted} pending=${summary.pending} errors=${summary.errors} cycles=${summary.cycles} duration=${m}m${s}s` }); } catch {}
@@ -296,6 +314,7 @@ class Orchestrator {
           // Persist flag to account status so the UI shows it (serialized via store.update).
           if (r && r.flag) {
             accountFlag = r.flag;
+            this._runFlags[account.name] = r.flag; // remember for the end-of-run "needs attention" list
             try {
               await store.update((d) => {
                 const acc = d.accounts.find(a => a.name === account.name);

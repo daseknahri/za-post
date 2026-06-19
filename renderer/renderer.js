@@ -1619,6 +1619,11 @@ function renderRunSummary(s) {
     lines.push('   Per account:');
     for (const n of names) { const a = byAcc[n]; lines.push(`     • ${n}: posted=${a.posted} pending=${a.pending} errors=${a.errors}`); }
   }
+  const flagged = s.flagged || [];
+  if (flagged.length) {
+    lines.push('   ⚠️ ACCOUNTS NEEDING ATTENTION:');
+    for (const f of flagged) lines.push(`     • ${f.name} → ${f.action}`);
+  }
   lines.push('   Full audit trail → Logs folder → run-report.csv');
   lines.push('═══════════════════════════════');
   addLog(lines.join('\n') + '\n');
