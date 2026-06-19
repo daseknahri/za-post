@@ -317,7 +317,19 @@ async function checkRateLimit(page) {
   try {
     return await page.evaluate(() => {
       const t = (document.body.innerText || '').toLowerCase();
-      return /you're temporarily blocked|temporarily restricted|doing this too (often|quickly)|try again later|action blocked/.test(t);
+      return /you're temporarily blocked|temporarily restricted|doing this too (often|quickly)|try again later|action blocked|we limit how often|protect the community from spam|you can try again later|going too fast|posting too (often|quickly)|nous limitons|réessayer plus tard|temporairement bloqué/.test(t);
+    });
+  } catch { return false; }
+}
+
+// Detect Facebook's "confirm you are a real person" / identity checkpoint, which blocks the
+// account from posting until the user completes it. Multilingual (EN/FR seen on these accounts).
+async function checkVerification(page) {
+  try {
+    return await page.evaluate(() => {
+      const t = (document.body.innerText || '').toLowerCase();
+      if (/\/checkpoint\//.test(location.href.toLowerCase())) return true;
+      return /confirm (that )?(you'?re|you are) a real person|confirm your identity|we need to confirm|we'?ll need you to confirm|confirmez que vous êtes une personne réelle|confirmer votre identité|confirme que tu es une personne réelle/.test(t);
     });
   } catch { return false; }
 }
@@ -827,7 +839,11 @@ async function runAccount(o) {
         // Per-group START banner — fired only after nav succeeds and before the auth checks.
         step('Group loaded');
 
-        if (/login|checkpoint/.test(page.url())) { step('Not logged in / checkpoint — aborting account'); errors++; noRetry = true; flag = 'needs_login'; report(groupName, gid, 'error', 'not logged in / checkpoint', ''); break; }
+        // Identity / "confirm you're a real person" checkpoint — flag distinctly so the
+        // operator knows to VERIFY this account (re-login won't fix it).
+        if (await checkVerification(page)) { step('🔐 Facebook wants identity/human verification — flagging account'); errors++; noRetry = true; flag = 'needs_verification'; report(groupName, gid, 'error', 'identity verification required', ''); break; }
+
+        if (/^https?:\/\/[^/]*\/login/.test(page.url())) { step('Not logged in — aborting account'); errors++; noRetry = true; flag = 'needs_login'; report(groupName, gid, 'error', 'not logged in', ''); break; }
         // Expired sessions don't redirect — they show the "Continue as <name>" picker
         // or a non-member "Join Group / Log in" wall. Detect and abort early & clearly.
         const authBad = await page.evaluate(() => {
@@ -962,7 +978,11 @@ async function runAccount(o) {
         const publishResult = await waitForPublish(page, dialogCountBefore, 30000, shouldStop);
         if (publishResult === 'stopped') { step('Stop requested during publish wait — halting'); break; }
         if (publishResult !== 'published') {
-          // Snapshot the dialog so a not-confirmed post is diagnosable (error text vs stuck).
+          // The post failed — find out WHY so the account can be flagged for the operator.
+          // Facebook's spam/rate-limit message appears in the composer right after clicking Post.
+          if (await checkRateLimit(page)) { step('🚫 Facebook is rate-limiting this account ("you can try again later") — backing off'); errors++; noRetry = true; flag = 'rate_limited'; report(groupName, gid, 'error', 'rate-limited — Facebook blocked the post', ''); break; }
+          if (await checkVerification(page)) { step('🔐 Facebook wants identity/human verification — flagging account'); errors++; noRetry = true; flag = 'needs_verification'; report(groupName, gid, 'error', 'identity verification required', ''); break; }
+          // Otherwise it's an unexplained failure — snapshot the dialog so it's diagnosable.
           const snap = await page.evaluate(() => { const d = document.querySelector('div[role="dialog"]'); return ((d && d.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 120); }).catch(() => '');
           step(`Post clicked but publish NOT confirmed (${publishResult})${snap ? ` — "${snap}"` : ''}; skipping group`);
           errors++; report(groupName, gid, 'error', `publish not confirmed (${publishResult})`, ''); continue;

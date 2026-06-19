@@ -966,13 +966,16 @@ function renderAccounts() {
     } else if (account.status === 'rate_limited') {
       statusClass = 'rate-limited';
       statusText = 'Rate-limited';
+    } else if (account.status === 'checkpoint') {
+      statusClass = 'error';
+      statusText = '🔐 Needs verification';
     }
 
     // Show lastMessage for ALL statuses (not just error/not_logged_in)
     let statusMessageHtml = '';
     if (account.lastMessage) {
       const msg = account.lastMessage.length > 80 ? account.lastMessage.substring(0, 80) + '...' : account.lastMessage;
-      const msgColor = (account.status === 'error' || account.status === 'not_logged_in') ? '#dc2626'
+      const msgColor = (account.status === 'error' || account.status === 'not_logged_in' || account.status === 'checkpoint') ? '#dc2626'
         : (account.status === 'logged_in') ? '#22c55e'
         : (account.status === 'rate_limited') ? '#f59e0b'
         : (account.status === 'checking' || account.status === 'logging_in') ? '#f59e0b'
@@ -980,6 +983,7 @@ function renderAccounts() {
       const msgIcon = (account.status === 'error' || account.status === 'not_logged_in') ? '⚠️'
         : (account.status === 'logged_in') ? '✅'
         : (account.status === 'rate_limited') ? '⏸'
+        : (account.status === 'checkpoint') ? '🔐'
         : (account.status === 'checking') ? '🔍'
         : (account.status === 'logging_in') ? '🔐'
         : 'ℹ️';

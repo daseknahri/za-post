@@ -301,7 +301,8 @@ class Orchestrator {
                 const acc = d.accounts.find(a => a.name === account.name);
                 if (!acc) return;
                 if (r.flag === 'needs_login') { acc.status = 'not_logged_in'; acc.lastMessage = '⚠️ Logged out during run — re-login required'; }
-                else if (r.flag === 'rate_limited') { acc.status = 'rate_limited'; acc.lastMessage = '⏸ Rate-limited by Facebook — backed off this cycle'; }
+                else if (r.flag === 'rate_limited') { acc.status = 'rate_limited'; acc.lastMessage = '⏸ Rate-limited by Facebook (posting too often) — wait, then it retries automatically'; }
+                else if (r.flag === 'needs_verification') { acc.status = 'checkpoint'; acc.lastMessage = '🔐 Facebook wants identity/human verification — open this account and complete the check'; }
                 else if (r.flag === 'account_disabled') { acc.status = 'error'; acc.lastMessage = '🚫 Account disabled/restricted by Facebook — needs manual attention'; }
               });
               this.emit('data-updated');
@@ -458,8 +459,8 @@ class Orchestrator {
       // All-sessions-invalid guard: if a whole cycle published/queued NOTHING and at least one
       // account reported it was logged out, looping again would just relaunch browsers that all
       // bail. Stop with a clear reason instead of spinning forever unattended.
-      if (cycleDealtIds.length === 0 && (cycleFlags.includes('needs_login') || cycleFlags.includes('account_disabled'))) {
-        this.log('🛑 No account could post this cycle — sessions are logged out or disabled. Stopping. Fix the accounts, then Start again.');
+      if (cycleDealtIds.length === 0 && (cycleFlags.includes('needs_login') || cycleFlags.includes('account_disabled') || cycleFlags.includes('needs_verification'))) {
+        this.log('🛑 No account could post this cycle — accounts need attention (logged out, disabled, or identity-verification required). Stopping. Fix the flagged accounts, then Start again.');
         break;
       }
       if ((settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {
