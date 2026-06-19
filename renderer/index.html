@@ -511,9 +511,9 @@
               <input type="checkbox" id="setting-hide-browser" class="w-5 h-5 rounded-md accent-accent">
               <span class="text-sm font-semibold text-gray-300">🙈 Hide Browser During Automation</span>
             </label>
-            <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled (default), the automation browser runs
-              off-screen so you don't see it — but it's still a real browser, so posting stays reliable. Turn OFF to
-              watch it work on-screen. (Earlier "true headless" mode broke Facebook posting; this no longer uses it.)</small>
+            <small class="block mt-2 text-xs text-gray-500 ml-8">⚠️ Leave this OFF. Facebook will NOT publish from a
+              hidden/off-screen window (it only submits when the window actually renders on screen), so hiding the
+              browser makes every post fail. This toggle is kept only for diagnostics.</small>
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
