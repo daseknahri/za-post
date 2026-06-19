@@ -640,6 +640,19 @@ async function runAccount(o) {
     '--no-first-run',
     '--no-default-browser-check',
     '--hide-crash-restore-bubble',
+    // ---- resource efficiency (headless automation needs none of this) ----
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    '--disable-dev-shm-usage',
+    '--disable-extensions',
+    '--disable-background-networking',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--mute-audio',
+    // ---- bound the on-disk caches so per-account profiles don't grow forever ----
+    '--disk-cache-size=52428800',   // 50 MB
+    '--media-cache-size=10485760',  // 10 MB
   ];
   store.sanitizeProfile(name); // don't let Chromium reopen the previous session's tabs
   // Proxy: Chrome can't do authenticated SOCKS5 directly, so we wrap the upstream

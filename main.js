@@ -20,6 +20,27 @@ function appendLogFile(line) {
   } catch {}
 }
 
+// Portable build has no installer — so on first launch we drop a desktop shortcut to the
+// app (the exe carries its own icon). A marker file means we never recreate a shortcut the
+// user deliberately deleted. Packaged + Windows only; best-effort.
+function ensureDesktopShortcut() {
+  if (process.platform !== 'win32' || !app.isPackaged) return;
+  try {
+    const marker = path.join(app.getPath('userData'), '.desktop-shortcut-done');
+    if (fs.existsSync(marker)) return;
+    const lnk = path.join(app.getPath('desktop'), 'Za Post Comment Tool.lnk');
+    const ok = shell.writeShortcutLink(lnk, 'create', {
+      target: process.execPath,
+      cwd: path.dirname(process.execPath),
+      description: 'Za Post Comment Tool — Facebook posting automation',
+      icon: process.execPath,
+      iconIndex: 0,
+    });
+    try { fs.writeFileSync(marker, new Date().toISOString()); } catch {}
+    appendLogFile(ok ? 'Created desktop shortcut' : 'Desktop shortcut create returned false');
+  } catch (e) { try { appendLogFile('Desktop shortcut failed: ' + e.message); } catch {} }
+}
+
 // Orphaned-Chromium sweep. A crashed or force-killed run can leave headless
 // chrome.exe processes alive, each holding a lock on its per-account profile dir
 // (so the NEXT run for that account fails to launch). We match ONLY chrome.exe
@@ -250,13 +271,25 @@ app.whenReady().then(async () => {
   try {
     const stat = fs.statSync(LOG_FILE);
     if (stat.size > 5 * 1024 * 1024) {
+      try { fs.renameSync(path.join(LOG_DIR, 'automation.log.1'), path.join(LOG_DIR, 'automation.log.2')); } catch {}
       fs.renameSync(LOG_FILE, path.join(LOG_DIR, 'automation.log.1'));
     }
   } catch {}
   appendLogFile('--- session start ---');
   // ---------------------------------------------------------------------------
 
+  ensureDesktopShortcut(); // first-run: drop a desktop icon (portable build has no installer)
+
   orchestrator = new Orchestrator(emit, { isLoginOpen: (name) => loginBrowsers.has(name) });
+
+  // Survive laptop sleep: a suspend drops every Chromium CDP connection, so HOLD the run on
+  // suspend and continue on wake. We only auto-resume a pause WE triggered (not a user pause).
+  let pausedBySystem = false;
+  try {
+    const { powerMonitor } = require('electron');
+    powerMonitor.on('suspend', () => { try { if (orchestrator && orchestrator.isRunning() && !orchestrator.isPaused()) { orchestrator.pause(); pausedBySystem = true; appendLogFile('System suspend — auto-paused the run'); } } catch {} });
+    powerMonitor.on('resume', () => { try { if (pausedBySystem && orchestrator && orchestrator.isPaused()) { orchestrator.resume(); appendLogFile('System resume — auto-resumed the run'); } pausedBySystem = false; } catch {} });
+  } catch {}
 
   // Remote control server + tunnel (best effort). Hooks delegate all mutations
   // back here so the data store stays the single source of truth.
