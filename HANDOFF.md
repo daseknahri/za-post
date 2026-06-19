@@ -11,6 +11,8 @@ All of the following was confirmed on live runs and is committed/pushed to `dase
 - **Hidden browser works** and is the default. Critical fact: Facebook will NOT publish from true-headless or a `SW_HIDE`'d window; it DOES publish from a **headful window parked off-screen** (`--window-position=-32000,-32000`) **+ focus/visibility emulation** (`Emulation.setFocusEmulationEnabled` + overriding `document.hidden`/`visibilityState`/`hasFocus`). A taskbar icon remains and can't be removed (Chrome re-asserts its window style) — unavoidable.
 - **Facebook account-limit handling:** detects rate-limit ("we limit how often…") and identity checkpoint ("confirm you are a real person", EN/FR); **skips the blocked account immediately**, **flags it in the Accounts UI** (⏸ Rate-limited / 🔐 Needs verification / ⚠️ likely blocked), and lists "accounts needing attention" in the end-of-run summary. A blocked account's post is **reassigned to a healthy account** (claim/release rotation), so no cycle is wasted.
 - Also done this session: durable data store + recovery, offline hold-and-resume, pause/resume/stop correctness, crash-resume, disk/CPU efficiency (capped caches + run-report rotation), first-run desktop shortcut, and a full run-report audit trail (`<userData>/logs/run-report.csv`).
+- **Pre-ship hardening pass (commit `e49be97`):** a 5-agent audit + fixes — hidden-browser CDP no longer silently skips the off-screen move (and forces off-screen via `Browser.setWindowBounds` so a profile/Windows reposition can't reveal it); `sanitizeProfile(name, hidden)` pins the window placement (off-screen for hidden runs, cleared so logins stay visible); watchdog probes liveness before aborting (survives laptop sleep) and stops touching a dead browser; single-shot bounded `browser.close()`; comment never returns false after the submit Enter (no double-post) + retries up to 3×; suspend/resume respects user pause intent.
+- **Packaging — the deliverable is the portable zip, built with `npm run pack:portable`** (`scripts/build-portable.js`). `npm run pack` (NSIS) FAILS on a normal account: electron-builder's winCodeSign cache contains macOS symlinks that need admin/Developer-Mode. `pack:portable` auto-seeds that cache *without* the `darwin` folder (which a Windows build never uses), builds electron-builder's `dir` target (no signing), then 7-zips a `Za Post Comment Tool/` folder + `build/READ-ME-FIRST.txt` → `dist/Za-Post-Comment-Tool-1.0.0-portable.zip` (~339 MB, Chromium bundled at `resources/chrome/chrome.exe`). `asarUnpack` includes puppeteer-extra*/proxy-chain.
 
 **Gotcha learned the hard way:** if an account fails to publish in BOTH hidden and visible, it's rate-limited/blocked on Facebook's side — NOT a hidden-mode bug. Test hidden with a known-healthy account.
 
@@ -24,8 +26,8 @@ All of the following was confirmed on live runs and is committed/pushed to `dase
 - Project path: `D:\za-post-main`
 - Runtime data path: `%APPDATA%\za-post-restored`
 - Local app/API while running: `http://127.0.0.1:3000`
-- Portable zip made for transfer:
-  `D:\za-post-main\dist\Za-Post-Comment-Tool-1.0.0-portable.zip`
+- Portable zip made for transfer (rebuild with `npm run pack:portable`):
+  `C:\Users\Dell\za-post-restored\dist\Za-Post-Comment-Tool-1.0.0-portable.zip`
 
 Do not treat `%APPDATA%\za-post-restored` as source code. It contains local runtime data, account browser profiles, cookies, uploaded images, and settings.
 

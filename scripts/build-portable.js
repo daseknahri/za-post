@@ -19,13 +19,37 @@ const README_SRC = path.join(ROOT, 'build', 'READ-ME-FIRST.txt');
 
 function run(cmd) { console.log('\n> ' + cmd); execSync(cmd, { cwd: ROOT, stdio: 'inherit' }); }
 
+// electron-builder's Windows build extracts a winCodeSign 7z that contains macOS symlinks; creating
+// those on Windows needs admin / Developer-Mode, and without it the extract aborts and the WHOLE
+// build fails (even the `dir` target downloads winCodeSign). Pre-seed the cache WITHOUT the darwin
+// folder (a Windows build never uses it) so the build works on a normal, non-admin user account.
+function ensureWinCodeSign() {
+  const cacheRoot = path.join(process.env.LOCALAPPDATA || '', 'electron-builder', 'Cache', 'winCodeSign');
+  const finalDir = path.join(cacheRoot, 'winCodeSign-2.6.0');
+  if (fs.existsSync(path.join(finalDir, 'windows-10'))) { console.log('\n> winCodeSign cache already seeded'); return; }
+  fs.mkdirSync(cacheRoot, { recursive: true });
+  const path7za = require('7zip-bin').path7za;
+  const archive = path.join(cacheRoot, 'winCodeSign-2.6.0.7z');
+  if (!fs.existsSync(archive)) {
+    const url = 'https://github.com/electron-userland/electron-builder-binaries/releases/download/winCodeSign-2.6.0/winCodeSign-2.6.0.7z';
+    console.log('\n> downloading winCodeSign-2.6.0.7z (one-time)');
+    execSync(`powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '${url}' -OutFile '${archive}'"`, { stdio: 'inherit' });
+  }
+  fs.rmSync(finalDir, { recursive: true, force: true });
+  console.log('\n> seeding winCodeSign cache (excluding darwin symlinks)');
+  execSync(`"${path7za}" x "${archive}" "-o${finalDir}" "-x!darwin" -y`, { cwd: ROOT, stdio: 'inherit' });
+}
+
 (async () => {
   if (!fs.existsSync(README_SRC)) throw new Error('missing build/READ-ME-FIRST.txt');
 
   // 1) refresh the bundled Chromium into ./chrome-bin (extraResources -> resources/chrome)
   run('node scripts/bundle-chromium.js');
 
-  // 2) build the unpacked app: `dir` target = no installer, no signing, no winCodeSign
+  // 1.5) make electron-builder's winCodeSign cache usable without admin/Developer-Mode
+  ensureWinCodeSign();
+
+  // 2) build the unpacked app: `dir` target = no installer, no signing
   console.log('\n> electron-builder (dir target)');
   const builder = require('electron-builder');
   await builder.build({ targets: builder.Platform.WINDOWS.createTarget('dir') });
@@ -44,15 +68,14 @@ function run(cmd) { console.log('\n> ' + cmd); execSync(cmd, { cwd: ROOT, stdio:
   fs.copyFileSync(README_SRC, path.join(staging, 'READ-ME-FIRST.txt'));
   fs.copyFileSync(README_SRC, path.join(DIST, 'READ-ME-FIRST.txt')); // handy reference next to the zip
 
-  // 4) zip the staging CONTENTS (folder + readme become the zip root) via .NET — fast, standard
+  // 4) zip the staging CONTENTS via 7-Zip — STANDARD forward-slash zip entries (the .NET Framework
+  // 4.x ZipFile API writes backslash separators that some extractors mishandle). cwd = staging so
+  // the "Za Post Comment Tool/" folder + readme land at the zip ROOT.
   const zipPath = path.join(DIST, ZIP_NAME);
   fs.rmSync(zipPath, { force: true });
-  const ps1 = path.join(DIST, '_zip.ps1');
-  fs.writeFileSync(ps1,
-    "Add-Type -AssemblyName System.IO.Compression.FileSystem\n" +
-    `[System.IO.Compression.ZipFile]::CreateFromDirectory('${staging}', '${zipPath}', 'Optimal', $false)\n`);
-  run(`powershell -NoProfile -ExecutionPolicy Bypass -File "${ps1}"`);
-  fs.rmSync(ps1, { force: true });
+  const path7za = require('7zip-bin').path7za;
+  console.log('\n> 7-Zip: packing portable archive');
+  execSync(`"${path7za}" a -tzip -mx=5 "${zipPath}" "*"`, { cwd: staging, stdio: 'inherit' });
 
   if (!fs.existsSync(zipPath)) throw new Error('zip was not created');
   const mb = Math.round(fs.statSync(zipPath).size / 1e6);
