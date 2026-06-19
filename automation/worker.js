@@ -346,6 +346,16 @@ async function evalTimed(page, fn, arg, ms = 12000) {
   finally { clearTimeout(t); }
 }
 
+// Resolve to `fallback` if a promise (any CDP op: $$, h.evaluate, target.evaluate…) doesn't
+// settle in `ms`, so a busy renderer can't hang a step to the 90s protocolTimeout. The original
+// op keeps running in the background harmlessly.
+function withTimeout(promise, ms, fallback) {
+  let t;
+  const safe = Promise.resolve(promise).catch(() => fallback);
+  const cap = new Promise((res) => { t = setTimeout(() => res(fallback), ms); });
+  return Promise.race([safe, cap]).finally(() => clearTimeout(t));
+}
+
 // Add the "first comment" (the link) to the JUST-published post. Reloads the group
 // so the new post renders, finds the article containing our caption, and types into
 // ITS "Write a public comment…" box. Returns true on success.
@@ -364,25 +374,25 @@ async function addFirstComment(page, gid, post, commentImg, step) {
 
     // If the session died between publishing and commenting, our post won't be in the
     // feed — name that explicitly instead of reporting a vague "no comment box".
-    const authBad = await page.evaluate(() => /continue as|use another profile/i.test(document.body.innerText || '')).catch(() => false);
+    const authBad = await withTimeout(page.evaluate(() => /continue as|use another profile/i.test(document.body.innerText || '')), 8000, false);
     if (authBad) { step('Comment: session expired after posting — skipped (re-login needed)'); return false; }
 
     const commentBoxes = async () => {
-      const all = (await page.$$('[contenteditable="true"], [role="textbox"]')).slice(0, 30);
+      const all = (await withTimeout(page.$$('[contenteditable="true"], [role="textbox"]'), 8000, [])).slice(0, 30);
       const out = [];
       for (const h of all) {
-        const isC = await h.evaluate((el) => {
+        const isC = await withTimeout(h.evaluate((el) => {
           const raw = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('aria-placeholder') || '');
           const norm = raw.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
           return /comment|hozzaszolas/.test(norm); // English + Hungarian "hozzaszolas" (accent-stripped)
-        }).catch(() => false);
+        }), 3000, false);
         if (isC) out.push(h);
       }
       return out;
     };
     const snip = (post.caption || '').replace(/\s+/g, ' ').trim().slice(0, 25);
 
-    let boxes = await commentBoxes();
+    let boxes = await withTimeout(commentBoxes(), 12000, []);
     if (!boxes.length) {
       // State 2: click the "Leave a comment" button — prefer the one in OUR post's article.
       step('Comment: no inline box yet — clicking "Leave a comment"');
@@ -400,7 +410,7 @@ async function addFirstComment(page, gid, post, commentImg, step) {
         if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return true; }
         return false;
       }, snip, 12000).catch(() => false);
-      if (clicked) { step('Comment: comment box opened'); await sleep(3500); boxes = await commentBoxes(); }
+      if (clicked) { step('Comment: comment box opened'); await sleep(3500); boxes = await withTimeout(commentBoxes(), 12000, []); }
       else step('Comment: "Leave a comment" button not found');
     }
     if (!boxes.length) { step('Comment: no comment box found — comment skipped'); return false; }
@@ -409,7 +419,7 @@ async function addFirstComment(page, gid, post, commentImg, step) {
     const target = boxes[0];
     // Focus via in-page scroll+focus (ElementHandle.click can hang on re-rendering feeds).
     step('Comment: focusing the comment box');
-    await target.evaluate((el) => { el.scrollIntoView({ block: 'center' }); el.focus(); }).catch(() => {});
+    await withTimeout(target.evaluate((el) => { el.scrollIntoView({ block: 'center' }); el.focus(); }), 5000, null);
     await sleep(600);
     if (commentImg) {
       // Scope the file input to the comment box's container ONLY (the document-level
@@ -453,7 +463,7 @@ async function addFirstComment(page, gid, post, commentImg, step) {
     const cdl = Date.now() + 4000;
     while (Date.now() < cdl) {
       await sleep(1000);
-      const state = await target.evaluate((el) => (el.textContent || '').trim()).catch(() => 'GONE');
+      const state = await withTimeout(target.evaluate((el) => (el.textContent || '').trim()), 3000, 'GONE');
       if (state === '' || state === 'GONE') { confirmed = true; break; } // emptied or re-rendered = submitted
     }
     step(confirmed ? 'Comment: posted and verified ✅' : 'Comment: sent (could not auto-verify)');
