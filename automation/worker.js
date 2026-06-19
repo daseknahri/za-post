@@ -697,6 +697,17 @@ async function runAccount(o) {
     const _pages = await browser.pages();
     for (let i = 1; i < _pages.length; i++) { try { await _pages[i].close(); } catch {} }
     const page = _pages[0] || (await browser.newPage());
+    // Make Facebook treat the page as FOCUSED + VISIBLE even when the window is off-screen.
+    // Without this, an off-screen/hidden window won't publish (FB defers work on a page it
+    // thinks is hidden) and the clipboard stays blocked. This is what lets "hidden" actually post.
+    try { const cdp = await page.target().createCDPSession(); await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }); } catch {}
+    try {
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+        Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+        document.hasFocus = () => true;
+      });
+    } catch {}
     // Allow clipboard access so captions can be PASTED (fast + reliable, like the original agent).
     try { await browser.defaultBrowserContext().overridePermissions('https://www.facebook.com', ['clipboard-read', 'clipboard-write']); } catch {}
     // Watchdog: hard cap on this account's run so one stuck account can never block the
