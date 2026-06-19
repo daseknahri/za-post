@@ -2,7 +2,19 @@
 
 Last updated: 2026-06-19. Read this first when continuing in a new session.
 
+> **Full project reference: [`DOCS.md`](DOCS.md)** — architecture, run lifecycle, settings,
+> data layout, packaging internals, and dev scripts. This file is the live *status*; DOCS.md is
+> the *how it works*.
+
 ## ⭐ STATUS 2026-06-19 — verified working end-to-end (read this first)
+
+**Comment robustness completed:** comments are hardened (CDP caps, 3× retry, no double-post,
+no wrong-post, tightened rate-limit, Hungarian) and now have a **permalink fallback** — at
+publish the post's own link is captured (skipping pinned posts), and if the feed scan can't
+find the comment box (short/image-only captions) the comment is made directly on the post's
+page. Purely additive: long-caption posts use the existing path unchanged. Two full lifecycle
+audits (adversarially verified, regression-reviewed clean) closed 12 confirmed defects — see
+[`DOCS.md`](DOCS.md) §8.
 
 The app **posts and comments reliably, including on Hungarian groups, with the browser hidden.**
 All of the following was confirmed on live runs and is committed/pushed to `daseknahri/za-post` `main`:

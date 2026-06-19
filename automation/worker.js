@@ -383,7 +383,7 @@ function withTimeout(promise, ms, fallback) {
 // Add the "first comment" (the link) to the JUST-published post. Reloads the group
 // so the new post renders, finds the article containing our caption, and types into
 // ITS "Write a public comment…" box. Returns true on success.
-async function addFirstComment(page, gid, post, commentImg, step) {
+async function addFirstComment(page, gid, post, commentImg, step, permalink) {
   let submitted = false; // once the submitting Enter is pressed, NEVER return false — the caller
                          // retries on false and would post a DUPLICATE comment.
   try {
@@ -440,6 +440,27 @@ async function addFirstComment(page, gid, post, commentImg, step) {
       }, snip, 12000).catch(() => false);
       if (clicked) { step('Comment: comment box opened'); await sleep(3500); boxes = await withTimeout(commentBoxes(), 12000, []); }
       else step('Comment: "Leave a comment" button not found');
+    }
+    // Permalink fallback: if the feed scan found nothing (common for short/image-only captions, where
+    // we won't guess which feed article is ours), open the post's OWN page — there it is the only
+    // article, so its comment box is unambiguous and no caption matching is needed.
+    if (!boxes.length && permalink) {
+      step('Comment: opening the post directly via its link');
+      await page.goto(permalink, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await sleep(3000);
+      await dismissPopups(page);
+      boxes = await withTimeout(commentBoxes(), 12000, []);
+      if (!boxes.length) {
+        const clicked2 = await evalTimed(page, () => {
+          const b = Array.from(document.querySelectorAll('[role="button"]')).find((e) => {
+            const norm = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+            return /leave a comment|^comment$|hozzaszolas/.test(norm);
+          });
+          if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return true; }
+          return false;
+        }, null, 12000).catch(() => false);
+        if (clicked2) { step('Comment: comment box opened (post page)'); await sleep(3000); boxes = await withTimeout(commentBoxes(), 12000, []); }
+      }
     }
     if (!boxes.length) { step('Comment: no comment box found — comment skipped'); return false; }
     step(`Comment: ${boxes.length} comment box(es) found`);
@@ -1127,6 +1148,24 @@ async function runAccount(o) {
         step('Posted successfully');
         posted++;
 
+        // Capture the just-published post's permalink while it is the NEWEST post in the feed (before
+        // anyone else posts), skipping any pinned/announcement post. The comment step can then open the
+        // post DIRECTLY — far more reliable than re-scanning the feed, especially for short/image-only
+        // captions. Best-effort; null just falls back to the feed scan.
+        let postPermalink = null;
+        try {
+          postPermalink = await withTimeout(page.evaluate(() => {
+            const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 6);
+            for (const a of arts) {
+              if (/pinned|épinglé|rögzített/.test((a.innerText || '').slice(0, 200).toLowerCase())) continue; // skip pinned
+              const link = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]');
+              if (link && link.href && /\/(posts|permalink)\//.test(link.href)) return link.href.split('?')[0];
+            }
+            return null;
+          }), 6000, null);
+        } catch {}
+        if (postPermalink) step('Comment: captured the post link for a direct, reliable comment');
+
         // First comment (the link) — reload, find OUR post, comment in its box.
         // addFirstComment logs every stage itself (via the same step() logger).
         // Fire when there is comment TEXT or a comment IMAGE — an image-only comment is valid.
@@ -1138,7 +1177,7 @@ async function runAccount(o) {
           let cok = false;
           for (let cAttempt = 1; cAttempt <= 3 && !cok && !shouldStop() && !aborted && browser && browser.isConnected(); cAttempt++) {
             if (cAttempt > 1) { step(`Comment: retry ${cAttempt}/3`); await sleepInterruptible(2500, shouldStop); }
-            cok = await addFirstComment(page, gid, post, commentImg, step);
+            cok = await addFirstComment(page, gid, post, commentImg, step, postPermalink);
           }
           commentResult = cok ? 'posted' : 'failed';
           if (!cok) step('Comment: could not post after 3 attempts — skipped');
