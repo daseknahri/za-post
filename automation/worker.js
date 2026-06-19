@@ -816,6 +816,16 @@ async function runAccount(o) {
         if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
         armWatchdog();
       }
+      // Likely-blocked guard: if we've attempted ≥2 groups with ZERO posts, this account
+      // probably can't post at all (silent block / restriction). Skip the rest immediately
+      // instead of grinding through every group (mirrors the old app passing a blocked account).
+      if (i >= 2 && posted === 0) {
+        if (await checkRateLimit(page)) flag = 'rate_limited';
+        else if (await checkVerification(page)) flag = 'needs_verification';
+        else if (!flag) flag = 'likely_blocked';
+        log(`🛑 [${name}] no posts after ${i} group(s) — skipping the rest (account looks blocked/restricted)`);
+        noRetry = true; break;
+      }
       const g = targetGroups[i];
       const gid = g.groupId || g.id;
       const groupName = g.name || gid;
@@ -859,12 +869,16 @@ async function runAccount(o) {
 
         // Clear cookie/notification banners, then bail out of this account if rate-limited.
         await dismissPopups(page);
-        if (await checkRateLimit(page)) { step('Rate-limited by Facebook - backing off this account'); errors++; noRetry = true; flag = 'rate_limited'; report(groupName, gid, 'error', 'rate-limited by Facebook', ''); break; }
+        if (await checkRateLimit(page)) { step('🛑 Rate-limited by Facebook — skipping this account immediately'); errors++; noRetry = true; flag = 'rate_limited'; report(groupName, gid, 'error', 'rate-limited by Facebook', ''); break; }
 
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
         const opened = await openComposer(page, step, name);
         if (!opened) {
+          // An account-level block can be WHY the composer won't open — confirm it and skip the
+          // WHOLE account immediately rather than trying every remaining group.
+          if (await checkRateLimit(page)) { step('🛑 Rate-limited by Facebook (composer blocked) — skipping this account immediately'); errors++; noRetry = true; flag = 'rate_limited'; report(groupName, gid, 'error', 'rate-limited — composer blocked', ''); break; }
+          if (await checkVerification(page)) { step('🔐 Facebook wants identity/human verification — skipping this account immediately'); errors++; noRetry = true; flag = 'needs_verification'; report(groupName, gid, 'error', 'identity verification required', ''); break; }
           // Name the likely cause so the operator can act (and knows it's not a generic bug).
           const why = await page.evaluate(() => {
             const t = (document.body.innerText || '').toLowerCase();
@@ -980,8 +994,8 @@ async function runAccount(o) {
         if (publishResult !== 'published') {
           // The post failed — find out WHY so the account can be flagged for the operator.
           // Facebook's spam/rate-limit message appears in the composer right after clicking Post.
-          if (await checkRateLimit(page)) { step('🚫 Facebook is rate-limiting this account ("you can try again later") — backing off'); errors++; noRetry = true; flag = 'rate_limited'; report(groupName, gid, 'error', 'rate-limited — Facebook blocked the post', ''); break; }
-          if (await checkVerification(page)) { step('🔐 Facebook wants identity/human verification — flagging account'); errors++; noRetry = true; flag = 'needs_verification'; report(groupName, gid, 'error', 'identity verification required', ''); break; }
+          if (await checkRateLimit(page)) { step('🛑 Facebook is rate-limiting this account ("you can try again later") — skipping this account immediately'); errors++; noRetry = true; flag = 'rate_limited'; report(groupName, gid, 'error', 'rate-limited — Facebook blocked the post', ''); break; }
+          if (await checkVerification(page)) { step('🔐 Facebook wants identity/human verification — skipping this account immediately'); errors++; noRetry = true; flag = 'needs_verification'; report(groupName, gid, 'error', 'identity verification required', ''); break; }
           // Otherwise it's an unexplained failure — snapshot the dialog so it's diagnosable.
           const snap = await page.evaluate(() => { const d = document.querySelector('div[role="dialog"]'); return ((d && d.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 120); }).catch(() => '');
           step(`Post clicked but publish NOT confirmed (${publishResult})${snap ? ` — "${snap}"` : ''}; skipping group`);

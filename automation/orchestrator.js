@@ -304,6 +304,7 @@ class Orchestrator {
                 else if (r.flag === 'rate_limited') { acc.status = 'rate_limited'; acc.lastMessage = '⏸ Rate-limited by Facebook (posting too often) — wait, then it retries automatically'; }
                 else if (r.flag === 'needs_verification') { acc.status = 'checkpoint'; acc.lastMessage = '🔐 Facebook wants identity/human verification — open this account and complete the check'; }
                 else if (r.flag === 'account_disabled') { acc.status = 'error'; acc.lastMessage = '🚫 Account disabled/restricted by Facebook — needs manual attention'; }
+                else if (r.flag === 'likely_blocked') { acc.status = 'error'; acc.lastMessage = '⚠️ Posted nothing across its groups — likely blocked/restricted; check this account on Facebook'; }
               });
               this.emit('data-updated');
             } catch {}
