@@ -1,5 +1,11 @@
 # Za Post Comment Tool — Restored (clean source)
 
+> **📖 Full, current reference: [`DOCS.md`](DOCS.md)** (architecture, run lifecycle, settings,
+> data layout, hidden/visible browser, packaging internals, robustness) · **Latest status:
+> [`HANDOFF.md`](HANDOFF.md)**. This README is the original reconstruction overview; DOCS.md
+> reflects the current hardened state. **To build the distributable:** `npm install` →
+> `npx puppeteer browsers install chrome` → `npm run pack:portable`.
+
 Facebook multi-account auto-poster (Electron + Puppeteer-extra/stealth). This is a
 **clean, fully-editable reconstruction** of the shipped "King" app, whose backend had
 been compiled to V8 bytecode (the original `main.js` source was lost). The renderer/UI
