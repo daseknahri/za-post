@@ -159,6 +159,7 @@ class Orchestrator {
     this._runStartedAt = Date.now();
     this._runStats = {}; // per-account totals across the whole run (for the end-of-run summary)
     this._runFlags = {}; // accountName -> flag set THIS run (rate_limited/checkpoint/etc.)
+    this._claimed = new Set(); // post ids claimed by an account this cycle (reset each cycle)
     this.emit('automation-started');
     this.emit('automation-progress', { ...this._progress });
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
@@ -219,8 +220,10 @@ class Orchestrator {
     try { store.appendReport({ ts: summary.finishedAt, account: '(run summary)', group: '', groupId: '', postId: '', result: `summary:${reason}`, comment: '', detail: `posted=${summary.posted} pending=${summary.pending} errors=${summary.errors} cycles=${summary.cycles} duration=${m}m${s}s` }); } catch {}
   }
 
-  // Choose the posts a given account publishes this cycle.
-  _postsForAccount(account, cycle) {
+  // Choose the posts a given account publishes this cycle. `claim`=true (at run time) reserves
+  // the post for this account so a parallel account can't grab the same one; failed claims are
+  // released so another account picks them up (see _runAccount).
+  _postsForAccount(account, cycle, claim = false) {
     const data = this._data;
     const filtered = data.posts.filter((p) => matchesFilter(p, account.postFilter || 'all'));
     if (!filtered.length) return [];
@@ -237,20 +240,21 @@ class Orchestrator {
     }
 
     // UNIQUE / SEQUENCE -> deal each post exactly ONCE across the active accounts, round-robin.
-    // `remaining` = posts not yet dealt; the account at active-index k takes remaining[k].
-    // No wrap: if fewer posts remain than accounts, the higher-index accounts post nothing
-    // (so when posts < accounts, only that many accounts post and the campaign then completes).
-    let remaining = filtered.filter((p) => !this._dealt.has(p.id));
+    // `remaining` = posts not yet dealt AND not already claimed by another account this cycle.
+    let remaining = filtered.filter((p) => !this._dealt.has(p.id) && !(this._claimed && this._claimed.has(p.id)));
     if (!remaining.length) return [];
     if (order.includes('random')) remaining = seededShuffle(remaining, (cycle + 1) * 7919); // randomized deal order (consistent within the cycle)
     const activeList = this._active || data.accounts.filter((a) => a.enabled !== false);
     const i = activeList.findIndex((a) => a.name === account.name);
     if (i < 0) return [];
-    // roundOffset rotates which account gets which post across Loop-campaign recycles, so an
-    // account posts different content over time. It's a rotation (permutation) -> no wrap/dup.
+    // roundOffset rotates which account gets which post across Loop-campaign recycles.
     const k = (i + (this._roundOffset || 0)) % activeList.length;
-    if (k >= remaining.length) return []; // this account's turn hasn't come up this cycle
-    return [remaining[k]];
+    // Take the positional post; if this account's slot is past the posts left (e.g. earlier
+    // accounts were BLOCKED and freed their post), pick up the FIRST still-available post so a
+    // healthy account is never idle while un-posted content waits.
+    const pick = remaining[k < remaining.length ? k : 0];
+    if (claim && this._claimed) this._claimed.add(pick.id);
+    return [pick];
   }
 
   // Returns { progressed, posted, pendingApproval, errors }. Rotation only advances
@@ -258,7 +262,7 @@ class Orchestrator {
   async _runAccount(account, cycle) {
     const data = this._data;
     const accountStart = Date.now();
-    const posts = this._postsForAccount(account, cycle);
+    const posts = this._postsForAccount(account, cycle, true); // claim at run time so parallel accounts don't collide
     if (!posts.length) { this.log(`↪️ [${account.name}] no eligible posts`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [], dealtIds: [] }; }
     const order = account.postingOrder || 'post-centric';
     const isUnique = order.includes('unique') || order === 'sequence';
@@ -343,6 +347,9 @@ class Orchestrator {
     // Surface the outcome so the operator sees pending/error counts in the log pane.
     this.log(`[${account.name}] ✅ Done in ${Math.round((Date.now() - accountStart) / 1000)}s`);
     this.log(`📊 [${account.name}] posted=${posted} pending=${pendingApproval} errors=${errors}`);
+    // Release claims for posts this account did NOT publish (blocked / failed), so a healthy
+    // account can pick them up later this same run instead of the post sitting idle.
+    if (this._claimed) for (const pp of posts) { if (!dealtIds.includes(pp.id)) this._claimed.delete(pp.id); }
     return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag, offline: accountOffline };
   }
 
@@ -360,6 +367,7 @@ class Orchestrator {
       this._active = active;
 
       cycle++;
+      this._claimed = new Set(); // fresh per-cycle claim ledger (released claims free a post for another account)
       // Unique modes deal each post once across accounts. When every active account is unique
       // and no un-dealt posts remain, the campaign is complete — stop and reset for the next run.
       if (active.reduce((s, a) => s + this._postsForAccount(a, cycle).length, 0) === 0) {
