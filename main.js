@@ -188,18 +188,20 @@ const _attentionNotified = new Map();
 function notifyAccountAttention(payload) {
   try {
     const name = (payload && payload.name) || 'An account';
-    const captcha = payload && payload.flag === 'needs_verification';
+    const flag = (payload && payload.flag) || '';
     const last = _attentionNotified.get(name) || 0;
     if (Date.now() - last < 10 * 60 * 1000) return; // at most one toast / 10 min per account
     _attentionNotified.set(name, Date.now());
     const { Notification } = require('electron');
     if (!Notification.isSupported()) return;
-    const n = new Notification({
-      title: captcha ? 'Za Post — verification needed' : 'Za Post — login needed',
-      body: captcha
-        ? `${name}: Facebook wants a human/identity check (captcha). Open this account, complete it, then Start again.`
-        : `${name}: session expired. Open this account and log in, then Start again.`,
-    });
+    const MSG = {
+      needs_verification: { title: 'Za Post — verification needed', body: `${name}: Facebook wants a human/identity check (captcha). Open this account, complete it, then Start again.` },
+      needs_login: { title: 'Za Post — login needed', body: `${name}: session expired. Open this account and log in, then Start again.` },
+      account_disabled: { title: 'Za Post — account disabled', body: `${name}: Facebook disabled/restricted this account. Check it on Facebook — it can't post.` },
+      likely_blocked: { title: 'Za Post — account not posting', body: `${name}: posted nothing across its groups (likely blocked/restricted). Check this account on Facebook.` },
+    };
+    const m = MSG[flag] || { title: 'Za Post — account needs attention', body: `${name}: needs attention — check it on Facebook.` };
+    const n = new Notification(m);
     n.on('click', () => { try { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } catch {} });
     n.show();
   } catch {}
@@ -269,6 +271,10 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  // If we LOST the single-instance lock, do NOTHING and let app.quit() proceed. Otherwise this
+  // second instance would run killOrphanChromium() (which kills the FIRST instance's live run/login
+  // browsers — they all live under ACCOUNTS_DIR), start a colliding server, and maybe auto-resume.
+  if (!gotLock) return;
   store.init(app.getPath('userData'));
   clearInterruptedLoginStates(); // triggers the first load() — surfaces any recovery below
 
@@ -336,7 +342,7 @@ app.whenReady().then(async () => {
   await remote.startServer(REMOTE_PORT, {
     getData,
     getStatus: () => orchestrator.isRunning(),
-    onStart: () => { setRunActive(true); return orchestrator.start(getData); },
+    onStart: async () => { const r = await orchestrator.start(getData); if (r && r.success !== false) setRunActive(true); return r; },
     onStop: () => { orchestrator.stop(); setRunActive(false); },
     addPost: (fields) => addPostFromRemote(fields),
     deletePost: (index) => deletePostByIndex(index),
@@ -367,7 +373,12 @@ app.whenReady().then(async () => {
   // ---- Auto-resume after shutdown / crash ------------------------------------
   // Capture whether the previous session left the run-active flag set.
   const wasInterrupted = isRunActive();
-  if (wasInterrupted && store.load().settings.resumeOnStartup === true && mainWindow) {
+  // Only resume if there is actually work left — a stale run-active flag (e.g. a crash just after the
+  // campaign completed) must not resurrect a finished run.
+  const _rd = store.load();
+  const _hasWork = (_rd.posts || []).length > 0 && (_rd.accounts || []).some((a) => a.enabled !== false && (a.assignedGroups || []).length > 0);
+  if (wasInterrupted && !_hasWork) { try { setRunActive(false); } catch {} }
+  if (wasInterrupted && _hasWork && _rd.settings.resumeOnStartup === true && mainWindow) {
     let resumeFired = false; // guard: fire exactly once
     mainWindow.webContents.once('did-finish-load', () => {
       if (resumeFired || orchestrator.isRunning()) return;
@@ -387,6 +398,10 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (orchestrator) orchestrator.stop();
+  // A clean window-all-closed is a deliberate user quit — durably clear run-active (synchronous
+  // fsync+rename) so the next launch won't auto-resume a run the user intentionally closed. A
+  // crash/hard-kill leaves the flag set, which is the legitimate crash-resume case.
+  try { setRunActive(false); } catch {}
   for (const [, entry] of loginBrowsers) { try { entry.browser.close(); } catch {} }
   remote.stopServer();
   if (process.platform !== 'darwin') app.quit();

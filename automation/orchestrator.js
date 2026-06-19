@@ -227,6 +227,10 @@ class Orchestrator {
     const data = this._data;
     const filtered = data.posts.filter((p) => matchesFilter(p, account.postFilter || 'all'));
     if (!filtered.length) return [];
+    // An account with NO assigned groups can't post anywhere — never assign it a post. Otherwise, in
+    // unique mode, it would "claim" a post it can't deliver and the campaign-complete probe could never
+    // reach zero, looping the run forever with zero progress.
+    if (!(account.assignedGroups && account.assignedGroups.length)) return [];
     const order = account.postingOrder || 'post-centric';
     const unique = order.includes('unique') || order === 'sequence';
 
@@ -311,10 +315,12 @@ class Orchestrator {
           });
           if (r && r.offline) accountOffline = true;
           posted += (r && r.posted) || 0; pendingApproval += (r && r.pendingApproval) || 0; errors += (r && r.errors) || 0;
-          // A post is "dealt" (rotation advances, not re-posted next cycle) if it published OR
-          // went pending. But ONLY a confirmed publish is auto-deletable — a pending post an
-          // admin may later reject must stay in the library, so pending ids never enter postedIds.
-          if (r && (r.posted || 0) > 0) { progressed = true; if (post.id) { postedIds.push(post.id); dealtIds.push(post.id); } }
+          // A post is "dealt" (rotation advances, not re-posted next cycle) if it published OR went
+          // pending in ANY group — we never re-post to avoid duplicates. But it is only auto-DELETABLE
+          // when it FULLY published to EVERY targeted group with no errors (r.fullyPosted); a partial
+          // publish (landed in some groups, errored in others) must STAY in the library so it is never
+          // lost. A pending post (admin may reject) also stays (never enters postedIds).
+          if (r && (r.posted || 0) > 0) { progressed = true; if (post.id) { if (r.fullyPosted) postedIds.push(post.id); dealtIds.push(post.id); } }
           else if (r && (r.pendingApproval || 0) > 0) { progressed = true; if (post.id) dealtIds.push(post.id); }
           // Persist flag to account status so the UI shows it (serialized via store.update).
           if (r && r.flag) {
@@ -333,8 +339,9 @@ class Orchestrator {
               this.emit('data-updated');
             } catch {}
             // Ping the user with a desktop notification when an account needs THEM (captcha /
-            // verification, or a re-login). main.js dedupes so it won't spam across cycles.
-            if (r.flag === 'needs_verification' || r.flag === 'needs_login') {
+            // verification, a re-login, a disabled account, or a likely block). main.js dedupes so
+            // it won't spam across cycles. rate_limited is excluded — it auto-retries.
+            if (['needs_verification', 'needs_login', 'account_disabled', 'likely_blocked'].includes(r.flag)) {
               this.emit('account-attention', { name: account.name, flag: r.flag });
             }
           }
@@ -364,6 +371,7 @@ class Orchestrator {
   async _loop(getData) {
     const _st = store.loadRotation();
     this._dealt = new Set(Array.isArray(_st.dealt) ? _st.dealt : []); // post-ids already dealt (unique modes)
+    this._zeroProgressCycles = 0; // consecutive cycles that dealt nothing -> stall breaker
     this._roundOffset = _st.roundOffset || 0; // rotates account↔post mapping across Loop-campaign recycles
     let cycle = 0;
     while (!this._shouldStop()) {
@@ -464,7 +472,7 @@ class Orchestrator {
         for (const r of results) { cyclePostedIds.push(...r.postedIds); cycleDealtIds.push(...r.dealtIds); if (r.flag) cycleFlags.push(r.flag); }
         // Persist dealt-ids incrementally (after each batch) so a crash mid-cycle can't
         // re-deal — and thus potentially re-post — the batches already completed.
-        if (cycleDealtIds.length) { try { store.saveRotation({ dealt: [...new Set([...this._dealt, ...cycleDealtIds])], roundOffset: this._roundOffset || 0 }); } catch {} }
+        if (cycleDealtIds.length && !store.saveRotation({ dealt: [...new Set([...this._dealt, ...cycleDealtIds])], roundOffset: this._roundOffset || 0 })) this.log('⚠️ Could not persist rotation state (disk full / file locked?) — a crash now could re-post already-published content. Free space or fix permissions.');
         // Connection lost mid-batch (a worker bailed fast on offline): HOLD the whole run
         // until the connection returns, then continue. Un-posted posts stay un-dealt → re-run.
         if (results.some((r) => r.offline) && !this._shouldStop()) {
@@ -480,7 +488,7 @@ class Orchestrator {
       // a failed account's post stays un-dealt and is re-dealt next cycle). Persisted for resume.
       if (cycleDealtIds.length) {
         for (const id of cycleDealtIds) this._dealt.add(id);
-        try { store.saveRotation({ dealt: [...this._dealt], roundOffset: this._roundOffset || 0 }); } catch {}
+        if (!store.saveRotation({ dealt: [...this._dealt], roundOffset: this._roundOffset || 0 })) this.log('⚠️ Could not persist rotation state — a crash now could re-post already-published content.');
       }
       if (this._shouldStop()) break;
 
@@ -505,6 +513,15 @@ class Orchestrator {
       // bail. Stop with a clear reason instead of spinning forever unattended.
       if (cycleDealtIds.length === 0 && (cycleFlags.includes('needs_login') || cycleFlags.includes('account_disabled') || cycleFlags.includes('needs_verification'))) {
         this.log('🛑 No account could post this cycle — accounts need attention (logged out, disabled, or identity-verification required). Stopping. Fix the flagged accounts, then Start again.');
+        break;
+      }
+      // Dead-fleet / stall breaker: if the run dealt NOTHING for several cycles in a row (every account
+      // rate-limited, likely-blocked, group-less, or disabled), STOP instead of relaunching browsers
+      // forever unattended. This catches the zero-progress cases the flag-specific guard above doesn't
+      // (especially an all-rate-limited fleet, which would otherwise loop and keep burning the accounts).
+      this._zeroProgressCycles = (cycleDealtIds.length === 0) ? (this._zeroProgressCycles || 0) + 1 : 0;
+      if (this._zeroProgressCycles >= 3) {
+        this.log('🛑 3 cycles in a row posted nothing — stopping so the app does not spin unattended. Check your accounts/groups (rate-limited, blocked, or no groups assigned), then Start again.');
         break;
       }
       if ((settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {

@@ -79,8 +79,8 @@ function startServer(port, injected) {
     const running = hooks.getStatus();
     res.json({ isRunning: running, pid: running ? process.pid : null, logs: logs.slice(-80).map(shapeLog) });
   });
-  app.post('/api/automation/start', (_req, res) => {
-    try { hooks.onStart(); res.json({ success: true }); } catch (e) { res.json({ success: false, error: e.message }); }
+  app.post('/api/automation/start', async (_req, res) => {
+    try { const r = await hooks.onStart(); res.json(r && r.success === false ? r : { success: true }); } catch (e) { res.json({ success: false, error: e.message }); }
   });
   app.post('/api/automation/stop', (_req, res) => {
     try { hooks.onStop(); res.json({ success: true }); } catch (e) { res.json({ success: false, error: e.message }); }

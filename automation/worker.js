@@ -338,7 +338,10 @@ async function checkRateLimit(page) {
   try {
     return await page.evaluate(() => {
       const t = (document.body.innerText || '').toLowerCase();
-      return /you're temporarily blocked|temporarily restricted|doing this too (often|quickly)|try again later|action blocked|we limit how often|protect the community from spam|you can try again later|going too fast|posting too (often|quickly)|nous limitons|réessayer plus tard|temporairement bloqué/.test(t);
+      // NOTE: bare "try again later" / "réessayer plus tard" are Facebook's GENERIC transient-error
+      // strings (network hiccup, image CDN fail) — they must NOT trigger a no-retry account abort, so
+      // only block-SPECIFIC phrasing is matched here.
+      return /you're temporarily blocked|temporarily restricted|doing this too (often|quickly)|action blocked|we limit how often|protect the community from spam|going too fast|posting too (often|quickly)|nous limitons|temporairement bloqué/.test(t);
     });
   } catch { return false; }
 }
@@ -421,10 +424,12 @@ async function addFirstComment(page, gid, post, commentImg, step) {
       step('Comment: no inline box yet — clicking "Leave a comment"');
       const clicked = await evalTimed(page, (s) => {
         const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 15);
-        // For short/common captions the snippet match is unreliable (could hit a pinned/banner
-        // post) — prefer the NEWEST article (arts[0]), which is almost always the one we just posted.
+        // Find OUR post by its caption snippet. Without a reliable match we can't tell which article
+        // is ours — arts[0] may be a PINNED/banner post — so DON'T guess: skip the fallback rather
+        // than risk attaching the comment/link to the wrong post (better no comment than a wrong one).
         const mine = (s && s.length >= 12) ? arts.find((a) => (a.textContent || '').includes(s)) : null;
-        const scope = mine || arts[0] || document;
+        if (!mine) return false;
+        const scope = mine;
         const b = Array.from(scope.querySelectorAll('[role="button"]'))
           .find((e) => {
             const norm = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
@@ -627,11 +632,13 @@ async function credentialLogin(page, email, password, log, name) {
       return 'checkpoint';
     }
 
-    // Success: check for c_user cookie
-    const pageCookies = await page.cookies().catch(() => []);
+    // Success: check for c_user cookie (capped — a wedged renderer must not hang auth for 90s)
+    const pageCookies = await withTimeout(page.cookies(), 8000, []);
     if (pageCookies.some((c) => c.name === 'c_user' && c.value)) {
       log(`✅ [${name}] logged in with stored credentials`);
-      store.writeCookies(name, pageCookies);
+      // Persisting cookies must NOT flip a confirmed login into a failure — a transient FS error here
+      // would otherwise make the caller flag needs_login and skip a genuinely logged-in account.
+      try { store.writeCookies(name, pageCookies); } catch (we) { log(`⚠️ [${name}] logged in but failed to persist cookies: ${we.message}`); }
       return true;
     }
 
@@ -708,7 +715,11 @@ async function runAccount(o) {
     '--disk-cache-size=52428800',   // 50 MB
     '--media-cache-size=10485760',  // 10 MB
   ];
-  store.sanitizeProfile(name, settings.hideBrowser !== false); // pin off-screen placement when hidden (opens invisible, no flash)
+  // Guard the pre-launch profile prep: ensureDir/mkdirSync can throw EPERM/EACCES (profile dir locked
+  // by a crashed Chromium, antivirus, or a disconnected drive). Fail this account cleanly with a
+  // per-account error instead of throwing opaquely out of the worker.
+  try { store.sanitizeProfile(name, settings.hideBrowser !== false); } // pin off-screen placement when hidden
+  catch (e) { log(`⚠️ [${name}] profile prep failed (${e.message}) — skipping account`); return { posted: 0, errors: 1, pendingApproval: 0, noRetry: false, flag: null, postedIds: [] }; }
   // Proxy: Chrome can't do authenticated SOCKS5 directly, so we wrap the upstream
   // through proxy-chain (a local anonymized HTTP proxy) when credentials are present.
   let proxyAuth = null, anonLocal = null, watchdog = null;
@@ -853,7 +864,7 @@ async function runAccount(o) {
       const cookieAuthed = await page.evaluate(() =>
         !/login|checkpoint/.test(location.href) && !/continue as|use another profile/i.test(document.body.innerText || '')
       ).catch(() => false);
-      const hasCUser = cookieAuthed && (await page.cookies().catch(() => [])).some((c) => c.name === 'c_user' && c.value);
+      const hasCUser = cookieAuthed && (await withTimeout(page.cookies(), 8000, [])).some((c) => c.name === 'c_user' && c.value);
       if (cookieAuthed && hasCUser) {
         log(`🔄 [${name}] session recovered with saved cookies`);
       } else {
@@ -918,13 +929,10 @@ async function runAccount(o) {
         if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
         armWatchdog();
       }
-      // After ≥2 groups with ZERO posts, RE-CHECK for an ACCOUNT-LEVEL block and skip the rest
-      // only if one is CONFIRMED. Per-group failures (e.g. "not a member" of those groups) are
-      // NOT a reason to skip the account's other groups, so without a confirmed block we keep going.
-      if (i >= 2 && posted === 0) {
-        if (await checkRateLimit(page)) { flag = 'rate_limited'; log(`🛑 [${name}] rate-limited — skipping the rest of this account`); noRetry = true; break; }
-        if (await checkVerification(page)) { flag = 'needs_verification'; log(`🔐 [${name}] needs identity verification — skipping the rest of this account`); noRetry = true; break; }
-      }
+      // (A previous "i>=2 re-check the block" scan lived here. It ran BEFORE navigating to group i,
+      // so it read the PREVIOUS group's STALE page and could false-flag a healthy account as
+      // rate-limited off a generic transient error — abandoning the rest of its groups. Removed: the
+      // real block checks already run per-group AFTER the group loads, below.)
       const g = targetGroups[i];
       const gid = g.groupId || g.id;
       const groupName = g.name || gid;
@@ -1128,7 +1136,7 @@ async function runAccount(o) {
           // Retry up to 3× — addFirstComment only returns false BEFORE it submits (no box found,
           // a stalled renderer, etc.), so re-trying (it reloads each time) can't post a duplicate.
           let cok = false;
-          for (let cAttempt = 1; cAttempt <= 3 && !cok && !shouldStop(); cAttempt++) {
+          for (let cAttempt = 1; cAttempt <= 3 && !cok && !shouldStop() && !aborted && browser && browser.isConnected(); cAttempt++) {
             if (cAttempt > 1) { step(`Comment: retry ${cAttempt}/3`); await sleepInterruptible(2500, shouldStop); }
             cok = await addFirstComment(page, gid, post, commentImg, step);
           }
@@ -1161,7 +1169,7 @@ async function runAccount(o) {
     }
     // Posted NOTHING across all its groups (errors, no specific reason) → flag the account so the
     // operator checks it, but we did NOT skip any group (avoids the per-group false positive).
-    if (posted === 0 && errors > 0 && !flag && !offline && !shouldStop()) flag = 'likely_blocked';
+    if (posted === 0 && pendingApproval === 0 && errors > 0 && !flag && !offline && !shouldStop()) flag = 'likely_blocked';
     // Persist refreshed cookies for next run.
     try { const cks = await withTimeout(page.cookies(), 8000, null); if (cks) store.writeCookies(name, cks); } catch {}
     fs.writeFileSync(require('path').join(store.accountDir(name), 'last-run-success.txt'),
@@ -1176,7 +1184,9 @@ async function runAccount(o) {
     if (anonLocal && proxyChain) { try { await proxyChain.closeAnonymizedProxy(anonLocal, true); } catch {} }
     for (const t of tempImages) { try { fs.unlinkSync(t); } catch {} }
   }
-  return { posted, errors, pendingApproval, noRetry, flag, offline };
+  // fullyPosted = the post landed in EVERY targeted group, none pending, no errors — only then is it
+  // safe to auto-delete from the library (a partial publish must be kept). See orchestrator deal gate.
+  return { posted, errors, pendingApproval, noRetry, flag, offline, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length };
 }
 
 // Strip fields Puppeteer's setCookie rejects; coerce sameSite.
