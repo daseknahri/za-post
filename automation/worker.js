@@ -249,10 +249,14 @@ async function waitForPublish(page, dialogCountBefore, timeout = 30000, shouldSt
     const sig = await page.evaluate(() => {
       const t = (document.body.innerText || '').toLowerCase();
       if (/pending|in review|will be reviewed|shared once approved|post is pending|posted to the group/.test(t)) return 'submitted';
+      // Explicit Facebook failure — return early instead of polling the full 30s, and never
+      // count it as published (so the post is retried, not lost).
+      if (/couldn.t post|can.t share|something went wrong|unable to post|failed to post|couldn.t share/.test(t)) return 'error';
       const hasEnabledPost = Array.from(document.querySelectorAll('div[role="dialog"] [role="button"]'))
         .some((b) => (b.getAttribute('aria-label') || b.textContent || '').trim().toLowerCase() === 'post' && b.getAttribute('aria-disabled') !== 'true');
       return hasEnabledPost ? 'open' : 'gone';
     }).catch(() => 'open');
+    if (sig === 'error') return 'error';
     if (sig === 'gone' || sig === 'submitted') return 'published';
     await sleep(2000);
   }
@@ -364,7 +368,9 @@ async function addFirstComment(page, gid, post, commentImg, step) {
       step('Comment: no inline box yet — clicking "Leave a comment"');
       const clicked = await evalTimed(page, (s) => {
         const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 15);
-        const mine = s && arts.find((a) => (a.textContent || '').includes(s));
+        // For short/common captions the snippet match is unreliable (could hit a pinned/banner
+        // post) — prefer the NEWEST article (arts[0]), which is almost always the one we just posted.
+        const mine = (s && s.length >= 12) ? arts.find((a) => (a.textContent || '').includes(s)) : null;
         const scope = mine || arts[0] || document;
         const b = Array.from(scope.querySelectorAll('[role="button"]'))
           .find((e) => /leave a comment|^comment$/i.test((e.getAttribute('aria-label') || e.textContent || '').trim()));
@@ -762,10 +768,12 @@ async function runAccount(o) {
         const authBad = await page.evaluate(() => {
           const t = document.body.innerText || '';
           const hasBtn = (re) => Array.from(document.querySelectorAll('[role="button"],span,a,button')).some((e) => re.test((e.textContent || '').trim()));
+          if (/your account has been disabled|we suspended your account|your account is restricted|confirm your identity/i.test(t)) return 'account-disabled';
           if (/continue as|use another profile/i.test(t)) return 'session-expired';
           if (hasBtn(/^join group$/i) && hasBtn(/^log in$/i)) return 'not-authenticated';
           return null;
         });
+        if (authBad === 'account-disabled') { step('🚫 Account disabled/restricted by Facebook — needs manual attention'); errors++; noRetry = true; flag = 'account_disabled'; report(groupName, gid, 'error', 'account disabled/restricted', ''); break; }
         if (authBad) { step(authBad === 'session-expired' ? 'Session expired - re-login required' : 'Not logged in / not a member'); errors++; noRetry = true; flag = 'needs_login'; report(groupName, gid, 'error', authBad, ''); break; }
 
         // Clear cookie/notification banners, then bail out of this account if rate-limited.
@@ -775,7 +783,17 @@ async function runAccount(o) {
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
         const opened = await openComposer(page, step, name);
-        if (!opened) { step('Could not open composer modal; skipping group'); errors++; report(groupName, gid, 'error', 'composer did not open', ''); continue; }
+        if (!opened) {
+          // Name the likely cause so the operator can act (and knows it's not a generic bug).
+          const why = await page.evaluate(() => {
+            const t = (document.body.innerText || '').toLowerCase();
+            if (/you can.t post|you.re not allowed to post|only members can post|membership request|^join group/.test(t)) return 'account not a member / lacks posting rights / pending approval';
+            if (/this content isn.t available|group isn.t available|content not found/.test(t)) return 'group unavailable or archived';
+            return null;
+          }).catch(() => null);
+          step(`Could not open composer — ${why || 'no composer trigger found (account may lack post rights, or Facebook changed the layout)'}; skipping group`);
+          errors++; report(groupName, gid, 'error', why || 'composer did not open', ''); continue;
+        }
         await sleep(1500);
         await dismissPopups(page);
         step('Composer opened; preparing post');
@@ -797,7 +815,15 @@ async function runAccount(o) {
         if (resolvedImages.length) {
           step(`Uploading ${resolvedImages.length} image(s)`);
           const input = (await page.$('div[role="dialog"] input[type="file"]')) || (await page.$(SEL.fileInput));
-          if (input) { await input.uploadFile(...resolvedImages); step('Image attached'); await sleepInterruptible(3500, shouldStop); }
+          if (input) {
+            // Cap the upload: a stalled CDP file transfer (big image / slow disk) must not
+            // hang the account for the full protocolTimeout and trip the watchdog.
+            let upTimer;
+            const upCap = new Promise((_, rej) => { upTimer = setTimeout(() => rej(new Error('uploadFile timeout')), 30000); });
+            try { await Promise.race([input.uploadFile(...resolvedImages), upCap]); step('Image attached'); await sleepInterruptible(3500, shouldStop); }
+            catch (upErr) { step(`Image upload stalled (${upErr.message}) — posting without image`); }
+            finally { clearTimeout(upTimer); }
+          }
           else step('Image input not found in composer; posting without local image attach');
         }
 
@@ -868,7 +894,12 @@ async function runAccount(o) {
         step('Post button clicked');
         const publishResult = await waitForPublish(page, dialogCountBefore, 30000, shouldStop);
         if (publishResult === 'stopped') { step('Stop requested during publish wait — halting'); break; }
-        if (publishResult !== 'published') { step('Post clicked but publish was NOT confirmed; skipping group'); errors++; report(groupName, gid, 'error', 'publish not confirmed', ''); continue; }
+        if (publishResult !== 'published') {
+          // Snapshot the dialog so a not-confirmed post is diagnosable (error text vs stuck).
+          const snap = await page.evaluate(() => { const d = document.querySelector('div[role="dialog"]'); return ((d && d.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 120); }).catch(() => '');
+          step(`Post clicked but publish NOT confirmed (${publishResult})${snap ? ` — "${snap}"` : ''}; skipping group`);
+          errors++; report(groupName, gid, 'error', `publish not confirmed (${publishResult})`, ''); continue;
+        }
         await sleepInterruptible(3000, shouldStop);
         // Check pending-approval BEFORE dismissing popups (a dismissible notice could be cleared).
         const isPending = await checkPendingApproval(page);

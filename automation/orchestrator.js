@@ -239,6 +239,7 @@ class Orchestrator {
   // when progressed, so a fully-crashed account retries the SAME post next cycle.
   async _runAccount(account, cycle) {
     const data = this._data;
+    const accountStart = Date.now();
     const posts = this._postsForAccount(account, cycle);
     if (!posts.length) { this.log(`↪️ [${account.name}] no eligible posts`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [], dealtIds: [] }; }
     const order = account.postingOrder || 'post-centric';
@@ -301,6 +302,7 @@ class Orchestrator {
                 if (!acc) return;
                 if (r.flag === 'needs_login') { acc.status = 'not_logged_in'; acc.lastMessage = '⚠️ Logged out during run — re-login required'; }
                 else if (r.flag === 'rate_limited') { acc.status = 'rate_limited'; acc.lastMessage = '⏸ Rate-limited by Facebook — backed off this cycle'; }
+                else if (r.flag === 'account_disabled') { acc.status = 'error'; acc.lastMessage = '🚫 Account disabled/restricted by Facebook — needs manual attention'; }
               });
               this.emit('data-updated');
             } catch {}
@@ -318,7 +320,7 @@ class Orchestrator {
       }
     }
     // Surface the outcome so the operator sees pending/error counts in the log pane.
-    this.log(`[${account.name}] ✅ Done: ${posted} posts`);
+    this.log(`[${account.name}] ✅ Done in ${Math.round((Date.now() - accountStart) / 1000)}s`);
     this.log(`📊 [${account.name}] posted=${posted} pending=${pendingApproval} errors=${errors}`);
     return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag, offline: accountOffline };
   }
@@ -456,8 +458,8 @@ class Orchestrator {
       // All-sessions-invalid guard: if a whole cycle published/queued NOTHING and at least one
       // account reported it was logged out, looping again would just relaunch browsers that all
       // bail. Stop with a clear reason instead of spinning forever unattended.
-      if (cycleDealtIds.length === 0 && cycleFlags.includes('needs_login')) {
-        this.log('🛑 No account could post this cycle — sessions appear logged out. Stopping. Re-login the accounts, then Start again.');
+      if (cycleDealtIds.length === 0 && (cycleFlags.includes('needs_login') || cycleFlags.includes('account_disabled'))) {
+        this.log('🛑 No account could post this cycle — sessions are logged out or disabled. Stopping. Fix the accounts, then Start again.');
         break;
       }
       if ((settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {
