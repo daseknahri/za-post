@@ -601,6 +601,43 @@ async function credentialLogin(page, email, password, log, name) {
   }
 }
 
+// Strip a window's taskbar button via WS_EX_TOOLWINDOW so a hidden run shows NO taskbar icon,
+// while leaving it a real composited window (Facebook still publishes). Best-effort, Windows-only.
+function hideFromTaskbar(pid) {
+  if (process.platform !== 'win32' || !pid) return Promise.resolve();
+  const ps = [
+    `$tp=${pid}`,
+    'Add-Type @"',
+    'using System;using System.Runtime.InteropServices;',
+    'public class W{',
+    '[DllImport("user32.dll")]public static extern bool EnumWindows(EnumProc cb,IntPtr l);',
+    '[DllImport("user32.dll")]public static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);',
+    '[DllImport("user32.dll")]public static extern bool IsWindowVisible(IntPtr h);',
+    '[DllImport("user32.dll")]public static extern int GetWindowLong(IntPtr h,int i);',
+    '[DllImport("user32.dll")]public static extern int SetWindowLong(IntPtr h,int i,int v);',
+    '[DllImport("user32.dll")]public static extern bool ShowWindow(IntPtr h,int n);',
+    'public delegate bool EnumProc(IntPtr h,IntPtr l);}',
+    '"@',
+    '$cb=[W+EnumProc]{param($h,$l)',
+    '$wp=0;[W]::GetWindowThreadProcessId($h,[ref]$wp)|Out-Null',
+    'if($wp -eq $tp -and [W]::IsWindowVisible($h)){',
+    '$ex=[W]::GetWindowLong($h,-20)',
+    '[W]::ShowWindow($h,0)|Out-Null',
+    '[W]::SetWindowLong($h,-20,($ex -bor 0x80) -band (-bnot 0x40000))|Out-Null',
+    '[W]::ShowWindow($h,8)|Out-Null}',
+    'return $true}',
+    '[W]::EnumWindows($cb,[IntPtr]::Zero)|Out-Null',
+  ].join("\n");
+  return new Promise((resolve) => {
+    try {
+      const cp = require('child_process').spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true });
+      const done = () => resolve();
+      cp.on('close', done); cp.on('error', done);
+      setTimeout(() => { try { cp.kill(); } catch {} resolve(); }, 8000);
+    } catch { resolve(); }
+  });
+}
+
 /**
  * @param {object}   o
  * @param {object}   o.account   account entity { name, assignedGroups, ... }
@@ -722,6 +759,9 @@ async function runAccount(o) {
     } catch {}
     // Allow clipboard access so captions can be PASTED (fast + reliable, like the original agent).
     try { await browser.defaultBrowserContext().overridePermissions('https://www.facebook.com', ['clipboard-read', 'clipboard-write']); } catch {}
+    // Completely hidden: drop the off-screen window's taskbar button (best-effort; it stays a
+    // real composited window so Facebook still posts). Small delay so the window exists first.
+    if (hidden) { try { await sleep(700); await hideFromTaskbar(browser.process() && browser.process().pid); } catch {} }
     // Watchdog: hard cap on this account's run so one stuck account can never block the
     // whole queue. Generous (a full post+comment is ~3-4 min) so it only fires on a real
     // hang, not normal slow posts. Closing the browser makes in-flight ops reject → cleanup.
