@@ -355,7 +355,11 @@ async function addFirstComment(page, gid, post, commentImg, step) {
       const all = (await page.$$('[contenteditable="true"], [role="textbox"]')).slice(0, 30);
       const out = [];
       for (const h of all) {
-        const isC = await h.evaluate((el) => /comment/i.test((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('aria-placeholder') || ''))).catch(() => false);
+        const isC = await h.evaluate((el) => {
+          const raw = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('aria-placeholder') || '');
+          const norm = raw.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+          return /comment|hozzaszolas/.test(norm); // English + Hungarian "hozzaszolas" (accent-stripped)
+        }).catch(() => false);
         if (isC) out.push(h);
       }
       return out;
@@ -373,7 +377,10 @@ async function addFirstComment(page, gid, post, commentImg, step) {
         const mine = (s && s.length >= 12) ? arts.find((a) => (a.textContent || '').includes(s)) : null;
         const scope = mine || arts[0] || document;
         const b = Array.from(scope.querySelectorAll('[role="button"]'))
-          .find((e) => /leave a comment|^comment$/i.test((e.getAttribute('aria-label') || e.textContent || '').trim()));
+          .find((e) => {
+            const norm = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+            return /leave a comment|^comment$|hozzaszolas/.test(norm); // English + Hungarian
+          });
         if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return true; }
         return false;
       }, snip, 12000).catch(() => false);
@@ -395,12 +402,30 @@ async function addFirstComment(page, gid, post, commentImg, step) {
         const c = el.closest('[role="article"], form, [data-pagelet]') || document;
         return c.querySelector('input[type="file"]');
       }).then((h) => h.asElement()).catch(() => null);
-      if (cInput) { try { await cInput.uploadFile(commentImg); step('Comment: image attached'); await sleep(2500); } catch (imgErr) { step(`Comment: image upload failed (${imgErr.message}) — posting text only`); } }
+      if (cInput) {
+        try {
+          await cInput.uploadFile(commentImg);
+          // Wait for the image PREVIEW to actually render before submitting, so a slow CDN
+          // upload can't be dropped when Enter fires (a blind fixed delay was unreliable).
+          await page.waitForFunction(() => !!document.querySelector('[role="article"] img[src^="blob:"], [role="dialog"] img[src^="blob:"]'), { timeout: 8000 }).catch(() => {});
+          step('Comment: image attached');
+          await sleep(1500);
+        } catch (imgErr) { step(`Comment: image upload failed (${imgErr.message}) — posting text only`); }
+      }
       else step('Comment: image input not found — posting text only');
     }
-    step('Comment: typing text');
-    await humanType(page, post.comment);
-    await sleep(800);
+    // Type the comment. In a FB comment box ENTER SUBMITS, so insert newlines as Shift+Enter
+    // and type the rest — otherwise a multi-line comment would submit at the first line.
+    const commentText = String(post.comment || '');
+    if (commentText.trim()) {
+      step('Comment: typing text');
+      const lines = commentText.split('\n');
+      for (let li = 0; li < lines.length; li++) {
+        if (lines[li]) await humanType(page, lines[li]);
+        if (li < lines.length - 1) { await page.keyboard.down('Shift'); await page.keyboard.press('Enter'); await page.keyboard.up('Shift'); }
+      }
+      await sleep(800);
+    }
     step('Comment: submitting (Enter)');
     await page.keyboard.press('Enter');
     // Confirm by watching the box we ACTUALLY typed into: FB clears it (or re-renders it
@@ -724,9 +749,16 @@ async function runAccount(o) {
     }
     // Comment image: explicit comment image, remote URL, or the post image when commentWithImage is on.
     let commentImg = null;
-    if (post.commentImagePath && fs.existsSync(post.commentImagePath)) commentImg = post.commentImagePath;
-    else if (post.commentImageUrl) { const dl = await downloadImage(post.commentImageUrl); if (dl) { commentImg = dl; tempImages.push(dl); } }
-    else if (settings.commentWithImage && resolvedImages.length) commentImg = resolvedImages[0];
+    if (post.commentImagePath) {
+      if (fs.existsSync(post.commentImagePath)) commentImg = post.commentImagePath;
+      else log(`⚠️ [${name}] comment image file not found (${post.commentImagePath}) — comment will have no image`);
+    } else if (post.commentImageUrl) {
+      const dl = await downloadImage(post.commentImageUrl);
+      if (dl) { commentImg = dl; tempImages.push(dl); }
+      else log(`⚠️ [${name}] comment image URL set but download failed — comment will have no image`);
+    } else if (settings.commentWithImage && resolvedImages.length) {
+      commentImg = resolvedImages[0];
+    }
 
     for (let i = 0; i < targetGroups.length; i++) {
       if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
@@ -921,8 +953,10 @@ async function runAccount(o) {
 
         // First comment (the link) — reload, find OUR post, comment in its box.
         // addFirstComment logs every stage itself (via the same step() logger).
-        let commentResult = (post.comment && post.comment.trim()) ? 'failed' : 'none';
-        if (post.comment && post.comment.trim()) {
+        // Fire when there is comment TEXT or a comment IMAGE — an image-only comment is valid.
+        const wantComment = !!((post.comment && post.comment.trim()) || commentImg);
+        let commentResult = wantComment ? 'failed' : 'none';
+        if (wantComment) {
           const cok = await addFirstComment(page, gid, post, commentImg, step);
           commentResult = cok ? 'posted' : 'failed';
         }
