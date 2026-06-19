@@ -74,6 +74,9 @@ function killOrphanChromium() {
 // two original apps. Default profile keeps the package name (the King set).
 const PROFILE = (process.argv.find((a) => a.startsWith('--profile=')) || '').split('=')[1] || process.env.ZA_PROFILE;
 if (PROFILE) app.setName('za-post-restored-' + PROFILE);
+// Required for Windows toast notifications (captcha/login alerts) to show with our identity —
+// without it, an unpackaged/portable run's notifications are silently dropped or mislabeled.
+try { app.setAppUserModelId('com.zapost.commenttool'); } catch {}
 
 // Single-instance lock — scoped per profile (app.setName above changes userData, so each
 // profile gets its own lock and can coexist with the default instance).
@@ -175,6 +178,31 @@ function emit(channel, payload) {
   if (channel === 'automation-stopped') {
     setRunActive(false);
   }
+  if (channel === 'account-attention') {
+    notifyAccountAttention(payload);
+  }
+}
+// Native desktop toast when an account needs YOU (captcha/verification or a re-login). Deduped so a
+// still-flagged account across cycles can't spam you.
+const _attentionNotified = new Map();
+function notifyAccountAttention(payload) {
+  try {
+    const name = (payload && payload.name) || 'An account';
+    const captcha = payload && payload.flag === 'needs_verification';
+    const last = _attentionNotified.get(name) || 0;
+    if (Date.now() - last < 10 * 60 * 1000) return; // at most one toast / 10 min per account
+    _attentionNotified.set(name, Date.now());
+    const { Notification } = require('electron');
+    if (!Notification.isSupported()) return;
+    const n = new Notification({
+      title: captcha ? 'Za Post — verification needed' : 'Za Post — login needed',
+      body: captcha
+        ? `${name}: Facebook wants a human/identity check (captcha). Open this account, complete it, then Start again.`
+        : `${name}: session expired. Open this account and log in, then Start again.`,
+    });
+    n.on('click', () => { try { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } catch {} });
+    n.show();
+  } catch {}
 }
 const ok = (extra = {}) => ({ success: true, ...extra });
 const fail = (error) => ({ success: false, error: String(error && error.message ? error.message : error) });

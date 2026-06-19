@@ -14,6 +14,27 @@ let proxyChain; try { proxyChain = require('proxy-chain'); } catch {}
 
 const store = require('../lib/store');
 const { chromiumPath } = require('../lib/chromium');
+const { execFile } = require('child_process');
+
+// Push a browser window BEHIND other windows WITHOUT activating it, so a VISIBLE run doesn't steal
+// focus or sit on top of the user's work. The --disable-backgrounding-occluded-windows launch flag
+// keeps the window rendering normally while it's in the background. Windows-only (no-op elsewhere).
+function sendWindowToBackground(pid) {
+  if (process.platform !== 'win32' || !pid) return Promise.resolve();
+  const script = [
+    "$ErrorActionPreference='SilentlyContinue'",
+    'Add-Type @"',
+    'using System;using System.Runtime.InteropServices;',
+    'public class ZaBg{[DllImport("user32.dll")]public static extern bool SetWindowPos(IntPtr h,IntPtr a,int x,int y,int cx,int cy,uint f);}',
+    '"@',
+    // HWND_BOTTOM=1; flags 0x13 = NOSIZE|NOMOVE|NOACTIVATE. Wait up to ~2.4s for the window handle.
+    `for($i=0;$i -lt 12;$i++){$p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if(-not $p){break}; $p.Refresh(); $h=$p.MainWindowHandle; if($h -ne [IntPtr]::Zero){[ZaBg]::SetWindowPos($h,[IntPtr]1,0,0,0,0,0x13)|Out-Null; break}; Start-Sleep -Milliseconds 200}`,
+  ].join('\n');
+  const b64 = Buffer.from(script, 'utf16le').toString('base64'); // -EncodedCommand avoids all quoting
+  return new Promise((resolve) => {
+    execFile('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', b64], { timeout: 12000, windowsHide: true }, () => resolve());
+  });
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -594,15 +615,16 @@ async function credentialLogin(page, email, password, log, name) {
 
     const url = page.url();
 
-    // Checkpoint / 2FA detection
-    if (/checkpoint|two_step|two_factor|login\/device-based/i.test(url)) {
-      log(`🚧 [${name}] hit a Facebook security check (2FA/checkpoint) — needs manual login`);
-      return false;
+    // Checkpoint / 2FA / captcha — needs a HUMAN, so signal 'checkpoint' (NOT a plain login
+    // failure) so the account is flagged needs_verification and you get a desktop notification.
+    if (/checkpoint|two_step|two_factor|login\/device-based|captcha/i.test(url)) {
+      log(`🚧 [${name}] hit a Facebook security check (2FA/checkpoint/captcha) — needs you`);
+      return 'checkpoint';
     }
     const bodyText = await page.evaluate(() => (document.body.innerText || '').toLowerCase()).catch(() => '');
-    if (/two.factor|two.step|confirm it.?s you|enter the code/i.test(bodyText)) {
-      log(`🚧 [${name}] hit a Facebook security check (2FA/checkpoint) — needs manual login`);
-      return false;
+    if (/two.factor|two.step|confirm it.?s you|enter the code|captcha|are you a robot|security check|real person/i.test(bodyText)) {
+      log(`🚧 [${name}] hit a Facebook security check (captcha/verification) — needs you`);
+      return 'checkpoint';
     }
 
     // Success: check for c_user cookie
@@ -771,6 +793,12 @@ async function runAccount(o) {
     } catch {}
     // Allow clipboard access so captions can be PASTED (fast + reliable, like the original agent).
     try { await browser.defaultBrowserContext().overridePermissions('https://www.facebook.com', ['clipboard-read', 'clipboard-write']); } catch {}
+    // VISIBLE mode: keep the window on-screen (better compositing/flow) but shove it to the BACK so
+    // it never steals focus or sits on top of your work. Hidden mode is already off-screen above.
+    if (!hidden && browser.process()) {
+      log(`🪟 [${name}] visible mode — parking the browser in the background (won't steal focus)`);
+      sendWindowToBackground(browser.process().pid).catch(() => {});
+    }
     // Watchdog: hard cap on this account's run so one stuck account can never block the
     // whole queue. Generous (a full post+comment is ~3-4 min) so it only fires on a real
     // hang, not normal slow posts. Closing the browser makes in-flight ops reject → cleanup.
@@ -832,12 +860,16 @@ async function runAccount(o) {
         // Cookie recovery failed — try stored credentials (OPT-IN) before flagging for manual login.
         if (account.email && account.password) {
           log(`🔐 [${name}] cookies failed — trying stored credentials...`);
-          const credOk = await credentialLogin(page, account.email, account.password, log, name);
-          if (credOk) {
+          const credResult = await credentialLogin(page, account.email, account.password, log, name);
+          if (credResult === true) {
             log(`🔄 [${name}] session recovered via credential login`);
             // fall through to the normal posting loop
+          } else if (credResult === 'checkpoint') {
+            log(`🔐 [${name}] auto-login blocked by a captcha/verification — flagging for you to solve`);
+            flag = 'needs_verification'; noRetry = true;
+            return { posted: 0, errors: 1, pendingApproval: 0, noRetry, flag, postedIds: [] };
           } else {
-            log(`❌ [${name}] re-login with saved cookies failed — flagging for manual login`);
+            log(`❌ [${name}] auto-login failed (wrong password or blocked) — flagging for manual login`);
             flag = 'needs_login'; noRetry = true;
             return { posted: 0, errors: 1, pendingApproval: 0, noRetry, flag, postedIds: [] };
           }

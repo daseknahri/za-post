@@ -332,6 +332,11 @@ class Orchestrator {
               });
               this.emit('data-updated');
             } catch {}
+            // Ping the user with a desktop notification when an account needs THEM (captcha /
+            // verification, or a re-login). main.js dedupes so it won't spam across cycles.
+            if (r.flag === 'needs_verification' || r.flag === 'needs_login') {
+              this.emit('account-attention', { name: account.name, flag: r.flag });
+            }
           }
           // Logged-out / rate-limited — don't launch a browser for this account's remaining posts this cycle.
           if (r && r.noRetry) { this.log(`⏭️ [${account.name}] skipping remaining posts this cycle (session/rate-limit)`); break postsLoop; }
