@@ -676,7 +676,7 @@ async function runAccount(o) {
     '--disk-cache-size=52428800',   // 50 MB
     '--media-cache-size=10485760',  // 10 MB
   ];
-  store.sanitizeProfile(name); // don't let Chromium reopen the previous session's tabs
+  store.sanitizeProfile(name, settings.hideBrowser !== false); // pin off-screen placement when hidden (opens invisible, no flash)
   // Proxy: Chrome can't do authenticated SOCKS5 directly, so we wrap the upstream
   // through proxy-chain (a local anonymized HTTP proxy) when credentials are present.
   let proxyAuth = null, anonLocal = null, watchdog = null;
@@ -723,7 +723,27 @@ async function runAccount(o) {
     // Make Facebook treat the page as FOCUSED + VISIBLE even when the window is off-screen.
     // Without this, an off-screen/hidden window won't publish (FB defers work on a page it
     // thinks is hidden) and the clipboard stays blocked. This is what lets "hidden" actually post.
-    try { const cdp = await page.target().createCDPSession(); await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }); } catch {}
+    let cdpSession = null;
+    try {
+      cdpSession = await page.target().createCDPSession();
+      await cdpSession.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+      if (hidden) {
+        // Force the window OFF-SCREEN regardless of what Chrome restored. --window-position is
+        // only the *initial* hint; Chrome re-applies the window placement it saved in the profile
+        // (a prior visible run, or Windows re-clamping a -32000 window onto a monitor), which is
+        // why a "hidden" run can still show a window. setWindowBounds is a direct command the
+        // restore logic can't override — normalize first (bounds are ignored while maximized),
+        // then shove it far off the top-left corner.
+        try {
+          const { windowId } = await cdpSession.send('Browser.getWindowForTarget');
+          await cdpSession.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
+          await cdpSession.send('Browser.setWindowBounds', { windowId, bounds: { left: -32000, top: -32000, width: 1280, height: 900 } });
+          const back = await cdpSession.send('Browser.getWindowBounds', { windowId });
+          const off = back && back.bounds && (back.bounds.left <= -2000 || back.bounds.top <= -2000);
+          log(`🙈 [${name}] window parked off-screen (${off ? 'confirmed' : `still at ${back && back.bounds ? back.bounds.left + ',' + back.bounds.top : '?'} — Windows clamped it`})`);
+        } catch (e) { log(`⚠️ [${name}] could not force-hide window (${e.message}) — it may be visible`); }
+      }
+    } catch {}
     try {
       await page.evaluateOnNewDocument(() => {
         Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });

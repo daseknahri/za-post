@@ -599,7 +599,7 @@ ipcMain.handle('close-login-browser', (_e, accountName) => {
 async function checkStatus(accountName) {
   let browser;
   try {
-    store.sanitizeProfile(accountName); // don't restore old tabs
+    store.sanitizeProfile(accountName, false); // headless probe; clear any off-screen bounds so a later login is visible
     browser = await puppeteer.launch({
       headless: true, userDataDir: store.profileDir(accountName),
       executablePath: chromiumPath(),
@@ -709,7 +709,7 @@ async function openLoginBrowser(accountName) {
 
   emit('automation-log', `🔐 [${accountName}] opening login browser...`);
 
-  store.sanitizeProfile(accountName); // wipe any saved tabs so it won't reopen 40 old pages
+  store.sanitizeProfile(accountName, false); // wipe saved tabs + clear off-screen bounds so the login window is VISIBLE
   const browser = await puppeteer.launch({
     headless: false, userDataDir: store.profileDir(accountName),
     executablePath: chromiumPath(),
