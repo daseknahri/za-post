@@ -460,7 +460,7 @@ async function addFirstComment(page, gid, post, commentImg, step) {
     // away) once it accepts the comment. Tracking the real target box is far more reliable
     // than re-scanning the feed by caption (which gave false "not confirmed" negatives).
     let confirmed = false;
-    const cdl = Date.now() + 4000;
+    const cdl = Date.now() + 6000; // allow slower submits to confirm (box empties) before giving up
     while (Date.now() < cdl) {
       await sleep(1000);
       const state = await withTimeout(target.evaluate((el) => (el.textContent || '').trim()), 3000, 'GONE');
@@ -1034,8 +1034,15 @@ async function runAccount(o) {
         const wantComment = !!((post.comment && post.comment.trim()) || commentImg);
         let commentResult = wantComment ? 'failed' : 'none';
         if (wantComment) {
-          const cok = await addFirstComment(page, gid, post, commentImg, step);
+          // Retry up to 3× — addFirstComment only returns false BEFORE it submits (no box found,
+          // a stalled renderer, etc.), so re-trying (it reloads each time) can't post a duplicate.
+          let cok = false;
+          for (let cAttempt = 1; cAttempt <= 3 && !cok && !shouldStop(); cAttempt++) {
+            if (cAttempt > 1) { step(`Comment: retry ${cAttempt}/3`); await sleepInterruptible(2500, shouldStop); }
+            cok = await addFirstComment(page, gid, post, commentImg, step);
+          }
           commentResult = cok ? 'posted' : 'failed';
+          if (!cok) step('Comment: could not post after 3 attempts — skipped');
         }
         report(groupName, gid, 'posted', '', commentResult);
       } catch (e) {
