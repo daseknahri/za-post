@@ -360,6 +360,8 @@ function withTimeout(promise, ms, fallback) {
 // so the new post renders, finds the article containing our caption, and types into
 // ITS "Write a public comment…" box. Returns true on success.
 async function addFirstComment(page, gid, post, commentImg, step) {
+  let submitted = false; // once the submitting Enter is pressed, NEVER return false — the caller
+                         // retries on false and would post a DUPLICATE comment.
   try {
     // Header: state the comment configuration so each group's comment is self-explanatory.
     const hasText = !!(post.comment && post.comment.trim());
@@ -456,20 +458,28 @@ async function addFirstComment(page, gid, post, commentImg, step) {
     }
     step('Comment: submitting (Enter)');
     await page.keyboard.press('Enter');
+    submitted = true; // past this point the comment IS sent — any error below is verify-only
     // Confirm by watching the box we ACTUALLY typed into: FB clears it (or re-renders it
     // away) once it accepts the comment. Tracking the real target box is far more reliable
     // than re-scanning the feed by caption (which gave false "not confirmed" negatives).
     let confirmed = false;
     const cdl = Date.now() + 6000; // allow slower submits to confirm (box empties) before giving up
-    while (Date.now() < cdl) {
-      await sleep(1000);
-      const state = await withTimeout(target.evaluate((el) => (el.textContent || '').trim()), 3000, 'GONE');
-      if (state === '' || state === 'GONE') { confirmed = true; break; } // emptied or re-rendered = submitted
-    }
+    try {
+      while (Date.now() < cdl) {
+        await sleep(1000);
+        const state = await withTimeout(target.evaluate((el) => (el.textContent || '').trim()), 3000, 'GONE');
+        if (state === '' || state === 'GONE') { confirmed = true; break; } // emptied or re-rendered = submitted
+      }
+    } catch {}
     step(confirmed ? 'Comment: posted and verified ✅' : 'Comment: sent (could not auto-verify)');
     await sleep(600);
     return true;
-  } catch (e) { step(`Comment: error — ${e.message}`); return false; }
+  } catch (e) {
+    // If Enter was already pressed, the comment is (probably) posted — returning false would make
+    // the caller retry and DOUBLE-post. Report it but treat as sent.
+    if (submitted) { step(`Comment: post-submit issue (${e.message}) — already sent, not retrying`); return true; }
+    step(`Comment: error — ${e.message}`); return false;
+  }
 }
 
 // Click into the composer's editable textbox so keystrokes land in the right place
@@ -696,6 +706,14 @@ async function runAccount(o) {
 
   let browser;
   let unregisterAborter = () => {};
+  let aborted = false;       // set by the watchdog so the group loop stops touching a dead browser
+  let browserClosed = false; // single-shot guard: aborter + watchdog + finally must not double-close
+  const closeBrowserOnce = async () => {
+    if (browserClosed) return; browserClosed = true;
+    // Bound the close so a wedged CDP socket can't block the worker slot, then hard-kill as fallback.
+    try { await Promise.race([browser.close().catch(() => {}), sleep(10000)]); } catch {}
+    try { const proc = browser && browser.process && browser.process(); if (proc) proc.kill(); } catch {}
+  };
   let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false;
   try {
     const hidden = settings.hideBrowser !== false; // default: hidden
@@ -713,27 +731,25 @@ async function runAccount(o) {
       protocolTimeout: 90000, // cap CDP op hangs (90s allows slow www->web redirects; still << default 180s)
     });
     if (typeof registerAborter === 'function') {
-      unregisterAborter = registerAborter(() => {
-        try { if (browser) browser.close(); } catch {}
-      });
+      unregisterAborter = registerAborter(() => { closeBrowserOnce(); });
     }
     const _pages = await browser.pages();
     for (let i = 1; i < _pages.length; i++) { try { await _pages[i].close(); } catch {} }
     const page = _pages[0] || (await browser.newPage());
-    // Make Facebook treat the page as FOCUSED + VISIBLE even when the window is off-screen.
-    // Without this, an off-screen/hidden window won't publish (FB defers work on a page it
-    // thinks is hidden) and the clipboard stays blocked. This is what lets "hidden" actually post.
+    // Make Facebook treat the page as FOCUSED + VISIBLE even when the window is off-screen, and
+    // force the window off-screen. Each CDP step has its OWN try/catch + log so a failure in one
+    // (e.g. a CDP attach race) can't silently skip the others — the force-off-screen MUST run when
+    // hidden even if focus-emulation throws, or a clamped window would stay visible undiagnosed.
     let cdpSession = null;
-    try {
-      cdpSession = await page.target().createCDPSession();
-      await cdpSession.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+    try { cdpSession = await page.target().createCDPSession(); }
+    catch (e) { log(`⚠️ [${name}] CDP attach failed (${e.message}) — focus/hide setup skipped, window may be visible`); }
+    if (cdpSession) {
       if (hidden) {
-        // Force the window OFF-SCREEN regardless of what Chrome restored. --window-position is
-        // only the *initial* hint; Chrome re-applies the window placement it saved in the profile
-        // (a prior visible run, or Windows re-clamping a -32000 window onto a monitor), which is
-        // why a "hidden" run can still show a window. setWindowBounds is a direct command the
-        // restore logic can't override — normalize first (bounds are ignored while maximized),
-        // then shove it far off the top-left corner.
+        // Force the window OFF-SCREEN as the FIRST post-launch CDP call (minimises the on-screen
+        // flash on machines that clamp -32000). --window-position is only the initial hint; Chrome
+        // re-applies saved placement and Windows can re-clamp, so setWindowBounds — a direct command
+        // the restore logic can't override — is what actually guarantees it. Normalize first (bounds
+        // are ignored while maximized), then shove it far off the top-left corner.
         try {
           const { windowId } = await cdpSession.send('Browser.getWindowForTarget');
           await cdpSession.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
@@ -743,7 +759,9 @@ async function runAccount(o) {
           log(`🙈 [${name}] window parked off-screen (${off ? 'confirmed' : `still at ${back && back.bounds ? back.bounds.left + ',' + back.bounds.top : '?'} — Windows clamped it`})`);
         } catch (e) { log(`⚠️ [${name}] could not force-hide window (${e.message}) — it may be visible`); }
       }
-    } catch {}
+      try { await cdpSession.send('Emulation.setFocusEmulationEnabled', { enabled: true }); }
+      catch (e) { log(`⚠️ [${name}] focus emulation failed (${e.message}) — publish may be slower`); }
+    }
     try {
       await page.evaluateOnNewDocument(() => {
         Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
@@ -757,7 +775,25 @@ async function runAccount(o) {
     // whole queue. Generous (a full post+comment is ~3-4 min) so it only fires on a real
     // hang, not normal slow posts. Closing the browser makes in-flight ops reject → cleanup.
     const accountBudget = Math.max(420000, targetGroups.length * 300000);
-    const armWatchdog = () => { watchdog = setTimeout(() => { log(`⏰ [${name}] time budget exceeded — aborting account`); try { if (browser) browser.close(); } catch {} watchdog = null; }, accountBudget); };
+    // The watchdog must fire ONLY when the account is genuinely wedged. setTimeout counts wall-clock,
+    // which includes laptop sleep — so on resume the timer can fire immediately on a perfectly healthy
+    // run. Before aborting, probe liveness: if the browser still answers a trivial evaluate it just
+    // resumed from sleep → re-arm; only abort if it's truly unresponsive.
+    const onWatchdogTick = async () => {
+      let alive = false;
+      try {
+        if (browser && browser.isConnected()) {
+          await Promise.race([page.evaluate(() => 1), new Promise((_, r) => setTimeout(() => r(new Error('probe timeout')), 8000))]);
+          alive = true;
+        }
+      } catch { alive = false; }
+      if (alive) { log(`⏰ [${name}] budget elapsed but browser is alive (likely resumed from sleep) — extending`); armWatchdog(); return; }
+      log(`⏰ [${name}] time budget exceeded and browser unresponsive — aborting account`);
+      aborted = true;
+      await closeBrowserOnce();
+      watchdog = null;
+    };
+    function armWatchdog() { watchdog = setTimeout(onWatchdogTick, accountBudget); }
     armWatchdog();
     // Fallback auth path if proxy-chain wasn't used.
     if (proxyAuth && proxyAuth.username && !anonLocal) {
@@ -837,6 +873,7 @@ async function runAccount(o) {
     }
 
     for (let i = 0; i < targetGroups.length; i++) {
+      if (aborted) { log(`⏹ [${name}] watchdog aborted this account — not touching the dead browser`); break; }
       if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
       // Pause holds here, between groups, so Pause takes effect mid-account. A deliberate
       // pause is NOT a hang: suspend the time-budget watchdog while held, then re-arm it on
@@ -1092,7 +1129,7 @@ async function runAccount(o) {
     // operator checks it, but we did NOT skip any group (avoids the per-group false positive).
     if (posted === 0 && errors > 0 && !flag && !offline && !shouldStop()) flag = 'likely_blocked';
     // Persist refreshed cookies for next run.
-    try { store.writeCookies(name, await page.cookies()); } catch {}
+    try { const cks = await withTimeout(page.cookies(), 8000, null); if (cks) store.writeCookies(name, cks); } catch {}
     fs.writeFileSync(require('path').join(store.accountDir(name), 'last-run-success.txt'),
       `${errors === 0 ? 'SUCCESS' : 'PARTIAL'}\nPosts: ${posted}\nPending: ${pendingApproval}\nTime: ${new Date().toISOString()}\n`);
   } catch (e) {
@@ -1101,7 +1138,7 @@ async function runAccount(o) {
   } finally {
     unregisterAborter();
     if (watchdog) clearTimeout(watchdog);
-    if (browser) await browser.close().catch(() => {});
+    if (browser) await closeBrowserOnce();
     if (anonLocal && proxyChain) { try { await proxyChain.closeAnonymizedProxy(anonLocal, true); } catch {} }
     for (const t of tempImages) { try { fs.unlinkSync(t); } catch {} }
   }

@@ -156,6 +156,7 @@ async function applyTunnelState(enabled) {
   }
 }
 let orchestrator = null;
+let userPauseActions = 0; // bumped on every USER pause/resume so suspend/resume can detect user intent
 const loginBrowsers = new Map(); // accountName -> { browser, interval }
 
 // ---- helpers -----------------------------------------------------------
@@ -285,10 +286,21 @@ app.whenReady().then(async () => {
   // Survive laptop sleep: a suspend drops every Chromium CDP connection, so HOLD the run on
   // suspend and continue on wake. We only auto-resume a pause WE triggered (not a user pause).
   let pausedBySystem = false;
+  let systemPauseToken = -1; // snapshot of userPauseActions when WE auto-paused
   try {
     const { powerMonitor } = require('electron');
-    powerMonitor.on('suspend', () => { try { if (orchestrator && orchestrator.isRunning() && !orchestrator.isPaused()) { orchestrator.pause(); pausedBySystem = true; appendLogFile('System suspend — auto-paused the run'); } } catch {} });
-    powerMonitor.on('resume', () => { try { if (pausedBySystem && orchestrator && orchestrator.isPaused()) { orchestrator.resume(); appendLogFile('System resume — auto-resumed the run'); } pausedBySystem = false; } catch {} });
+    powerMonitor.on('suspend', () => { try { if (orchestrator && orchestrator.isRunning() && !orchestrator.isPaused()) { orchestrator.pause(); pausedBySystem = true; systemPauseToken = userPauseActions; appendLogFile('System suspend — auto-paused the run'); } } catch {} });
+    // Auto-resume ONLY if we paused AND the user issued no pause/resume since — otherwise the user
+    // deliberately paused after the system pause, and waking must NOT silently un-pause their run.
+    powerMonitor.on('resume', () => {
+      try {
+        if (pausedBySystem && orchestrator && orchestrator.isPaused()) {
+          if (userPauseActions === systemPauseToken) { orchestrator.resume(); appendLogFile('System resume — auto-resumed the run'); }
+          else appendLogFile('System resume — left paused (you paused it manually)');
+        }
+        pausedBySystem = false;
+      } catch {}
+    });
   } catch {}
 
   // Remote control server + tunnel (best effort). Hooks delegate all mutations
@@ -826,12 +838,14 @@ ipcMain.handle('stop-automation', () => {
 ipcMain.handle('pause-automation', () => {
   if (!orchestrator) return fail('Orchestrator not ready');
   if (!orchestrator.isRunning()) return fail('Automation is not running');
+  userPauseActions++; // record user intent so a system resume won't override it
   orchestrator.pause(); return ok();
 });
 ipcMain.handle('resume-automation', () => {
   if (!orchestrator) return fail('Orchestrator not ready');
   if (!orchestrator.isRunning()) return fail('Automation is not running');
   if (!orchestrator.isPaused()) return fail('Automation is not paused');
+  userPauseActions++; // record user intent so a system resume won't override it
   orchestrator.resume(); return ok();
 });
 ipcMain.handle('finish-automation', () => {

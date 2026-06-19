@@ -1,0 +1,44 @@
+============================================================
+  Za Post Comment Tool — Portable build
+============================================================
+
+WHAT THIS IS
+  A desktop tool that posts to your Facebook groups automatically.
+  Everything it needs is inside this folder — no installation required.
+
+HOW TO RUN
+  1. Extract this zip anywhere (e.g. Desktop or C:\Apps).
+  2. Open the "Za Post Comment Tool" folder.
+  3. Double-click  "Za Post Comment Tool.exe"
+
+  First launch only: Windows may show a blue "Windows protected your PC"
+  screen (because the app isn't code-signed). Click:
+        More info  ->  Run anyway
+  This is normal for in-house tools and only happens once.
+
+  After the first launch a "Za Post Comment Tool" shortcut is added to your
+  Desktop automatically — use that to open the app from then on. (Keep this
+  folder where it is; the shortcut points to the .exe inside it.)
+
+FIRST-TIME SETUP (inside the app)
+  1. Accounts  -> Add an account -> click "Login".
+     A browser window opens. Log into Facebook, then close that window.
+     The account status should turn to "logged in".
+  2. Groups    -> add the Facebook groups you want to post to
+     (paste the group URL or ID, and assign groups to each account).
+  3. Posts     -> add your post (caption, optional image, optional comment).
+  4. Settings  -> set the timing (interval, delays, posts per group, etc.).
+  5. Click "Start Automation".
+
+GOOD TO KNOW
+  - An internet connection is required (it posts to Facebook).
+  - The browser it controls (Chromium) is bundled — nothing else to install.
+  - When "Hide browser" is on (default), automation runs invisibly; only a
+    Chrome icon may appear briefly in the taskbar. Login windows are always
+    visible so you can sign in.
+  - Your accounts, groups, posts and login sessions are saved per Windows
+    user under:  %APPDATA%\za-post-restored
+  - To move the tool to another PC, just copy this folder (logins won't
+    transfer — you'll log in again on the new PC).
+
+============================================================
