@@ -459,8 +459,6 @@ function initializeEventListeners() {
   document.getElementById('btn-start-automation').addEventListener('click', startAutomation);
   document.getElementById('btn-stop-automation').addEventListener('click', stopAutomation);
   document.getElementById('btn-pause-automation').addEventListener('click', togglePauseAutomation);
-  document.getElementById('btn-resume-automation').addEventListener('click', resumeAutomation);
-  document.getElementById('btn-finish-automation').addEventListener('click', finishAutomation);
 
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
   document.getElementById('btn-save-proxies').addEventListener('click', saveProxies);
@@ -1563,8 +1561,6 @@ async function checkAutomationStatus() {
 function updateAutomationControls() {
   const startBtn   = document.getElementById('btn-start-automation');
   const pauseBtn   = document.getElementById('btn-pause-automation');
-  const resumeBtn  = document.getElementById('btn-resume-automation');
-  const finishBtn  = document.getElementById('btn-finish-automation');
   const stopBtn    = document.getElementById('btn-stop-automation');
   const pausedInd  = document.getElementById('paused-indicator');
 
@@ -1580,16 +1576,12 @@ function updateAutomationControls() {
     // IDLE: only Start visible & enabled
     show(startBtn,  true);  setEnabled(startBtn,  true);
     show(pauseBtn,  false);
-    show(resumeBtn, false);
-    show(finishBtn, false);
     show(stopBtn,   false);
     if (pausedInd) pausedInd.style.display = 'none';
   } else if (isPaused) {
-    // PAUSED: Pause becomes Resume. Stop remains a hard interrupt.
+    // PAUSED: the Pause button becomes Resume. Stop remains a hard interrupt.
     show(startBtn,  false);
     show(pauseBtn,  true);  setEnabled(pauseBtn, !isStopping);
-    show(resumeBtn, false);
-    show(finishBtn, false);
     show(stopBtn,   true);  setEnabled(stopBtn, !isStopping);
     if (pauseBtn) pauseBtn.innerHTML = '<span>▶️</span> Resume';
     if (stopBtn) stopBtn.innerHTML = isStopping ? '<span>⏹️</span> Stopping…' : '<span>⏹️</span> Stop';
@@ -1598,8 +1590,6 @@ function updateAutomationControls() {
     // RUNNING: Pause toggle + hard Stop.
     show(startBtn,  false);
     show(pauseBtn,  true);  setEnabled(pauseBtn,  !isStopping);
-    show(resumeBtn, false);
-    show(finishBtn, false);
     show(stopBtn,   true);  setEnabled(stopBtn,   !isStopping);
     if (pauseBtn) pauseBtn.innerHTML = '<span>⏸</span> Pause';
     if (stopBtn) stopBtn.innerHTML = isStopping ? '<span>⏹️</span> Stopping…' : '<span>⏹️</span> Stop';
@@ -1754,29 +1744,6 @@ async function resumeAutomation() {
     }
   } catch (e) {
     showNotification('Failed to resume: ' + e.message, 'error');
-  }
-}
-
-async function finishAutomation() {
-  try {
-    const result = await window.electronAPI.finishAutomation();
-    if (result && result.success) {
-      addLog('\n🏁 Finish requested — current batch will complete, then automation ends.\n');
-      showNotification('Automation will finish after current batch.', 'info');
-      // Show "finishing…" state: disable Pause/Resume/Finish, keep Stop active
-      const pauseBtn  = document.getElementById('btn-pause-automation');
-      const resumeBtn = document.getElementById('btn-resume-automation');
-      const finishBtn = document.getElementById('btn-finish-automation');
-      const stopBtn   = document.getElementById('btn-stop-automation');
-      if (pauseBtn)  { pauseBtn.disabled  = true;  pauseBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
-      if (resumeBtn) { resumeBtn.disabled = true;  resumeBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
-      if (finishBtn) { finishBtn.disabled = true;  finishBtn.textContent = '🏁 Finishing…'; finishBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
-      if (stopBtn)   { stopBtn.disabled   = false; stopBtn.classList.remove('opacity-50', 'cursor-not-allowed'); }
-    } else {
-      showNotification('Failed to finish: ' + ((result && result.error) || 'unknown error'), 'error');
-    }
-  } catch (e) {
-    showNotification('Failed to finish: ' + e.message, 'error');
   }
 }
 

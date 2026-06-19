@@ -281,6 +281,7 @@ class Orchestrator {
             registerAborter: (abort) => this._registerAborter(abort),
             isOnline: () => isOnline(), // lets the worker bail fast when offline instead of burning nav timeouts
             waitIfPaused: () => this._waitWhilePaused(), // Pause holds between groups, mid-account
+            isPaused: () => this._paused,                // so the worker can suspend its watchdog while paused
             // Per-(account,group,post) outcome → append to the persistent audit trail.
             onResult: (rec) => { try { store.appendReport(rec); } catch {} },
           });

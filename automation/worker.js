@@ -564,7 +564,7 @@ async function credentialLogin(page, email, password, log, name) {
  * @param {()=>boolean} o.shouldStop
  */
 async function runAccount(o) {
-  const { account, post, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult, isOnline, waitIfPaused } = o;
+  const { account, post, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused } = o;
   const name = account.name;
 
   // Emit one audit record per (account, group, post) outcome for the persistent run report.
@@ -650,7 +650,8 @@ async function runAccount(o) {
     // whole queue. Generous (a full post+comment is ~3-4 min) so it only fires on a real
     // hang, not normal slow posts. Closing the browser makes in-flight ops reject → cleanup.
     const accountBudget = Math.max(420000, targetGroups.length * 300000);
-    watchdog = setTimeout(() => { log(`⏰ [${name}] time budget exceeded — aborting account`); try { if (browser) browser.close(); } catch {} watchdog = null; }, accountBudget);
+    const armWatchdog = () => { watchdog = setTimeout(() => { log(`⏰ [${name}] time budget exceeded — aborting account`); try { if (browser) browser.close(); } catch {} watchdog = null; }, accountBudget); };
+    armWatchdog();
     // Fallback auth path if proxy-chain wasn't used.
     if (proxyAuth && proxyAuth.username && !anonLocal) {
       await page.authenticate({ username: proxyAuth.username, password: proxyAuth.password }).catch(() => {});
@@ -723,8 +724,15 @@ async function runAccount(o) {
 
     for (let i = 0; i < targetGroups.length; i++) {
       if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
-      // Pause holds here, between groups, so Pause takes effect mid-account (not only between accounts).
-      if (waitIfPaused) { await waitIfPaused(); if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; } }
+      // Pause holds here, between groups, so Pause takes effect mid-account. A deliberate
+      // pause is NOT a hang: suspend the time-budget watchdog while held, then re-arm it on
+      // resume so a long pause can't make the watchdog kill this account's browser.
+      if (isPaused && isPaused()) {
+        if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+        if (waitIfPaused) await waitIfPaused();
+        if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
+        armWatchdog();
+      }
       const g = targetGroups[i];
       const gid = g.groupId || g.id;
       const groupName = g.name || gid;
