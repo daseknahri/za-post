@@ -1,6 +1,23 @@
 # Za Post Comment Tool - Session Handoff
 
-Last updated: 2026-06-18. Read this first when continuing in a new Codex session.
+Last updated: 2026-06-19. Read this first when continuing in a new session.
+
+## ⭐ STATUS 2026-06-19 — verified working end-to-end (read this first)
+
+The app **posts and comments reliably, including on Hungarian groups, with the browser hidden.**
+All of the following was confirmed on live runs and is committed/pushed to `daseknahri/za-post` `main`:
+
+- **Posting + first-comment work** (Hungarian comment box/button matchers fixed — they were English-only and silently skipped comments).
+- **Hidden browser works** and is the default. Critical fact: Facebook will NOT publish from true-headless or a `SW_HIDE`'d window; it DOES publish from a **headful window parked off-screen** (`--window-position=-32000,-32000`) **+ focus/visibility emulation** (`Emulation.setFocusEmulationEnabled` + overriding `document.hidden`/`visibilityState`/`hasFocus`). A taskbar icon remains and can't be removed (Chrome re-asserts its window style) — unavoidable.
+- **Facebook account-limit handling:** detects rate-limit ("we limit how often…") and identity checkpoint ("confirm you are a real person", EN/FR); **skips the blocked account immediately**, **flags it in the Accounts UI** (⏸ Rate-limited / 🔐 Needs verification / ⚠️ likely blocked), and lists "accounts needing attention" in the end-of-run summary. A blocked account's post is **reassigned to a healthy account** (claim/release rotation), so no cycle is wasted.
+- Also done this session: durable data store + recovery, offline hold-and-resume, pause/resume/stop correctness, crash-resume, disk/CPU efficiency (capped caches + run-report rotation), first-run desktop shortcut, and a full run-report audit trail (`<userData>/logs/run-report.csv`).
+
+**Gotcha learned the hard way:** if an account fails to publish in BOTH hidden and visible, it's rate-limited/blocked on Facebook's side — NOT a hidden-mode bug. Test hidden with a known-healthy account.
+
+**Remaining:** none blocking. Captions type slowly in hidden mode (clipboard needs real window focus, which off-screen lacks) — known limitation. Optional: a second-virtual-desktop trick to drop the taskbar icon. Note the workspace below says `D:\za-post-main`; the current machine's clean rebuild is `C:\Users\Dell\za-post-restored` — same repo.
+
+---
+
 
 ## Current Workspace
 
