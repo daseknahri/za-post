@@ -339,6 +339,10 @@ async function evalTimed(page, fn, arg, ms = 12000) {
 // ITS "Write a public comment…" box. Returns true on success.
 async function addFirstComment(page, gid, post, commentImg, step) {
   try {
+    // Header: state the comment configuration so each group's comment is self-explanatory.
+    const hasText = !!(post.comment && post.comment.trim());
+    const mode = hasText && commentImg ? 'text + image' : hasText ? 'text-only' : 'image-only';
+    step(`Comment: starting (${mode})${hasText ? ` — "${shortText(post.comment, 50)}"` : ''}`);
     // Plain group URL (the chronological param renders a feed WITHOUT inline comment
     // affordances). Let the feed render; do NOT scroll (FB virtualizes the top post).
     step('Comment: reloading group to locate the post');
@@ -407,8 +411,8 @@ async function addFirstComment(page, gid, post, commentImg, step) {
           await cInput.uploadFile(commentImg);
           // Wait for the image PREVIEW to actually render before submitting, so a slow CDN
           // upload can't be dropped when Enter fires (a blind fixed delay was unreliable).
-          await page.waitForFunction(() => !!document.querySelector('[role="article"] img[src^="blob:"], [role="dialog"] img[src^="blob:"]'), { timeout: 8000 }).catch(() => {});
-          step('Comment: image attached');
+          const previewed = await page.waitForFunction(() => !!document.querySelector('[role="article"] img[src^="blob:"], [role="dialog"] img[src^="blob:"]'), { timeout: 8000 }).then(() => true).catch(() => false);
+          step(previewed ? 'Comment: image attached (preview rendered)' : 'Comment: image uploaded (preview not detected — submitting anyway)');
           await sleep(1500);
         } catch (imgErr) { step(`Comment: image upload failed (${imgErr.message}) — posting text only`); }
       }
@@ -418,13 +422,15 @@ async function addFirstComment(page, gid, post, commentImg, step) {
     // and type the rest — otherwise a multi-line comment would submit at the first line.
     const commentText = String(post.comment || '');
     if (commentText.trim()) {
-      step('Comment: typing text');
       const lines = commentText.split('\n');
+      step(`Comment: typing text (${commentText.length} chars${lines.length > 1 ? `, ${lines.length} lines` : ''})`);
       for (let li = 0; li < lines.length; li++) {
         if (lines[li]) await humanType(page, lines[li]);
         if (li < lines.length - 1) { await page.keyboard.down('Shift'); await page.keyboard.press('Enter'); await page.keyboard.up('Shift'); }
       }
       await sleep(800);
+    } else if (commentImg) {
+      step('Comment: image-only (no text)');
     }
     step('Comment: submitting (Enter)');
     await page.keyboard.press('Enter');
@@ -750,14 +756,14 @@ async function runAccount(o) {
     // Comment image: explicit comment image, remote URL, or the post image when commentWithImage is on.
     let commentImg = null;
     if (post.commentImagePath) {
-      if (fs.existsSync(post.commentImagePath)) commentImg = post.commentImagePath;
+      if (fs.existsSync(post.commentImagePath)) { commentImg = post.commentImagePath; log(`🖼 [${name}] comment image: uploaded file`); }
       else log(`⚠️ [${name}] comment image file not found (${post.commentImagePath}) — comment will have no image`);
     } else if (post.commentImageUrl) {
       const dl = await downloadImage(post.commentImageUrl);
-      if (dl) { commentImg = dl; tempImages.push(dl); }
+      if (dl) { commentImg = dl; tempImages.push(dl); log(`🖼 [${name}] comment image: downloaded from URL`); }
       else log(`⚠️ [${name}] comment image URL set but download failed — comment will have no image`);
     } else if (settings.commentWithImage && resolvedImages.length) {
-      commentImg = resolvedImages[0];
+      commentImg = resolvedImages[0]; log(`🖼 [${name}] comment image: reusing the post image (commentWithImage)`);
     }
 
     for (let i = 0; i < targetGroups.length; i++) {
