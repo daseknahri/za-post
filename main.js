@@ -99,7 +99,15 @@ let RUN_STATE_FILE = null;
 
 /** Persist active=true/false atomically so a hard kill leaves the flag intact. */
 function setRunActive(active) {
-  try { fs.writeFileSync(RUN_STATE_FILE, JSON.stringify({ active: !!active, ts: Date.now() })); } catch {}
+  // Durable write (temp → fsync → rename) so a hard kill can't leave a torn run-state file
+  // that would silently suppress crash-resume.
+  try {
+    const tmp = RUN_STATE_FILE + '.tmp';
+    const fd = fs.openSync(tmp, 'w');
+    try { fs.writeSync(fd, JSON.stringify({ active: !!active, ts: Date.now() })); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, RUN_STATE_FILE);
+  } catch {}
 }
 /** Returns true if the previous session left active=true (interrupted / shutdown). */
 function isRunActive() {
@@ -139,8 +147,10 @@ function emit(channel, payload) {
     remote.addLog(line);
     appendLogFile(line);
   }
-  // Natural completion: clear the run-active flag so no unwanted resume on next launch.
-  if (channel === 'automation-stopped' && (payload === 'completed' || payload === 'finished')) {
+  // ANY terminal state clears the run-active flag — completed, finished, AND stopped
+  // (including internal stops like maxCycles / no-posts / all-logged-out). Otherwise the
+  // flag stays set and the next launch auto-resumes a run that already ended, forever.
+  if (channel === 'automation-stopped') {
     setRunActive(false);
   }
 }
@@ -284,7 +294,7 @@ app.whenReady().then(async () => {
   // ---- Auto-resume after shutdown / crash ------------------------------------
   // Capture whether the previous session left the run-active flag set.
   const wasInterrupted = isRunActive();
-  if (wasInterrupted && store.load().settings.resumeOnStartup !== false && mainWindow) {
+  if (wasInterrupted && store.load().settings.resumeOnStartup === true && mainWindow) {
     let resumeFired = false; // guard: fire exactly once
     mainWindow.webContents.once('did-finish-load', () => {
       if (resumeFired || orchestrator.isRunning()) return;

@@ -1634,6 +1634,7 @@ function renderRunSummary(s) {
 }
 
 async function startAutomation() {
+  if (isAutomationRunning) { showNotification('Automation is already running', 'info'); return; }
   if (appData.posts.length === 0) {
     showNotification('Please add some posts first', 'error');
     return;

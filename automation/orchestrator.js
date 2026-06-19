@@ -18,17 +18,29 @@ const { runAccount } = require('./worker');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let axios; try { axios = require('axios'); } catch {}
+const https = require('https');
 
-async function isOnline() {
-  if (!axios) return true;
-  const urls = ['https://connectivitycheck.gstatic.com/generate_204', 'https://www.facebook.com'];
-  for (const url of urls) {
+// Probe one URL with a hard timeout; resolve true on ANY HTTP response, false on error/timeout.
+function probe(url, ms) {
+  if (axios) return axios.get(url, { timeout: ms, validateStatus: () => true, maxRedirects: 1 }).then(() => true).catch(() => false);
+  // Fallback when axios is missing — never silently assume "online".
+  return new Promise((resolve) => {
+    let done = false; const fin = (v) => { if (!done) { done = true; resolve(v); } };
     try {
-      await axios.get(url, { timeout: 8000, validateStatus: () => true, maxRedirects: 1 });
-      return true;
-    } catch {}
-  }
-  return false;
+      const req = https.get(url, { timeout: ms }, (res) => { res.destroy(); fin(true); });
+      req.on('error', () => fin(false));
+      req.on('timeout', () => { req.destroy(); fin(false); });
+    } catch { fin(false); }
+  });
+}
+
+// Online if EITHER probe responds within 5s. Parallel (a single dead host can't add 8s) and
+// hard-capped so a graceful Stop is never blocked for long.
+async function isOnline() {
+  const urls = ['https://connectivitycheck.gstatic.com/generate_204', 'https://www.facebook.com'];
+  const all = Promise.all(urls.map((u) => probe(u, 5000))).then((r) => r.some(Boolean));
+  const cap = new Promise((r) => setTimeout(() => r(false), 5000));
+  return Promise.race([all, cap]);
 }
 
 function matchesFilter(post, filter) {
@@ -90,7 +102,7 @@ class Orchestrator {
     this.emit('automation-progress', { ...this._progress });
   }
   resume() {
-    if (!this._paused) return;
+    if (!this.running || !this._paused) return; // never "resume" a dead run (UI desync guard)
     this._paused = false;
     this._progress.paused = false;
     this.log('▶️ Resumed');
@@ -249,7 +261,7 @@ class Orchestrator {
       this.log(`[${account.name}] 📋 Mode: ${modeLabel} → all ${kGroups} groups`);
     }
     this.log(`[${account.name}] 🚀 Starting...`);
-    let progressed = false, posted = 0, pendingApproval = 0, errors = 0, accountFlag = null;
+    let progressed = false, posted = 0, pendingApproval = 0, errors = 0, accountFlag = null, accountOffline = false;
     const postedIds = []; // posts confirmed PUBLISHED — safe to auto-delete
     const dealtIds = [];  // posts dealt this cycle (published OR pending) — don't re-deal
     postsLoop:
@@ -267,9 +279,12 @@ class Orchestrator {
             shouldStop: () => this._shouldStop(),
             isLoginOpen: this.isLoginOpen,
             registerAborter: (abort) => this._registerAborter(abort),
+            isOnline: () => isOnline(), // lets the worker bail fast when offline instead of burning nav timeouts
+            waitIfPaused: () => this._waitWhilePaused(), // Pause holds between groups, mid-account
             // Per-(account,group,post) outcome → append to the persistent audit trail.
             onResult: (rec) => { try { store.appendReport(rec); } catch {} },
           });
+          if (r && r.offline) accountOffline = true;
           posted += (r && r.posted) || 0; pendingApproval += (r && r.pendingApproval) || 0; errors += (r && r.errors) || 0;
           // A post is "dealt" (rotation advances, not re-posted next cycle) if it published OR
           // went pending. But ONLY a confirmed publish is auto-deletable — a pending post an
@@ -297,14 +312,14 @@ class Orchestrator {
           errors++;
           this.log(`❌ [${account.name}] crashed (attempt ${attempt}/${MAX}): ${e.message}`);
           if (attempt >= MAX || this._shouldStop()) break;
-          await sleep(5000);
+          await this._interruptibleSleep(5000); // observe Stop during the retry backoff
         }
       }
     }
     // Surface the outcome so the operator sees pending/error counts in the log pane.
     this.log(`[${account.name}] ✅ Done: ${posted} posts`);
     this.log(`📊 [${account.name}] posted=${posted} pending=${pendingApproval} errors=${errors}`);
-    return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag };
+    return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag, offline: accountOffline };
   }
 
   async _loop(getData) {
@@ -383,9 +398,9 @@ class Orchestrator {
         }
         const results = await Promise.all(batch.map(async (account) => {
           const r = await this._runAccount(account, cycle)
-            .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [] }; });
+            .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [], offline: false }; });
           this.log(`✓ [${account.name}] Completed`);
-          const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null };
+          const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null, offline: (r && r.offline) || false };
           this._progress.accountsDone++;
           this._progress.posted += res.posted;
           this._progress.errors += res.errors;
@@ -399,6 +414,15 @@ class Orchestrator {
         const batchOk = results.filter((r) => r.progressed).length;
         this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) --- Waiting ${Number.isFinite(settings.accountDelay) ? settings.accountDelay : 1} minute(s) before next batch...`);
         for (const r of results) { cyclePostedIds.push(...r.postedIds); cycleDealtIds.push(...r.dealtIds); if (r.flag) cycleFlags.push(r.flag); }
+        // Persist dealt-ids incrementally (after each batch) so a crash mid-cycle can't
+        // re-deal — and thus potentially re-post — the batches already completed.
+        if (cycleDealtIds.length) { try { store.saveRotation({ dealt: [...new Set([...this._dealt, ...cycleDealtIds])], roundOffset: this._roundOffset || 0 }); } catch {} }
+        // Connection lost mid-batch (a worker bailed fast on offline): HOLD the whole run
+        // until the connection returns, then continue. Un-posted posts stay un-dealt → re-run.
+        if (results.some((r) => r.offline) && !this._shouldStop()) {
+          this.log('🌐 Connection lost mid-batch — holding until it returns...');
+          await this._waitForConnectivity();
+        }
         if (this._finish) break;
         if (b < batches.length - 1 && !this._shouldStop()) {
           await this._waitWithCountdown((Number.isFinite(settings.accountDelay) ? settings.accountDelay : 1) * 60000, 'Next batch');

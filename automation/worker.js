@@ -239,10 +239,11 @@ async function clickPostButton(page) {
 
 // Confirm the post actually published: the composer dialog closes OR the enabled
 // "Post" button disappears. Returns 'published' or 'timeout'.
-async function waitForPublish(page, dialogCountBefore, timeout = 30000) {
+async function waitForPublish(page, dialogCountBefore, timeout = 30000, shouldStop = () => false) {
   await sleep(1500); // let the click take effect before the first check (avoid false positive)
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
+    if (shouldStop()) return 'stopped'; // halt promptly on Stop instead of polling for 30s
     const dialogCount = await page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length).catch(() => -1);
     if (dialogCount >= 0 && dialogCountBefore > 0 && dialogCount < dialogCountBefore) return 'published';
     const sig = await page.evaluate(() => {
@@ -563,7 +564,7 @@ async function credentialLogin(page, email, password, log, name) {
  * @param {()=>boolean} o.shouldStop
  */
 async function runAccount(o) {
-  const { account, post, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult } = o;
+  const { account, post, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult, isOnline, waitIfPaused } = o;
   const name = account.name;
 
   // Emit one audit record per (account, group, post) outcome for the persistent run report.
@@ -623,7 +624,7 @@ async function runAccount(o) {
 
   let browser;
   let unregisterAborter = () => {};
-  let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null;
+  let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false;
   try {
     const hidden = settings.hideBrowser !== false; // default: hidden (new headless renders FB fine)
     log(`🖥️ [${name}] launching browser (${hidden ? 'hidden' : 'visible'})`);
@@ -722,6 +723,8 @@ async function runAccount(o) {
 
     for (let i = 0; i < targetGroups.length; i++) {
       if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
+      // Pause holds here, between groups, so Pause takes effect mid-account (not only between accounts).
+      if (waitIfPaused) { await waitIfPaused(); if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; } }
       const g = targetGroups[i];
       const gid = g.groupId || g.id;
       const groupName = g.name || gid;
@@ -730,7 +733,15 @@ async function runAccount(o) {
         step(`Navigate to group (${i + 1}/${targetGroups.length})`);
         const gotoGroup = () => page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
         let navOk = await gotoGroup();
-        if (!navOk) { step('Navigation attempt failed; retrying'); await sleepInterruptible(3000, shouldStop); navOk = await gotoGroup(); }
+        if (!navOk) {
+          // Distinguish a network outage from a Facebook issue: if we're OFFLINE, bail fast
+          // (don't burn 90s timeouts per group) so the orchestrator can hold for reconnect.
+          if (typeof isOnline === 'function' && !(await isOnline())) {
+            step('🌐 Offline — pausing this account; the run resumes when the connection returns');
+            offline = true; break;
+          }
+          step('Navigation attempt failed; retrying'); await sleepInterruptible(3000, shouldStop); navOk = await gotoGroup();
+        }
         if (!navOk) { step('Navigation failed; skipping group'); errors++; report(groupName, gid, 'error', 'navigation failed', ''); continue; }
         await sleep(3000);
 
@@ -847,7 +858,8 @@ async function runAccount(o) {
         const clicked = await clickPostButton(page);
         if (!clicked) { step('Post button not found; skipping group'); errors++; report(groupName, gid, 'error', 'post button not found', ''); continue; }
         step('Post button clicked');
-        const publishResult = await waitForPublish(page, dialogCountBefore);
+        const publishResult = await waitForPublish(page, dialogCountBefore, 30000, shouldStop);
+        if (publishResult === 'stopped') { step('Stop requested during publish wait — halting'); break; }
         if (publishResult !== 'published') { step('Post clicked but publish was NOT confirmed; skipping group'); errors++; report(groupName, gid, 'error', 'publish not confirmed', ''); continue; }
         await sleepInterruptible(3000, shouldStop);
         // Check pending-approval BEFORE dismissing popups (a dismissible notice could be cleared).
@@ -913,7 +925,7 @@ async function runAccount(o) {
     if (anonLocal && proxyChain) { try { await proxyChain.closeAnonymizedProxy(anonLocal, true); } catch {} }
     for (const t of tempImages) { try { fs.unlinkSync(t); } catch {} }
   }
-  return { posted, errors, pendingApproval, noRetry, flag };
+  return { posted, errors, pendingApproval, noRetry, flag, offline };
 }
 
 // Strip fields Puppeteer's setCookie rejects; coerce sameSite.
