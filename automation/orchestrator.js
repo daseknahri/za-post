@@ -437,6 +437,14 @@ class Orchestrator {
           this.log(`[${ba.name}] Starting with ${(ba.assignedGroups || []).length} groups`);
         }
         const results = await Promise.all(batch.map(async (account) => {
+          // Mid-run toggle: if the user turned this account OFF since the cycle began, skip it now so
+          // it stops working DURING the run (the cycle's account list was snapshotted at its start).
+          const live = (getData().accounts || []).find((a) => a.name === account.name);
+          if (live && live.enabled === false) {
+            this.log(`⏸️ [${account.name}] turned OFF — skipping for the rest of this run`);
+            this._progress.accountsDone++; this.emit('automation-progress', { ...this._progress });
+            return { account, progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [], dealtIds: [], flag: null, offline: false };
+          }
           const r = await this._runAccount(account, cycle)
             .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [], offline: false }; });
           this.log(`✓ [${account.name}] Completed`);

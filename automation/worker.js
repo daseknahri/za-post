@@ -907,6 +907,8 @@ async function runAccount(o) {
     for (let i = 0; i < targetGroups.length; i++) {
       if (aborted) { log(`⏹ [${name}] watchdog aborted this account — not touching the dead browser`); break; }
       if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
+      // Mid-run toggle: stop between groups if the user turned this account OFF during the run.
+      try { const me = store.load().accounts.find((a) => a.name === name); if (me && me.enabled === false) { log(`⏸ [${name}] turned OFF — stopping this account`); break; } } catch {}
       // Pause holds here, between groups, so Pause takes effect mid-account. A deliberate
       // pause is NOT a hang: suspend the time-budget watchdog while held, then re-arm it on
       // resume so a long pause can't make the watchdog kill this account's browser.
