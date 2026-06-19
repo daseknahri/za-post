@@ -347,7 +347,7 @@ async function addFirstComment(page, gid, post, commentImg, step) {
     // affordances). Let the feed render; do NOT scroll (FB virtualizes the top post).
     step('Comment: reloading group to locate the post');
     await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-    await sleep(5000);
+    await sleep(3000);
     await dismissPopups(page);
 
     // If the session died between publishing and commenting, our post won't be in the
@@ -398,7 +398,7 @@ async function addFirstComment(page, gid, post, commentImg, step) {
     // Focus via in-page scroll+focus (ElementHandle.click can hang on re-rendering feeds).
     step('Comment: focusing the comment box');
     await target.evaluate((el) => { el.scrollIntoView({ block: 'center' }); el.focus(); }).catch(() => {});
-    await sleep(1000);
+    await sleep(600);
     if (commentImg) {
       // Scope the file input to the comment box's container ONLY (the document-level
       // input is the feed composer — never fall back to it or we'd mis-attach).
@@ -428,7 +428,7 @@ async function addFirstComment(page, gid, post, commentImg, step) {
         if (lines[li]) await humanType(page, lines[li]);
         if (li < lines.length - 1) { await page.keyboard.down('Shift'); await page.keyboard.press('Enter'); await page.keyboard.up('Shift'); }
       }
-      await sleep(800);
+      await sleep(500);
     } else if (commentImg) {
       step('Comment: image-only (no text)');
     }
@@ -438,14 +438,14 @@ async function addFirstComment(page, gid, post, commentImg, step) {
     // away) once it accepts the comment. Tracking the real target box is far more reliable
     // than re-scanning the feed by caption (which gave false "not confirmed" negatives).
     let confirmed = false;
-    const cdl = Date.now() + 6000;
+    const cdl = Date.now() + 4000;
     while (Date.now() < cdl) {
       await sleep(1000);
       const state = await target.evaluate((el) => (el.textContent || '').trim()).catch(() => 'GONE');
       if (state === '' || state === 'GONE') { confirmed = true; break; } // emptied or re-rendered = submitted
     }
     step(confirmed ? 'Comment: posted and verified ✅' : 'Comment: sent (could not auto-verify)');
-    await sleep(1000);
+    await sleep(600);
     return true;
   } catch (e) { step(`Comment: error — ${e.message}`); return false; }
 }
@@ -635,7 +635,6 @@ async function runAccount(o) {
   const launchArgs = [
     '--no-sandbox',
     '--disable-blink-features=AutomationControlled',
-    '--window-position=-32000,-32000',
     '--window-size=1280,900',
     '--no-first-run',
     '--no-default-browser-check',
@@ -676,10 +675,14 @@ async function runAccount(o) {
   let unregisterAborter = () => {};
   let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false;
   try {
-    const hidden = settings.hideBrowser !== false; // default: hidden (new headless renders FB fine)
-    log(`🖥️ [${name}] launching browser (${hidden ? 'hidden' : 'visible'})`);
+    const hidden = settings.hideBrowser !== false; // default: hidden
+    // ALWAYS headful — Facebook's composer (clipboard, typing focus, publish) misbehaves in true
+    // headless even with stealth. "Hidden" just parks the real window OFF-SCREEN so it's invisible
+    // but still a normal browser FB treats correctly; "visible" puts it on-screen for watching.
+    launchArgs.push(hidden ? '--window-position=-32000,-32000' : '--window-position=80,40');
+    log(`🖥️ [${name}] launching browser (${hidden ? 'hidden (off-screen)' : 'visible'})`);
     browser = await puppeteer.launch({
-      headless: hidden, // true = new headless (no window, no taskbar). false = visible for debugging.
+      headless: false,
       executablePath: chromiumPath(),
       userDataDir: store.profileDir(name),
       args: launchArgs,
@@ -899,15 +902,17 @@ async function runAccount(o) {
             await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
             await page.keyboard.press('Backspace'); await sleep(150);
             await humanType(page, post.caption);
-            captionState = await waitForCaptionState(page, post.caption, 5000);
-            if (!captionState.matched) {
-              // One retry: re-focus and type again
-              step('Caption still not verified after typing; retrying once');
+            captionState = await waitForCaptionState(page, post.caption, 2500);
+            // Only RE-TYPE if nothing landed (editor still empty). If text IS present but our
+            // readability check can't match it (common — FB hides the editor's text), accept it
+            // and let the publish confirmation verify. Avoids a pointless ~10s full re-type.
+            if (!captionState.matched && (captionState.len || 0) === 0) {
+              step('Caption did not land — retyping once');
               await focusEditable(page);
               await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
               await page.keyboard.press('Backspace'); await sleep(150);
               await humanType(page, post.caption);
-              captionState = await waitForCaptionState(page, post.caption, 5000);
+              captionState = await waitForCaptionState(page, post.caption, 2500);
             }
           }
           if (captionState.matched || await captionOk()) {
