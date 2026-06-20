@@ -12,8 +12,10 @@
 //                           post DIFFERENT content in the same cycle (rotates each cycle)
 //   random-unique        -> like post-centric-unique but the per-account pick is shuffled
 
+const path = require('path');
 const store = require('../lib/store');
 const { runAccount } = require('./worker');
+const { ProxyHealthManager } = require('../lib/proxy');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -37,13 +39,20 @@ function probe(url, ms) {
   });
 }
 
-// Online if EITHER probe responds within 5s. Parallel (a single dead host can't add 8s) and
-// hard-capped so a graceful Stop is never blocked for long.
-async function isOnline() {
+// Online if EITHER probe responds (only declare offline when BOTH fail). M3-10: the per-probe
+// window is raised to 12s so a slow-but-real network (VPN, congested link) isn't misread as offline,
+// and the cap is INTERRUPTIBLE — a graceful Stop resolves it within ~250ms instead of blocking for
+// the full window on a dead network.
+async function isOnline(shouldStop = () => false, timeoutMs = 12000) {
   const urls = ['https://connectivitycheck.gstatic.com/generate_204', 'https://www.facebook.com'];
-  const all = Promise.all(urls.map((u) => probe(u, 5000))).then((r) => r.some(Boolean));
-  const cap = new Promise((r) => setTimeout(() => r(false), 5000));
-  return Promise.race([all, cap]);
+  const all = Promise.all(urls.map((u) => probe(u, timeoutMs))).then((r) => r.some(Boolean));
+  let iv;
+  const cap = new Promise((resolve) => {
+    const start = Date.now();
+    iv = setInterval(() => { if (shouldStop() || Date.now() - start >= timeoutMs) resolve(false); }, 250);
+  });
+  try { return await Promise.race([all, cap]); }
+  finally { clearInterval(iv); }
 }
 
 function matchesFilter(post, filter) {
@@ -72,6 +81,7 @@ class Orchestrator {
   constructor(emit, options) {
     this.emit = emit;
     this.options = options || {};
+    this._proxyHealth = new ProxyHealthManager(); // E-X3: per-proxy failure tracking + cool-down
     this.isLoginOpen = (this.options && typeof this.options.isLoginOpen === 'function') ? this.options.isLoginOpen : () => false;
     this.running = false;
     this._stop = false;
@@ -123,7 +133,7 @@ class Orchestrator {
   async _waitForConnectivity() {
     let offlineLogged = false;
     while (!this._shouldStop()) {
-      if (await isOnline()) {
+      if (await isOnline(() => this._shouldStop())) {
         if (offlineLogged) {
           this.log('🌐 Connection restored — continuing');
           if (this._progress) { this._progress.offline = false; this.emit('automation-progress', { ...this._progress }); }
@@ -141,6 +151,12 @@ class Orchestrator {
   }
 
   log(msg) { this.emit('automation-log', msg); }
+
+  // E-X3/E-X4: proxy health tracking. reportProxy is handed to the worker; getProxyHealth feeds the
+  // /api/proxies/health endpoint + the diagnostics. Health tracking never blocks a post.
+  _proxyHealthFile() { return path.join((store.paths && store.paths.USER_DATA) || '', 'proxy-health.json'); }
+  reportProxy(proxyStr, ok, reason) { if (!proxyStr) return; try { ok ? this._proxyHealth.markOk(proxyStr) : this._proxyHealth.markFail(proxyStr, reason); } catch {} }
+  getProxyHealth() { try { return this._proxyHealth.getStats(); } catch { return { proxies: [], summary: { total: 0, healthy: 0, failing: 0, onCooldown: 0 } }; } }
 
   // Human-readable label for a postingOrder value.
   _modeLabel(order) {
@@ -293,6 +309,7 @@ class Orchestrator {
     }
     this.log(`[${account.name}] 🚀 Starting...`);
     let progressed = false, posted = 0, pendingApproval = 0, errors = 0, accountFlag = null, accountOffline = false;
+    let accountCrashes = 0; // M3-09: consecutive posts that crashed out for this account
     const postedIds = []; // posts confirmed PUBLISHED — safe to auto-delete
     const dealtIds = [];  // posts dealt this cycle (published OR pending) — don't re-deal
     try {
@@ -302,6 +319,7 @@ class Orchestrator {
       // Per-account crash isolation + restart (approximates the old supervisor that
       // could relaunch a crashed account worker independently).
       const MAX = 2;
+      let crashedOut = false; // M3-09: did this post exhaust all retries with a CRASH?
       for (let attempt = 1; attempt <= MAX; attempt++) {
         try {
           const r = await runAccount({
@@ -312,10 +330,11 @@ class Orchestrator {
             isLoginOpen: this.isLoginOpen,
             registerAborter: (abort) => this._registerAborter(abort),
             isOnline: () => isOnline(), // lets the worker bail fast when offline instead of burning nav timeouts
+            reportProxy: (p, ok, reason) => this.reportProxy(p, ok, reason), // E-X3: per-proxy health from the worker
             waitIfPaused: () => this._waitWhilePaused(), // Pause holds between groups, mid-account
             isPaused: () => this._paused,                // so the worker can suspend its watchdog while paused
             // Per-(account,group,post) outcome → append to the persistent audit trail.
-            onResult: (rec) => { try { store.appendReport(rec); } catch {} },
+            onResult: (rec) => { try { if (!store.appendReport(rec) && !this._auditWarned) { this._auditWarned = true; this.log('⚠️ Could not write an audit-log row (disk full / permissions?) — the run continues but run-report.jsonl/.csv may be incomplete. Fix disk/permissions to restore the audit trail.'); } } catch {} },
           });
           if (r && r.offline) accountOffline = true;
           posted += (r && r.posted) || 0; pendingApproval += (r && r.pendingApproval) || 0; errors += (r && r.errors) || 0;
@@ -357,10 +376,24 @@ class Orchestrator {
         catch (e) {
           errors++;
           this.log(`❌ [${account.name}] crashed (attempt ${attempt}/${MAX}): ${e.message}`);
+          if (attempt >= MAX) crashedOut = true;
           if (attempt >= MAX || this._shouldStop()) break;
           await this._interruptibleSleep(5000); // observe Stop during the retry backoff
         }
       }
+      // M3-09: if this post exhausted its retries with a CRASH, count it. After 2 crashed posts in a
+      // row the account is likely broken (dead browser, corrupt profile, OOM) — stop burning the run
+      // on it: skip its remaining posts this cycle and flag it for attention. Any non-crash resets.
+      if (crashedOut) {
+        if (++accountCrashes >= 2) {
+          this.log(`🛑 [${account.name}] ${accountCrashes} posts crashed in a row — skipping its remaining posts this cycle (likely a broken profile/browser). Flagged for attention.`);
+          accountFlag = accountFlag || 'likely_blocked';
+          this._runFlags[account.name] = accountFlag;
+          try { await store.update((d) => { const acc = d.accounts.find((a) => a.name === account.name); if (acc) { acc.status = 'error'; acc.lastMessage = '⚠️ The browser crashed repeatedly for this account — check its profile/proxy or recreate it.'; } }); this.emit('data-updated'); } catch {}
+          this.emit('account-attention', { name: account.name, flag: accountFlag });
+          break postsLoop;
+        }
+      } else accountCrashes = 0;
     }
     // Surface the outcome so the operator sees pending/error counts in the log pane.
     this.log(`[${account.name}] ✅ Done in ${Math.round((Date.now() - accountStart) / 1000)}s`);
@@ -383,8 +416,11 @@ class Orchestrator {
       await store.update((d) => {
         const acc = d.accounts.find((a) => a.name === name);
         if (!acc) return;
-        if (!acc.daily || acc.daily.date !== today) acc.daily = { date: today, count: 0 };
-        acc.daily.count += res.posted || 0;
+        // Monotonic daily-cap reset (see store.dailyRolledOver): only a genuinely later UTC day
+        // resets the count; a clock moved backward keeps counting, so the cap can't be cleared
+        // by rewinding the clock.
+        if (store.dailyRolledOver(acc.daily, today)) acc.daily = { date: today, count: 0 };
+        acc.daily.count = (Number(acc.daily.count) || 0) + (res.posted || 0);
         if (res.flag === 'rate_limited') {
           acc.rlStrikes = (acc.rlStrikes || 0) + 1;
           const hours = Math.min(48, baseHours * Math.pow(2, acc.rlStrikes - 1));
@@ -397,12 +433,33 @@ class Orchestrator {
     } catch {}
   }
 
+  // Persist this cycle's dealt post-ids to disk, THEN mirror them into the in-memory _dealt set.
+  // Returns false — and halts the run — if the write fails: a post that was published but whose
+  // dealt-state couldn't be saved would be re-dealt and RE-POSTED after a crash/restart, so we
+  // stop loudly rather than let duplicate-post risk compound batch after batch.
+  _persistDealt(cycleDealtIds) {
+    if (!cycleDealtIds || !cycleDealtIds.length) return true;
+    const merged = [...new Set([...this._dealt, ...cycleDealtIds])];
+    if (store.saveRotation({ dealt: merged, roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0 })) {
+      this._dealt = new Set(merged);
+      return true;
+    }
+    this.log('🚨 CRITICAL: could not save rotation state (disk full / file locked / no write permission). Posts published this batch are NOT recorded as done — continuing would risk RE-POSTING them after a crash or restart. STOPPING the run now. Free disk space or fix the data-folder permissions, then Start again.');
+    this._stop = true;
+    this.emit('automation-progress', { ...this._progress });
+    return false;
+  }
+
   async _loop(getData) {
     const _st = store.loadRotation();
     this._dealt = new Set(Array.isArray(_st.dealt) ? _st.dealt : []); // post-ids already dealt (unique modes)
     this._zeroProgressCycles = 0; // consecutive cycles that dealt nothing -> stall breaker
     this._proxyWarned = false;    // one-time per-run "proxies off / shared IP" warning
+    this._auditWarned = false;    // one-time per-run "audit-log write failed" warning
     this._roundOffset = _st.roundOffset || 0; // rotates account↔post mapping across Loop-campaign recycles
+    this._staggerRotation = _st.staggerRotation || 0; // E-N3: rotates account START order each cycle (fairness)
+    this._retryCount = {}; // E-N4: per-account consecutive rate-limit retries → stagger decay (in-memory)
+    try { this._proxyHealth.load(this._proxyHealthFile()); } catch {} // E-X3: restore proxy health (prunes >1h)
     let cycle = 0;
     while (!this._shouldStop()) {
       this._data = getData(); // re-read each cycle so mid-run edits take effect
@@ -476,85 +533,110 @@ class Orchestrator {
       await this._waitWhilePaused(); if (this._shouldStop()) break;
       await this._waitForConnectivity(); if (this._shouldStop()) break;
 
-      const batches = chunk(active, settings.parallelAccounts || 3);
+      // E-N3: rotate the LAUNCH order each cycle for fairness (so account 0 isn't perpetually the
+      // freshest/first). Rotation affects START ORDER ONLY — this._active stays unrotated so unique-
+      // mode post assignment (which keys off positional index + roundOffset) is unchanged.
+      const rot = active.length ? (this._staggerRotation || 0) % active.length : 0;
+      const queue = active.slice(rot).concat(active.slice(0, rot));
       const cyclePostedIds = []; // published this cycle (auto-deletable)
       const cycleDealtIds = [];  // dealt this cycle (published OR pending — rotation)
       const cycleFlags = [];     // per-account flags (needs_login / rate_limited) seen this cycle
-      for (let b = 0; b < batches.length; b++) {
-        if (this._shouldStop()) break;
+
+      // E-N5: DYNAMIC CONCURRENCY POOL — run all active accounts through `poolSize` slots, launching
+      // the next the INSTANT a slot frees (no batch barrier wasting the fast accounts' idle time).
+      // Invariants preserved: per-account gates (enabled / cool-down / daily-cap) run BEFORE each
+      // account; dealt-ids are persisted PER COMPLETION (halt-on-write-failure intact); stagger
+      // spaces the initial fill to avoid a coordinated burst; offline drains + holds; Finish drains
+      // the in-flight set then exits.
+      const poolSize = Math.max(1, Number(settings.parallelAccounts) || 2);
+      this.log(`🧵 Pool: ${queue.length} account(s), up to ${poolSize} at a time (${new Date().toLocaleTimeString()})`);
+      let launchIdx = 0, stopPool = false, sawOffline = false;
+      let firstStart = 0, lastEnd = 0, cpuMs = 0, ranCount = 0;
+
+      const runOne = async (account) => {
+        const myLaunch = launchIdx++;
+        // Stagger only the INITIAL fill (the first poolSize launches start near-simultaneously); later
+        // launches are completion-triggered and already spread out in time. E-N4: halve per retry.
+        if (settings.staggerAccounts !== false && myLaunch > 0 && myLaunch < poolSize && !this._shouldStop() && !stopPool) {
+          const retries = (this._retryCount && this._retryCount[account.name]) || 0;
+          const base = Math.max(0, Math.min(myLaunch * 35000 * Math.pow(0.5, retries), 35000));
+          if (base > 0) await this._interruptibleSleep(jitter(base, 0.5));
+        }
+        if (this._shouldStop() || stopPool || this._finish) return;
+        // Mid-run toggle: if the user turned this account OFF since the cycle began, skip it now.
+        const live = (getData().accounts || []).find((a) => a.name === account.name);
+        const idle = (msg) => { this.log(msg); this._progress.accountsDone++; this.emit('automation-progress', { ...this._progress }); };
+        if (live && live.enabled === false) return idle(`⏸️ [${account.name}] turned OFF — skipping for the rest of this run`);
+        // Rate-limit COOL-DOWN: a recently rate-limited account rests for hours instead of re-hammering FB.
+        if (live && live.rateLimitedUntil && live.rateLimitedUntil > Date.now()) {
+          const mins = Math.ceil((live.rateLimitedUntil - Date.now()) / 60000);
+          return idle(`🧊 [${account.name}] cooling down after a rate-limit — ${mins} min left; skipping this cycle`);
+        }
+        // Per-account DAILY CAP on group-posts (0 = off).
+        const cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
+        const usedToday = (cap > 0 && live) ? store.dailyUsed(live.daily) : 0;
+        if (cap > 0 && usedToday >= cap) return idle(`📵 [${account.name}] daily cap reached (${usedToday}/${cap} group-posts today) — skipping until tomorrow`);
+        const maxThisRun = cap > 0 ? (cap - usedToday) : Infinity;
+
+        const t0 = Date.now(); if (!firstStart) firstStart = t0;
+        this.log(`[${account.name}] Starting with ${(account.assignedGroups || []).length} groups`);
+        const r = await this._runAccount(account, cycle, maxThisRun)
+          .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [], offline: false }; });
+        const dur = Date.now() - t0; lastEnd = Date.now(); cpuMs += dur; ranCount++;
+        this.log(`✓ [${account.name}] Completed in ${Math.round(dur / 1000)}s`);
+        const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null, offline: (r && r.offline) || false, durationMs: dur };
+        // Persist this account's daily count + rate-limit cool-down.
+        await this._recordAccountOutcome(account.name, res, settings);
+        // E-N4: track per-account rate-limit retries for stagger decay (reset on a clean post).
+        this._retryCount = this._retryCount || {};
+        if (res.flag === 'rate_limited') this._retryCount[account.name] = (this._retryCount[account.name] || 0) + 1;
+        else if (res.progressed) this._retryCount[account.name] = 0;
+        this._progress.accountsDone++; this._progress.posted += res.posted; this._progress.errors += res.errors; this._progress.pending += res.pendingApproval;
+        const st = (this._runStats[account.name] = this._runStats[account.name] || { posted: 0, pending: 0, errors: 0 });
+        st.posted += res.posted; st.pending += res.pendingApproval; st.errors += res.errors;
+        this.emit('automation-progress', { ...this._progress });
+        cyclePostedIds.push(...res.postedIds); cycleDealtIds.push(...res.dealtIds); if (res.flag) cycleFlags.push(res.flag);
+        // Persist dealt-ids the MOMENT this account finishes so a crash can't re-deal (re-post) an
+        // already-published post. _persistDealt halts the run (sets _stop) on a write failure.
+        if (res.dealtIds.length && !this._persistDealt(res.dealtIds)) { stopPool = true; return; }
+        if (res.offline) { sawOffline = true; stopPool = true; } // connection lost mid-flight → drain + hold
+      };
+
+      const inFlight = new Set();
+      const launchNext = () => {
+        if (stopPool || this._shouldStop() || this._finish || !queue.length) return;
+        const account = queue.shift();
+        const p = runOne(account).catch((e) => { this.log(`❌ pool error: ${e.message}`); }).finally(() => inFlight.delete(p));
+        inFlight.add(p);
+      };
+      while ((queue.length || inFlight.size) && !this._shouldStop()) {
         await this._waitWhilePaused(); if (this._shouldStop()) break;
-        await this._waitForConnectivity(); if (this._shouldStop()) break;
-        const batch = batches[b];
-        this.log(`═══ BATCH ${b + 1}: ${batch.map((a) => a.name).join(', ')} (${new Date().toLocaleTimeString()}) ═══`);
-        for (const ba of batch) {
-          this.log(`[${ba.name}] Starting with ${(ba.assignedGroups || []).length} groups`);
-        }
-        const results = await Promise.all(batch.map(async (account, idx) => {
-          // Stagger account starts within a batch so 2-3 browsers don't hit Facebook at the SAME
-          // instant from the same IP block (a coordinated-burst signal). Spread over ~0-90s.
-          if (settings.staggerAccounts !== false && idx > 0 && !this._shouldStop()) {
-            await this._interruptibleSleep(jitter(idx * 35000, 0.5));
-          }
-          // Mid-run toggle: if the user turned this account OFF since the cycle began, skip it now so
-          // it stops working DURING the run (the cycle's account list was snapshotted at its start).
-          const live = (getData().accounts || []).find((a) => a.name === account.name);
-          const idle = (msg) => { this.log(msg); this._progress.accountsDone++; this.emit('automation-progress', { ...this._progress }); return { account, progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [], dealtIds: [], flag: null, offline: false }; };
-          if (live && live.enabled === false) return idle(`⏸️ [${account.name}] turned OFF — skipping for the rest of this run`);
-          // Rate-limit COOL-DOWN: a recently rate-limited account rests for hours (exponential) instead
-          // of re-hammering FB every cycle (which escalates a soft limit into a hard block).
-          if (live && live.rateLimitedUntil && live.rateLimitedUntil > Date.now()) {
-            const mins = Math.ceil((live.rateLimitedUntil - Date.now()) / 60000);
-            return idle(`🧊 [${account.name}] cooling down after a rate-limit — ${mins} min left; skipping this cycle`);
-          }
-          // Per-account DAILY CAP on group-posts (0 = off) — keeps each account within a human-plausible
-          // daily volume; the counter resets each calendar day.
-          const cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
-          const usedToday = (cap > 0 && live && live.daily && live.daily.date === store.todayKey()) ? (live.daily.count || 0) : 0;
-          if (cap > 0 && usedToday >= cap) {
-            return idle(`📵 [${account.name}] daily cap reached (${usedToday}/${cap} group-posts today) — skipping until tomorrow`);
-          }
-          // Remaining budget for today is passed into the worker so a single run STOPS at the cap
-          // (instead of posting to every group and overshooting by groups-1). Infinity when cap is off.
-          const maxThisRun = cap > 0 ? (cap - usedToday) : Infinity;
-          const r = await this._runAccount(account, cycle, maxThisRun)
-            .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [], offline: false }; });
-          this.log(`✓ [${account.name}] Completed`);
-          const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null, offline: (r && r.offline) || false };
-          // Persist this account's daily group-post count + rate-limit cool-down.
-          await this._recordAccountOutcome(account.name, res, settings);
-          this._progress.accountsDone++;
-          this._progress.posted += res.posted;
-          this._progress.errors += res.errors;
-          this._progress.pending += res.pendingApproval;
-          // Per-account run totals for the end-of-run summary.
-          const st = (this._runStats[account.name] = this._runStats[account.name] || { posted: 0, pending: 0, errors: 0 });
-          st.posted += res.posted; st.pending += res.pendingApproval; st.errors += res.errors;
-          this.emit('automation-progress', { ...this._progress });
-          return res;
-        }));
-        const batchOk = results.filter((r) => r.progressed).length;
-        this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) --- Waiting ~${Number.isFinite(settings.accountDelay) ? settings.accountDelay : 2} minute(s) before next batch...`);
-        for (const r of results) { cyclePostedIds.push(...r.postedIds); cycleDealtIds.push(...r.dealtIds); if (r.flag) cycleFlags.push(r.flag); }
-        // Persist dealt-ids incrementally (after each batch) so a crash mid-cycle can't
-        // re-deal — and thus potentially re-post — the batches already completed.
-        if (cycleDealtIds.length && !store.saveRotation({ dealt: [...new Set([...this._dealt, ...cycleDealtIds])], roundOffset: this._roundOffset || 0 })) this.log('⚠️ Could not persist rotation state (disk full / file locked?) — a crash now could re-post already-published content. Free space or fix permissions.');
-        // Connection lost mid-batch (a worker bailed fast on offline): HOLD the whole run
-        // until the connection returns, then continue. Un-posted posts stay un-dealt → re-run.
-        if (results.some((r) => r.offline) && !this._shouldStop()) {
-          this.log('🌐 Connection lost mid-batch — holding until it returns...');
-          await this._waitForConnectivity();
-        }
-        if (this._finish) break;
-        if (b < batches.length - 1 && !this._shouldStop()) {
-          await this._waitWithCountdown(jitter((Number.isFinite(settings.accountDelay) ? settings.accountDelay : 2) * 60000), 'Next batch');
-        }
+        while (inFlight.size < poolSize && queue.length && !stopPool && !this._finish && !this._shouldStop()) launchNext();
+        if (!inFlight.size) break; // nothing running and nothing launchable (finish / stop / drained)
+        await Promise.race([...inFlight]); // wake as soon as ONE slot frees, then top the pool back up
       }
-      // Mark this cycle's published posts as DEALT (drives the round-robin: each post once;
-      // a failed account's post stays un-dealt and is re-dealt next cycle). Persisted for resume.
-      if (cycleDealtIds.length) {
-        for (const id of cycleDealtIds) this._dealt.add(id);
-        if (!store.saveRotation({ dealt: [...this._dealt], roundOffset: this._roundOffset || 0 })) this.log('⚠️ Could not persist rotation state — a crash now could re-post already-published content.');
+      await Promise.allSettled([...inFlight]); // drain whatever is still running before the cycle ends
+
+      // E-N2: pool-utilization metric — how busy the slots were kept (cpu busy time vs the wall-clock
+      // span × slots). Low util ⇒ the pool was starved (few eligible accounts) or accounts were uneven.
+      if (ranCount > 0) {
+        const span = Math.max(1, lastEnd - firstStart);
+        const util = Math.min(100, Math.round((cpuMs / (span * poolSize)) * 100));
+        this.log(`[pool-stats] ran=${ranCount} wall=${Math.round(span / 1000)}s busy=${Math.round(cpuMs / 1000)}s util=${util}% (pool=${poolSize})`);
       }
+      // E-N3: advance the start-order rotation for next cycle's fairness (persisted via _persistDealt).
+      if (active.length) this._staggerRotation = ((this._staggerRotation || 0) + 1) % active.length;
+      try { this._proxyHealth.save(this._proxyHealthFile()); } catch {} // E-X3: persist proxy health each cycle
+      // Connection lost mid-cycle (a worker bailed fast on offline): HOLD until it returns, then the
+      // un-posted posts stay un-dealt and are re-run next cycle.
+      if (sawOffline && !this._shouldStop()) {
+        this.log('🌐 Connection lost mid-cycle — holding until it returns...');
+        await this._waitForConnectivity();
+      }
+      // Dealt-ids were already persisted incrementally per batch by _persistDealt (above), which
+      // mirrors them into this._dealt and halts the run on a write failure — so there is nothing
+      // left to mark or save here. (Round-robin invariant, for reference: each post is dealt once;
+      // a failed account's post stays un-dealt and is re-dealt next cycle.)
       if (this._shouldStop()) break;
 
       // One-time campaign: remove the posts PUBLISHED this cycle so each post is used
@@ -586,7 +668,19 @@ class Orchestrator {
       // (especially an all-rate-limited fleet, which would otherwise loop and keep burning the accounts).
       this._zeroProgressCycles = (cycleDealtIds.length === 0) ? (this._zeroProgressCycles || 0) + 1 : 0;
       if (this._zeroProgressCycles >= 3) {
-        this.log('🛑 3 cycles in a row posted nothing — stopping so the app does not spin unattended. Check your accounts/groups (rate-limited, blocked, or no groups assigned), then Start again.');
+        // M4-09: name the most likely root cause so the operator knows whether to WAIT (cool-down)
+        // or ACT (assign groups / fix flagged accounts), instead of a generic "check your accounts".
+        const active = this._active || [];
+        const now = Date.now();
+        const rl = active.filter((a) => (Number(a.rateLimitedUntil) || 0) > now).length;
+        const noGroups = active.filter((a) => !(a.assignedGroups && a.assignedGroups.length)).length;
+        const flagged = Object.keys(this._runFlags || {}).length;
+        let cause;
+        if (active.length && rl === active.length) cause = `all ${active.length} active account(s) are rate-limited and cooling down — wait for the cool-down to elapse, then Start again`;
+        else if (active.length && noGroups === active.length) cause = 'no active account has any groups assigned — assign groups in the Accounts tab';
+        else if (flagged) cause = `${flagged} account(s) need attention (logged out, checkpoint, or blocked) — fix the flagged accounts, then Start again`;
+        else cause = 'check your accounts/groups (rate-limited, blocked, logged out, or no groups assigned)';
+        this.log(`🛑 3 cycles in a row posted nothing — stopping so the app doesn't spin unattended. Likely cause: ${cause}.`);
         break;
       }
       if ((settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {

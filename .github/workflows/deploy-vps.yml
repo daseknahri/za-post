@@ -1,0 +1,22 @@
+name: Build VPS license server image
+
+# Builds (and optionally pushes) the Docker image for vps-server/. Triggers on a vps-* tag or
+# manually. Fill in the registry login + push/deploy steps for your host (Coolify, GHCR, etc.).
+on:
+  push:
+    tags: ['vps-v*']
+  workflow_dispatch:
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build license-server image
+        run: docker build -t za-post-license-server:${{ github.sha }} ./vps-server
+      # - name: Log in to your registry
+      #   run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login <registry> -u <user> --password-stdin
+      # - name: Push
+      #   run: docker push <registry>/za-post-license-server:${{ github.sha }}
+      # Coolify users: trigger a redeploy webhook here, e.g.
+      # - run: curl -fsSL "${{ secrets.COOLIFY_DEPLOY_WEBHOOK }}"

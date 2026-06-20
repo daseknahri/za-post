@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   closeLoginBrowser: (name) => ipcRenderer.invoke('close-login-browser', name),
   toggleAccount: (name, enabled) => ipcRenderer.invoke('toggle-account', name, enabled),
   setAccountCredentials: (name, email, password) => ipcRenderer.invoke('set-account-credentials', name, email, password),
+  getAccountCredentials: (name) => ipcRenderer.invoke('get-account-credentials', name),
 
   // Automation operations
   startAutomation: () => ipcRenderer.invoke('start-automation'),
@@ -39,8 +40,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // File operations
   selectImage: () => ipcRenderer.invoke('select-image'),
 
+  renameAccount: (oldName, newName) => ipcRenderer.invoke('rename-account', oldName, newName),
+
   // Settings
   saveSettings: (settings) => ipcRenderer.invoke('save-settings', settings),
+
+  // Proxies
+  getProxies: () => ipcRenderer.invoke('get-proxies'),
+  saveProxies: (proxies) => ipcRenderer.invoke('save-proxies', proxies),
+  toggleProxies: (enabled) => ipcRenderer.invoke('toggle-proxies', enabled),
+
+  // Remote dashboard + licensing
+  getRemoteUrl: () => ipcRenderer.invoke('get-remote-url'),
+  getLicenseInfo: () => ipcRenderer.invoke('get-license-info'),
+  getServerUrl: () => ipcRenderer.invoke('get-server-url'),
+  updateServerUrl: (url) => ipcRenderer.invoke('update-server-url', url),
 
   // Event listeners
   onAutomationLog: (callback) => {
@@ -75,6 +89,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   onAutomationResumed: (callback) => {
     ipcRenderer.on('automation-resumed', () => callback());
+  },
+  onAccountAttention: (callback) => {
+    ipcRenderer.on('account-attention', (_e, info) => callback(info));
   },
 
   // Open the logs folder in the OS file explorer

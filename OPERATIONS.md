@@ -108,7 +108,14 @@ account statuses, change the interval, and manage the post queue.
 
 ---
 
-## 6. Deferred: turning this into a sellable product
-Parked until you ask. Would involve: real license validation + machine binding + revoke/expiry
-(your VPS code-server at `144.91.127.7:3509` is still alive), code protection (bytenode/obfuscation),
-an `electron-builder` installer with a bundled Node + Chromium runtime, auto-update, and code signing.
+## 6. Turning this into a sellable product
+**Licensing is now IMPLEMENTED (opt-in).** Per-seat machine-bound keys with tiered limits
+(`trial`/`standard`/`pro`), revocation, expiry, and a 7-day offline grace period are built and
+enforced in the backend — see `vps-server/` (server + `gen-key.js`/`revoke.js`) and `lib/license.js`.
+Turn the client gate on with `ENABLE_LICENSE=1` (or `settings.licenseEnabled`). The VPS key store is
+encrypted at rest with `KEYS_ENCRYPTION_KEY`. See `ENV.md` for all env vars and `vps-server/DEPLOY-COOLIFY.md`
+for deployment (run it behind an HTTPS proxy).
+
+Still open / optional: confirm the live HTTPS endpoint for `lib/license.js` `DEFAULT_SERVER`
+(currently `http://144.91.127.7:3509`), code protection (bytenode/obfuscation), an auto-updater, and
+code-signing the desktop build (set `CSC_LINK`/`CSC_KEY_PASSWORD` — see `ENV.md`).

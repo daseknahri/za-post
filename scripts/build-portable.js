@@ -23,20 +23,45 @@ function run(cmd) { console.log('\n> ' + cmd); execSync(cmd, { cwd: ROOT, stdio:
 // those on Windows needs admin / Developer-Mode, and without it the extract aborts and the WHOLE
 // build fails (even the `dir` target downloads winCodeSign). Pre-seed the cache WITHOUT the darwin
 // folder (a Windows build never uses it) so the build works on a normal, non-admin user account.
+// M4-04: don't hardcode the winCodeSign version — discover the one electron-builder will actually
+// request (by scanning app-builder-lib) so a version bump can't silently break the seed. Override
+// with WIN_CODESIGN_VERSION; fall back to a known-good default and warn.
+function detectWinCodeSignVersion(fallback) {
+  if (process.env.WIN_CODESIGN_VERSION) return process.env.WIN_CODESIGN_VERSION;
+  try {
+    const base = path.dirname(require.resolve('app-builder-lib/package.json'));
+    const grep = (dir) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) { const r = grep(p); if (r) return r; }
+        else if (e.name.endsWith('.js')) { const m = fs.readFileSync(p, 'utf8').match(/winCodeSign-(\d+\.\d+\.\d+)/); if (m) return m[1]; }
+      }
+      return null;
+    };
+    const found = grep(path.join(base, 'out'));
+    if (found) return found;
+    console.warn('\n> ⚠️ could not detect electron-builder\'s winCodeSign version — falling back to ' + fallback + '. If the build fails on a winCodeSign extract, set WIN_CODESIGN_VERSION to the version electron-builder logs.');
+  } catch (e) { console.warn('\n> ⚠️ winCodeSign version detection failed (' + e.message + ') — using ' + fallback); }
+  return fallback;
+}
+
+const WIN_CODESIGN_VERSION = detectWinCodeSignVersion('2.6.0');
+
 function ensureWinCodeSign() {
+  const v = WIN_CODESIGN_VERSION;
   const cacheRoot = path.join(process.env.LOCALAPPDATA || '', 'electron-builder', 'Cache', 'winCodeSign');
-  const finalDir = path.join(cacheRoot, 'winCodeSign-2.6.0');
-  if (fs.existsSync(path.join(finalDir, 'windows-10'))) { console.log('\n> winCodeSign cache already seeded'); return; }
+  const finalDir = path.join(cacheRoot, `winCodeSign-${v}`);
+  if (fs.existsSync(path.join(finalDir, 'windows-10'))) { console.log(`\n> winCodeSign cache already seeded (${v})`); return; }
   fs.mkdirSync(cacheRoot, { recursive: true });
   const path7za = require('7zip-bin').path7za;
-  const archive = path.join(cacheRoot, 'winCodeSign-2.6.0.7z');
+  const archive = path.join(cacheRoot, `winCodeSign-${v}.7z`);
   if (!fs.existsSync(archive)) {
-    const url = 'https://github.com/electron-userland/electron-builder-binaries/releases/download/winCodeSign-2.6.0/winCodeSign-2.6.0.7z';
-    console.log('\n> downloading winCodeSign-2.6.0.7z (one-time)');
+    const url = `https://github.com/electron-userland/electron-builder-binaries/releases/download/winCodeSign-${v}/winCodeSign-${v}.7z`;
+    console.log(`\n> downloading winCodeSign-${v}.7z (one-time)`);
     execSync(`powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '${url}' -OutFile '${archive}'"`, { stdio: 'inherit' });
   }
   fs.rmSync(finalDir, { recursive: true, force: true });
-  console.log('\n> seeding winCodeSign cache (excluding darwin symlinks)');
+  console.log(`\n> seeding winCodeSign cache ${v} (excluding darwin symlinks)`);
   execSync(`"${path7za}" x "${archive}" "-o${finalDir}" "-x!darwin" -y`, { cwd: ROOT, stdio: 'inherit' });
 }
 

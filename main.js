@@ -96,6 +96,7 @@ const store = require('./lib/store');
 const remote = require('./server');
 const { Orchestrator } = require('./automation/orchestrator');
 const license = require('./lib/license');
+const secret = require('./lib/secret');
 const { chromiumPath } = require('./lib/chromium');
 
 // Puppeteer (stealth) — used for interactive login + status checks.
@@ -149,7 +150,7 @@ async function applyTunnelState(enabled) {
   if (enabled && !tunnelActive) {
     tunnelActive = true;
     emit('automation-log', '🌐 Starting remote-access tunnel...');
-    try { remote.startTunnel(REMOTE_PORT, (u) => { tunnelUrl = u ? `${u}/?token=${REMOTE_TOKEN}` : u; send('remote-url-update', tunnelUrl); if (u) emit('automation-log', `🔐 Remote dashboard ready (keep this URL private): ${tunnelUrl}`); }); }
+    try { remote.startTunnel(REMOTE_PORT, (u) => { tunnelUrl = u ? `${u}/?token=${REMOTE_TOKEN}` : u; send('remote-url-update', tunnelUrl); if (u) emit('automation-log', `🔐 Remote dashboard ready — open it from the app (the access-token URL is kept OUT of the logs). Base: ${u}`); }); }
     catch (e) { tunnelActive = false; emit('automation-log', '🌐 Tunnel failed: ' + e.message); }
   } else if (!enabled && tunnelActive) {
     tunnelActive = false; tunnelUrl = '';
@@ -350,6 +351,7 @@ app.whenReady().then(async () => {
     loginAccount: (name) => openLoginBrowser(name),
     closeLogin: (name) => closeLoginBrowser(name),
     getTunnelUrl: () => tunnelUrl || '',
+    getProxyHealth: () => orchestrator.getProxyHealth(), // E-X4: /api/proxies/health
     apiToken: REMOTE_TOKEN, // gate /api/* when reached over the public tunnel
     uploadDir: path.join(app.getPath('userData'), 'uploads'),
     imagesDir: store.paths.IMAGES_DIR,
@@ -362,9 +364,11 @@ app.whenReady().then(async () => {
   // License gate — OPT-IN, off by default. When OFF, boot is identical to before.
   const LICENSE_ON = !!(process.env.ENABLE_LICENSE || (store.load().settings && store.load().settings.licenseEnabled));
   if (!LICENSE_ON) {
+    setLicenseState({ valid: true, tier: 'owner', limits: license.UNLIMITED }, false); // owner/dev: unlimited
     createWindow();
   } else {
     const r = await license.checkCached(app.getPath('userData'), licenseServerUrl());
+    setLicenseState(r, true); // enforce the validated tier's limits from here on
     if (r.valid) createWindow();
     else if (r.revoked) showRevokedWindow();
     else showLicenseWindow();
@@ -477,11 +481,13 @@ ipcMain.handle('add-groups-bulk', (_e, items) => {
     if (!Array.isArray(items)) return fail('Expected an array of group URLs/IDs');
     const data = getData();
     const existingIds = new Set(data.groups.map((g) => g.groupId));
-    let added = 0, skipped = 0;
+    let added = 0, skipped = 0, limited = 0;
     const now = Date.now();
     for (let i = 0; i < items.length; i++) {
       const groupId = extractGroupId(String(items[i] || ''));
       if (!groupId || existingIds.has(groupId)) { skipped++; continue; }
+      // M1-05: stop adding once the license group limit is reached (count the rest as "limited").
+      if (overLimit('groups', data.groups.length)) { limited++; continue; }
       existingIds.add(groupId);
       data.groups.push({
         id: `group-${now}-${i}`,
@@ -492,7 +498,7 @@ ipcMain.handle('add-groups-bulk', (_e, items) => {
     }
     store.save(data);
     send('data-updated');
-    return ok({ added, skipped });
+    return ok({ added, skipped, limited, message: limited ? `${limited} group(s) not added — your ${_licenseState.tier} plan limit of ${_licenseState.limits.maxGroups} groups was reached.` : undefined });
   } catch (e) { return fail(e); }
 });
 
@@ -524,6 +530,7 @@ ipcMain.handle('add-group', (_e, group) => {
   const data = getData();
   const groupId = extractGroupId(group.groupId);
   if (!groupId) return fail('Invalid group ID / URL');
+  const over = overLimit('groups', data.groups.length); if (over) return over; // M1-05 backend enforcement
   data.groups.push({ id: 'group-' + Date.now(), groupId, name: group.name || `Group ${data.groups.length + 1}` });
   store.save(data); send('data-updated'); return ok();
 });
@@ -552,6 +559,7 @@ ipcMain.handle('create-account', (_e, accountName, alias) => {
   const data = getData();
   if (!accountName) return fail('Account name required');
   if (data.accounts.some((a) => a.name === accountName)) return fail('Account already exists');
+  const over = overLimit('accounts', data.accounts.length); if (over) return over; // M1-05 backend enforcement
   data.accounts.push({
     name: accountName, alias: alias || '', status: 'not_logged_in', lastMessage: '',
     assignedGroups: [], postFilter: 'all', postingOrder: 'post-centric-unique', enabled: true,
@@ -583,11 +591,21 @@ ipcMain.handle('set-account-credentials', (_e, accountName, email, password) => 
   const data = getData();
   const a = data.accounts.find((x) => x.name === accountName);
   if (!a) return fail('Account not found');
-  a.email = email || '';
-  a.password = password || '';
+  // M3-01: encrypt credentials at rest (Electron safeStorage / DPAPI). Falls back to plaintext only
+  // where OS encryption is unavailable (dev). decrypt() in the worker is transparent.
+  a.email = secret.encrypt(email || '');
+  a.password = secret.encrypt(password || '');
   store.save(data);
   send('data-updated');
   return ok();
+});
+
+// Decrypted email + whether a password is set, for the edit-account form (local renderer only —
+// never returns the password itself). M3-01: credentials are encrypted at rest.
+ipcMain.handle('get-account-credentials', (_e, accountName) => {
+  const a = getData().accounts.find((x) => x.name === accountName);
+  if (!a) return fail('Account not found');
+  return ok({ email: secret.decrypt(a.email || ''), hasPassword: !!a.password });
 });
 
 ipcMain.handle('rename-account', (_e, oldName, newName) => {
@@ -618,16 +636,23 @@ ipcMain.handle('import-cookies', async (_e, accountName, cookies) => {
     if (!Array.isArray(raw)) return fail('Cookies must be an array');
     // Some exporters wrap in { cookies: [...] } or { cookie: [...] }
     if (!raw.length && raw.cookies) raw = raw.cookies;
-    const arr = raw.filter((c) => c && typeof c === 'object' && c.name && 'value' in c);
+    // M3-06: require a non-empty name AND a non-empty value (an empty value is a dead cookie that
+    // silently breaks the session) instead of just "has a value key".
+    const arr = raw.filter((c) => c && typeof c === 'object' && c.name && String(c.name).trim() && c.value != null && String(c.value) !== '');
     const skipped = raw.length - arr.length;
-    if (!arr.length) return fail('No valid cookies found (each entry needs name + value)');
+    if (!arr.length) return fail('No valid cookies found (each entry needs a non-empty name + value)');
+    // Facebook needs c_user (account id) + xs (session) to be logged in. Warn if the import lacks
+    // them — a top cause of "imported but still logged out".
+    const names = new Set(arr.map((c) => String(c.name)));
+    const missing = ['c_user', 'xs'].filter((k) => !names.has(k));
     store.writeCookies(accountName, arr);
-    console.log(`[import-cookies] ${accountName}: imported ${arr.length}, skipped ${skipped} junk entries`);
+    console.log(`[import-cookies] ${accountName}: imported ${arr.length}, skipped ${skipped} junk entr${skipped === 1 ? 'y' : 'ies'}${missing.length ? `, MISSING critical cookie(s): ${missing.join(', ')}` : ''}`);
     setAccountStatus(accountName, 'checking', 'Verifying…');
     send('data-updated');
     const status = await checkStatus(accountName);
     setAccountStatus(accountName, status.status, status.message, status);
-    return ok({ status: status.status, message: status.message, imported: arr.length, skipped });
+    const warning = missing.length ? `Imported, but missing ${missing.join(' & ')} — Facebook will treat this account as logged out. Re-export cookies while logged in.` : undefined;
+    return ok({ status: status.status, message: status.message, imported: arr.length, skipped, warning });
   } catch (e) { return fail(e); }
 });
 
@@ -718,14 +743,22 @@ function setAccountStatus(name, status, message, result) {
   store.update((data) => {
     const a = data.accounts.find((x) => x.name === name);
     if (!a) return;
-    a.status = status; a.lastMessage = message || '';
+    // M2-02: a concurrent check-account-status must not downgrade a still-active rate-limit /
+    // checkpoint / verification / disabled flag the run just set (a headless cookie probe reads
+    // "logged_in" even for an account that's blocked from POSTING). Keep the flag; still refresh
+    // the identity fields below.
+    if (!store.preserveAttentionStatus(a.status, a.rateLimitedUntil, status)) {
+      a.status = status; a.lastMessage = message || '';
+    }
     if (result && result.fbUserId) a.fbUserId = result.fbUserId;
     if (result && result.fbName !== undefined) a.fbName = result.fbName;
     if (result && result.status === 'logged_in') a.lastChecked = Date.now();
     // Opportunistically prune any assignedGroups that no longer exist in data.groups.
     const valid = new Set(data.groups.map((g) => g.id));
     a.assignedGroups = (a.assignedGroups || []).filter((id) => valid.has(id));
-  }).then(() => send('data-updated')).catch(() => {});
+    // (data-updated is emitted only after a SUCCESSFUL write below — never on a failed write,
+    // so the UI can't show a status the disk never persisted.)
+  }).then(() => send('data-updated')).catch((e) => { try { console.error('[setAccountStatus] persist failed for', name, '-', (e && e.message) || e); } catch {} });
 }
 
 function clearInterruptedLoginStates() {
@@ -841,7 +874,7 @@ async function openLoginBrowser(accountName) {
         if (captured.id && captured.pass) {
           try {
             const d = getData(); const acc = d.accounts.find((a) => a.name === accountName);
-            if (acc) { acc.email = captured.id; acc.password = captured.pass; store.save(d); send('data-updated'); emit('automation-log', `🔑 [${accountName}] login credentials saved for auto-login`); }
+            if (acc) { acc.email = secret.encrypt(captured.id); acc.password = secret.encrypt(captured.pass); store.save(d); send('data-updated'); emit('automation-log', `🔑 [${accountName}] login credentials saved (encrypted) for auto-login`); }
           } catch {}
         }
         emit('automation-log', `✅ [${accountName}] logged in as ${res.fbName || '(unknown)'} (c_user=${res.fbUserId || '?'})`);
@@ -906,17 +939,9 @@ ipcMain.handle('get-automation-status', () => ok({ isRunning: orchestrator.isRun
 // Coerce + clamp numeric settings to sane ranges. Defense-in-depth: the UI guards on
 // save, but the remote HTTP path (or a hand-edited data.json) could inject a 0/NaN/negative
 // delay — a 0 inter-group/cycle delay hammers Facebook and gets accounts locked.
-function clampSettings(s) {
-  const n = (v, def, min, max) => { let x = Number(v); if (!Number.isFinite(x)) x = def; return Math.min(max, Math.max(min, Math.round(x * 1000) / 1000)); };
-  const out = { ...(s || {}) };
-  if ('parallelAccounts' in out) out.parallelAccounts = n(out.parallelAccounts, 3, 1, 20);
-  if ('waitInterval' in out)     out.waitInterval     = n(out.waitInterval, 60, 0, 1440);
-  if ('accountDelay' in out)     out.accountDelay     = n(out.accountDelay, 1, 0, 1440);
-  if ('groupDelay' in out)       out.groupDelay       = n(out.groupDelay, 60, 0, 3600);
-  if ('postsPerGroup' in out)    out.postsPerGroup    = n(out.postsPerGroup, 1, 0, 100000);
-  if ('maxCycles' in out)        out.maxCycles        = n(out.maxCycles, 0, 0, 100000);
-  return out;
-}
+// Settings clamping now lives in lib/store.js (unit-tested, single source of truth). Kept as a thin
+// hoisted wrapper so existing call sites are unchanged.
+function clampSettings(s) { return store.clampSettings(s); }
 
 ipcMain.handle('save-settings', async (_e, settings) => {
   try {
@@ -951,8 +976,37 @@ ipcMain.handle('select-image', async () => {
   return r.canceled || !r.filePaths.length ? null : r.filePaths[0];
 });
 
-// Permissive LOCAL license — the app runs without a validation server.
-ipcMain.handle('get-license-info', () => ({ valid: true, lifetime: true, maxGroups: 9999, maxAccounts: 9999 }));
+// ---- License enforcement state (M1-05) ----------------------------------------------------------
+// The single source of truth the create handlers enforce against. When the license gate is OFF
+// (owner/dev), the app runs unlimited. When ON, this holds the validated tier's limits. UI checks
+// are advisory only — THIS is what actually blocks over-limit creates, including a direct IPC call.
+let _licenseState = { valid: true, enforced: false, tier: 'owner', limits: { maxAccounts: Infinity, maxGroups: Infinity } };
+function setLicenseState(r, enforced) {
+  _licenseState = {
+    valid: !!(r && r.valid),
+    enforced: !!enforced,
+    tier: (r && r.tier) || (enforced ? 'standard' : 'owner'),
+    limits: license.limitsOf(r),
+  };
+}
+// Returns a fail() result if creating `add` more of `kind` ('accounts'|'groups') would exceed the
+// license limit; null if allowed. Enforced ONLY when the license gate is on (owner/dev = unlimited).
+function overLimit(kind, currentCount, add = 1) {
+  if (!_licenseState.enforced) return null;
+  if (!_licenseState.valid) return fail('Your license is not active — restart and re-validate before adding accounts or groups.');
+  const limit = kind === 'accounts' ? _licenseState.limits.maxAccounts : _licenseState.limits.maxGroups;
+  if (!Number.isFinite(limit)) return null;
+  if (currentCount + add > limit) return fail(`License limit reached: your ${_licenseState.tier} plan allows ${limit} ${kind} (you have ${currentCount}). Upgrade your plan to add more.`);
+  return null;
+}
+
+// Real license info for the renderer (replaces the old permissive 9999 stub). Reflects the actual
+// validated tier + limits; Infinity is surfaced as 9999 so the UI shows a number.
+ipcMain.handle('get-license-info', () => {
+  const L = _licenseState;
+  const toN = (v) => (Number.isFinite(v) ? v : 9999);
+  return { valid: L.valid, enforced: L.enforced, tier: L.tier, lifetime: !L.enforced, maxAccounts: toN(L.limits.maxAccounts), maxGroups: toN(L.limits.maxGroups) };
+});
 ipcMain.handle('get-remote-url', () => tunnelUrl || '');
 ipcMain.handle('open-logs-folder', () => {
   try { shell.openPath(LOG_DIR || app.getPath('userData')); return ok(); } catch (e) { return fail(e); }
@@ -960,6 +1014,7 @@ ipcMain.handle('open-logs-folder', () => {
 ipcMain.on('validate-license-async', async (e, key) => {
   try {
     const r = await license.activate(app.getPath('userData'), key, licenseServerUrl());
+    setLicenseState(r, true); // adopt the newly-validated tier's limits for enforcement
     if (r.valid) {
       e.sender.send('license-validation-result', { valid: true });
       if (licenseWindow) { licenseWindow.close(); licenseWindow = null; }

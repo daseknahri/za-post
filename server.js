@@ -24,6 +24,7 @@ let hooks = {
   loginAccount: () => {},            // (name) => Promise
   closeLogin: () => {},              // (name) => void
   getTunnelUrl: () => '',            // () => string
+  getProxyHealth: () => ({ proxies: [], summary: { total: 0, healthy: 0, failing: 0, onCooldown: 0 } }), // E-X4
 };
 
 function shapeLog(l) {
@@ -141,6 +142,8 @@ function startServer(port, injected) {
     res.json({ accounts });
   });
   app.get('/api/groups', (_req, res) => res.json({ groups: hooks.getData().groups || [] }));
+  // E-X4: proxy health snapshot (behind the same X-Access-Token as the other /api routes).
+  app.get('/api/proxies/health', (_req, res) => { try { res.json(hooks.getProxyHealth()); } catch (e) { res.status(500).json({ error: e.message }); } });
   app.post('/api/accounts/:name/login', async (req, res) => {
     try { await hooks.loginAccount(req.params.name); res.json({ success: true, message: `Login window opened for ${req.params.name}` }); }
     catch (e) { res.json({ success: false, error: e.message }); }

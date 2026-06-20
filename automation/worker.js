@@ -16,6 +16,7 @@ const store = require('../lib/store');
 const { chromiumPath } = require('../lib/chromium');
 const spintax = require('../lib/spintax');
 const imageVary = require('../lib/imageVary');
+const secret = require('../lib/secret');
 const { execFile } = require('child_process');
 
 // Push a browser window BEHIND other windows WITHOUT activating it, so a VISIBLE run doesn't steal
@@ -128,14 +129,75 @@ function displayName(value) {
   }
 }
 
-// Download a remote image to a temp file; return its path (or null).
+// Retry an async operation with a per-attempt timeout and exponential backoff. Returns
+// { ok:true, result } on the first success, or { ok:false, error } after exhausting attempts.
+// Pure and dependency-free so the upload/download reliability path is unit-testable without a
+// real browser. `fn` receives the 1-based attempt number.
+async function retryAsync(fn, opts = {}) {
+  const attempts = Math.max(1, opts.attempts || 3);
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 30000;
+  const baseDelayMs = Number.isFinite(opts.baseDelayMs) ? opts.baseDelayMs : 1500;
+  const label = opts.label || 'operation';
+  const onAttempt = typeof opts.onAttempt === 'function' ? opts.onAttempt : null;
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let timer;
+    try {
+      const result = await Promise.race([
+        Promise.resolve().then(() => fn(attempt)),
+        new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`${label} timeout after ${timeoutMs}ms`)), timeoutMs); }),
+      ]);
+      clearTimeout(timer);
+      return { ok: true, result };
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      if (onAttempt) { try { onAttempt(attempt, attempts, e); } catch {} }
+      if (attempt < attempts) await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt - 1)));
+    }
+  }
+  return { ok: false, error: lastErr };
+}
+
+// Download a remote image to a temp file; return its path (or null). Retries transient
+// network failures (with a per-attempt timeout) so a single blip doesn't silently drop the
+// post's image and leave it publishing a bare caption.
+// M3-03: SSRF / resource guard. A post's image URL is fetched by the APP process (full network
+// access), so a malicious URL could hit internal services (169.254.169.254 metadata, localhost
+// admin panels, private LAN hosts) or non-image schemes. Allow only http/https to PUBLIC hosts.
+// Literal-IP based (no DNS resolution) — a pragmatic guard for a desktop tool. PURE / unit-tested.
+function isSafeImageUrl(url) {
+  let u;
+  try { u = new URL(String(url)); } catch { return false; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host || host === 'localhost' || host.endsWith('.localhost')) return false;
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const a = Number(m[1]), b = Number(m[2]);
+    if (a === 0 || a === 127 || a === 10 || (a === 169 && b === 254) || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || a >= 224) return false;
+  }
+  if (host === '::1' || host.startsWith('fe80') || host.startsWith('fc') || host.startsWith('fd')) return false; // IPv6 loopback / link-local / ULA
+  return true;
+}
+
 async function downloadImage(url) {
   if (!axios || !url) return null;
+  if (!isSafeImageUrl(url)) return null; // SSRF guard — reject internal/private/non-http(s) targets
+  const r = await retryAsync(() => axios.get(url, {
+    responseType: 'arraybuffer', timeout: 30000,
+    maxRedirects: 1,                       // a redirect can't bounce us to an internal host past the guard
+    maxContentLength: 15 * 1024 * 1024,    // cap the download so a giant/streaming URL can't exhaust memory
+    maxBodyLength: 15 * 1024 * 1024,
+  }), { attempts: 3, timeoutMs: 35000, baseDelayMs: 1500, label: 'image download' });
+  if (!r.ok) return null;
+  // Reject non-image responses (an HTML error page / unexpected content type isn't an image).
+  const ct = String((r.result.headers && (r.result.headers['content-type'] || r.result.headers['Content-Type'])) || '').toLowerCase();
+  if (ct && !ct.startsWith('image/')) return null;
   try {
-    const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 30000 });
     const ext = (String(url).match(/\.(jpg|jpeg|png|gif|webp)/i) || [, 'jpg'])[1];
     const file = path.join(os.tmpdir(), `za-img-${Date.now()}-${Math.floor(Math.random() * 1e6)}.${ext}`);
-    fs.writeFileSync(file, Buffer.from(res.data));
+    fs.writeFileSync(file, Buffer.from(r.result.data));
     return file;
   } catch { return null; }
 }
@@ -157,9 +219,114 @@ const SEL = {
   ],
 };
 
+// ---- Facebook state-detection patterns (single source of truth) --------------------------------
+// Facebook localizes every string and A/B-tests its DOM, so detection keys off TEXT across many
+// locales plus URL/structure cues. These arrays are passed INTO page.evaluate() so the browser
+// context and the Node-side unit tests share ONE list. All matching is accent-insensitive and
+// lowercase (see normText / the in-page norm()). Add a locale's phrases here and every detector
+// + its test picks them up. (M1-03 / M1-04.)
+const FB = {
+  // Rate-limit / temporary-block WALL phrasing ONLY. Generic "try again later" / "réessayer plus
+  // tard" are transient network/CDN errors — deliberately NOT here, so they never trip a no-retry
+  // account abort.
+  rateLimit: [
+    "you're temporarily blocked", 'temporarily blocked', 'temporarily restricted',
+    'doing this too often', 'doing this too quickly', 'action blocked', 'we limit how often',
+    'protect our community from spam', 'protect the community from spam', 'going too fast',
+    'posting too often', 'posting too quickly', "you can't use this feature right now",
+    'you cant use this feature right now', 'this feature for a while',
+    'nous limitons', 'temporairement bloque', 'vous allez trop vite', 'action bloquee',     // FR
+    'temporalmente bloqueado', 'bloqueado temporalmente', 'lo haces con demasiada frecuencia', // ES
+    'estas bloqueado temporalmente', 'has estado bloqueado',
+    'voruebergehend gesperrt', 'vorubergehend gesperrt', 'du machst das zu oft',             // DE
+    'temporaneamente bloccato', 'bloccato temporaneamente',                                  // IT
+    'bloqueado temporariamente', 'voce esta temporariamente bloqueado',                      // PT
+    'atmenetileg letiltottuk', 'tul gyakran', 'tul gyorsan',                                 // HU
+  ],
+  // Identity / human checkpoint text.
+  checkpoint: [
+    'confirm that you are a real person', "confirm that you're a real person",
+    'confirm you are a real person', 'confirm your identity', 'we need to confirm',
+    "we'll need you to confirm", 'help us confirm', 'security check', 'please confirm your identity',
+    'confirmez que vous etes une personne reelle', 'confirmer votre identite',               // FR
+    'confirma que eres una persona real', 'confirma tu identidad', 'verifica tu identidad',  // ES
+    'bestatige, dass du eine echte person bist', 'bestatige deine identitat',                // DE
+    'conferma di essere una persona reale', 'conferma la tua identita',                      // IT
+    'confirme que voce e uma pessoa real', 'confirme sua identidade',                        // PT
+    'erositsd meg, hogy valodi szemely vagy', 'biztonsagi ellenorzes',                       // HU
+  ],
+  // URL fragments that ALWAYS mean an identity/human gate (conservative — these don't appear in a
+  // normal group-posting URL).
+  checkpointUrl: ['/checkpoint/', '/confirmidentity', '/verify', '/challenge'],
+  // Pending-admin-approval phrasing (moderated groups). Multi-word ONLY — a bare "pending" would
+  // false-match unrelated UI ("pending friend requests").
+  pending: [
+    'will be reviewed', 'shared once approved', 'post is pending', 'pending approval',
+    'pending admin approval', 'waiting for admin approval', 'waiting for moderator approval',
+    'your post is pending', 'awaiting approval', 'needs to be approved', 'in review by',
+    'sera examinee', 'doit etre approuve', 'approbation',                                    // FR ("en attente d'approbation" — apostrophe-safe)
+    'pendiente de aprobacion', 'sera revisada', 'debe ser aprobada',                         // ES
+    'wird uberpruft', 'muss genehmigt werden', 'ausstehende genehmigung',                    // DE
+    'in attesa di approvazione',                                                             // IT
+    'aguardando aprovacao', 'sera analisada',                                                // PT
+    'jovahagyasra var',                                                                      // HU
+  ],
+  // Submit/"Post" button label text across locales (matched against the FULL trimmed label so we
+  // never grab a longer label that merely contains the word, e.g. "Post to your story").
+  postButton: [
+    'post', 'publish', 'share', 'send', 'post to group',
+    'publier', 'partager', 'envoyer',                 // FR
+    'publicar', 'compartir', 'enviar',                // ES / PT
+    'posten', 'teilen', 'senden', 'veroffentlichen',  // DE
+    'pubblica', 'condividi', 'invia',                 // IT
+    'kozzetetel', 'megosztas', 'kuldes',              // HU
+  ],
+  // Comment-box aria hints across locales.
+  commentBox: ['comment', 'commentaire', 'comentario', 'comentar', 'kommentar', 'commento', 'hozzaszolas'],
+};
+
+// Accent-insensitive lowercase normalize — mirrors the in-page norm() so Node tests and the
+// browser context agree on what matches.
+function normText(s) { return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase(); }
+function matchesAny(text, patterns) { const t = normText(text); return (patterns || []).some((p) => t.includes(p)); }
+// Block-WALL only (transient errors are excluded from FB.rateLimit by construction).
+function isRateLimitText(text) { return matchesAny(text, FB.rateLimit); }
+function isCheckpointText(text, url) {
+  const u = normText(url);
+  if (u && FB.checkpointUrl.some((frag) => u.includes(frag))) return true;
+  return matchesAny(text, FB.checkpoint);
+}
+function isPendingText(text) { return matchesAny(text, FB.pending); }
+// Full-label (not substring) match so we click the composer's Post, not a label that contains it.
+function isPostButtonLabel(label) { return FB.postButton.includes(normText(label).replace(/\s+/g, ' ').trim()); }
+function isCommentBoxLabel(label) { return matchesAny(label, FB.commentBox); }
+
+// Kill any lingering Chromium still holding THIS account's profile lock — e.g. a browser that was
+// force-killed mid-run and left a SingletonLock, which would otherwise make the next launch fail
+// with "profile prep failed". Windows-only, best-effort, and SCOPED to the exact profile path
+// (ends in \chrome-profile) so it can never touch another account's browser or the user's real
+// Chrome. Mirrors main.js killOrphanChromium but per-account and safe to run mid-session. (M2-06)
+function killChromiumForProfile(profilePath, log) {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32' || !profilePath) return resolve(0);
+    const psPath = String(profilePath).replace(/'/g, "''");
+    const ps = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*${psPath}*' } | Select-Object -ExpandProperty ProcessId`;
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 12000 }, (_err, stdout) => {
+      const pids = String(stdout || '').split(/\r?\n/).map((s) => s.trim()).filter((s) => /^\d+$/.test(s));
+      if (!pids.length) return resolve(0);
+      if (log) log(`🧹 clearing ${pids.length} stale browser process(es) holding the profile lock`);
+      let pending = pids.length, killed = 0;
+      for (const pid of pids) {
+        execFile('taskkill', ['/F', '/T', '/PID', pid], { windowsHide: true, timeout: 8000 }, (e) => { if (!e) killed++; if (--pending === 0) resolve(killed); });
+      }
+    });
+  });
+}
+
 // Parse a stored proxy string -> parts + upstream URL. Accepts BOTH common formats:
 //   scheme://user:pass@host:port   (standard URL form — what most provider dashboards give)
 //   scheme://host:port[:user:pass] (compact colon form)
+const PROXY_SCHEMES = new Set(['http', 'https', 'socks', 'socks4', 'socks5', 'socks5h']);
 function parseProxy(str) {
   if (!str) return null;
   let scheme, ip, port, user, pass;
@@ -170,9 +337,37 @@ function parseProxy(str) {
     if (!m) return null;
     [, scheme, ip, port, user, pass] = m;
   }
+  // M3-06: validate scheme + port so a malformed proxy fails HERE (caller logs a clear message and
+  // skips the account) instead of silently at Chrome launch (407s / posting from the bare IP).
+  scheme = String(scheme).toLowerCase();
+  const portN = Number(port);
+  if (!PROXY_SCHEMES.has(scheme) || !(Number.isInteger(portN) && portN >= 1 && portN <= 65535)) return null;
   const auth = user ? `${encodeURIComponent(user)}:${encodeURIComponent(pass || '')}@` : '';
   return { scheme, server: `${scheme}://${ip}:${port}`, username: user || null, password: pass || null,
     upstream: `${scheme}://${auth}${ip}:${port}` };
+}
+
+// E-P1: classify a per-group error to decide retry policy. 'block' (rate-limit / checkpoint /
+// verification) must NEVER be retried — retrying would hammer Facebook and escalate a soft limit.
+// 'transient' (CDP drop / timeout / network) is safe to retry, but ONLY before the publish click.
+// 'permanent' (missing group / no post button) means skip the group. Pure / unit-tested.
+function classifyGroupError(message) {
+  const m = String(message || '').toLowerCase();
+  if (/rate.?limit|temporarily blocked|action blocked|checkpoint|verification|too fast|too often/.test(m)) return 'block';
+  if (/target closed|session closed|protocol error|detached|timeout|timed out|econnreset|socket hang up|net::err|navigation failed|cdp/.test(m)) return 'transient';
+  return 'permanent';
+}
+
+// E-X2: when a proxy string won't parse, suggest the likely-correct schemed form so the operator can
+// fix the format without guessing. Returns a hint string ('' if none / already schemed). Pure.
+function proxyFormatHint(str) {
+  const s = String(str || '').trim();
+  if (!s) return '';
+  if (/^\w+:\/\//.test(s)) return ''; // already has a scheme — the problem is elsewhere
+  const parts = s.split(':');
+  if (parts.length === 2 && /^\d+$/.test(parts[1])) return `add a scheme, e.g. "socks5://${s}" or "http://${s}"`;
+  if (parts.length === 4 && /^\d+$/.test(parts[1])) return `add a scheme, e.g. "socks5://${parts[0]}:${parts[1]}:${parts[2]}:${parts[3]}" (host:port:user:pass) or "http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}"`;
+  return 'expected scheme://host:port or scheme://user:pass@host:port';
 }
 
 // Locate the first visible matching selector IN-PAGE (fast, no hang), then click it
@@ -299,25 +494,27 @@ async function openComposer(page, log, name) {
     }
     await sleep(1500);
   }
+  if (log) log('⚠️ SELECTOR DRIFT? Composer never opened after 4 attempts — Facebook may have changed the "Write something" trigger, or the page is in an unexpected locale/state. Run scripts/inspect-fb.js on this account to capture the current DOM.');
   return false;
 }
 
 async function clickPostButton(page) {
-  // Find the enabled "Post" button (prefer one inside an open dialog), return its
-  // coordinates, and click with a REAL mouse event — synthetic .click() doesn't submit
-  // on web.facebook.com (same reason the composer trigger needs a real click).
-  const pt = await page.evaluate(() => {
+  // Find the enabled submit button (prefer one inside an open dialog), return its coordinates, and
+  // click with a REAL mouse event — synthetic .click() doesn't submit on web.facebook.com. Matches
+  // the full label against FB.postButton (post/publish/share/send + locales) so a FB UI/locale
+  // change doesn't silently break posting. Full-label (not substring) match avoids grabbing a
+  // longer button like "Post to your story".
+  const pt = await page.evaluate((labels) => {
+    const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
     const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
     const scope = dialogs.length ? dialogs : [document];
     for (const root of scope) {
-      const btn = Array.from(root.querySelectorAll('[role="button"]')).find((b) => {
-        const label = (b.getAttribute('aria-label') || b.textContent || '').trim().toLowerCase();
-        return label === 'post' && b.getAttribute('aria-disabled') !== 'true';
-      });
-      if (btn) { btn.scrollIntoView({ block: 'center' }); const r = btn.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; }
+      const btn = Array.from(root.querySelectorAll('[role="button"], button')).find((b) =>
+        b.getAttribute('aria-disabled') !== 'true' && !b.disabled && labels.includes(norm(b.getAttribute('aria-label') || b.textContent)));
+      if (btn) { btn.scrollIntoView({ block: 'center' }); const r = btn.getBoundingClientRect(); if (r.width && r.height) return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; }
     }
     return null;
-  }).catch(() => null);
+  }, FB.postButton).catch(() => null);
   // Move the cursor to the button along a path (and a brief hover) before clicking, like a human —
   // a click with no preceding mousemove is a bot tell FB's integrity JS looks for.
   if (pt) { await moveMouseTo(page, pt.x, pt.y); await page.mouse.click(pt.x, pt.y, { delay: 40 }).catch(() => {}); return true; }
@@ -350,13 +547,14 @@ async function waitForPublish(page, dialogCountBefore, timeout = 30000, shouldSt
   return 'timeout';
 }
 
-// Detect the "pending admin approval" state moderated groups show after posting.
+// Detect the "pending admin approval" state moderated groups show after posting. Phrase list is
+// FB.pending (multi-locale, single source of truth — also unit-tested).
 async function checkPendingApproval(page) {
   try {
-    return await page.evaluate(() => {
-      const t = (document.body.innerText || '').toLowerCase();
-      return /post (is |will be |has been )?(pending|in review|reviewed|shared once approved)|waiting for (admin|moderator) approval|pending approval|your post is pending/i.test(t);
-    });
+    return await page.evaluate((pats) => {
+      const t = (document.body.innerText || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+      return pats.some((p) => t.includes(p));
+    }, FB.pending);
   } catch { return false; }
 }
 
@@ -402,27 +600,31 @@ async function dismissPopups(page) {
 }
 
 // Detect a rate-limit / temporary block wall so we can back off instead of failing silently.
+// Phrase list is FB.rateLimit (block-WALL phrasing only — generic transient "try again later"
+// is deliberately excluded; multi-locale; unit-tested).
 async function checkRateLimit(page) {
   try {
-    return await page.evaluate(() => {
-      const t = (document.body.innerText || '').toLowerCase();
-      // NOTE: bare "try again later" / "réessayer plus tard" are Facebook's GENERIC transient-error
-      // strings (network hiccup, image CDN fail) — they must NOT trigger a no-retry account abort, so
-      // only block-SPECIFIC phrasing is matched here.
-      return /you're temporarily blocked|temporarily restricted|doing this too (often|quickly)|action blocked|we limit how often|protect the community from spam|going too fast|posting too (often|quickly)|nous limitons|temporairement bloqué/.test(t);
-    });
+    return await page.evaluate((pats) => {
+      const t = (document.body.innerText || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+      return pats.some((p) => t.includes(p));
+    }, FB.rateLimit);
   } catch { return false; }
 }
 
 // Detect Facebook's "confirm you are a real person" / identity checkpoint, which blocks the
-// account from posting until the user completes it. Multilingual (EN/FR seen on these accounts).
+// account from posting until the user completes it. Text (FB.checkpoint, multi-locale) OR a
+// checkpoint URL OR a captcha/challenge structure in the DOM — any one is enough.
 async function checkVerification(page) {
   try {
-    return await page.evaluate(() => {
-      const t = (document.body.innerText || '').toLowerCase();
-      if (/\/checkpoint\//.test(location.href.toLowerCase())) return true;
-      return /confirm (that )?(you'?re|you are) a real person|confirm your identity|we need to confirm|we'?ll need you to confirm|confirmez que vous êtes une personne réelle|confirmer votre identité|confirme que tu es une personne réelle/.test(t);
-    });
+    return await page.evaluate((cfg) => {
+      const url = (location.href || '').toLowerCase();
+      if (cfg.urls.some((u) => url.includes(u))) return true;
+      const t = (document.body.innerText || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+      if (cfg.texts.some((p) => t.includes(p))) return true;
+      // Structural cue: a captcha/challenge vendor frame or an explicit checkpoint form/input.
+      if (document.querySelector('iframe[src*="captcha" i], iframe[title*="captcha" i], form[action*="checkpoint" i], input[name*="captcha" i]')) return true;
+      return false;
+    }, { urls: FB.checkpointUrl, texts: FB.checkpoint });
   } catch { return false; }
 }
 
@@ -475,11 +677,11 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink) {
       const all = (await withTimeout(page.$$('[contenteditable="true"], [role="textbox"]'), 8000, [])).slice(0, 30);
       const out = [];
       for (const h of all) {
-        const isC = await withTimeout(h.evaluate((el) => {
+        const isC = await withTimeout(h.evaluate((el, hints) => {
           const raw = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('aria-placeholder') || '');
           const norm = raw.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-          return /comment|hozzaszolas/.test(norm); // English + Hungarian "hozzaszolas" (accent-stripped)
-        }), 3000, false);
+          return hints.some((w) => norm.includes(w)); // FB.commentBox: EN/FR/ES/PT/DE/IT/HU
+        }, FB.commentBox), 3000, false);
         if (isC) out.push(h);
       }
       return out;
@@ -546,14 +748,19 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink) {
         return c.querySelector('input[type="file"]');
       }).then((h) => h.asElement()).catch(() => null);
       if (cInput) {
-        try {
-          await cInput.uploadFile(commentImg);
+        // Bound the upload with a per-attempt timeout (the comment image input had NONE — a
+        // stalled CDP transfer could hang ~90s) and retry once before falling back to text-only.
+        const cu = await retryAsync(() => cInput.uploadFile(commentImg), {
+          attempts: 2, timeoutMs: 30000, baseDelayMs: 1500, label: 'comment image upload',
+          onAttempt: (a, n, e) => step(`Comment: image upload attempt ${a}/${n} failed (${e.message})${a < n ? ' — retrying' : ''}`),
+        });
+        if (cu.ok) {
           // Wait for the image PREVIEW to actually render before submitting, so a slow CDN
           // upload can't be dropped when Enter fires (a blind fixed delay was unreliable).
           const previewed = await page.waitForFunction(() => !!document.querySelector('[role="article"] img[src^="blob:"], [role="dialog"] img[src^="blob:"]'), { timeout: 8000 }).then(() => true).catch(() => false);
           step(previewed ? 'Comment: image attached (preview rendered)' : 'Comment: image uploaded (preview not detected — submitting anyway)');
           await sleep(1500);
-        } catch (imgErr) { step(`Comment: image upload failed (${imgErr.message}) — posting text only`); }
+        } else { step(`Comment: image upload failed after retries (${cu.error && cu.error.message}) — posting text only`); }
       }
       else step('Comment: image input not found — posting text only');
     }
@@ -577,16 +784,26 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink) {
     // Confirm by watching the box we ACTUALLY typed into: FB clears it (or re-renders it
     // away) once it accepts the comment. Tracking the real target box is far more reliable
     // than re-scanning the feed by caption (which gave false "not confirmed" negatives).
-    let confirmed = false;
-    const cdl = Date.now() + 6000; // allow slower submits to confirm (box empties) before giving up
-    try {
-      while (Date.now() < cdl) {
+    // E-P4: confirm delivery by watching the box we ACTUALLY typed into — FB empties it (or
+    // re-renders it away) once it accepts the comment. If it doesn't empty, re-press Enter ONCE and
+    // watch again. This can't double-post: pressing Enter on an already-empty box is a no-op (FB
+    // won't submit an empty comment), and we never re-run the whole comment flow after submit.
+    const watchEmptied = async (ms) => {
+      const dl = Date.now() + ms;
+      while (Date.now() < dl) {
         await sleep(1000);
-        const state = await withTimeout(target.evaluate((el) => (el.textContent || '').trim()), 3000, 'GONE');
-        if (state === '' || state === 'GONE') { confirmed = true; break; } // emptied or re-rendered = submitted
+        const state = await withTimeout(target.evaluate((el) => (el.textContent || '').trim()), 3000, 'GONE').catch(() => 'GONE');
+        if (state === '' || state === 'GONE') return true; // emptied or re-rendered = submitted
       }
-    } catch {}
-    step(confirmed ? 'Comment: posted and verified ✅' : 'Comment: sent (could not auto-verify)');
+      return false;
+    };
+    let confirmed = await watchEmptied(4000);
+    if (!confirmed) {
+      step('Comment: not confirmed yet — re-pressing Enter once');
+      try { await page.keyboard.press('Enter'); } catch {}
+      confirmed = await watchEmptied(3000);
+    }
+    step(confirmed ? 'Comment: posted and verified ✅ (box emptied)' : 'Comment: sent but NOT verified (box did not empty after a retry) — verify this group manually');
     await sleep(600);
     return true;
   } catch (e) {
@@ -753,6 +970,7 @@ async function credentialLogin(page, email, password, log, name) {
  */
 async function runAccount(o) {
   const { account, post: basePost, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused, maxThisRun } = o;
+  const reportProxy = typeof o.reportProxy === 'function' ? o.reportProxy : () => {}; // E-X3: proxy health (no-op if absent)
   const name = account.name;
   // Per-account successful-run counter (file-based) — drives the new-account WARM-UP gate below.
   const runCountFile = path.join(store.accountDir(name), 'run-count.txt');
@@ -812,6 +1030,10 @@ async function runAccount(o) {
   // Guard the pre-launch profile prep: ensureDir/mkdirSync can throw EPERM/EACCES (profile dir locked
   // by a crashed Chromium, antivirus, or a disconnected drive). Fail this account cleanly with a
   // per-account error instead of throwing opaquely out of the worker.
+  // M2-06: clear any zombie Chromium still holding THIS profile's lock (a browser force-killed
+  // mid-run) BEFORE prepping/launching, so the account doesn't fail with "profile prep failed".
+  // The isLoginOpen guard above already returned if a login browser is open, so this can't kill it.
+  try { const cleared = await killChromiumForProfile(store.profileDir(name), (m) => log(`[${name}] ${m}`)); if (cleared) await sleep(800); } catch {}
   try { store.sanitizeProfile(name, settings.hideBrowser !== false); } // pin off-screen placement when hidden
   catch (e) { log(`⚠️ [${name}] profile prep failed (${e.message}) — skipping account`); return { posted: 0, errors: 1, pendingApproval: 0, noRetry: false, flag: null, postedIds: [] }; }
   // Proxy: Chrome can't do authenticated SOCKS5 directly, so we wrap the upstream
@@ -833,13 +1055,14 @@ async function runAccount(o) {
       if (p) {
         proxyAuth = p;
         if (p.username && proxyChain) {
-          try { anonLocal = await proxyChain.anonymizeProxy(p.upstream); launchArgs.push(`--proxy-server=${anonLocal}`); log(`🌐 [${name}] proxy ${p.server} (auth via proxy-chain)`); }
-          catch (e) { launchArgs.push(`--proxy-server=${p.server}`); log(`⚠️ [${name}] proxy-chain failed (${e.message}) — auth credentials may be dropped, expect 407s`); }
+          try { anonLocal = await proxyChain.anonymizeProxy(p.upstream); launchArgs.push(`--proxy-server=${anonLocal}`); log(`✅ [${name}] proxy ${p.server} (auth via proxy-chain)`); reportProxy(proxyStr, true); }
+          catch (e) { launchArgs.push(`--proxy-server=${p.server}`); log(`⚠️ [${name}] proxy-chain failed (${e.message}) — auth credentials may be dropped, expect 407s`); reportProxy(proxyStr, false, 'proxy-chain: ' + e.message); }
         } else { launchArgs.push(`--proxy-server=${p.server}`); log(`🌐 [${name}] proxy ${p.server}`); }
       } else {
         // A configured-but-malformed proxy is a real misconfig. Do NOT silently post from the bare
         // IP (that defeats the point and can burn the account) — skip it and tell the operator.
-        log(`🚫 [${name}] proxy string is invalid ("${shortText(proxyStr, 40)}") — skipping this account so it does NOT post from your real IP. Fix the proxy in the Accounts tab.`);
+        const hint = proxyFormatHint(proxyStr);
+        log(`🚫 [${name}] proxy string is invalid ("${shortText(proxyStr, 40)}")${hint ? ' — ' + hint : ''}. Skipping this account so it does NOT post from your real IP. Fix the proxy in the Accounts tab.`);
         report('', '', 'error', 'invalid proxy — account skipped', '');
         return { posted: 0, errors: 1, pendingApproval: 0, noRetry: true, flag: 'proxy_invalid', postedIds: [] };
       }
@@ -961,9 +1184,11 @@ async function runAccount(o) {
     };
     function armWatchdog() { watchdog = setTimeout(onWatchdogTick, accountBudget); }
     armWatchdog();
-    // Fallback auth path if proxy-chain wasn't used.
+    // Fallback auth path if proxy-chain wasn't used. E-X1: log the outcome (it was silently
+    // swallowed before) so a 407 storm is diagnosable. We still continue either way.
     if (proxyAuth && proxyAuth.username && !anonLocal) {
-      await page.authenticate({ username: proxyAuth.username, password: proxyAuth.password }).catch(() => {});
+      try { await page.authenticate({ username: proxyAuth.username, password: proxyAuth.password }); log(`✅ [${name}] proxy auth via page.authenticate`); }
+      catch (e) { log(`⚠️ [${name}] proxy auth (page.authenticate) failed (${e.message}) — 407s expected`); }
     }
 
     // Auth bootstrap: PREFER the profile's own logged-in session (from an in-app
@@ -996,9 +1221,13 @@ async function runAccount(o) {
         log(`🔄 [${name}] session recovered with saved cookies`);
       } else {
         // Cookie recovery failed — try stored credentials (OPT-IN) before flagging for manual login.
-        if (account.email && account.password) {
+        // M3-01: credentials are encrypted at rest (safeStorage); decrypt is transparent (legacy
+        // plaintext passes through). Decrypt may yield '' if this machine can't unlock them.
+        const credEmail = secret.decrypt(account.email);
+        const credPass = secret.decrypt(account.password);
+        if (credEmail && credPass) {
           log(`🔐 [${name}] cookies failed — trying stored credentials...`);
-          const credResult = await credentialLogin(page, account.email, account.password, log, name);
+          const credResult = await credentialLogin(page, credEmail, credPass, log, name);
           if (credResult === true) {
             log(`🔄 [${name}] session recovered via credential login`);
             // fall through to the normal posting loop
@@ -1056,7 +1285,20 @@ async function runAccount(o) {
       commentImg = resolvedImages[0]; log(`🖼 [${name}] comment image: reusing the post image (commentWithImage)`);
     }
 
+    // The post is meant to carry an image but none could be resolved (missing local file, or a
+    // URL that wouldn't download even after retries). Do NOT fall through to the group loop —
+    // groupImages would be empty and every group would publish a bare caption (silent data loss).
+    // Bail for this post; it stays un-dealt and is retried next cycle.
+    const wantsImage = !!((basePost.imagePaths && basePost.imagePaths.length) || basePost.imagePath || basePost.imageUrl);
+    if (wantsImage && !resolvedImages.length) {
+      log(`❌ [${name}] post requires an image but none could be resolved — not posting (would be image-less). Will retry next cycle.`);
+      report('', '', 'error', 'post image could not be resolved', '');
+      return { posted: 0, errors: 1, pendingApproval: 0, noRetry: true, flag: null, postedIds: [], dealtIds: [], fullyPosted: false, offline: false };
+    }
+
+    const groupRetries = {}; // E-P1: per-group transient-retry counter (max 1 retry, pre-publish only)
     for (let i = 0; i < targetGroups.length; i++) {
+      let publishClicked = false; // E-P1: once true, NEVER retry this group (would risk a double-post)
       if (aborted) { log(`⏹ [${name}] watchdog aborted this account — not touching the dead browser`); break; }
       if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
       // Mid-run toggle: stop between groups if the user turned this account OFF during the run.
@@ -1184,16 +1426,26 @@ async function runAccount(o) {
         if (groupImages.length) {
           step(`Uploading ${groupImages.length} image(s)`);
           const input = (await page.$('div[role="dialog"] input[type="file"]')) || (await page.$(SEL.fileInput));
-          if (input) {
-            // Cap the upload: a stalled CDP file transfer (big image / slow disk) must not
-            // hang the account for the full protocolTimeout and trip the watchdog.
-            let upTimer;
-            const upCap = new Promise((_, rej) => { upTimer = setTimeout(() => rej(new Error('uploadFile timeout')), 30000); });
-            try { await Promise.race([input.uploadFile(...groupImages), upCap]); step('Image attached'); await sleepInterruptible(3500, shouldStop); }
-            catch (upErr) { step(`Image upload stalled (${upErr.message}) — posting without image`); }
-            finally { clearTimeout(upTimer); }
+          if (!input) {
+            // The post is meant to carry an image — never publish it image-less. Skip the group
+            // (it stays un-dealt and is retried next cycle) instead of posting a bare caption.
+            step('Image input not found in composer — skipping group to avoid an image-less post');
+            errors++; report(groupName, gid, 'error', 'image input not found in composer', ''); continue;
           }
-          else step('Image input not found in composer; posting without local image attach');
+          // Retry the upload (a stalled CDP file transfer / slow disk is often transient) with a
+          // per-attempt timeout so it can't hang the account for the full protocolTimeout.
+          const up = await retryAsync(() => input.uploadFile(...groupImages), {
+            attempts: 3, timeoutMs: 30000, baseDelayMs: 1500, label: 'image upload',
+            onAttempt: (a, n, e) => step(`Image upload attempt ${a}/${n} failed (${e.message})${a < n ? ' — retrying' : ''}`),
+          });
+          if (!up.ok) {
+            // Retries exhausted. Do NOT click Post — a post without its intended image is silent
+            // data loss. Skip the group; it stays un-dealt and is retried next cycle.
+            step('Image upload failed after retries — skipping group (will retry next cycle)');
+            errors++; report(groupName, gid, 'error', 'image upload failed after retries', ''); continue;
+          }
+          step('Image attached');
+          await sleepInterruptible(3500, shouldStop);
         }
 
         // Caption — PASTE it (clipboard + Ctrl+V, like the original "Caption pasted"); fast and
@@ -1245,22 +1497,28 @@ async function runAccount(o) {
         step('Waiting for Post button to enable');
         const dialogCountBefore = await page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length).catch(() => 1);
         // Log what the Post-button scan sees (dialogs open, found label) — mirrors original's "🔍 Dialogs: N".
-        const postBtnInfo = await page.evaluate(() => {
+        const postBtnInfo = await page.evaluate((labels) => {
+          const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
           const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
           const scope = dialogs.length ? dialogs : [document];
           for (const root of scope) {
-            const btn = Array.from(root.querySelectorAll('[role="button"]')).find((b) => {
-              const label = (b.getAttribute('aria-label') || b.textContent || '').trim().toLowerCase();
-              return label === 'post' && b.getAttribute('aria-disabled') !== 'true';
-            });
+            const btn = Array.from(root.querySelectorAll('[role="button"], button')).find((b) =>
+              b.getAttribute('aria-disabled') !== 'true' && !b.disabled && labels.includes(norm(b.getAttribute('aria-label') || b.textContent)));
             if (btn) return { found: true, dialogs: dialogs.length, label: (btn.getAttribute('aria-label') || btn.textContent || '').trim() };
           }
-          return { found: false, dialogs: dialogs.length };
-        }).catch(() => null);
+          // None matched — collect the enabled button labels we DID see so drift is diagnosable.
+          const seen = [];
+          for (const root of scope) for (const b of root.querySelectorAll('[role="button"], button')) {
+            const l = (b.getAttribute('aria-label') || b.textContent || '').replace(/\s+/g, ' ').trim();
+            if (l && b.getAttribute('aria-disabled') !== 'true') seen.push(l);
+          }
+          return { found: false, dialogs: dialogs.length, seen: seen.slice(0, 10) };
+        }, FB.postButton).catch(() => null);
         if (postBtnInfo) {
           if (postBtnInfo.found) step(`Post button found (label="${postBtnInfo.label}")`);
-          else step(`Post button NOT found (${postBtnInfo.dialogs} dialog(s) scanned)`);
+          else step(`⚠️ Post button NOT found (${postBtnInfo.dialogs} dialog(s)) — possible selector drift. Buttons seen: ${(postBtnInfo.seen || []).join(' | ') || '(none)'}. If this recurs, run scripts/inspect-fb.js.`);
         }
+        publishClicked = true; // E-P1: from here on this group must NOT be retried (would double-post)
         const clicked = await clickPostButton(page);
         if (!clicked) { step('Post button not found; skipping group'); errors++; report(groupName, gid, 'error', 'post button not found', ''); continue; }
         step('Post button clicked');
@@ -1294,6 +1552,23 @@ async function runAccount(o) {
         // Success log — keep caption snippet for the renderer's auto-delete tracker.
         step('Posted successfully');
         posted++;
+        // E-P3: even when publish "succeeded", scan once for a block/checkpoint phrase the
+        // pre-publish detectors didn't catch. If present, the account is being throttled NOW — cool
+        // it down IMMEDIATELY (skip this post's comment + the account's remaining groups) instead of
+        // only warning. The post itself already landed, so it's still recorded as 'posted'.
+        let emergingBlock = false;
+        try {
+          const suspect = await evalTimed(page, (cfg) => {
+            const t = (document.body.innerText || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+            return [...cfg.rate, ...cfg.cp].find((p) => t.includes(p)) || null;
+          }, { rate: FB.rateLimit, cp: FB.checkpoint }, 6000);
+          if (suspect) { emergingBlock = true; step(`🛑 Posted, but an EMERGING block/checkpoint phrase is present ("${suspect}") — cooling down this account immediately (emerging limit, distinct from an explicit block)`); }
+        } catch {}
+        if (emergingBlock) {
+          flag = 'rate_limited'; noRetry = true;
+          report(groupName, gid, 'posted', 'emerging block detected after publish — cooling down (comment skipped)', 'skipped');
+          break;
+        }
 
         // Capture the just-published post's permalink while it is the NEWEST post in the feed (before
         // anyone else posts), skipping any pinned/announcement post. The comment step can then open the
@@ -1338,6 +1613,16 @@ async function runAccount(o) {
         }
         report(groupName, gid, 'posted', '', commentResult);
       } catch (e) {
+        // E-P1: retry the SAME group ONCE on a TRANSIENT failure that happened BEFORE the publish
+        // click — so we reclaim groups lost to a CDP blip / nav timeout without any double-post risk.
+        // Block errors (rate-limit/checkpoint) and post-publish errors are never retried here.
+        const cls = classifyGroupError(e.message);
+        if (cls === 'transient' && !publishClicked && (groupRetries[gid] || 0) < 1 && !shouldStop() && browser && browser.isConnected()) {
+          groupRetries[gid] = (groupRetries[gid] || 0) + 1;
+          step(`Transient error before publish (${e.message}) — retrying this group once`);
+          await sleepInterruptible(2500, shouldStop);
+          i--; continue; // re-attempt the same group (nothing was published)
+        }
         errors++;
         step(`Error: ${e.message}`);
         report(groupName, gid, 'error', e.message, '');
@@ -1416,5 +1701,6 @@ module.exports = {
   // exported for diagnostics — use the EXACT worker logic
   clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish,
   // exported for tests (no runtime effect)
-  jitter, varyLinks,
+  jitter, varyLinks, retryAsync, downloadImage, isSafeImageUrl, proxyFormatHint, classifyGroupError,
+  FB, isRateLimitText, isCheckpointText, isPendingText, isPostButtonLabel, isCommentBoxLabel,
 };

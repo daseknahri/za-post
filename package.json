@@ -14,7 +14,9 @@
     "bundle:chromium": "node scripts/bundle-chromium.js",
     "pack": "node scripts/bundle-chromium.js && electron-builder --win nsis",
     "pack:portable": "node scripts/build-portable.js",
-    "compile": "node -e \"require('bytenode').compileFile('main.js','main.jsc')\""
+    "compile": "node -e \"require('bytenode').compileFile('main.js','main.jsc')\"",
+    "test": "node --test \"tests/**/*.test.js\"",
+    "test:antispam": "node scripts/test-antispam.js"
   },
   "dependencies": {
     "axios": "^1.13.2",

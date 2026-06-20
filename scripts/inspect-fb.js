@@ -61,6 +61,10 @@ function probe() {
     editables: collect('[contenteditable="true"], [role="textbox"]'),
     composerTriggers: collect('[role="button"], span, div[role="button"]').filter((e) =>
       /write something|discussion|create.*post|photo\/video|what'?s on your mind/i.test(e.text)),
+    // E-P2: the "share to / select groups / post-to destination" UI — what we need to detect so a
+    // post can never be sprayed to the wrong group(s). Match destination/audience/group-select text.
+    shareTargets: collect('[role="button"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="listitem"], div[aria-label]').filter((e) =>
+      /post to|share to|share now|select group|choose group|your groups|audience|anyone|public|members|where do you want|more places|publier dans|partager dans|publicar en|compartir en|gruppen|teilen in/i.test(e.text || e.ariaLabel)),
   };
 }
 
@@ -83,7 +87,9 @@ function probe() {
       headless: false,
       userDataDir: path.join(ROOT, 'accounts', ACC, 'chrome-profile'),
       defaultViewport: { width: 1280, height: 900 },
-      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--window-position=-32000,-32000', '--window-size=1300,950'],
+      // E-P2 recon: ON-SCREEN so you can manually open the "Post to / share to groups" picker and the
+      // final dump captures it. This script NEVER clicks the final Post — it is capture-only.
+      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--window-position=60,40', '--window-size=1300,950'],
     });
     const page = (await browser.pages())[0] || (await browser.newPage());
     try { await page.setCookie(...cookies.map(normalizeCookie)); } catch (e) { console.error('cookie load:', e.message); }
@@ -124,6 +130,31 @@ function probe() {
         return d ? d.outerHTML.slice(0, 60000) : '';
       });
       fs.writeFileSync(path.join(OUT_DIR, 'composer-dialog.html'), dialogHtml || '(no dialog)');
+
+      // 5) E-P2: type a caption to enable Post and surface the "Post to / share to" destination
+      //    selector, then capture it. NEVER clicks Post — capture-only.
+      try {
+        const ed = await page.$('div[role="dialog"] [contenteditable="true"], div[role="dialog"] [role="textbox"]');
+        if (ed) { await ed.click({ delay: 30 }).catch(() => {}); await page.keyboard.type('recon test — do not post', { delay: 20 }); await sleep(2500); }
+      } catch {}
+      await page.screenshot({ path: path.join(OUT_DIR, '4-with-caption.png') }).catch(() => {});
+      report.steps.withCaptionProbe = await page.evaluate(probe);
+      fs.writeFileSync(path.join(OUT_DIR, 'composer-with-caption.html'),
+        await page.evaluate(() => { const d = document.querySelector('div[role="dialog"]'); return d ? d.outerHTML.slice(0, 120000) : '(no dialog)'; }));
+
+      // 6) Interactive window: MANUALLY open the "Post to" / audience / share-to-groups picker now.
+      //    Held for 90s, screenshotting + dumping every 15s so whatever you reveal is captured.
+      console.log('\n>>> A browser window is open. If you see a "Post to"/audience/destination control, CLICK it');
+      console.log('    to reveal the group-selection list. Do NOT click the final Post. Capturing for 90s...\n');
+      for (let k = 1; k <= 6; k++) {
+        await sleep(15000);
+        await page.screenshot({ path: path.join(OUT_DIR, `5-interactive-${k}.png`) }).catch(() => {});
+        try {
+          const html = await page.evaluate(() => Array.from(document.querySelectorAll('div[role="dialog"]')).map((d) => d.outerHTML.slice(0, 80000)).join('\n<!-- ===== next dialog ===== -->\n'));
+          fs.writeFileSync(path.join(OUT_DIR, `interactive-${k}.html`), html || '(no dialog)');
+          report.steps[`interactiveProbe${k}`] = await page.evaluate(probe);
+        } catch {}
+      }
     }
   } catch (e) {
     report.error = e.message;

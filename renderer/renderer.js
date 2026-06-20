@@ -22,6 +22,7 @@ let isAutomationRunning = false;
 let isPaused = false;
 let localStartInFlight = false;
 let isStopping = false;
+let isFinishing = false; // M2-03: "finish after the current batch" requested
 let currentLoginAccount = null;
 let appLimits = { maxGroups: 10, maxAccounts: 5 }; // Default limits
 
@@ -80,6 +81,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       isAutomationRunning = true;
       isPaused = false;
       isStopping = false;
+      isFinishing = false;
       updateAutomationControls();
       if (!localStartInFlight) {
       showNotification('Automation started externally', 'success');
@@ -180,10 +182,31 @@ document.addEventListener('DOMContentLoaded', async () => {
     isAutomationRunning = false;
     isPaused = false;
     isStopping = false;
+    isFinishing = false;
     updateAutomationControls();
     addLog(`\n✅ Automation ${reason || 'stopped'}.\n`);
     await loadData(); // refresh — the backend may have auto-deleted posted items during the run
   });
+
+  // M2-03: live attention — when the run flags an account (rate-limited, checkpoint, needs login,
+  // etc.), notify the operator and refresh so the account's status badge updates without a reload.
+  if (window.electronAPI.onAccountAttention) {
+    window.electronAPI.onAccountAttention(async (info) => {
+      const name = (info && info.name) || 'An account';
+      const flag = (info && info.flag) || 'attention';
+      const MSG = {
+        rate_limited: 'rate-limited by Facebook — cooling down',
+        needs_login: 'session expired — needs re-login',
+        needs_verification: 'Facebook wants a human/identity check',
+        account_disabled: 'disabled/restricted by Facebook',
+        likely_blocked: 'posted nothing (likely blocked) — check it',
+        proxy_invalid: 'proxy is invalid — fix it in Accounts',
+      };
+      showNotification(`⚠️ ${name}: ${MSG[flag] || flag}`, 'error');
+      try { await loadData(); } catch {}
+      try { highlightAccountCard(name); } catch {}
+    });
+  }
 
   // End-of-run summary: render a persistent roll-up the operator can read at a glance.
   window.electronAPI.onAutomationSummary((summary) => {
@@ -459,6 +482,8 @@ function initializeEventListeners() {
   document.getElementById('btn-start-automation').addEventListener('click', startAutomation);
   document.getElementById('btn-stop-automation').addEventListener('click', stopAutomation);
   document.getElementById('btn-pause-automation').addEventListener('click', togglePauseAutomation);
+  const finishBtn = document.getElementById('btn-finish-automation');
+  if (finishBtn) finishBtn.addEventListener('click', finishAutomation);
 
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
   document.getElementById('btn-save-proxies').addEventListener('click', saveProxies);
@@ -1033,7 +1058,7 @@ function renderAccounts() {
       : `<button onclick="toggleAccountEnabled('${account.name}')" title="Click to enable this account" style="background:#6b7280;color:#fff;border:none;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;line-height:1.4;">Off</button>`;
 
     return `
-      <div class="account-card" style="${isEnabled ? '' : 'opacity:0.5;'}">
+      <div class="account-card" data-account-name="${escapeHtml(account.name)}" style="${isEnabled ? '' : 'opacity:0.5;'}">
         <div class="account-header">
           <div class="account-avatar">${displayName.charAt(0).toUpperCase()}</div>
           <div class="account-info">
@@ -1228,7 +1253,7 @@ async function updateAccountProxy(accountName, proxyValue) {
 // Edit account name and alias
 let editingAccountName = null;
 
-function editAccount(accountName) {
+async function editAccount(accountName) {
   const account = appData.accounts.find(a => a.name === accountName);
   if (!account) return;
 
@@ -1238,13 +1263,20 @@ function editAccount(accountName) {
   document.getElementById('edit-account-alias').value = account.alias || '';
   document.getElementById('edit-account-name').value = accountName;
 
-  // Credential section: pre-fill email (not password), show badge if password is set
-  document.getElementById('edit-account-email').value = account.email || '';
+  // Credential section: clear first, then fetch the DECRYPTED email from main (M3-01 — creds are
+  // encrypted at rest, so appData.email is ciphertext and must not be shown directly).
+  document.getElementById('edit-account-email').value = '';
   document.getElementById('edit-account-password').value = ''; // never pre-fill password
   const badge = document.getElementById('edit-account-cred-badge');
-  if (badge) badge.style.display = account.password ? 'block' : 'none';
-
+  if (badge) badge.style.display = 'none';
   openModal('modal-edit-account');
+  try {
+    const cred = await window.electronAPI.getAccountCredentials(accountName);
+    if (cred && cred.success) {
+      document.getElementById('edit-account-email').value = cred.email || '';
+      if (badge) badge.style.display = cred.hasPassword ? 'block' : 'none';
+    }
+  } catch {}
 }
 
 async function saveAccountCredentials() {
@@ -1584,6 +1616,7 @@ function updateAutomationControls() {
   const startBtn   = document.getElementById('btn-start-automation');
   const pauseBtn   = document.getElementById('btn-pause-automation');
   const stopBtn    = document.getElementById('btn-stop-automation');
+  const finishBtn  = document.getElementById('btn-finish-automation');
   const pausedInd  = document.getElementById('paused-indicator');
 
   const setEnabled = (btn, enabled) => {
@@ -1593,26 +1626,35 @@ function updateAutomationControls() {
     btn.classList.toggle('cursor-not-allowed', !enabled);
   };
   const show = (btn, visible) => { if (btn) btn.style.display = visible ? '' : 'none'; };
+  // Finish is available while a run is active (running or paused), disabled once requested or stopping.
+  const applyFinish = () => {
+    show(finishBtn, true);
+    setEnabled(finishBtn, !isStopping && !isFinishing);
+    if (finishBtn) finishBtn.innerHTML = isFinishing ? '<span>🏁</span> Finishing…' : '<span>🏁</span> Finish after batch';
+  };
 
   if (!isAutomationRunning) {
     // IDLE: only Start visible & enabled
     show(startBtn,  true);  setEnabled(startBtn,  true);
     show(pauseBtn,  false);
     show(stopBtn,   false);
+    show(finishBtn, false);
     if (pausedInd) pausedInd.style.display = 'none';
   } else if (isPaused) {
     // PAUSED: the Pause button becomes Resume. Stop remains a hard interrupt.
     show(startBtn,  false);
     show(pauseBtn,  true);  setEnabled(pauseBtn, !isStopping);
     show(stopBtn,   true);  setEnabled(stopBtn, !isStopping);
+    applyFinish();
     if (pauseBtn) pauseBtn.innerHTML = '<span>▶️</span> Resume';
     if (stopBtn) stopBtn.innerHTML = isStopping ? '<span>⏹️</span> Stopping…' : '<span>⏹️</span> Stop';
     if (pausedInd) pausedInd.style.display = '';
   } else {
-    // RUNNING: Pause toggle + hard Stop.
+    // RUNNING: Pause toggle + graceful Finish + hard Stop.
     show(startBtn,  false);
     show(pauseBtn,  true);  setEnabled(pauseBtn,  !isStopping);
     show(stopBtn,   true);  setEnabled(stopBtn,   !isStopping);
+    applyFinish();
     if (pauseBtn) pauseBtn.innerHTML = '<span>⏸</span> Pause';
     if (stopBtn) stopBtn.innerHTML = isStopping ? '<span>⏹️</span> Stopping…' : '<span>⏹️</span> Stop';
     if (pausedInd) pausedInd.style.display = 'none';
@@ -1652,6 +1694,7 @@ function renderRunSummary(s) {
 
 async function startAutomation() {
   if (isAutomationRunning) { showNotification('Automation is already running', 'info'); return; }
+  if (localStartInFlight) return; // M4-07: guard against a double-click starting two runs
   if (appData.posts.length === 0) {
     showNotification('Please add some posts first', 'error');
     return;
@@ -1735,6 +1778,42 @@ async function stopAutomation() {
     updateAutomationControls();
     showNotification('Failed to stop automation: ' + e.message, 'error');
   }
+}
+
+// M2-03: graceful finish — let the current batch complete, then end the run (no new work starts).
+async function finishAutomation() {
+  if (!isAutomationRunning || isFinishing) return;
+  isFinishing = true;
+  updateAutomationControls();
+  try {
+    const result = await window.electronAPI.finishAutomation();
+    if (result && result.success !== false) {
+      addLog('\n🏁 Will finish after the current batch — no new work will start.\n');
+      showNotification('Finishing after the current batch…', 'info');
+    } else {
+      isFinishing = false; updateAutomationControls();
+      showNotification('Failed to finish: ' + ((result && result.error) || 'unknown error'), 'error');
+    }
+  } catch (e) {
+    isFinishing = false; updateAutomationControls();
+    showNotification('Failed to finish: ' + (e && e.message || e), 'error');
+  }
+}
+
+// M2-03: briefly pulse an account's card so a live attention flag is easy to spot. Best-effort —
+// finds the card by the account name and is a no-op if the layout doesn't expose one.
+function highlightAccountCard(name) {
+  const container = document.getElementById('accounts-container');
+  if (!container || !name) return;
+  let card = container.querySelector(`[data-account-name="${(window.CSS && CSS.escape) ? CSS.escape(name) : name}"]`);
+  if (!card) {
+    // Fallback: match a card whose text contains the account name.
+    card = Array.from(container.children).find((c) => (c.textContent || '').includes(name));
+  }
+  if (!card) return;
+  card.classList.add('ring-2', 'ring-red-500/70');
+  card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  setTimeout(() => { try { card.classList.remove('ring-2', 'ring-red-500/70'); } catch {} }, 6000);
 }
 
 async function pauseAutomation() {
@@ -1849,6 +1928,8 @@ function loadSettings() {
   document.getElementById('setting-randomize-links').checked = appData.settings.randomizeLinks !== false;
   document.getElementById('setting-stagger-accounts').checked = appData.settings.staggerAccounts !== false;
   document.getElementById('setting-enable-warmup').checked = appData.settings.enableWarmup || false;
+  document.getElementById('setting-warmup-runs').value = appData.settings.warmupRuns !== undefined ? appData.settings.warmupRuns : 5;
+  document.getElementById('setting-cooldown-hours').value = appData.settings.rateLimitCooldownHours !== undefined ? appData.settings.rateLimitCooldownHours : 4;
 }
 
 async function saveSettings() {
@@ -1856,7 +1937,7 @@ async function saveSettings() {
   // NaN can't, e.g., silently disable the inter-group delay and trigger rate-limits.
   const intOr = (id, def) => { const v = parseInt(document.getElementById(id).value, 10); return Number.isFinite(v) ? v : def; };
   const settings = {
-    ...appData.settings, // preserve settings that have no form input (e.g. warmupRuns, rateLimitCooldownHours)
+    ...appData.settings, // preserve settings that have no form input
     parallelAccounts: intOr('setting-parallel-accounts', 2),
     waitInterval: intOr('setting-wait-interval', 120),
     accountDelay: intOr('setting-account-delay', 2),
@@ -1878,6 +1959,8 @@ async function saveSettings() {
     randomizeLinks: document.getElementById('setting-randomize-links').checked,
     staggerAccounts: document.getElementById('setting-stagger-accounts').checked,
     enableWarmup: document.getElementById('setting-enable-warmup').checked,
+    warmupRuns: intOr('setting-warmup-runs', 5),
+    rateLimitCooldownHours: intOr('setting-cooldown-hours', 4),
   };
 
   const result = await window.electronAPI.saveSettings(settings);
@@ -2046,6 +2129,8 @@ function showNotification(message, type = 'info') {
   const notification = document.createElement('div');
   notification.className = `notification ${type}`;
   notification.textContent = message;
+  notification.title = 'Click to dismiss';
+  notification.style.cursor = 'pointer';
 
   // Add to container
   container.appendChild(notification);
@@ -2053,16 +2138,16 @@ function showNotification(message, type = 'info') {
   // Trigger animation
   setTimeout(() => notification.classList.add('show'), 10);
 
-  // Remove after 3 seconds
-  setTimeout(() => {
+  // M4-07: errors stay long enough to actually read (10s) — a critical failure must not vanish in
+  // 3s — and ANY notification can be dismissed early by clicking it.
+  const dismiss = () => {
+    if (notification._dismissed) return;
+    notification._dismissed = true;
     notification.classList.remove('show');
-    setTimeout(() => {
-      notification.remove();
-      if (container.childNodes.length === 0) {
-        container.remove();
-      }
-    }, 300);
-  }, 3000);
+    setTimeout(() => { notification.remove(); if (container.childNodes.length === 0) container.remove(); }, 300);
+  };
+  notification.addEventListener('click', dismiss);
+  setTimeout(dismiss, type === 'error' ? 10000 : 3000);
 
   // Also log if automation view is active
   if (document.getElementById('automation-view').classList.contains('active')) {
