@@ -231,6 +231,16 @@ contains macOS symlinks whose extraction needs admin / Windows Developer Mode. S
 | `test-notif.js` | verify Windows toast notifications work |
 | `test-comment.js`, `diag-comment.js`, `inspect-fb.js`, … | FB DOM diagnostics |
 | `migrate.js`, `prep-accounts.js`, `sync-memberships.js` | data/account utilities |
+| `test-fingerprint.js` | **live** browser fingerprint test — launches the real Chromium as the worker does and asserts the bot-tells are gone (webdriver, WebGL renderer, screenX, focus/visibility). `node scripts/test-fingerprint.js` |
+| `test-antispam.js` | backend suite — spintax, image variation, link variation, jitter, and a real Orchestrator+store run proving daily-cap / cool-down / persistence. `node scripts/test-antispam.js` |
+
+### Verifying a build (no Facebook login needed)
+```bash
+node scripts/test-fingerprint.js   # 10 checks — proves the fingerprint fixes take effect in a real browser
+node scripts/test-antispam.js      # 27 checks — proves content variation + cap/cool-down/persistence
+```
+Both exit 0 on success. They cover everything except an actual post to Facebook (which needs a
+logged-in account + a real group — do that manually with ONE account first; see §13 + HANDOFF.md).
 
 ## 13. Anti-spam hardening (why posts get flagged, and the mitigations)
 
