@@ -1394,4 +1394,6 @@ module.exports = {
   runAccount, parseProxy, normalizeCookie, addFirstComment,
   // exported for diagnostics — use the EXACT worker logic
   clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish,
+  // exported for tests (no runtime effect)
+  jitter, varyLinks,
 };

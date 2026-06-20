@@ -614,4 +614,4 @@ class Orchestrator {
   }
 }
 
-module.exports = { Orchestrator };
+module.exports = { Orchestrator, _test: { jitter } };
