@@ -42,10 +42,11 @@ const ok = (name, cond, extra) => { if (cond) { passed++; console.log('PASS ' + 
   // ---- C) link variation + jitter bounds ----------------------------------
   const worker = require('../automation/worker');
   const linked = worker.varyLinks('see http://example.com and https://shop.io/p?id=9 now', 'acctX|grp7');
-  const refs = (linked.match(/ref=/g) || []).length;
-  ok('varyLinks tags BOTH urls with a ref param', refs === 2, linked);
+  const tags = (linked.match(/[?&]s=/g) || []).length;
+  ok('varyLinks tags BOTH urls (s= param, NOT colliding ref=)', tags === 2 && !/ref=/.test(linked), linked);
   ok('varyLinks keeps the original domains', linked.includes('http://example.com') && linked.includes('https://shop.io/p?id=9'));
-  ok('varyLinks uses ? for param-less url and & for one with a query', /example\.com\?ref=/.test(linked) && /id=9&ref=/.test(linked));
+  ok('varyLinks uses ? for param-less url and & for one with a query', /example\.com\?s=/.test(linked) && /id=9&s=/.test(linked));
+  ok('varyLinks REPLACES an existing ref=/s= instead of doubling', (() => { const r = worker.varyLinks('http://x.io/a?ref=old', 'z'); return /\?s=[a-z0-9]+$/.test(r) && !/ref=/.test(r) && (r.match(/s=/g) || []).length === 1; })());
   ok('varyLinks leaves link-free text alone', worker.varyLinks('no links here', 's') === 'no links here');
   let jmin = Infinity, jmax = -Infinity, jneg = false;
   for (let i = 0; i < 2000; i++) { const v = worker.jitter(1000, 0.3); jmin = Math.min(jmin, v); jmax = Math.max(jmax, v); if (v < 0) jneg = true; }
@@ -59,10 +60,12 @@ const ok = (name, cond, extra) => { if (cond) { passed++; console.log('PASS ' + 
   worker.runAccount = async (o) => {
     const name = o.account.name;
     const ng = (o.account.assignedGroups || []).length;
-    calls.push(name);
+    calls.push({ name, maxThisRun: o.maxThisRun });
     if (name === 'rlacct') return { posted: 0, errors: 1, pendingApproval: 0, noRetry: true, flag: 'rate_limited', postedIds: [], dealtIds: [], fullyPosted: false, offline: false };
+    // Honor the orchestrator's per-run cap budget, exactly as the real worker's group loop does.
+    const posted = Math.min(ng, Number.isFinite(o.maxThisRun) ? o.maxThisRun : ng);
     const ids = o.post && o.post.id ? [o.post.id] : [];
-    return { posted: ng, errors: 0, pendingApproval: 0, noRetry: false, flag: null, postedIds: ids, dealtIds: ids, fullyPosted: true, offline: false };
+    return { posted, errors: 0, pendingApproval: 0, noRetry: false, flag: null, postedIds: ids, dealtIds: ids, fullyPosted: posted === ng, offline: false };
   };
   const store = require('../lib/store');
   const { Orchestrator } = require('../automation/orchestrator');
@@ -92,16 +95,18 @@ const ok = (name, cond, extra) => { if (cond) { passed++; console.log('PASS ' + 
   try { orch.stop(); } catch {}
   ok('orchestrator run completed (no hang)', finished === true);
 
-  const count = (n) => calls.filter((c) => c === n).length;
+  const count = (n) => calls.filter((c) => c.name === n).length;
   const hasLog = (re) => logs.some((l) => re.test(l));
-  ok('daily cap: capacct ran ONCE then was capped (3 posts >= cap 2)', count('capacct') === 1, `ran ${count('capacct')}x`);
+  const capCall = calls.find((c) => c.name === 'capacct');
+  ok('daily cap: capacct received maxThisRun budget = 2 (cap 2 - used 0)', capCall && capCall.maxThisRun === 2, JSON.stringify(capCall));
+  ok('daily cap: capacct ran ONCE then was capped next cycle', count('capacct') === 1, `ran ${count('capacct')}x`);
   ok('daily cap: log shows the cap skip', hasLog(/daily cap reached/i));
   ok('cool-down: rlacct ran ONCE then was skipped while cooling down', count('rlacct') === 1, `ran ${count('rlacct')}x`);
   ok('cool-down: log shows the cooling-down skip', hasLog(/cooling down/i));
   const after = store.load();
   const cap = after.accounts.find((a) => a.name === 'capacct');
   const rl = after.accounts.find((a) => a.name === 'rlacct');
-  ok('persisted: capacct.daily.count recorded (=3)', cap && cap.daily && cap.daily.count === 3, JSON.stringify(cap && cap.daily));
+  ok('persisted: capacct.daily.count == 2 (stopped AT the cap, no overshoot)', cap && cap.daily && cap.daily.count === 2, JSON.stringify(cap && cap.daily));
   ok('persisted: rlacct.rateLimitedUntil set in the future', rl && rl.rateLimitedUntil > Date.now(), String(rl && rl.rateLimitedUntil));
   ok('persisted: rlacct.rlStrikes incremented', rl && rl.rlStrikes >= 1, String(rl && rl.rlStrikes));
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}

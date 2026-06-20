@@ -267,7 +267,7 @@ class Orchestrator {
 
   // Returns { progressed, posted, pendingApproval, errors }. Rotation only advances
   // when progressed, so a fully-crashed account retries the SAME post next cycle.
-  async _runAccount(account, cycle) {
+  async _runAccount(account, cycle, maxThisRun) {
     const data = this._data;
     const accountStart = Date.now();
     const posts = this._postsForAccount(account, cycle, true); // claim at run time so parallel accounts don't collide
@@ -305,7 +305,7 @@ class Orchestrator {
       for (let attempt = 1; attempt <= MAX; attempt++) {
         try {
           const r = await runAccount({
-            account, post, groups: data.groups, settings: data.settings,
+            account, maxThisRun, post, groups: data.groups, settings: data.settings,
             useProxies: !!data.useProxies, proxies: data.proxies || [],
             log: (m) => this.log(m),
             shouldStop: () => this._shouldStop(),
@@ -389,7 +389,8 @@ class Orchestrator {
           acc.rlStrikes = (acc.rlStrikes || 0) + 1;
           const hours = Math.min(48, baseHours * Math.pow(2, acc.rlStrikes - 1));
           acc.rateLimitedUntil = Date.now() + Math.round(hours * 3600000);
-        } else if ((res.posted || 0) > 0 && !res.flag && (acc.rateLimitedUntil || acc.rlStrikes)) {
+        } else if (((res.posted || 0) + (res.pendingApproval || 0)) > 0 && !res.flag && (acc.rateLimitedUntil || acc.rlStrikes)) {
+          // Recovered (posted OR queued for approval with no flag) — clear the cool-down.
           acc.rateLimitedUntil = 0; acc.rlStrikes = 0;
         }
       });
@@ -410,10 +411,20 @@ class Orchestrator {
       const active = accounts.filter((a) => a.enabled !== false);
       if (!active.length) { this.log('⚠️ No enabled accounts — stopping.'); break; }
       this._active = active;
-      // Shared-IP warning: many accounts from ONE IP is a top coordinated-spam signal.
-      if (!settings.useProxies && active.length > 1 && !this._proxyWarned) {
+      // Shared-IP warning (once per run): many accounts from ONE IP is a top coordinated-spam signal.
+      if (!this._proxyWarned && active.length > 1) {
         this._proxyWarned = true;
-        this.log(`⚠️ Proxies are OFF and ${active.length} accounts are active — they will all post from the SAME IP. Facebook links accounts that share an IP and can flag them together. Strongly consider assigning a proxy per account (Accounts tab), or run fewer accounts at once.`);
+        if (!settings.useProxies) {
+          this.log(`⚠️ Proxies are OFF and ${active.length} accounts are active — they will all post from the SAME IP. Facebook links accounts that share an IP and can flag them together. Strongly consider assigning a proxy per account (Accounts tab), or run fewer accounts at once.`);
+        } else {
+          const poolN = ((this._data && this._data.proxies) || []).length;
+          const onPool = active.filter((a) => !(a.proxy && String(a.proxy).trim())).length; // accounts relying on the shared pool
+          if (onPool > 0 && poolN === 0) {
+            this.log(`⚠️ Proxies are ON but ${onPool} account(s) have NO proxy assigned and the pool is empty — they will post from your real IP. Assign a proxy per account in the Accounts tab.`);
+          } else if (onPool > poolN && poolN > 0) {
+            this.log(`⚠️ ${onPool} accounts share a pool of only ${poolN} prox${poolN === 1 ? 'y' : 'ies'} — some will exit from the SAME IP (Facebook links accounts that share an IP). Add more proxies, or assign a unique proxy per account.`);
+          }
+        }
       }
 
       cycle++;
@@ -498,10 +509,14 @@ class Orchestrator {
           // Per-account DAILY CAP on group-posts (0 = off) — keeps each account within a human-plausible
           // daily volume; the counter resets each calendar day.
           const cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
-          if (cap > 0 && live && live.daily && live.daily.date === store.todayKey() && (live.daily.count || 0) >= cap) {
-            return idle(`📵 [${account.name}] daily cap reached (${live.daily.count}/${cap} group-posts today) — skipping until tomorrow`);
+          const usedToday = (cap > 0 && live && live.daily && live.daily.date === store.todayKey()) ? (live.daily.count || 0) : 0;
+          if (cap > 0 && usedToday >= cap) {
+            return idle(`📵 [${account.name}] daily cap reached (${usedToday}/${cap} group-posts today) — skipping until tomorrow`);
           }
-          const r = await this._runAccount(account, cycle)
+          // Remaining budget for today is passed into the worker so a single run STOPS at the cap
+          // (instead of posting to every group and overshooting by groups-1). Infinity when cap is off.
+          const maxThisRun = cap > 0 ? (cap - usedToday) : Infinity;
+          const r = await this._runAccount(account, cycle, maxThisRun)
             .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [], offline: false }; });
           this.log(`✓ [${account.name}] Completed`);
           const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null, offline: (r && r.offline) || false };
@@ -518,7 +533,7 @@ class Orchestrator {
           return res;
         }));
         const batchOk = results.filter((r) => r.progressed).length;
-        this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) --- Waiting ${Number.isFinite(settings.accountDelay) ? settings.accountDelay : 1} minute(s) before next batch...`);
+        this.log(`--- Batch ${b + 1} done (${batchOk}/${batch.length} OK) --- Waiting ~${Number.isFinite(settings.accountDelay) ? settings.accountDelay : 2} minute(s) before next batch...`);
         for (const r of results) { cyclePostedIds.push(...r.postedIds); cycleDealtIds.push(...r.dealtIds); if (r.flag) cycleFlags.push(r.flag); }
         // Persist dealt-ids incrementally (after each batch) so a crash mid-cycle can't
         // re-deal — and thus potentially re-post — the batches already completed.
@@ -561,7 +576,7 @@ class Orchestrator {
       // All-sessions-invalid guard: if a whole cycle published/queued NOTHING and at least one
       // account reported it was logged out, looping again would just relaunch browsers that all
       // bail. Stop with a clear reason instead of spinning forever unattended.
-      if (cycleDealtIds.length === 0 && (cycleFlags.includes('needs_login') || cycleFlags.includes('account_disabled') || cycleFlags.includes('needs_verification'))) {
+      if (cycleDealtIds.length === 0 && (cycleFlags.includes('needs_login') || cycleFlags.includes('account_disabled') || cycleFlags.includes('needs_verification') || cycleFlags.includes('proxy_invalid'))) {
         this.log('🛑 No account could post this cycle — accounts need attention (logged out, disabled, or identity-verification required). Stopping. Fix the flagged accounts, then Start again.');
         break;
       }
@@ -584,7 +599,10 @@ class Orchestrator {
 
   async _interruptibleSleep(ms) {
     const step = 1000; let waited = 0;
-    while (waited < ms && !this._shouldStop()) { await sleep(Math.min(step, ms - waited)); waited += step; }
+    while (waited < ms && !this._shouldStop()) {
+      if (this._paused) { await this._waitWhilePaused(); if (this._shouldStop()) break; continue; } // honor Pause (e.g. mid-stagger)
+      await sleep(Math.min(step, ms - waited)); waited += step;
+    }
   }
 
   // Sleep with a live countdown so the log keeps updating during long waits (between

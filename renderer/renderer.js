@@ -1856,9 +1856,10 @@ async function saveSettings() {
   // NaN can't, e.g., silently disable the inter-group delay and trigger rate-limits.
   const intOr = (id, def) => { const v = parseInt(document.getElementById(id).value, 10); return Number.isFinite(v) ? v : def; };
   const settings = {
-    parallelAccounts: intOr('setting-parallel-accounts', 3),
-    waitInterval: intOr('setting-wait-interval', 60),
-    accountDelay: intOr('setting-account-delay', 1),
+    ...appData.settings, // preserve settings that have no form input (e.g. warmupRuns, rateLimitCooldownHours)
+    parallelAccounts: intOr('setting-parallel-accounts', 2),
+    waitInterval: intOr('setting-wait-interval', 120),
+    accountDelay: intOr('setting-account-delay', 2),
     postsPerGroup: intOr('setting-posts-per-group', 1),
     commentWithImage: document.getElementById('setting-comment-with-image').checked,
     autoDeletePosted: document.getElementById('setting-auto-delete-posted').checked,

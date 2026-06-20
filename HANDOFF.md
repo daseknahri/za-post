@@ -19,8 +19,21 @@ variation, **per-account stable proxy** (`account.proxy`, set in Accounts tab; i
 skips the account rather than posting from the real IP), and opt-in new-account **warm-up**. New UI:
 per-account proxy field + a "Anti-spam (Facebook safety)" settings group. New dep: `jimp@0.22.12`.
 Honest caveat in DOCS §13: identical content to many groups is inherently spam-shaped; the durable
-fix is lower volume + variation + good per-account IPs + aged accounts. **Not yet live-tested** by
-the operator — defaults are conservative; tune in Settings.
+fix is lower volume + variation + good per-account IPs + aged accounts.
+
+**Tested + reviewed (2026-06-20):** a live real-browser fingerprint test (`scripts/test-fingerprint.js`,
+10/10 — WebGL = real Intel GPU not SwiftShader, webdriver false, clean UA, screenX patched) and a
+backend suite (`scripts/test-antispam.js`, 27/27 — spintax/image/link variation + a real
+Orchestrator+store run proving daily-cap/cool-down/persistence). A 4-agent regression review then
+drove fixes: parseProxy now accepts `scheme://user:pass@host:port` (was hard-skipping accounts with
+that standard format), daily cap now stops mid-run (no overshoot, via `maxThisRun`), proxy_invalid
+added to the all-fail stop guard, cool-down clears on pending-only recovery, stagger is Pause-aware,
+screen-geometry getters moved to the Window prototype, varyLinks uses a non-colliding `s=` param
+(not `ref=`) and replaces rather than doubles, shared-IP pool warning, and saveSettings preserves
+non-form keys. **Still requires a real FB post by the operator** to confirm end-to-end (needs an
+account logged in — can't be automated). Known deferred gap: per-account User-Agent is not varied
+(risky to spoof without engine mismatch; running many accounts on one machine inherently shares
+canvas/WebGL/fonts — real mitigation is per-account proxies, done, + separate machines for scale).
 
 ## ⭐ STATUS 2026-06-19 — verified working end-to-end (read this first)
 

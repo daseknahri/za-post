@@ -96,8 +96,12 @@ function varyLinks(text, seedStr) {
   return String(text).replace(/https?:\/\/[^\s]+/g, (url) => {
     const clean = url.replace(/[).,]+$/, ''); // don't swallow trailing punctuation
     const trail = url.slice(clean.length);
-    const sep = clean.includes('?') ? '&' : '?';
-    return `${clean}${sep}ref=${tag()}${trail}`;
+    // Use a neutral key 's' (NOT 'ref', which collides with Facebook's own ?ref= params), and
+    // REPLACE an existing s=/ref= rather than appending a second one.
+    let u = clean;
+    if (/[?&](?:s|ref)=[^&]*/.test(u)) u = u.replace(/([?&])(?:s|ref)=[^&]*/, `$1s=${tag()}`);
+    else u += (u.includes('?') ? '&' : '?') + `s=${tag()}`;
+    return `${u}${trail}`;
   });
 }
 
@@ -153,12 +157,19 @@ const SEL = {
   ],
 };
 
-// Parse a stored proxy string "scheme://ip:port[:user:pass]" -> parts + upstream URL.
+// Parse a stored proxy string -> parts + upstream URL. Accepts BOTH common formats:
+//   scheme://user:pass@host:port   (standard URL form — what most provider dashboards give)
+//   scheme://host:port[:user:pass] (compact colon form)
 function parseProxy(str) {
   if (!str) return null;
-  const m = String(str).match(/^(\w+):\/\/([^:]+):(\d+)(?::([^:]+):(.+))?$/);
-  if (!m) return null;
-  const [, scheme, ip, port, user, pass] = m;
+  let scheme, ip, port, user, pass;
+  let m = String(str).trim().match(/^(\w+):\/\/([^:@/\s]+):([^@/\s]+)@([^:/@\s]+):(\d+)$/);
+  if (m) { [, scheme, user, pass, ip, port] = m; }
+  else {
+    m = String(str).trim().match(/^(\w+):\/\/([^:\s]+):(\d+)(?::([^:]+):(.+))?$/);
+    if (!m) return null;
+    [, scheme, ip, port, user, pass] = m;
+  }
   const auth = user ? `${encodeURIComponent(user)}:${encodeURIComponent(pass || '')}@` : '';
   return { scheme, server: `${scheme}://${ip}:${port}`, username: user || null, password: pass || null,
     upstream: `${scheme}://${auth}${ip}:${port}` };
@@ -741,7 +752,7 @@ async function credentialLogin(page, email, password, log, name) {
  * @param {()=>boolean} o.shouldStop
  */
 async function runAccount(o) {
-  const { account, post: basePost, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused } = o;
+  const { account, post: basePost, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused, maxThisRun } = o;
   const name = account.name;
   // Per-account successful-run counter (file-based) — drives the new-account WARM-UP gate below.
   const runCountFile = path.join(store.accountDir(name), 'run-count.txt');
@@ -903,8 +914,12 @@ async function runAccount(o) {
         // The hidden window is parked at -32000,-32000 (impossible on a real desktop). Report a
         // plausible on-screen position so screenX/Y/Left/Top don't expose the off-screen trick —
         // this leak is present even in "visible" mode's initial frame, matching the user's symptom.
+        // Define on Window.prototype (where real browsers expose these) so a probe of
+        // Object.getOwnPropertyDescriptor(window,'screenX') sees no own-property override.
+        const proto = Object.getPrototypeOf(window) || window;
         for (const pv of [['screenX', 80], ['screenY', 40], ['screenLeft', 80], ['screenTop', 40]]) {
-          try { Object.defineProperty(window, pv[0], { configurable: true, get: () => pv[1] }); } catch {}
+          try { Object.defineProperty(proto, pv[0], { configurable: true, get: () => pv[1] }); }
+          catch { try { Object.defineProperty(window, pv[0], { configurable: true, get: () => pv[1] }); } catch {} }
         }
       });
     } catch {}
@@ -924,7 +939,7 @@ async function runAccount(o) {
     // watchdog. The watchdog still probes liveness before aborting, so a generous budget is safe.
     const _gd = (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 180) * 1.3;
     const _cd = Number.isFinite(settings.commentDelayMax) ? settings.commentDelayMax : 180;
-    const perGroupMs = (_gd + _cd + 150) * 1000;
+    const perGroupMs = (_gd + _cd + 250) * 1000; // +250s work headroom (dwell + slow-typing fallback + upload + publish)
     const accountBudget = Math.max(600000, Math.round(targetGroups.length * perGroupMs));
     // The watchdog must fire ONLY when the account is genuinely wedged. setTimeout counts wall-clock,
     // which includes laptop sleep — so on resume the timer can fire immediately on a perfectly healthy
@@ -1335,6 +1350,11 @@ async function runAccount(o) {
         }
       }
 
+      // Daily-cap budget: stop this account once it has used its remaining posts for today, so a
+      // single run can't overshoot the cap by (groups - 1). maxThisRun is the orchestrator's
+      // remaining-budget for this account today (Infinity / undefined when the cap is off).
+      if (Number.isFinite(maxThisRun) && posted >= maxThisRun) { log(`📵 [${name}] reached today's remaining post budget (${posted}) — stopping this account`); break; }
+
       // Interruptible delay between groups (respects Stop + configurable groupDelay), jittered ±30%
       // so the cadence is never metronomic (a fixed gap is itself a bot signal).
       if (i < targetGroups.length - 1) {
@@ -1352,8 +1372,9 @@ async function runAccount(o) {
     try { const cks = await withTimeout(page.cookies(), 8000, null); if (cks) store.writeCookies(name, cks); } catch {}
     fs.writeFileSync(require('path').join(store.accountDir(name), 'last-run-success.txt'),
       `${errors === 0 ? 'SUCCESS' : 'PARTIAL'}\nPosts: ${posted}\nPending: ${pendingApproval}\nTime: ${new Date().toISOString()}\n`);
-    // Bump the warm-up run counter once this account has actually posted something.
-    if (posted > 0) { try { fs.writeFileSync(runCountFile, String(priorRuns + 1)); } catch {} }
+    // Bump the warm-up run counter for any completed run (not only posted>0) so a new account that
+    // keeps failing to post still ages out of warm-up instead of repeating the warm-up browse forever.
+    try { fs.writeFileSync(runCountFile, String(priorRuns + 1)); } catch {}
   } catch (e) {
     errors++;
     log(`❌ [${name}] fatal: ${e.message}`);
