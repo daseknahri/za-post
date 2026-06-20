@@ -549,6 +549,74 @@
             </label>
             <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, the app will be registered as a Windows login item and start automatically when you sign in. Disabled by default.</small>
           </div>
+
+          <!-- Anti-spam sub-section -->
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+            <h3 class="text-sm font-bold text-gray-200 mb-4" style="border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 10px;">🛡️ Anti-spam (Facebook safety)</h3>
+
+            <div class="space-y-4">
+              <div>
+                <label for="setting-comment-delay-min" class="block text-sm font-semibold text-gray-300 mb-2">First-comment delay min (seconds)</label>
+                <input type="number" id="setting-comment-delay-min" min="0" value="60"
+                  class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">Minimum seconds to wait before posting the first comment after a post</small>
+              </div>
+
+              <div>
+                <label for="setting-comment-delay-max" class="block text-sm font-semibold text-gray-300 mb-2">First-comment delay max (seconds)</label>
+                <input type="number" id="setting-comment-delay-max" min="0" value="180"
+                  class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">Maximum seconds to wait before posting the first comment after a post</small>
+              </div>
+
+              <div>
+                <label for="setting-daily-cap" class="block text-sm font-semibold text-gray-300 mb-2">Daily post cap per account (0 = off)</label>
+                <input type="number" id="setting-daily-cap" min="0" value="0"
+                  class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">Maximum posts per account per day; 0 means no cap</small>
+              </div>
+
+              <div>
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-vary-content" class="w-5 h-5 rounded-md accent-accent" checked>
+                  <span class="text-sm font-semibold text-gray-300">Vary captions/comments with {a|b|c} spintax</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, {option1|option2|option3} blocks in captions and comments are randomly resolved per post — helps avoid duplicate-content flags</small>
+              </div>
+
+              <div>
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-vary-images" class="w-5 h-5 rounded-md accent-accent" checked>
+                  <span class="text-sm font-semibold text-gray-300">Vary image per group (unique hash)</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">Applies an invisible per-group pixel tweak so each uploaded image has a unique hash, reducing duplicate-media detection</small>
+              </div>
+
+              <div>
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-randomize-links" class="w-5 h-5 rounded-md accent-accent" checked>
+                  <span class="text-sm font-semibold text-gray-300">Randomize links in first comment</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">Adds a random tracking parameter to links in the first comment so each URL is unique and harder to flag as repetitive spam</small>
+              </div>
+
+              <div>
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-stagger-accounts" class="w-5 h-5 rounded-md accent-accent" checked>
+                  <span class="text-sm font-semibold text-gray-300">Stagger account start times</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">Adds a random delay between accounts starting a new cycle so they don't all hit Facebook simultaneously</small>
+              </div>
+
+              <div>
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-enable-warmup" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">Warm up new accounts before posting</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, new accounts will browse and interact lightly before their first post to appear more human to Facebook</small>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -678,6 +746,7 @@
           <label for="post-caption" class="block text-sm font-semibold text-gray-300 mb-2">Caption *</label>
           <textarea id="post-caption" rows="4" placeholder="Enter your post caption..."
             class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all resize-y"></textarea>
+          <small class="block mt-2 text-xs text-gray-500">Tip: write {Hello|Hi|Hey} — each group gets a random variant. Helps avoid spam flags.</small>
         </div>
 
         <div class="form-group">

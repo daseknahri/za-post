@@ -231,3 +231,59 @@ contains macOS symlinks whose extraction needs admin / Windows Developer Mode. S
 | `test-notif.js` | verify Windows toast notifications work |
 | `test-comment.js`, `diag-comment.js`, `inspect-fb.js`, … | FB DOM diagnostics |
 | `migrate.js`, `prep-accounts.js`, `sync-memberships.js` | data/account utilities |
+
+## 13. Anti-spam hardening (why posts get flagged, and the mitigations)
+
+Facebook filters group posts to spam based on **what & how** you post, not whether the browser
+window is visible. A grounded audit of the posting code found five risk dimensions; each now has
+code mitigations (all on by default, tunable in **Settings → Anti-spam**).
+
+**Fingerprint** (`automation/worker.js` launch + `evaluateOnNewDocument`)
+- Removed `--disable-gpu` / `--disable-software-rasterizer` — they forced WebGL onto the
+  **"Google SwiftShader"** software renderer, a near-unique headless/bot tell present even in
+  visible mode. With the GPU on (the run is headful) WebGL reports a real renderer.
+- Patched the off-screen geometry leak: the hidden window is parked at `-32000,-32000`
+  (impossible on a real desktop); `screenX/Y/Left/Top` are now overridden to plausible on-screen
+  values so JS can't read the off-screen position.
+
+**Human-likeness** (`worker.js`)
+- Captions: typing slowed to ~35–105 ms/keystroke (was 5–17 ms). Paste stays as the reliable
+  fallback (a `page.keyboard` Ctrl+V dispatches a **trusted** paste event).
+- Real multi-step mouse movement before the composer and Post-button clicks (was teleport-click).
+- A "read the feed" dwell (mouse drift + a few scrolls with pauses) before each composer open.
+
+**Velocity / cadence** (`worker.js` + `automation/orchestrator.js`)
+- Every delay is jittered ±20–30% so the cadence is never metronomic.
+- Safer defaults: `groupDelay` 60→**180 s**, `waitInterval` 60→**120 min**, `accountDelay` 1→**2 min**,
+  `parallelAccounts` 3→**2**. Accounts in a batch are **staggered** (`staggerAccounts`) so they
+  don't hit FB at the same instant.
+- **Per-account daily cap** (`dailyCap`, 0 = off): max group-posts/account/day, resets at midnight.
+- **Rate-limit cool-down** (`rateLimitCooldownHours`, default 4 h, exponential ×2 per strike, ≤48 h):
+  a rate-limited account rests for hours instead of re-hammering every cycle. Persisted per account
+  (`rateLimitedUntil`/`rlStrikes`) and cleared on a clean post.
+
+**Content variation** — the #1 fix (identical text+image to many groups is FB's strongest signal)
+- **Spintax** (`lib/spintax.js`): captions/comments support `{a|b|c}`; each group gets a different
+  expansion (`varyContent`).
+- **Image variation** (`lib/imageVary.js`, uses `jimp`): per-(account,group) the image is trimmed a
+  few %, tone-shifted, and lightly noised so the **perceptual hash differs** while it looks identical
+  (`varyImages`). Falls back to the original if jimp is unavailable.
+- **First-comment delay** (`commentDelayMin`/`Max`, default 60–180 s): the comment (often a link) is
+  no longer dropped ~6 s after the post — post-then-instant-link is a textbook spam pattern. The
+  permalink is captured **before** the wait so the post is still found reliably afterward.
+- **Link variation** (`randomizeLinks`): links in the first comment get a unique `?ref=` param so the
+  same URL isn't posted verbatim everywhere.
+
+**Account trust / IP** (`worker.js` proxy block + `orchestrator.js`)
+- **Per-account stable proxy**: each account uses `account.proxy` (set in the Accounts tab) or a pool
+  entry chosen by a stable hash of its name — so an account keeps the **same exit IP** every run
+  (was a random pool pick per launch). A configured-but-invalid proxy now **skips** the account
+  (`proxy_invalid`) instead of silently posting from the real IP.
+- A one-time per-run warning fires when proxies are OFF and >1 account is active (shared-IP risk).
+- **Warm-up** (`enableWarmup`, opt-in): an account browses the feed for its first `warmupRuns` runs
+  before posting (tracked via `accounts/<name>/run-count.txt`).
+
+**Honest limitation:** posting identical promo content to many groups from many accounts is
+inherently spam-shaped — these changes materially cut the flag rate but can't make it invisible.
+The durable fix is **lower volume + real content variation + good per-account residential IPs +
+aged/warmed accounts.**

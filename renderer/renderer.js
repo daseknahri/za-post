@@ -1092,7 +1092,16 @@ function renderAccounts() {
             <option value="sequence" ${account.postingOrder === 'sequence' ? 'selected' : ''}>📋 Progressive (Sequential)</option>
           </select>
         </div>
-        
+
+        <!-- Per-Account Proxy Section -->
+        <div class="account-proxy" style="margin: 12px 0; padding: 10px; background: #1e293b; border-radius: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <span style="font-size: 12px; color: #94a3b8;">🌐 Account Proxy:</span>
+          </div>
+          <input type="text" id="account-proxy-${account.name}" value="${escapeHtml(account.proxy || '')}" placeholder="scheme://ip:port[:user:pass] — e.g. socks5://1.2.3.4:1080:user:pass" onchange="updateAccountProxy('${account.name}', this.value)" style="width: 100%; padding: 8px 12px; background: #1f2937; border: 1px solid #374151; border-radius: 6px; color: #e5e7eb; font-size: 13px; box-sizing: border-box;">
+          <small style="display: block; margin-top: 6px; font-size: 11px; color: #6b7280;">One stable proxy per account (recommended). Leave blank to use the global pool / your IP.</small>
+        </div>
+
         <div class="account-actions" style="display: flex; gap: 6px;">
           <button class="btn-primary" onclick="loginAccount('${account.name}')">
             🔐 Login
@@ -1205,6 +1214,15 @@ async function updatePostingOrder(accountName, orderValue) {
     'sequence': 'Progressive (Sequential)'
   };
   showNotification(`Posting method set to: ${orderLabels[orderValue]}`, 'success');
+}
+
+// Update per-account proxy
+async function updateAccountProxy(accountName, proxyValue) {
+  const account = appData.accounts.find(a => a.name === accountName);
+  if (!account) return;
+  account.proxy = (proxyValue || '').trim();
+  await saveData();
+  showNotification(account.proxy ? `Proxy set for ${accountName}` : `Proxy cleared for ${accountName}`, 'success');
 }
 
 // Edit account name and alias
@@ -1823,6 +1841,14 @@ function loadSettings() {
   document.getElementById('setting-loop-campaign').checked = appData.settings.loopCampaign || false;
   document.getElementById('setting-resume-on-startup').checked = appData.settings.resumeOnStartup === true;
   document.getElementById('setting-launch-on-startup').checked = appData.settings.launchOnStartup || false;
+  document.getElementById('setting-comment-delay-min').value = appData.settings.commentDelayMin !== undefined ? appData.settings.commentDelayMin : 60;
+  document.getElementById('setting-comment-delay-max').value = appData.settings.commentDelayMax !== undefined ? appData.settings.commentDelayMax : 180;
+  document.getElementById('setting-daily-cap').value = appData.settings.dailyCap !== undefined ? appData.settings.dailyCap : 0;
+  document.getElementById('setting-vary-content').checked = appData.settings.varyContent !== false;
+  document.getElementById('setting-vary-images').checked = appData.settings.varyImages !== false;
+  document.getElementById('setting-randomize-links').checked = appData.settings.randomizeLinks !== false;
+  document.getElementById('setting-stagger-accounts').checked = appData.settings.staggerAccounts !== false;
+  document.getElementById('setting-enable-warmup').checked = appData.settings.enableWarmup || false;
 }
 
 async function saveSettings() {
@@ -1843,6 +1869,14 @@ async function saveSettings() {
     loopCampaign: document.getElementById('setting-loop-campaign').checked,
     resumeOnStartup: document.getElementById('setting-resume-on-startup').checked,
     launchOnStartup: document.getElementById('setting-launch-on-startup').checked,
+    commentDelayMin: intOr('setting-comment-delay-min', 60),
+    commentDelayMax: intOr('setting-comment-delay-max', 180),
+    dailyCap: intOr('setting-daily-cap', 0),
+    varyContent: document.getElementById('setting-vary-content').checked,
+    varyImages: document.getElementById('setting-vary-images').checked,
+    randomizeLinks: document.getElementById('setting-randomize-links').checked,
+    staggerAccounts: document.getElementById('setting-stagger-accounts').checked,
+    enableWarmup: document.getElementById('setting-enable-warmup').checked,
   };
 
   const result = await window.electronAPI.saveSettings(settings);

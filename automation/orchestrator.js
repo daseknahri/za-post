@@ -17,6 +17,9 @@ const { runAccount } = require('./worker');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Jitter a delay by ±pct so batch/cycle gaps are never metronomic (a fixed cadence is a bot signal).
+const jitter = (ms, pct = 0.25) => Math.round(Math.max(0, Number(ms) || 0) * (1 - pct + Math.random() * pct * 2));
+
 let axios; try { axios = require('axios'); } catch {}
 const https = require('https');
 
@@ -202,6 +205,7 @@ class Orchestrator {
       needs_login: 'log in again (its session expired)',
       account_disabled: 'check it on Facebook — the account is disabled/restricted',
       likely_blocked: 'check it on Facebook — it posted nothing (likely blocked/restricted)',
+      proxy_invalid: 'fix this account’s proxy in the Accounts tab — it was skipped so it never posts from your real IP',
     };
     const flagged = Object.entries(this._runFlags || {}).map(([name, flag]) => ({ name, flag, action: ACTION[flag] || 'check this account on Facebook' }));
     summary.flagged = flagged;
@@ -335,13 +339,14 @@ class Orchestrator {
                 else if (r.flag === 'needs_verification') { acc.status = 'checkpoint'; acc.lastMessage = '🔐 Facebook wants identity/human verification — open this account and complete the check'; }
                 else if (r.flag === 'account_disabled') { acc.status = 'error'; acc.lastMessage = '🚫 Account disabled/restricted by Facebook — needs manual attention'; }
                 else if (r.flag === 'likely_blocked') { acc.status = 'error'; acc.lastMessage = '⚠️ Posted nothing across its groups — likely blocked/restricted; check this account on Facebook'; }
+                else if (r.flag === 'proxy_invalid') { acc.status = 'error'; acc.lastMessage = '🚫 Invalid proxy — account skipped (it won’t post from your real IP). Fix its proxy in the Accounts tab.'; }
               });
               this.emit('data-updated');
             } catch {}
             // Ping the user with a desktop notification when an account needs THEM (captcha /
             // verification, a re-login, a disabled account, or a likely block). main.js dedupes so
             // it won't spam across cycles. rate_limited is excluded — it auto-retries.
-            if (['needs_verification', 'needs_login', 'account_disabled', 'likely_blocked'].includes(r.flag)) {
+            if (['needs_verification', 'needs_login', 'account_disabled', 'likely_blocked', 'proxy_invalid'].includes(r.flag)) {
               this.emit('account-attention', { name: account.name, flag: r.flag });
             }
           }
@@ -368,10 +373,34 @@ class Orchestrator {
     }
   }
 
+  // Persist per-account daily volume + rate-limit cool-down after a run (serialized via store.update
+  // so it can't clobber a concurrent UI/remote edit). Daily count drives the dailyCap gate; the
+  // cool-down timestamp drives the skip above. A clean post clears any prior cool-down/strikes.
+  async _recordAccountOutcome(name, res, settings) {
+    const today = store.todayKey();
+    const baseHours = Number.isFinite(settings.rateLimitCooldownHours) ? settings.rateLimitCooldownHours : 4;
+    try {
+      await store.update((d) => {
+        const acc = d.accounts.find((a) => a.name === name);
+        if (!acc) return;
+        if (!acc.daily || acc.daily.date !== today) acc.daily = { date: today, count: 0 };
+        acc.daily.count += res.posted || 0;
+        if (res.flag === 'rate_limited') {
+          acc.rlStrikes = (acc.rlStrikes || 0) + 1;
+          const hours = Math.min(48, baseHours * Math.pow(2, acc.rlStrikes - 1));
+          acc.rateLimitedUntil = Date.now() + Math.round(hours * 3600000);
+        } else if ((res.posted || 0) > 0 && !res.flag && (acc.rateLimitedUntil || acc.rlStrikes)) {
+          acc.rateLimitedUntil = 0; acc.rlStrikes = 0;
+        }
+      });
+    } catch {}
+  }
+
   async _loop(getData) {
     const _st = store.loadRotation();
     this._dealt = new Set(Array.isArray(_st.dealt) ? _st.dealt : []); // post-ids already dealt (unique modes)
     this._zeroProgressCycles = 0; // consecutive cycles that dealt nothing -> stall breaker
+    this._proxyWarned = false;    // one-time per-run "proxies off / shared IP" warning
     this._roundOffset = _st.roundOffset || 0; // rotates account↔post mapping across Loop-campaign recycles
     let cycle = 0;
     while (!this._shouldStop()) {
@@ -381,6 +410,11 @@ class Orchestrator {
       const active = accounts.filter((a) => a.enabled !== false);
       if (!active.length) { this.log('⚠️ No enabled accounts — stopping.'); break; }
       this._active = active;
+      // Shared-IP warning: many accounts from ONE IP is a top coordinated-spam signal.
+      if (!settings.useProxies && active.length > 1 && !this._proxyWarned) {
+        this._proxyWarned = true;
+        this.log(`⚠️ Proxies are OFF and ${active.length} accounts are active — they will all post from the SAME IP. Facebook links accounts that share an IP and can flag them together. Strongly consider assigning a proxy per account (Accounts tab), or run fewer accounts at once.`);
+      }
 
       cycle++;
       this._claimed = new Set(); // fresh per-cycle claim ledger (released claims free a post for another account)
@@ -444,19 +478,35 @@ class Orchestrator {
         for (const ba of batch) {
           this.log(`[${ba.name}] Starting with ${(ba.assignedGroups || []).length} groups`);
         }
-        const results = await Promise.all(batch.map(async (account) => {
+        const results = await Promise.all(batch.map(async (account, idx) => {
+          // Stagger account starts within a batch so 2-3 browsers don't hit Facebook at the SAME
+          // instant from the same IP block (a coordinated-burst signal). Spread over ~0-90s.
+          if (settings.staggerAccounts !== false && idx > 0 && !this._shouldStop()) {
+            await this._interruptibleSleep(jitter(idx * 35000, 0.5));
+          }
           // Mid-run toggle: if the user turned this account OFF since the cycle began, skip it now so
           // it stops working DURING the run (the cycle's account list was snapshotted at its start).
           const live = (getData().accounts || []).find((a) => a.name === account.name);
-          if (live && live.enabled === false) {
-            this.log(`⏸️ [${account.name}] turned OFF — skipping for the rest of this run`);
-            this._progress.accountsDone++; this.emit('automation-progress', { ...this._progress });
-            return { account, progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [], dealtIds: [], flag: null, offline: false };
+          const idle = (msg) => { this.log(msg); this._progress.accountsDone++; this.emit('automation-progress', { ...this._progress }); return { account, progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [], dealtIds: [], flag: null, offline: false }; };
+          if (live && live.enabled === false) return idle(`⏸️ [${account.name}] turned OFF — skipping for the rest of this run`);
+          // Rate-limit COOL-DOWN: a recently rate-limited account rests for hours (exponential) instead
+          // of re-hammering FB every cycle (which escalates a soft limit into a hard block).
+          if (live && live.rateLimitedUntil && live.rateLimitedUntil > Date.now()) {
+            const mins = Math.ceil((live.rateLimitedUntil - Date.now()) / 60000);
+            return idle(`🧊 [${account.name}] cooling down after a rate-limit — ${mins} min left; skipping this cycle`);
+          }
+          // Per-account DAILY CAP on group-posts (0 = off) — keeps each account within a human-plausible
+          // daily volume; the counter resets each calendar day.
+          const cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
+          if (cap > 0 && live && live.daily && live.daily.date === store.todayKey() && (live.daily.count || 0) >= cap) {
+            return idle(`📵 [${account.name}] daily cap reached (${live.daily.count}/${cap} group-posts today) — skipping until tomorrow`);
           }
           const r = await this._runAccount(account, cycle)
             .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [], offline: false }; });
           this.log(`✓ [${account.name}] Completed`);
           const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null, offline: (r && r.offline) || false };
+          // Persist this account's daily group-post count + rate-limit cool-down.
+          await this._recordAccountOutcome(account.name, res, settings);
           this._progress.accountsDone++;
           this._progress.posted += res.posted;
           this._progress.errors += res.errors;
@@ -481,7 +531,7 @@ class Orchestrator {
         }
         if (this._finish) break;
         if (b < batches.length - 1 && !this._shouldStop()) {
-          await this._waitWithCountdown((Number.isFinite(settings.accountDelay) ? settings.accountDelay : 1) * 60000, 'Next batch');
+          await this._waitWithCountdown(jitter((Number.isFinite(settings.accountDelay) ? settings.accountDelay : 2) * 60000), 'Next batch');
         }
       }
       // Mark this cycle's published posts as DEALT (drives the round-robin: each post once;
@@ -527,8 +577,8 @@ class Orchestrator {
       if ((settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {
         this.log(`🏁 Reached maxCycles (${settings.maxCycles}) — finishing.`); break;
       }
-      this.log(`✅ Cycle ${cycle} complete. Waiting ${Number.isFinite(settings.waitInterval) ? settings.waitInterval : 60} min before next cycle…`);
-      await this._waitWithCountdown((Number.isFinite(settings.waitInterval) ? settings.waitInterval : 60) * 60000, 'Next cycle');
+      this.log(`✅ Cycle ${cycle} complete. Waiting ~${Number.isFinite(settings.waitInterval) ? settings.waitInterval : 120} min (±20%) before next cycle…`);
+      await this._waitWithCountdown(jitter((Number.isFinite(settings.waitInterval) ? settings.waitInterval : 120) * 60000, 0.2), 'Next cycle');
     }
   }
 

@@ -14,6 +14,8 @@ let proxyChain; try { proxyChain = require('proxy-chain'); } catch {}
 
 const store = require('../lib/store');
 const { chromiumPath } = require('../lib/chromium');
+const spintax = require('../lib/spintax');
+const imageVary = require('../lib/imageVary');
 const { execFile } = require('child_process');
 
 // Push a browser window BEHIND other windows WITHOUT activating it, so a VISIBLE run doesn't steal
@@ -46,6 +48,57 @@ async function sleepInterruptible(ms, shouldStop = () => false, step = 500) {
     waited += chunk;
   }
   return !shouldStop();
+}
+
+// Jitter a base delay by ±pct (default ±30%) so no two waits are identical — a fixed cadence
+// is itself a bot signal. Always returns a non-negative integer ms.
+function jitter(ms, pct = 0.3) {
+  const base = Math.max(0, Number(ms) || 0);
+  return Math.round(base * (1 - pct + Math.random() * pct * 2));
+}
+
+// Move the cursor to (x,y) along a short multi-step path instead of teleport-clicking. FB's
+// integrity JS expects a real mouse trajectory before a click; a click with no preceding
+// mousemove is non-human. Best-effort — never throws into the caller.
+async function moveMouseTo(page, x, y) {
+  try {
+    const steps = 8 + Math.floor(Math.random() * 10);
+    await page.mouse.move(x + (Math.random() * 6 - 3), y + (Math.random() * 6 - 3), { steps });
+    await sleep(40 + Math.floor(Math.random() * 120));
+  } catch {}
+}
+
+// Land on a group and behave like a human reading before composing: a little mouse drift and a
+// few wheel scrolls with pauses, total ~5-13s. Reduces the "instant composer open" bot pattern.
+async function humanDwell(page, shouldStop = () => false) {
+  try {
+    await moveMouseTo(page, 380 + Math.random() * 240, 280 + Math.random() * 160);
+    const scrolls = 2 + Math.floor(Math.random() * 3);
+    for (let s = 0; s < scrolls && !shouldStop(); s++) {
+      try { await page.mouse.wheel({ deltaY: 200 + Math.random() * 320 }); } catch {}
+      await sleep(700 + Math.floor(Math.random() * 1500));
+    }
+    if (!shouldStop()) { try { await page.mouse.wheel({ deltaY: -(150 + Math.random() * 200) }); } catch {} }
+    await sleepInterruptible(1500 + Math.floor(Math.random() * 3000), shouldStop, 500);
+  } catch {}
+}
+
+// Give each link in the text a unique query param so the SAME url isn't posted verbatim to every
+// group (FB dedups exact URLs across groups). Adds ?ref=/&ref=<short per-account+group hash>.
+function varyLinks(text, seedStr) {
+  if (!text) return text;
+  let n = 0;
+  const tag = () => {
+    const base = `${seedStr}|${n++}|${Date.now()}`;
+    let h = 5381; for (let i = 0; i < base.length; i++) h = ((h << 5) + h + base.charCodeAt(i)) >>> 0;
+    return h.toString(36).slice(0, 8);
+  };
+  return String(text).replace(/https?:\/\/[^\s]+/g, (url) => {
+    const clean = url.replace(/[).,]+$/, ''); // don't swallow trailing punctuation
+    const trail = url.slice(clean.length);
+    const sep = clean.includes('?') ? '&' : '?';
+    return `${clean}${sep}ref=${tag()}${trail}`;
+  });
 }
 
 function shortText(text, max = 90) {
@@ -129,7 +182,7 @@ async function clickPoint(page, selectors, timeout = 8000) {
       }
       return null;
     }, sels).catch(() => null);
-    if (pt) { await page.mouse.click(pt.x, pt.y, { delay: 40 }).catch(() => {}); return true; }
+    if (pt) { await moveMouseTo(page, pt.x, pt.y); await page.mouse.click(pt.x, pt.y, { delay: 40 }).catch(() => {}); return true; }
     await sleep(400);
   }
   return false;
@@ -254,7 +307,9 @@ async function clickPostButton(page) {
     }
     return null;
   }).catch(() => null);
-  if (pt) { await page.mouse.click(pt.x, pt.y, { delay: 40 }).catch(() => {}); return true; }
+  // Move the cursor to the button along a path (and a brief hover) before clicking, like a human —
+  // a click with no preceding mousemove is a bot tell FB's integrity JS looks for.
+  if (pt) { await moveMouseTo(page, pt.x, pt.y); await page.mouse.click(pt.x, pt.y, { delay: 40 }).catch(() => {}); return true; }
   return false;
 }
 
@@ -308,9 +363,11 @@ async function humanType(page, text) {
     let timer;
     const cap = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('keyboard.type timeout')), 15000); });
     try {
-      await Promise.race([page.keyboard.type(c, { delay: 5 + Math.floor(Math.random() * 12) }), cap]);
+      // ~35-105 ms/keystroke models a real typist (~50 WPM). The old 5-17 ms was machine-fast.
+      await Promise.race([page.keyboard.type(c, { delay: 35 + Math.floor(Math.random() * 70) }), cap]);
     } finally { clearTimeout(timer); }
-    await sleep(30 + Math.floor(Math.random() * 90));
+    // Inter-chunk pause, with an occasional longer "thinking" beat.
+    await sleep(60 + Math.floor(Math.random() * 160) + (Math.random() < 0.1 ? 300 + Math.floor(Math.random() * 700) : 0));
   }
 }
 
@@ -684,8 +741,11 @@ async function credentialLogin(page, email, password, log, name) {
  * @param {()=>boolean} o.shouldStop
  */
 async function runAccount(o) {
-  const { account, post, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused } = o;
+  const { account, post: basePost, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused } = o;
   const name = account.name;
+  // Per-account successful-run counter (file-based) — drives the new-account WARM-UP gate below.
+  const runCountFile = path.join(store.accountDir(name), 'run-count.txt');
+  let priorRuns = 0; try { priorRuns = parseInt(fs.readFileSync(runCountFile, 'utf8'), 10) || 0; } catch {}
 
   // Emit one audit record per (account, group, post) outcome for the persistent run report.
   const report = (groupName, gid, result, detail, commentResult) => {
@@ -693,7 +753,7 @@ async function runAccount(o) {
     try {
       onResult({
         ts: new Date().toISOString(), account: name, group: displayName(groupName), groupId: gid,
-        postId: post && post.id, caption: shortText((post && post.caption) || '', 60),
+        postId: basePost && basePost.id, caption: shortText((basePost && basePost.caption) || '', 60),
         result, comment: commentResult || '', detail: detail || '',
       });
     } catch {}
@@ -722,9 +782,11 @@ async function runAccount(o) {
     '--no-first-run',
     '--no-default-browser-check',
     '--hide-crash-restore-bubble',
-    // ---- resource efficiency (headless automation needs none of this) ----
-    '--disable-gpu',
-    '--disable-software-rasterizer',
+    // ---- resource efficiency ----
+    // NOTE: --disable-gpu / --disable-software-rasterizer were REMOVED on purpose. They force
+    // Chromium's WebGL onto the SwiftShader CPU renderer, and navigator WebGL RENDERER then
+    // reports "Google SwiftShader" — a near-unique headless/bot fingerprint FB reads on every
+    // page load. Keeping the GPU on lets WebGL report a real renderer (the run is headful).
     '--disable-dev-shm-usage',
     '--disable-extensions',
     '--disable-background-networking',
@@ -745,16 +807,33 @@ async function runAccount(o) {
   // through proxy-chain (a local anonymized HTTP proxy) when credentials are present.
   let proxyAuth = null, anonLocal = null, watchdog = null;
   const tempImages = []; // downloaded remote images to clean up at the end
-  if (useProxies && proxies && proxies.length) {
-    const p = parseProxy(proxies[Math.floor(Math.random() * proxies.length)]);
-    if (p) {
-      proxyAuth = p;
-      if (p.username && proxyChain) {
-        try { anonLocal = await proxyChain.anonymizeProxy(p.upstream); launchArgs.push(`--proxy-server=${anonLocal}`); log(`🌐 [${name}] proxy ${p.server} (auth via proxy-chain)`); }
-        catch (e) { launchArgs.push(`--proxy-server=${p.server}`); log(`⚠️ [${name}] proxy-chain failed (${e.message}) — auth credentials may be dropped, expect 407s`); }
-      } else { launchArgs.push(`--proxy-server=${p.server}`); log(`🌐 [${name}] proxy ${p.server}`); }
+  if (useProxies) {
+    // Per-account STABLE proxy: prefer the account's OWN assigned proxy; else pick from the shared
+    // pool by a stable hash of the account name, so an account keeps the SAME exit IP every run.
+    // (FB trusts a consistent per-account IP and links accounts that share/hop IPs — the old code
+    // picked a RANDOM pool entry each launch, making every account look like it changed IP each run.)
+    let proxyStr = (account.proxy && String(account.proxy).trim()) || '';
+    if (!proxyStr && proxies && proxies.length) {
+      let h = 0; for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+      proxyStr = proxies[h % proxies.length];
+    }
+    if (proxyStr) {
+      const p = parseProxy(proxyStr);
+      if (p) {
+        proxyAuth = p;
+        if (p.username && proxyChain) {
+          try { anonLocal = await proxyChain.anonymizeProxy(p.upstream); launchArgs.push(`--proxy-server=${anonLocal}`); log(`🌐 [${name}] proxy ${p.server} (auth via proxy-chain)`); }
+          catch (e) { launchArgs.push(`--proxy-server=${p.server}`); log(`⚠️ [${name}] proxy-chain failed (${e.message}) — auth credentials may be dropped, expect 407s`); }
+        } else { launchArgs.push(`--proxy-server=${p.server}`); log(`🌐 [${name}] proxy ${p.server}`); }
+      } else {
+        // A configured-but-malformed proxy is a real misconfig. Do NOT silently post from the bare
+        // IP (that defeats the point and can burn the account) — skip it and tell the operator.
+        log(`🚫 [${name}] proxy string is invalid ("${shortText(proxyStr, 40)}") — skipping this account so it does NOT post from your real IP. Fix the proxy in the Accounts tab.`);
+        report('', '', 'error', 'invalid proxy — account skipped', '');
+        return { posted: 0, errors: 1, pendingApproval: 0, noRetry: true, flag: 'proxy_invalid', postedIds: [] };
+      }
     } else {
-      log(`⚠️ [${name}] proxies enabled but the proxy string is invalid — running WITHOUT proxy`);
+      log(`⚠️ [${name}] proxies are ON but this account has NO proxy assigned (pool empty) — it will post from your real IP. Assign a proxy in the Accounts tab.`);
     }
   }
 
@@ -821,6 +900,12 @@ async function runAccount(o) {
         Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
         Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
         document.hasFocus = () => true;
+        // The hidden window is parked at -32000,-32000 (impossible on a real desktop). Report a
+        // plausible on-screen position so screenX/Y/Left/Top don't expose the off-screen trick —
+        // this leak is present even in "visible" mode's initial frame, matching the user's symptom.
+        for (const pv of [['screenX', 80], ['screenY', 40], ['screenLeft', 80], ['screenTop', 40]]) {
+          try { Object.defineProperty(window, pv[0], { configurable: true, get: () => pv[1] }); } catch {}
+        }
       });
     } catch {}
     // Allow clipboard access so captions can be PASTED (fast + reliable, like the original agent).
@@ -834,7 +919,13 @@ async function runAccount(o) {
     // Watchdog: hard cap on this account's run so one stuck account can never block the
     // whole queue. Generous (a full post+comment is ~3-4 min) so it only fires on a real
     // hang, not normal slow posts. Closing the browser makes in-flight ops reject → cleanup.
-    const accountBudget = Math.max(420000, targetGroups.length * 300000);
+    // Budget scales with the CONFIGURED per-group pacing (group delay + comment delay + ~150s of
+    // work, +30% jitter headroom) so the new, intentionally-slower human timing never trips the
+    // watchdog. The watchdog still probes liveness before aborting, so a generous budget is safe.
+    const _gd = (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 180) * 1.3;
+    const _cd = Number.isFinite(settings.commentDelayMax) ? settings.commentDelayMax : 180;
+    const perGroupMs = (_gd + _cd + 150) * 1000;
+    const accountBudget = Math.max(600000, Math.round(targetGroups.length * perGroupMs));
     // The watchdog must fire ONLY when the account is genuinely wedged. setTimeout counts wall-clock,
     // which includes laptop sleep — so on resume the timer can fire immediately on a perfectly healthy
     // run. Before aborting, probe liveness: if the browser still answers a trivial evaluate it just
@@ -915,21 +1006,35 @@ async function runAccount(o) {
       log(`🔑 [${name}] using existing profile session`);
     }
 
+    // New-account WARM-UP (opt-in): before its first few posts, an account browses the feed like a
+    // human (scroll + pauses) so it isn't a brand-new identity that ONLY ever opens group composers
+    // and posts promos — a strong new-account spam signal.
+    if (settings.enableWarmup && priorRuns < (Number.isFinite(settings.warmupRuns) ? settings.warmupRuns : 5) && !shouldStop()) {
+      log(`🌱 [${name}] warm-up (prior posting runs: ${priorRuns}) — browsing the feed before posting`);
+      try {
+        await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        await sleep(2000);
+        await dismissPopups(page);
+        await humanDwell(page, shouldStop);
+        await humanDwell(page, shouldStop);
+      } catch (e) { log(`⚠️ [${name}] warm-up skipped (${e.message})`); }
+    }
+
     // Resolve images once: local files, or download remote URLs to temp.
-    let resolvedImages = (post.imagePaths && post.imagePaths.length ? post.imagePaths : (post.imagePath ? [post.imagePath] : []))
+    let resolvedImages = (basePost.imagePaths && basePost.imagePaths.length ? basePost.imagePaths : (basePost.imagePath ? [basePost.imagePath] : []))
       .filter((p) => p && fs.existsSync(p));
-    if (!resolvedImages.length && post.imageUrl) {
-      const dl = await downloadImage(post.imageUrl);
+    if (!resolvedImages.length && basePost.imageUrl) {
+      const dl = await downloadImage(basePost.imageUrl);
       if (dl) { resolvedImages = [dl]; tempImages.push(dl); log(`⬇️ [${name}] image downloaded from URL`); }
       else log(`⚠️ [${name}] image URL set but download failed — posting without image`);
     }
     // Comment image: explicit comment image, remote URL, or the post image when commentWithImage is on.
     let commentImg = null;
-    if (post.commentImagePath) {
-      if (fs.existsSync(post.commentImagePath)) { commentImg = post.commentImagePath; log(`🖼 [${name}] comment image: uploaded file`); }
-      else log(`⚠️ [${name}] comment image file not found (${post.commentImagePath}) — comment will have no image`);
-    } else if (post.commentImageUrl) {
-      const dl = await downloadImage(post.commentImageUrl);
+    if (basePost.commentImagePath) {
+      if (fs.existsSync(basePost.commentImagePath)) { commentImg = basePost.commentImagePath; log(`🖼 [${name}] comment image: uploaded file`); }
+      else log(`⚠️ [${name}] comment image file not found (${basePost.commentImagePath}) — comment will have no image`);
+    } else if (basePost.commentImageUrl) {
+      const dl = await downloadImage(basePost.commentImageUrl);
       if (dl) { commentImg = dl; tempImages.push(dl); log(`🖼 [${name}] comment image: downloaded from URL`); }
       else log(`⚠️ [${name}] comment image URL set but download failed — comment will have no image`);
     } else if (settings.commentWithImage && resolvedImages.length) {
@@ -958,6 +1063,14 @@ async function runAccount(o) {
       const gid = g.groupId || g.id;
       const groupName = g.name || gid;
       const step = createStepLogger(log, name, groupName);
+      // Per-group content variation: expand {a|b|c} spintax so THIS group gets a different caption
+      // and comment than the others, and give any link in the comment a unique tracking param. This
+      // is the #1 fix for "identical content to many groups" — FB's strongest content-spam signal.
+      let captionText = basePost.caption || '', commentText = basePost.comment || '';
+      if (settings.varyContent !== false) { captionText = spintax.expand(captionText); commentText = spintax.expand(commentText); }
+      if (settings.randomizeLinks !== false) commentText = varyLinks(commentText, `${name}|${gid}`);
+      const post = { ...basePost, caption: captionText, comment: commentText };
+      let groupImages = resolvedImages, groupCommentImg = commentImg; // per-group (optionally perturbed) images
       try {
         step(`Navigate to group (${i + 1}/${targetGroups.length})`);
         const gotoGroup = () => page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
@@ -999,6 +1112,10 @@ async function runAccount(o) {
         await dismissPopups(page);
         if (await checkRateLimit(page)) { step('🛑 Rate-limited by Facebook — skipping this account immediately'); errors++; noRetry = true; flag = 'rate_limited'; report(groupName, gid, 'error', 'rate-limited by Facebook', ''); break; }
 
+        // Dwell like a human reading the group feed (mouse drift + a few scrolls with pauses)
+        // before composing, instead of opening the composer instantly on every visit (a bot tell).
+        await humanDwell(page, shouldStop);
+
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
         const opened = await openComposer(page, step, name);
@@ -1033,17 +1150,31 @@ async function runAccount(o) {
           return !!state.matched || (!post.caption.trim() && state.len > 0);
         };
 
+        // Perturb the image per (account, group) so the SAME picture doesn't upload with an
+        // IDENTICAL perceptual hash to every group — FB dedups images across groups, a strong
+        // spam signal. Visually identical; best-effort (falls back to the original if jimp is off).
+        if (settings.varyImages !== false && imageVary.available() && resolvedImages.length) {
+          const vi = [];
+          for (const im of resolvedImages) {
+            const v = await imageVary.varyImage(im, `${name}|${gid}|${im}`);
+            if (v) { vi.push(v); tempImages.push(v); } else vi.push(im);
+          }
+          groupImages = vi;
+          if (groupCommentImg) { const cv = await imageVary.varyImage(groupCommentImg, `${name}|${gid}|c|${groupCommentImg}`); if (cv) { groupCommentImg = cv; tempImages.push(cv); } }
+          step('Image varied (unique hash for this group)');
+        }
+
         // Image FIRST, then caption — mirrors the original agent. Paste is atomic so the
         // image's re-render can't clobber the caption. Scope the file input to the DIALOG.
-        if (resolvedImages.length) {
-          step(`Uploading ${resolvedImages.length} image(s)`);
+        if (groupImages.length) {
+          step(`Uploading ${groupImages.length} image(s)`);
           const input = (await page.$('div[role="dialog"] input[type="file"]')) || (await page.$(SEL.fileInput));
           if (input) {
             // Cap the upload: a stalled CDP file transfer (big image / slow disk) must not
             // hang the account for the full protocolTimeout and trip the watchdog.
             let upTimer;
             const upCap = new Promise((_, rej) => { upTimer = setTimeout(() => rej(new Error('uploadFile timeout')), 30000); });
-            try { await Promise.race([input.uploadFile(...resolvedImages), upCap]); step('Image attached'); await sleepInterruptible(3500, shouldStop); }
+            try { await Promise.race([input.uploadFile(...groupImages), upCap]); step('Image attached'); await sleepInterruptible(3500, shouldStop); }
             catch (upErr) { step(`Image upload stalled (${upErr.message}) — posting without image`); }
             finally { clearTimeout(upTimer); }
           }
@@ -1094,7 +1225,8 @@ async function runAccount(o) {
         }
 
         // Publish — then CONFIRM it actually published (dialog closed / Post button gone).
-        await sleepInterruptible(1500, shouldStop);
+        // Variable human "re-read before posting" pause (2-8s), not a fixed 1.5s on every post.
+        await sleepInterruptible(2000 + Math.floor(Math.random() * 6000), shouldStop, 500);
         step('Waiting for Post button to enable');
         const dialogCountBefore = await page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length).catch(() => 1);
         // Log what the Post-button scan sees (dialogs open, found label) — mirrors original's "🔍 Dialogs: N".
@@ -1140,7 +1272,7 @@ async function runAccount(o) {
           step('Post submitted but PENDING ADMIN APPROVAL - not counted, comment skipped');
           pendingApproval++;
           report(groupName, gid, 'pending', 'awaiting admin approval', 'skipped');
-          if (i < targetGroups.length - 1) await sleepInterruptible((Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000, shouldStop, 1000);
+          if (i < targetGroups.length - 1) await sleepInterruptible(jitter((Number.isFinite(settings.groupDelay) ? settings.groupDelay : 180) * 1000), shouldStop, 1000);
           continue;
         }
 
@@ -1166,18 +1298,25 @@ async function runAccount(o) {
         } catch {}
         if (postPermalink) step('Comment: captured the post link for a direct, reliable comment');
 
-        // First comment (the link) — reload, find OUR post, comment in its box.
+        // First comment (often a link) — reload, find OUR post, comment in its box.
         // addFirstComment logs every stage itself (via the same step() logger).
         // Fire when there is comment TEXT or a comment IMAGE — an image-only comment is valid.
-        const wantComment = !!((post.comment && post.comment.trim()) || commentImg);
+        const wantComment = !!((post.comment && post.comment.trim()) || groupCommentImg);
         let commentResult = wantComment ? 'failed' : 'none';
         if (wantComment) {
+          // CRITICAL anti-spam: do NOT comment seconds after the post — post-then-instant-link is a
+          // textbook spam pattern. Wait a randomized human gap first. The permalink was already
+          // captured above, so OUR post is still found reliably even after the wait.
+          const lo = Number.isFinite(settings.commentDelayMin) ? settings.commentDelayMin : 60;
+          const hi = Number.isFinite(settings.commentDelayMax) ? settings.commentDelayMax : 180;
+          const cd = Math.round((Math.min(lo, hi) + Math.random() * Math.abs(hi - lo)) * 1000);
+          if (cd > 0 && !shouldStop()) { step(`Comment: waiting ${Math.round(cd / 1000)}s before commenting (avoids the instant post→link spam pattern)`); await sleepInterruptible(cd, shouldStop, 1000); }
           // Retry up to 3× — addFirstComment only returns false BEFORE it submits (no box found,
           // a stalled renderer, etc.), so re-trying (it reloads each time) can't post a duplicate.
           let cok = false;
           for (let cAttempt = 1; cAttempt <= 3 && !cok && !shouldStop() && !aborted && browser && browser.isConnected(); cAttempt++) {
             if (cAttempt > 1) { step(`Comment: retry ${cAttempt}/3`); await sleepInterruptible(2500, shouldStop); }
-            cok = await addFirstComment(page, gid, post, commentImg, step, postPermalink);
+            cok = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink);
           }
           commentResult = cok ? 'posted' : 'failed';
           if (!cok) step('Comment: could not post after 3 attempts — skipped');
@@ -1196,12 +1335,12 @@ async function runAccount(o) {
         }
       }
 
-      // Interruptible delay between groups (respects Stop + configurable groupDelay).
+      // Interruptible delay between groups (respects Stop + configurable groupDelay), jittered ±30%
+      // so the cadence is never metronomic (a fixed gap is itself a bot signal).
       if (i < targetGroups.length - 1) {
-        const d = (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 60) * 1000;
+        const d = jitter((Number.isFinite(settings.groupDelay) ? settings.groupDelay : 180) * 1000);
         if (d > 0) {
-          const dMin = Math.round(d / 60000);
-          step(`Wait ${dMin > 0 ? dMin + 'min' : Math.round(d / 1000) + 's'} before next group`);
+          step(`Wait ${d >= 60000 ? Math.round(d / 60000) + 'min' : Math.round(d / 1000) + 's'} before next group`);
           await sleepInterruptible(d, shouldStop, 1000);
         }
       }
@@ -1213,6 +1352,8 @@ async function runAccount(o) {
     try { const cks = await withTimeout(page.cookies(), 8000, null); if (cks) store.writeCookies(name, cks); } catch {}
     fs.writeFileSync(require('path').join(store.accountDir(name), 'last-run-success.txt'),
       `${errors === 0 ? 'SUCCESS' : 'PARTIAL'}\nPosts: ${posted}\nPending: ${pendingApproval}\nTime: ${new Date().toISOString()}\n`);
+    // Bump the warm-up run counter once this account has actually posted something.
+    if (posted > 0) { try { fs.writeFileSync(runCountFile, String(priorRuns + 1)); } catch {} }
   } catch (e) {
     errors++;
     log(`❌ [${name}] fatal: ${e.message}`);

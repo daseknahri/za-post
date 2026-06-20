@@ -21,6 +21,7 @@
     "cloudflared": "^0.7.1",
     "cors": "^2.8.5",
     "express": "^5.2.1",
+    "jimp": "^0.22.12",
     "multer": "^2.0.2",
     "node-machine-id": "^1.1.12",
     "proxy-chain": "^2.7.0",
@@ -29,9 +30,9 @@
     "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "devDependencies": {
+    "bytenode": "^1.5.7",
     "electron": "^35.0.0",
-    "electron-builder": "^24.13.3",
-    "bytenode": "^1.5.7"
+    "electron-builder": "^24.13.3"
   },
   "build": {
     "appId": "com.zapost.commenttool",
@@ -58,7 +59,10 @@
       "!**/.cache/**"
     ],
     "extraResources": [
-      { "from": "chrome-bin", "to": "chrome" }
+      {
+        "from": "chrome-bin",
+        "to": "chrome"
+      }
     ],
     "asarUnpack": [
       "node_modules/bytenode/**",
