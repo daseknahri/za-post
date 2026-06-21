@@ -1331,13 +1331,22 @@ function renderModeratorPanel() {
       <div style="margin-top:10px;">${rows || '<div style="font-size:12px; color:#6b7280;">No moderators yet — click “➕ Add admin”, log it in, and (if 2+) assign groups below.</div>'}</div>
     </div>`;
 }
-// MOD: add an admin/moderator account straight from the Groups page — create + flag as moderator +
-// open the login browser. It never enters the posting Accounts list.
-async function addModeratorAccount() {
-  const accountName = (prompt('Name for the admin/moderator account (letters, numbers, _ only):') || '').trim();
-  if (!accountName) return;
+// MOD: add an admin/moderator account straight from the Groups page. Opens a modal (Electron's
+// renderer does NOT support window.prompt — it returns null — so a modal is required).
+function addModeratorAccount() {
+  const input = document.getElementById('admin-name');
+  if (input) input.value = '';
+  openModal('modal-add-admin');
+  setTimeout(() => { try { document.getElementById('admin-name').focus(); } catch {} }, 120);
+}
+// MOD: create the moderator from the modal — create account + flag as moderator (so it never posts and
+// never shows in the posting Accounts list) + open its login window.
+async function submitAddModerator() {
+  const accountName = ((document.getElementById('admin-name') || {}).value || '').trim();
+  if (!accountName) { showNotification('Please enter a name', 'error'); return; }
   if (!/^[a-zA-Z0-9_]+$/.test(accountName)) { showNotification('Name can only contain letters, numbers, and underscores', 'error'); return; }
   if ((appData.accounts || []).some((a) => a.name === accountName)) { showNotification('An account with that name already exists', 'error'); return; }
+  closeModal('modal-add-admin');
   showNotification('Creating moderator account…', 'info');
   const result = await window.electronAPI.createAccount(accountName, '');
   if (!result || !result.success) { showNotification('Failed to create: ' + ((result && result.error) || 'unknown'), 'error'); return; }

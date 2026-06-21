@@ -994,6 +994,31 @@
     </div>
   </div>
 
+  <!-- Modal for Adding a Group Moderator (admin) -->
+  <div id="modal-add-admin" class="modal">
+    <div class="modal-content bg-dark-700/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl max-w-md w-full">
+      <div class="modal-header flex justify-between items-center p-5 border-b border-white/5">
+        <h3 class="text-lg font-bold text-white">🛡️ Add group moderator (admin)</h3>
+        <button class="modal-close w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-500/20 transition-all" onclick="closeModal('modal-add-admin')">&times;</button>
+      </div>
+      <div class="modal-body p-5 space-y-4">
+        <div class="form-group">
+          <label for="admin-name" class="block text-sm font-semibold text-gray-300 mb-2">Moderator name *</label>
+          <input type="text" id="admin-name" placeholder="e.g., admin1"
+            class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+          <small class="block mt-2 text-xs text-gray-500">Letters, numbers and underscores only. This is an admin account that approves held posts — it never posts.</small>
+        </div>
+        <div class="info-box bg-accent/5 border border-accent/10 rounded-xl p-4">
+          <p class="text-xs text-gray-400">ℹ️ After you click Create, a login window opens — log in your admin Facebook account there. It won't appear in the Accounts tab.</p>
+        </div>
+      </div>
+      <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
+        <button class="btn-secondary px-5 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all" onclick="closeModal('modal-add-admin')">Cancel</button>
+        <button class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all" onclick="submitAddModerator()">Create &amp; log in</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Modal for Login Instructions -->
   <div id="modal-login-instructions" class="modal">
     <div
