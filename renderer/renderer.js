@@ -866,6 +866,7 @@ async function saveEditPost() {
 
 // Groups Management
 function renderGroups() {
+  try { renderModeratorPanel(); } catch {}
   const container = document.getElementById('groups-container');
 
   if (appData.groups.length === 0) {
@@ -971,7 +972,7 @@ function renderAccounts() {
     return;
   }
 
-  container.innerHTML = appData.accounts.map(account => {
+  container.innerHTML = appData.accounts.filter((a) => !a.isModerator).map(account => {
     const isEnabled = account.enabled !== false; // treat missing/undefined as true
 
     let statusClass = '';
@@ -1130,14 +1131,12 @@ function renderAccounts() {
           <small style="display: block; margin-top: 6px; font-size: 11px; color: #6b7280;">One stable proxy per account (recommended). Leave blank to use the global pool / your IP.</small>
         </div>
 
-        <!-- Moderator role: approves held ("Spam potentiel") posts so post+comment go live (needs "Enable moderator approval" in Settings) -->
-        <div class="account-moderator" style="margin: 12px 0; padding: 10px; background: #1e293b; border-radius: 8px;">
-          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:12px; color:#94a3b8;">
-            <input type="checkbox" ${account.isModerator ? 'checked' : ''} onchange="toggleModerator('${account.name}', this.checked)" style="width:16px;height:16px;accent-color:#6366f1;">
-            🛡️ Group moderator (auto-approves held posts) — set ONE admin account
-          </label>
-          <input type="text" value="${escapeHtml(account.fbDisplayName || '')}" placeholder="FB display name (e.g. Abdo Abdo) — how this account appears as a post author" onchange="updateFbDisplayName('${account.name}', this.value)" style="width:100%; margin-top:8px; padding:8px 12px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:13px; box-sizing:border-box;">
-          <small style="display:block; margin-top:6px; font-size:11px; color:#6b7280;">Auto-captured at login; set manually if approval can't match this account's posts.</small>
+        <!-- FB display name — how this account appears as a post author, so the moderator can recognise
+             its held posts in the queue. Auto-captured at login; the moderator itself is set in the Groups tab. -->
+        <div class="account-fbname" style="margin: 12px 0; padding: 10px; background: #1e293b; border-radius: 8px;">
+          <div style="font-size:12px; color:#94a3b8; margin-bottom:6px;">🪪 FB display name</div>
+          <input type="text" value="${escapeHtml(account.fbDisplayName || '')}" placeholder="e.g. Abdo Abdo — how this account appears as a post author" onchange="updateFbDisplayName('${account.name}', this.value)" style="width:100%; padding:8px 12px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:13px; box-sizing:border-box;">
+          <small style="display:block; margin-top:6px; font-size:11px; color:#6b7280;">Auto-captured at login; set manually if moderator approval can't match this account's posts.</small>
         </div>
 
         <div class="account-actions" style="display: flex; gap: 6px;">
@@ -1263,12 +1262,13 @@ async function updateAccountProxy(accountName, proxyValue) {
   showNotification(account.proxy ? `Proxy set for ${accountName}` : `Proxy cleared for ${accountName}`, 'success');
 }
 
-// MOD: designate the single group-moderator account (approves held posts). Exactly one moderator.
-async function toggleModerator(name, checked) {
-  (appData.accounts || []).forEach((a) => { a.isModerator = (a.name === name) ? !!checked : false; });
+// MOD: designate the single group-moderator account (approves held posts). Selecting '' clears it.
+async function toggleModerator(name) {
+  (appData.accounts || []).forEach((a) => { a.isModerator = (!!name && a.name === name); });
   await saveData();
-  showNotification(checked ? `🛡️ ${name} is the group moderator (approves held posts)` : 'Moderator role cleared', 'success');
-  try { renderAccounts(); } catch {}
+  const set = (appData.accounts || []).find((a) => a.isModerator);
+  showNotification(set ? `🛡️ ${set.name} is the group moderator (approves held posts; it won't post)` : 'Moderator cleared', 'success');
+  try { renderModeratorPanel(); renderAccounts(); } catch {}
 }
 // MOD: the FB display name used to recognise this account's posts in the moderation queue.
 async function updateFbDisplayName(name, value) {
@@ -1277,6 +1277,42 @@ async function updateFbDisplayName(name, value) {
   a.fbDisplayName = (value || '').trim();
   await saveData();
   showNotification(`FB display name ${a.fbDisplayName ? 'set' : 'cleared'} for ${name}`, 'success');
+}
+// MOD: the dedicated moderator section in the Groups view — designate the admin account, log it in,
+// set its display name. It approves held posts in all groups you admin and never posts itself.
+function renderModeratorPanel() {
+  const el = document.getElementById('moderator-panel');
+  if (!el) return;
+  const accts = appData.accounts || [];
+  const mod = accts.find((a) => a.isModerator);
+  const enabled = appData.settings && appData.settings.moderationEnabled === true;
+  const opts = ['<option value="">— None —</option>']
+    .concat(accts.map((a) => `<option value="${escapeHtml(a.name)}" ${a.isModerator ? 'selected' : ''}>${escapeHtml(a.alias || a.name)}</option>`)).join('');
+  const badge = mod ? (mod.status === 'logged_in'
+    ? '<span style="color:#34d399;">● logged in</span>'
+    : `<span style="color:#fbbf24;">● ${escapeHtml(mod.status || 'not logged in')}</span>`) : '';
+  el.innerHTML = `
+    <div style="padding:16px; background:linear-gradient(135deg, rgba(99,102,241,0.10), rgba(21,27,48,0.55)); border:1px solid rgba(99,102,241,0.28); border-radius:16px;">
+      <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+        <div>
+          <div style="font-weight:700; color:#e2e8f0;">🛡️ Group Moderator</div>
+          <div style="font-size:12px; color:#94a3b8; margin-top:2px; max-width:560px;">Approves posts Facebook holds in "Spam potentiel" / pending across the groups you admin, so the post goes live and its comment can land. This account <b>never posts</b>.</div>
+        </div>
+        <div style="font-size:12px; color:${enabled ? '#34d399' : '#fbbf24'};">${enabled ? '✓ approval ON' : '⚠ turn ON “moderator approval” in Settings'}</div>
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px;">
+        <div>
+          <label style="font-size:11px; color:#94a3b8;">Moderator account (your group admin)</label>
+          <select onchange="toggleModerator(this.value)" style="width:100%; margin-top:4px; padding:8px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:13px;">${opts}</select>
+          ${mod ? `<div style="font-size:11px; margin-top:6px; color:#94a3b8;">${badge} · <a href="#" onclick="loginAccount('${escapeHtml(mod.name)}');return false;" style="color:#818cf8;">log in / re-login</a></div>` : '<div style="font-size:11px; margin-top:6px; color:#6b7280;">Add your admin account on the Accounts tab and log it in, then pick it here.</div>'}
+        </div>
+        <div>
+          <label style="font-size:11px; color:#94a3b8;">Its FB display name (to skip its own posts)</label>
+          <input type="text" value="${mod ? escapeHtml(mod.fbDisplayName || '') : ''}" ${mod ? '' : 'disabled'} placeholder="${mod ? 'e.g. your admin name' : 'select a moderator first'}" ${mod ? `onchange="updateFbDisplayName('${escapeHtml(mod.name)}', this.value)"` : ''} style="width:100%; margin-top:4px; padding:8px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:13px; box-sizing:border-box;">
+          <div style="font-size:11px; color:#6b7280; margin-top:6px;">Covers all groups you admin — held posts are approved wherever they appear.</div>
+        </div>
+      </div>
+    </div>`;
 }
 
 // Edit account name and alias

@@ -290,7 +290,7 @@ class Orchestrator {
     let remaining = filtered.filter((p) => !this._dealt.has(p.id) && !(claimedSet && claimedSet.has(p.id)));
     if (!remaining.length) return [];
     if (order.includes('random')) remaining = seededShuffle(remaining, (cycle + 1) * 7919); // randomized deal order (consistent within the cycle)
-    const activeList = this._active || data.accounts.filter((a) => a.enabled !== false);
+    const activeList = this._active || data.accounts.filter((a) => a.enabled !== false && !a.isModerator);
     const i = activeList.findIndex((a) => a.name === account.name);
     if (i < 0) return [];
     // roundOffset rotates which account gets which post across Loop-campaign recycles.
@@ -504,7 +504,7 @@ class Orchestrator {
       this._data = getData(); // re-read each cycle so mid-run edits take effect
       const { posts, accounts, settings } = this._data;
       if (!posts.length) { this.log('⚠️ No posts configured — stopping.'); break; }
-      const active = accounts.filter((a) => a.enabled !== false);
+      const active = accounts.filter((a) => a.enabled !== false && !a.isModerator); // MOD: the moderator only approves, never posts
       if (!active.length) { this.log('⚠️ No enabled accounts — stopping.'); break; }
       this._active = active;
       // Shared-IP warning (once per run): many accounts from ONE IP is a top coordinated-spam signal.
