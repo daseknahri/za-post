@@ -661,18 +661,10 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink) {
     const hasText = !!(post.comment && post.comment.trim());
     const mode = hasText && commentImg ? 'text + image' : hasText ? 'text-only' : 'image-only';
     step(`Comment: starting (${mode})${hasText ? ` — "${shortText(post.comment, 50)}"` : ''}`);
-    // Plain group URL (the chronological param renders a feed WITHOUT inline comment
-    // affordances). Let the feed render; do NOT scroll (FB virtualizes the top post).
-    step('Comment: reloading group to locate the post');
-    await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-    await sleep(3000);
-    await dismissPopups(page);
-
-    // If the session died between publishing and commenting, our post won't be in the
-    // feed — name that explicitly instead of reporting a vague "no comment box".
-    const authBad = await withTimeout(page.evaluate(() => /continue as|use another profile/i.test(document.body.innerText || '')), 8000, false);
-    if (authBad) { step('Comment: session expired after posting — skipped (re-login needed)'); return false; }
-
+    // The first comment must land on OUR just-published post. After the anti-spam wait the feed may
+    // have shifted (others posted), so the ONLY reliable anchor is the post's OWN page (permalink),
+    // captured right after publishing. Strategy: permalink-direct PRIMARY → feed-scan (caption-matched,
+    // top-3 only) FALLBACK → skip rather than guess.
     const commentBoxes = async () => {
       const all = (await withTimeout(page.$$('[contenteditable="true"], [role="textbox"]'), 8000, [])).slice(0, 30);
       const out = [];
@@ -686,53 +678,88 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink) {
       }
       return out;
     };
-    const snip = (post.caption || '').replace(/\s+/g, ' ').trim().slice(0, 25);
+    // Slow-internet readiness gate: wait until an article AND a candidate comment box exist before
+    // scanning. Bounded by `ms`; each check is capped (never hangs).
+    const waitInteractive = async (ms) => {
+      const dl = Date.now() + ms;
+      while (Date.now() < dl) {
+        const ready = await evalTimed(page, () => {
+          const arts = Array.from(document.querySelectorAll('div[role="article"]'));
+          return arts.length > 0 && arts.some((a) => a.querySelector('[contenteditable="true"], [role="textbox"]'));
+        }, null, 4000).catch(() => false);
+        if (ready) return true;
+        await sleep(1000);
+      }
+      return false;
+    };
+    const clickLeaveComment = () => evalTimed(page, () => {
+      const b = Array.from(document.querySelectorAll('[role="button"]')).find((e) => {
+        const norm = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+        return /leave a comment|^comment$|hozzaszolas|commenter|comentar|kommentar|commenta/.test(norm);
+      });
+      if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return true; }
+      return false;
+    }, null, 12000).catch(() => false);
 
-    let boxes = await withTimeout(commentBoxes(), 12000, []);
-    if (!boxes.length) {
-      // State 2: click the "Leave a comment" button — prefer the one in OUR post's article.
-      step('Comment: no inline box yet — clicking "Leave a comment"');
-      const clicked = await evalTimed(page, (s) => {
-        const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 15);
-        // Find OUR post by its caption snippet. Without a reliable match we can't tell which article
-        // is ours — arts[0] may be a PINNED/banner post — so DON'T guess: skip the fallback rather
-        // than risk attaching the comment/link to the wrong post (better no comment than a wrong one).
-        const mine = (s && s.length >= 12) ? arts.find((a) => (a.textContent || '').includes(s)) : null;
-        if (!mine) return false;
-        const scope = mine;
-        const b = Array.from(scope.querySelectorAll('[role="button"]'))
-          .find((e) => {
-            const norm = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-            return /leave a comment|^comment$|hozzaszolas/.test(norm); // English + Hungarian
-          });
-        if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return true; }
-        return false;
-      }, snip, 12000).catch(() => false);
-      if (clicked) { step('Comment: comment box opened'); await sleep(3500); boxes = await withTimeout(commentBoxes(), 12000, []); }
-      else step('Comment: "Leave a comment" button not found');
+    const snip = (post.caption || '').replace(/\s+/g, ' ').trim();
+    // C6: can't prove which post is ours (no link + nothing to match on) → SKIP, never guess.
+    if (snip.length < 12 && !permalink) { step('Comment: caption too short and no post link — skipping to avoid a wrong-post comment'); return 'skipped'; }
+
+    let boxes = [];
+    let permalinkFailed = false;
+
+    // PRIMARY: comment on the post's OWN page (it's the only article there → unambiguous = right post).
+    if (permalink) {
+      step('Comment: opening the post directly via its link (primary — guarantees the right post)');
+      const navOk = await page.goto(permalink, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
+      if (!navOk) { permalinkFailed = true; step('Comment: could not open the post link — falling back to the group feed'); }
+      else {
+        await page.waitForSelector('div[role="article"], [aria-label*="omment"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
+        const ready = await waitInteractive(10000);
+        step(ready ? 'Comment: post page ready' : 'Comment: post page not fully interactive (timeout) — trying anyway');
+        await dismissPopups(page);
+        const authBad = await withTimeout(page.evaluate(() => /continue as|use another profile|log in to facebook/i.test(document.body.innerText || '')), 8000, false);
+        if (authBad) { step('Comment: session expired after posting — skipped (re-login needed)'); return 'failed'; }
+        boxes = await withTimeout(commentBoxes(), 15000, []);
+        if (!boxes.length) {
+          step('Comment: no inline box on the post page — clicking "Leave a comment"');
+          if (await clickLeaveComment()) { step('Comment: comment box opened (post page)'); await sleep(2500); boxes = await withTimeout(commentBoxes(), 15000, []); }
+        }
+      }
     }
-    // Permalink fallback: if the feed scan found nothing (common for short/image-only captions, where
-    // we won't guess which feed article is ours), open the post's OWN page — there it is the only
-    // article, so its comment box is unambiguous and no caption matching is needed.
-    if (!boxes.length && permalink) {
-      step('Comment: opening the post directly via its link');
-      await page.goto(permalink, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      await sleep(3000);
+
+    // FALLBACK: feed-scan — ONLY when there's no usable permalink. Requires a caption match AND top-3
+    // recency so we never comment on the wrong (older) post after the anti-spam wait pushed ours down.
+    if (!boxes.length && (!permalink || permalinkFailed)) {
+      step('Comment: locating the post in the group feed (fallback)');
+      await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+      await page.waitForSelector('div[role="article"], [aria-label*="omment"], [aria-label*="ommentaire"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
+      await waitInteractive(10000);
       await dismissPopups(page);
-      boxes = await withTimeout(commentBoxes(), 12000, []);
+      const authBad = await withTimeout(page.evaluate(() => /continue as|use another profile/i.test(document.body.innerText || '')), 8000, false);
+      if (authBad) { step('Comment: session expired after posting — skipped (re-login needed)'); return 'failed'; }
+      boxes = await withTimeout(commentBoxes(), 15000, []);
       if (!boxes.length) {
-        const clicked2 = await evalTimed(page, () => {
-          const b = Array.from(document.querySelectorAll('[role="button"]')).find((e) => {
+        step('Comment: no inline box — clicking "Leave a comment" on OUR post (top-3 + caption match)');
+        const clicked = await evalTimed(page, (s) => {
+          // A just-published post is at the TOP — only the top 3 articles can be ours. A snippet match
+          // further down is almost certainly a different (older) post — never comment there.
+          const top = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 3);
+          const mine = (s && s.length >= 12) ? top.find((a) => (a.textContent || '').includes(s)) : null;
+          if (!mine) return false;
+          const b = Array.from(mine.querySelectorAll('[role="button"]')).find((e) => {
             const norm = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-            return /leave a comment|^comment$|hozzaszolas/.test(norm);
+            return /leave a comment|^comment$|hozzaszolas|commenter|comentar|kommentar/.test(norm);
           });
           if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return true; }
           return false;
-        }, null, 12000).catch(() => false);
-        if (clicked2) { step('Comment: comment box opened (post page)'); await sleep(3000); boxes = await withTimeout(commentBoxes(), 12000, []); }
+        }, snip.slice(0, 25), 12000).catch(() => false);
+        if (clicked) { step('Comment: comment box opened'); await sleep(2500); boxes = await withTimeout(commentBoxes(), 15000, []); }
+        else step('Comment: could not confidently find OUR post in the feed — not commenting (avoids a wrong-post)');
       }
     }
-    if (!boxes.length) { step('Comment: no comment box found — comment skipped'); return false; }
+
+    if (!boxes.length) { step('Comment: no comment box found — comment not sent'); return 'failed'; }
     step(`Comment: ${boxes.length} comment box(es) found`);
 
     const target = boxes[0];
@@ -757,7 +784,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink) {
         if (cu.ok) {
           // Wait for the image PREVIEW to actually render before submitting, so a slow CDN
           // upload can't be dropped when Enter fires (a blind fixed delay was unreliable).
-          const previewed = await page.waitForFunction(() => !!document.querySelector('[role="article"] img[src^="blob:"], [role="dialog"] img[src^="blob:"]'), { timeout: 8000 }).then(() => true).catch(() => false);
+          const previewed = await page.waitForFunction(() => !!document.querySelector('[role="article"] img[src^="blob:"], [role="dialog"] img[src^="blob:"]'), { timeout: 15000 }).then(() => true).catch(() => false);
           step(previewed ? 'Comment: image attached (preview rendered)' : 'Comment: image uploaded (preview not detected — submitting anyway)');
           await sleep(1500);
         } else { step(`Comment: image upload failed after retries (${cu.error && cu.error.message}) — posting text only`); }
@@ -800,17 +827,35 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink) {
     let confirmed = await watchEmptied(4000);
     if (!confirmed) {
       step('Comment: not confirmed yet — re-pressing Enter once');
-      try { await page.keyboard.press('Enter'); } catch {}
+      try { await page.keyboard.press('Enter'); } catch {} // no-op on an already-empty box (FB rejects empty) — can't double-post
       confirmed = await watchEmptied(3000);
     }
-    step(confirmed ? 'Comment: posted and verified ✅ (box emptied)' : 'Comment: sent but NOT verified (box did not empty after a retry) — verify this group manually');
+    // C9: landing verification (READ-ONLY) — did our comment text actually appear under the post?
+    // We never re-type or re-submit here; this only LABELS the outcome so the operator can tell a
+    // confirmed comment from an at-risk one. Outcome: posted / not_visible / unconfirmed.
+    let outcome = confirmed ? 'unconfirmed' : 'not_visible'; // start from the box-empty signal
+    const commentSnip = String(post.comment || '').replace(/\s+/g, ' ').trim().slice(0, 30);
+    if (commentSnip.length >= 6) {
+      const seen = await evalTimed(page, (s) => {
+        const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 3);
+        return arts.some((a) => (a.innerText || '').includes(s));
+      }, commentSnip, 6000).catch(() => null);
+      if (seen === true) outcome = 'posted';
+      else if (seen === false && confirmed) outcome = 'not_visible';
+      // seen === null (timeout): keep the box-empty result (unconfirmed/not_visible)
+    } else if (confirmed) {
+      outcome = 'posted'; // image-only / very short comment: an emptied box is our best available signal
+    }
+    step(outcome === 'posted' ? 'Comment: posted and verified ✅ (visible under the post)'
+       : outcome === 'not_visible' ? 'Comment: sent but NOT visible under the post — verify this group manually'
+       : 'Comment: sent (delivery not auto-verified) — likely OK, spot-check if unsure');
     await sleep(600);
-    return true;
+    return outcome;
   } catch (e) {
-    // If Enter was already pressed, the comment is (probably) posted — returning false would make
-    // the caller retry and DOUBLE-post. Report it but treat as sent.
-    if (submitted) { step(`Comment: post-submit issue (${e.message}) — already sent, not retrying`); return true; }
-    step(`Comment: error — ${e.message}`); return false;
+    // If Enter was already pressed, the comment is (probably) sent — returning a retryable 'failed'
+    // would make the caller re-run and DOUBLE-post. Report it but treat as sent (unconfirmed).
+    if (submitted) { step(`Comment: post-submit issue (${e.message}) — already sent, not retrying`); return 'unconfirmed'; }
+    step(`Comment: error — ${e.message}`); return 'failed';
   }
 }
 
@@ -1535,19 +1580,34 @@ async function runAccount(o) {
           errors++; report(groupName, gid, 'error', `publish not confirmed (${publishResult})`, ''); continue;
         }
         await sleepInterruptible(3000, shouldStop);
-        // Check pending-approval BEFORE dismissing popups (a dismissible notice could be cleared).
-        const isPending = await checkPendingApproval(page);
+        // Pending-approval detection (BEFORE dismissing popups — a dismissible notice could be cleared).
+        // BUG FIX: a moderated group's RULE text ("all posts will be reviewed by admins") was
+        // false-positiving the body-text scan and skipping posts that actually LANDED. Corroborate
+        // with FACT: if our post is verifiably LIVE in the feed (the newest non-pinned article
+        // contains our caption and isn't itself pending-badged), it did NOT go pending — never skip a
+        // post that's visible. Only fall back to the text scan when we can't confirm (short/image-only
+        // captions, where we can't reliably match our article).
+        const pendingSnip = (post.caption || '').replace(/\s+/g, ' ').trim().slice(0, 25);
+        const postIsLive = pendingSnip.length >= 12 ? await evalTimed(page, (s) => {
+          const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 4);
+          return arts.some((a) => {
+            const head = (a.innerText || '').slice(0, 200).toLowerCase();
+            if (/pending|en attente|ausstehend|in attesa|pendiente|aguardando|jovahagyas/.test(head)) return false; // this article IS pending-badged
+            return (a.textContent || '').includes(s);
+          });
+        }, pendingSnip, 6000).catch(() => false) : false;
+        const isPending = !postIsLive && await checkPendingApproval(page);
         await dismissPopups(page); // clear "Your post might be reviewed" etc.
 
-        // Moderated groups queue posts for admin approval — don't count as posted and
-        // skip the comment (the post isn't in the feed yet).
+        // Moderated groups queue posts for admin approval — don't count as posted and skip the comment.
         if (isPending) {
-          step('Post submitted but PENDING ADMIN APPROVAL - not counted, comment skipped');
+          step('Post submitted but PENDING ADMIN APPROVAL — not counted, comment skipped');
           pendingApproval++;
           report(groupName, gid, 'pending', 'awaiting admin approval', 'skipped');
           if (i < targetGroups.length - 1) await sleepInterruptible(jitter((Number.isFinite(settings.groupDelay) ? settings.groupDelay : 180) * 1000), shouldStop, 1000);
           continue;
         }
+        if (postIsLive) step('Confirmed live in the feed (a moderated-group "will be reviewed" notice, if any, was a false positive)');
 
         // Success log — keep caption snippet for the renderer's auto-delete tracker.
         step('Posted successfully');
@@ -1570,23 +1630,27 @@ async function runAccount(o) {
           break;
         }
 
-        // Capture the just-published post's permalink while it is the NEWEST post in the feed (before
-        // anyone else posts), skipping any pinned/announcement post. The comment step can then open the
-        // post DIRECTLY — far more reliable than re-scanning the feed, especially for short/image-only
-        // captions. Best-effort; null just falls back to the feed scan.
+        // Capture the just-published post's permalink WHILE it's the newest post (BEFORE the anti-spam
+        // wait shuffles the feed). The comment step opens the post DIRECTLY via this link — the only
+        // reliable way to find OUR post after a 1-3 min wait. Verify the link is OURS by matching the
+        // caption (when long enough); image-only/short trusts the newest-non-pinned position. Retry ≤2×.
+        const capSnip = (post.caption || '').replace(/\s+/g, ' ').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().slice(0, 25);
         let postPermalink = null;
-        try {
-          postPermalink = await withTimeout(page.evaluate(() => {
+        for (let pA = 1; pA <= 2 && !postPermalink && !shouldStop(); pA++) {
+          const cap = await withTimeout(page.evaluate((s) => {
+            const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
             const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 6);
             for (const a of arts) {
               if (/pinned|épinglé|rögzített/.test((a.innerText || '').slice(0, 200).toLowerCase())) continue; // skip pinned
               const link = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]');
-              if (link && link.href && /\/(posts|permalink)\//.test(link.href)) return link.href.split('?')[0];
+              if (link && link.href && /\/(posts|permalink)\//.test(link.href)) return { href: link.href.split('?')[0], matched: !s || norm(a.textContent).includes(s) };
             }
             return null;
-          }), 6000, null);
-        } catch {}
-        if (postPermalink) step('Comment: captured the post link for a direct, reliable comment');
+          }, capSnip), 6000, null).catch(() => null);
+          if (cap && (cap.matched || capSnip.length < 12)) { postPermalink = cap.href; step(`Comment: captured the post link (${cap.matched ? 'caption verified ✓' : 'by position'}) for a direct comment`); }
+          else { if (cap) step(`Comment: newest post link didn't match our caption (attempt ${pA}/2)`); if (pA < 2) await sleepInterruptible(2000, shouldStop); }
+        }
+        if (!postPermalink) step('Comment: no verified post link — the comment step will use the caption/feed fallback');
 
         // First comment (often a link) — reload, find OUR post, comment in its box.
         // addFirstComment logs every stage itself (via the same step() logger).
@@ -1601,15 +1665,22 @@ async function runAccount(o) {
           const hi = Number.isFinite(settings.commentDelayMax) ? settings.commentDelayMax : 180;
           const cd = Math.round((Math.min(lo, hi) + Math.random() * Math.abs(hi - lo)) * 1000);
           if (cd > 0 && !shouldStop()) { step(`Comment: waiting ${Math.round(cd / 1000)}s before commenting (avoids the instant post→link spam pattern)`); await sleepInterruptible(cd, shouldStop, 1000); }
-          // Retry up to 3× — addFirstComment only returns false BEFORE it submits (no box found,
-          // a stalled renderer, etc.), so re-trying (it reloads each time) can't post a duplicate.
-          let cok = false;
-          for (let cAttempt = 1; cAttempt <= 3 && !cok && !shouldStop() && !aborted && browser && browser.isConnected(); cAttempt++) {
-            if (cAttempt > 1) { step(`Comment: retry ${cAttempt}/3`); await sleepInterruptible(2500, shouldStop); }
-            cok = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink);
+          // Retry up to 3× — addFirstComment only returns the retryable 'failed' BEFORE it presses
+          // Enter (no box found, stalled renderer; 'skipped' for short-caption-no-link), so a retry
+          // (it re-navigates each time) can NEVER duplicate an already-sent comment. C2: keep a per-
+          // attempt human gap so retries don't collapse into an instant burst.
+          let cres = 'failed';
+          for (let cAttempt = 1; cAttempt <= 3 && cres === 'failed' && !shouldStop() && !aborted && browser && browser.isConnected(); cAttempt++) {
+            if (cAttempt > 1) {
+              const gap = Math.max(2500, Math.round(Math.min(lo, hi) * 1000 * 0.25)); // ~25% of the min delay
+              step(`Comment: retry ${cAttempt}/3 (waiting ${Math.round(gap / 1000)}s — keeping the human cadence)`);
+              await sleepInterruptible(gap, shouldStop);
+            }
+            cres = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink);
           }
-          commentResult = cok ? 'posted' : 'failed';
-          if (!cok) step('Comment: could not post after 3 attempts — skipped');
+          commentResult = cres;
+          if (cres === 'failed') step('Comment: could not place the comment after 3 attempts — left uncommented');
+          else if (cres === 'skipped') step('Comment: skipped (could not safely identify our post)');
         }
         report(groupName, gid, 'posted', '', commentResult);
       } catch (e) {
