@@ -1580,77 +1580,68 @@ async function runAccount(o) {
           errors++; report(groupName, gid, 'error', `publish not confirmed (${publishResult})`, ''); continue;
         }
         await sleepInterruptible(3000, shouldStop);
-        // Pending-approval detection (BEFORE dismissing popups — a dismissible notice could be cleared).
-        // BUG FIX: a moderated group's RULE text ("all posts will be reviewed by admins") was
-        // false-positiving the body-text scan and skipping posts that actually LANDED. Corroborate
-        // with FACT: if our post is verifiably LIVE in the feed (the newest non-pinned article
-        // contains our caption and isn't itself pending-badged), it did NOT go pending — never skip a
-        // post that's visible. Only fall back to the text scan when we can't confirm (short/image-only
-        // captions, where we can't reliably match our article).
-        const pendingSnip = (post.caption || '').replace(/\s+/g, ' ').trim().slice(0, 25);
-        const postIsLive = pendingSnip.length >= 12 ? await evalTimed(page, (s) => {
-          const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 4);
-          return arts.some((a) => {
-            const head = (a.innerText || '').slice(0, 200).toLowerCase();
-            if (/pending|en attente|ausstehend|in attesa|pendiente|aguardando|jovahagyas/.test(head)) return false; // this article IS pending-badged
-            return (a.textContent || '').includes(s);
-          });
-        }, pendingSnip, 6000).catch(() => false) : false;
-        const isPending = !postIsLive && await checkPendingApproval(page);
-        await dismissPopups(page); // clear "Your post might be reviewed" etc.
+        await dismissPopups(page);
 
-        // Moderated groups queue posts for admin approval — don't count as posted and skip the comment.
-        if (isPending) {
-          step('Post submitted but PENDING ADMIN APPROVAL — not counted, comment skipped');
-          pendingApproval++;
-          report(groupName, gid, 'pending', 'awaiting admin approval', 'skipped');
-          if (i < targetGroups.length - 1) await sleepInterruptible(jitter((Number.isFinite(settings.groupDelay) ? settings.groupDelay : 180) * 1000), shouldStop, 1000);
-          continue;
-        }
-        if (postIsLive) step('Confirmed live in the feed (a moderated-group "will be reviewed" notice, if any, was a false positive)');
-
-        // Success log — keep caption snippet for the renderer's auto-delete tracker.
-        step('Posted successfully');
-        posted++;
-        // E-P3: even when publish "succeeded", scan once for a block/checkpoint phrase the
-        // pre-publish detectors didn't catch. If present, the account is being throttled NOW — cool
-        // it down IMMEDIATELY (skip this post's comment + the account's remaining groups) instead of
-        // only warning. The post itself already landed, so it's still recorded as 'posted'.
+        // E-P3: emerging block/checkpoint check on the post-publish page (BEFORE we navigate away — the
+        // notice appears in the composer/page right after Post). If present, the account is throttled
+        // NOW: the post landed (count it) but cool down + skip its comment + the account's remaining groups.
         let emergingBlock = false;
         try {
           const suspect = await evalTimed(page, (cfg) => {
             const t = (document.body.innerText || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
             return [...cfg.rate, ...cfg.cp].find((p) => t.includes(p)) || null;
           }, { rate: FB.rateLimit, cp: FB.checkpoint }, 6000);
-          if (suspect) { emergingBlock = true; step(`🛑 Posted, but an EMERGING block/checkpoint phrase is present ("${suspect}") — cooling down this account immediately (emerging limit, distinct from an explicit block)`); }
+          if (suspect) { emergingBlock = true; step(`🛑 Posted, but an EMERGING block/checkpoint phrase is present ("${suspect}") — cooling down this account immediately`); }
         } catch {}
         if (emergingBlock) {
-          flag = 'rate_limited'; noRetry = true;
-          report(groupName, gid, 'posted', 'emerging block detected after publish — cooling down (comment skipped)', 'skipped');
+          posted++; flag = 'rate_limited'; noRetry = true;
+          report(groupName, gid, 'posted', 'emerging block after publish — cooling down (comment skipped)', 'skipped');
           break;
         }
 
-        // Capture the just-published post's permalink WHILE it's the newest post (BEFORE the anti-spam
-        // wait shuffles the feed). The comment step opens the post DIRECTLY via this link — the only
-        // reliable way to find OUR post after a 1-3 min wait. Verify the link is OURS by matching the
-        // caption (when long enough); image-only/short trusts the newest-non-pinned position. Retry ≤2×.
+        // GROUND TRUTH for posted-vs-pending AND a reliable comment link: reload the group and look for
+        // OUR post. Right after publishing our post isn't in the feed DOM yet — which made the text-only
+        // "pending" scan FALSE-POSITIVE on a moderated group's RULE text ("posts will be reviewed") and
+        // made the permalink capture miss. After a reload our post is at the TOP, so we can both confirm
+        // it's live AND grab its verified permalink. It's only genuinely PENDING when our post is truly
+        // absent from the feed and a pending notice is present.
         const capSnip = (post.caption || '').replace(/\s+/g, ' ').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().slice(0, 25);
         let postPermalink = null;
-        for (let pA = 1; pA <= 2 && !postPermalink && !shouldStop(); pA++) {
-          const cap = await withTimeout(page.evaluate((s) => {
-            const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-            const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 6);
-            for (const a of arts) {
-              if (/pinned|épinglé|rögzített/.test((a.innerText || '').slice(0, 200).toLowerCase())) continue; // skip pinned
-              const link = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]');
-              if (link && link.href && /\/(posts|permalink)\//.test(link.href)) return { href: link.href.split('?')[0], matched: !s || norm(a.textContent).includes(s) };
-            }
-            return null;
-          }, capSnip), 6000, null).catch(() => null);
-          if (cap && (cap.matched || capSnip.length < 12)) { postPermalink = cap.href; step(`Comment: captured the post link (${cap.matched ? 'caption verified ✓' : 'by position'}) for a direct comment`); }
-          else { if (cap) step(`Comment: newest post link didn't match our caption (attempt ${pA}/2)`); if (pA < 2) await sleepInterruptible(2000, shouldStop); }
+        step('Verifying the post landed (reloading the group)…');
+        await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+        await page.waitForSelector('div[role="article"]', { timeout: 25000 }).catch(() => {});
+        await sleep(3000);
+        await dismissPopups(page);
+        const find = await evalTimed(page, (s) => {
+          const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+          const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 6)
+            .filter((a) => !/pinned|épinglé|rögzített/.test((a.innerText || '').slice(0, 200).toLowerCase()));
+          const linkOf = (a) => { const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); return (l && /\/(posts|permalink)\//.test(l.href || '')) ? l.href.split('?')[0] : null; };
+          if (s) for (const a of arts) { if (norm(a.textContent).includes(s) && linkOf(a)) return { href: linkOf(a), matched: true }; } // caption-matched = definitely OURS
+          for (const a of arts) { if (linkOf(a)) return { href: linkOf(a), matched: false }; } // else newest non-pinned (short/image)
+          return null;
+        }, capSnip, 8000).catch(() => null);
+
+        if (find && find.matched) {
+          postPermalink = find.href;
+          step('Confirmed LIVE — our post is in the feed (verified). Commenting on it directly.');
+        } else if (capSnip.length >= 12 && await checkPendingApproval(page)) {
+          // Long caption, NOT found in the feed, AND a pending notice present → genuinely pending.
+          step('Post is PENDING ADMIN APPROVAL (not in the feed) — not counted, comment skipped');
+          pendingApproval++;
+          report(groupName, gid, 'pending', 'awaiting admin approval', 'skipped');
+          if (i < targetGroups.length - 1) await sleepInterruptible(jitter((Number.isFinite(settings.groupDelay) ? settings.groupDelay : 180) * 1000), shouldStop, 1000);
+          continue;
+        } else {
+          // Publish was confirmed; either no pending notice, or a short/image caption we can't match —
+          // trust the publish. Use the newest link (if any) for the comment, else the feed fallback.
+          postPermalink = find ? find.href : null;
+          step(`Posted (publish confirmed)${postPermalink ? ' — using the post link for the comment' : ' — comment will use the feed fallback'}`);
         }
-        if (!postPermalink) step('Comment: no verified post link — the comment step will use the caption/feed fallback');
+
+        // Success log — keep caption snippet for the renderer's auto-delete tracker.
+        step('Posted successfully');
+        posted++;
 
         // First comment (often a link) — reload, find OUR post, comment in its box.
         // addFirstComment logs every stage itself (via the same step() logger).
