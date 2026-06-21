@@ -929,6 +929,10 @@ ipcMain.handle('stop-automation', () => {
 ipcMain.handle('reset-rotation', () => {
   try { return orchestrator.resetRotation(); } catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
 });
+// On-demand moderator approval — approve held "Spam potentiel" posts now (stop → approve → continue).
+ipcMain.handle('approve-held-now', async () => {
+  try { return await orchestrator.approveHeldNow(getData()); } catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+});
 ipcMain.handle('pause-automation', () => {
   if (!orchestrator) return fail('Orchestrator not ready');
   if (!orchestrator.isRunning()) return fail('Automation is not running');

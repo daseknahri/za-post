@@ -216,6 +216,9 @@ class Orchestrator {
         this.emit('automation-stopped', reason);
         this.log(`⏹ Automation ${reason}.`);
       });
+    // Concurrent moderator: a SECOND browser approves held "Spam potentiel" posts in the BACKGROUND while
+    // the posting pool keeps running — the operator never has to stop. Self-gates on moderationEnabled.
+    this._startModeratorLoop(getData);
     return { success: true };
   }
 
@@ -463,6 +466,91 @@ class Orchestrator {
       // account can pick them up this same run. In a finally so it runs even if the body throws.
       if (this._claimed) for (const pp of posts) { if (!dealtIds.includes(pp.id)) this._claimed.delete(pp.id); }
     }
+  }
+
+  // MODERATOR APPROVAL pass — approve OUR posts that FB held in the "Spam potentiel"/pending queue, so
+  // they go public and their comment can land. Routes each held post to the moderator that covers its
+  // group (group.moderatedBy, or the lone moderator). Runs both inside the cycle (end of pool) and ON
+  // DEMAND via approveHeldNow(). shouldStop lets the cycle version abort on a Stop.
+  async _runModeratorApproval(data, shouldStop) {
+    shouldStop = shouldStop || (() => false);
+    const settings = data.settings || {};
+    const heldNow = (store.loadModeration().held || []).filter((h) => h.status === 'held');
+    const moderators = (data.accounts || []).filter((a) => a.isModerator);
+    if (!heldNow.length) { return { held: 0, moderators: moderators.length }; } // quiet — callers decide whether to announce
+    if (!moderators.length) { this.log('⚠️ Posts are HELD in "Spam potentiel" but NO moderator is set — designate one in the Groups tab → 🛡️ Group Moderator (and log it in).'); return { held: heldNow.length, moderators: 0 }; }
+    const modByName = new Map(moderators.map((m) => [m.name, m]));
+    const groupModerator = (gid) => {
+      const g = (data.groups || []).find((x) => (x.groupId || x.id) === gid);
+      const named = g && g.moderatedBy ? modByName.get(g.moderatedBy) : null;
+      return named || (moderators.length === 1 ? moderators[0] : null);
+    };
+    const byMod = new Map(); const unassigned = [];
+    for (const h of heldNow) { const m = groupModerator(h.gid); if (!m) { unassigned.push(h); continue; } if (!byMod.has(m.name)) byMod.set(m.name, { mod: m, held: [] }); byMod.get(m.name).held.push(h); }
+    if (unassigned.length) this.log(`⚠️ ${unassigned.length} held post(s) are in groups with no assigned moderator — set each group's moderator in the Groups tab.`);
+    const posterNames = [...new Set((data.accounts || []).filter((a) => !a.isModerator && a.fbDisplayName && String(a.fbDisplayName).trim()).map((a) => String(a.fbDisplayName).trim()))];
+    const { runModerator } = require('./moderator');
+    for (const { mod, held } of byMod.values()) {
+      if (shouldStop()) break;
+      const gids = new Set(held.map((h) => h.gid));
+      const modGroups = (data.groups || []).filter((g) => gids.has(g.groupId || g.id));
+      await runModerator({ account: mod, groups: modGroups, settings, held, posterNames, log: (m) => this.log(m), shouldStop });
+    }
+    return { held: heldNow.length, moderators: moderators.length };
+  }
+
+  // Interruptible wait that wakes early when the run stops (used by the concurrent moderator loop).
+  _modSleep(ms) {
+    return new Promise((resolve) => {
+      let waited = 0; const step = 1000;
+      const id = setInterval(() => { waited += step; if (!this.running || this._stop || waited >= ms) { clearInterval(id); resolve(); } }, step);
+    });
+  }
+
+  // Concurrent moderator loop — runs alongside the posting pool. Every ~2 min it checks the held queue
+  // and, if there are held posts (and moderation is on + a moderator is set), runs an approval pass in a
+  // SEPARATE browser. So spam-held posts get approved automatically, in the background, without the
+  // operator ever stopping the run. Self-gates each tick (moderationEnabled can be toggled mid-run);
+  // shares the _approving guard with the end-of-cycle sweep + manual trigger so passes never overlap.
+  _startModeratorLoop(getData) {
+    if (this._modLoop) return;
+    this._modLoop = true;
+    const CHECK_MS = 120000;
+    (async () => {
+      await this._modSleep(45000); // let the first posts land/hold before the first scan
+      while (this.running && !this._stop) {
+        try {
+          const data = (typeof getData === 'function') ? getData() : (this._data || {});
+          const on = !!(data.settings && data.settings.moderationEnabled);
+          const held = on ? (store.loadModeration().held || []).filter((h) => h.status === 'held') : [];
+          if (on && held.length && !this._approving && !this._paused) {
+            this._approving = true;
+            this.log(`🛡️ Concurrent moderator: ${held.length} held post(s) detected — approving in the background (posting continues)…`);
+            try { await this._runModeratorApproval(data, () => this._stop); }
+            catch (e) { this.log(`⚠️ moderator loop error: ${e.message}`); }
+            finally { this._approving = false; }
+          }
+        } catch (e) { this.log(`⚠️ moderator loop: ${e.message}`); }
+        await this._modSleep(CHECK_MS);
+      }
+      this._modLoop = false;
+    })();
+  }
+
+  // On-demand moderator approval (force a pass now). Callable from the UI/IPC; guarded so two passes
+  // can't overlap. The concurrent loop above is the primary, automatic mechanism.
+  async approveHeldNow(data) {
+    if (this._approving) { this.log('🛡️ A moderator-approval pass is already running.'); return { ok: false, reason: 'busy' }; }
+    data = data || this._data || {};
+    if (!(data.settings && data.settings.moderationEnabled)) { this.log('🛡️ Turn on "Moderator Approval" (Groups tab) before approving held posts.'); return { ok: false, reason: 'disabled' }; }
+    this._approving = true;
+    try {
+      this.log('🛡️ Manual moderator-approval pass requested…');
+      const r = await this._runModeratorApproval(data, () => false);
+      if (r && r.held === 0) this.log('🛡️ No posts are currently held for approval.');
+      return { ok: true, ...r };
+    } catch (e) { this.log(`⚠️ moderator approval error: ${e.message}`); return { ok: false, error: e.message }; }
+    finally { this._approving = false; }
   }
 
   // Persist per-account daily volume + rate-limit cool-down after a run (serialized via store.update
@@ -752,35 +840,11 @@ class Orchestrator {
       // feed), so the first comment can't attach. A designated MODERATOR account (admin of the groups)
       // approves OUR held posts so they go live. DRY-RUN for now: it scans the queues and LOGS what it
       // would approve (no clicks) so we refine the queue DOM live, then enable the click. No-op when off.
-      if (settings.moderationEnabled && !this._shouldStop()) {
-        try {
-          const heldNow = (store.loadModeration().held || []).filter((h) => h.status === 'held');
-          const moderators = (data.accounts || []).filter((a) => a.isModerator);
-          if (heldNow.length && !moderators.length) {
-            this.log('⚠️ Moderation is ON but NO moderator account is set — held posts will NOT be approved. Designate one in the Groups tab → 🛡️ Group Moderator.');
-          } else if (heldNow.length) {
-            // Route each held post to the moderator that covers ITS group. group.moderatedBy names the
-            // moderator account; if a group has none and there's exactly one moderator, that one covers
-            // it (backward-compatible single-moderator default). Supports N moderators, each its groups.
-            const modByName = new Map(moderators.map((m) => [m.name, m]));
-            const groupModerator = (gid) => {
-              const g = (data.groups || []).find((x) => (x.groupId || x.id) === gid);
-              const named = g && g.moderatedBy ? modByName.get(g.moderatedBy) : null;
-              return named || (moderators.length === 1 ? moderators[0] : null);
-            };
-            const byMod = new Map(); const unassigned = [];
-            for (const h of heldNow) { const m = groupModerator(h.gid); if (!m) { unassigned.push(h); continue; } if (!byMod.has(m.name)) byMod.set(m.name, { mod: m, held: [] }); byMod.get(m.name).held.push(h); }
-            if (unassigned.length) this.log(`⚠️ ${unassigned.length} held post(s) are in groups with no assigned moderator — set each group's moderator in the Groups tab.`);
-            const posterNames = [...new Set((data.accounts || []).filter((a) => !a.isModerator && a.fbDisplayName && String(a.fbDisplayName).trim()).map((a) => String(a.fbDisplayName).trim()))];
-            const { runModerator } = require('./moderator');
-            for (const { mod, held } of byMod.values()) {
-              if (this._shouldStop()) break;
-              const gids = new Set(held.map((h) => h.gid));
-              const modGroups = (data.groups || []).filter((g) => gids.has(g.groupId || g.id));
-              await runModerator({ account: mod, groups: modGroups, settings, held, posterNames, log: (m) => this.log(m), shouldStop: () => this._shouldStop() });
-            }
-          }
-        } catch (e) { this.log(`⚠️ moderator phase error: ${e.message}`); }
+      if (settings.moderationEnabled && !this._shouldStop() && !this._approving) {
+        this._approving = true;
+        try { await this._runModeratorApproval(data, () => this._shouldStop()); }
+        catch (e) { this.log(`⚠️ moderator phase error: ${e.message}`); }
+        finally { this._approving = false; }
       }
 
       // ── PHASE 3: COMMENT RESCUE ───────────────────────────────────────────────────────────────────
