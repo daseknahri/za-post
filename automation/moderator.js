@@ -191,22 +191,24 @@ async function runModerator(o) {
         try {
           const diag = await evalTimed(page, (snips) => {
             const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-            const counts = { posinset: document.querySelectorAll('[aria-posinset]').length, article: document.querySelectorAll('div[role="article"]').length, feed: document.querySelectorAll('[role="feed"]').length, main: document.querySelectorAll('[role="main"]').length };
-            const all = Array.from(document.querySelectorAll('div, article, li, section'));
+            const counts = { checkbox: document.querySelectorAll('input[type="checkbox"], [role="checkbox"]').length, posinset: document.querySelectorAll('[aria-posinset]').length };
+            // ALL distinct actionable labels on the page — reveals the approve mechanism (per-post "Publier"/
+            // "Approve"/"Allow", a bulk-action bar, a "···" menu, etc.).
+            const labels = [];
+            Array.from(document.querySelectorAll('[role="button"], button, [role="menuitem"], [role="tab"]')).forEach((b) => { const l = norm((b.getAttribute && b.getAttribute('aria-label')) || b.textContent || ''); if (l && l.length >= 2 && l.length <= 30) labels.push(l); });
+            const pageButtons = [...new Set(labels)].slice(0, 40);
+            // locate our caption + describe whether it's wrapped in a clickable post link
+            const all = Array.from(document.querySelectorAll('div, span, a, li'));
             for (const snip of snips) {
               if (!snip || snip.length < 8) continue;
-              // smallest element whose text contains our caption (the post body), then climb to its card
-              const hits = all.filter((e) => norm(e.innerText || '').includes(snip));
-              if (!hits.length) continue;
-              const el = hits[hits.length - 1]; // deepest/smallest container holding the caption
-              const chain = []; let n = el;
-              for (let i = 0; i < 7 && n && n.tagName; i++) { const cls = String(n.className || '').split(' ').filter(Boolean)[0] || ''; chain.push(`${n.tagName.toLowerCase()}${n.getAttribute && n.getAttribute('role') ? '[role=' + n.getAttribute('role') + ']' : ''}${n.getAttribute && n.getAttribute('aria-posinset') != null ? '[posinset]' : ''}${cls ? '.' + cls.slice(0, 12) : ''}`); n = n.parentElement; }
-              // author candidates near the caption (look on the el + a few ancestors)
-              const aCand = [];
-              let scope = el; for (let i = 0; i < 4 && scope; i++) { Array.from(scope.querySelectorAll('a[href], h3, h4, strong, span')).slice(0, 40).forEach((a) => { const t = (a.textContent || '').replace(/\s+/g, ' ').trim(); const href = a.getAttribute && a.getAttribute('href'); if (t && t.length >= 2 && t.length <= 40 && (href || /^(H3|H4|STRONG)$/.test(a.tagName))) aCand.push(`${a.tagName.toLowerCase()}${href ? '@' + href.slice(0, 30) : ''}:${t.slice(0, 30)}`); }); scope = scope.parentElement; }
-              return { counts, chain, text: norm(el.innerText).slice(0, 100), authors: [...new Set(aCand)].slice(0, 8) };
+              let el = null, best = Infinity;
+              for (const e of all) { const t = norm(e.textContent || ''); if (t.includes(snip) && t.length < best) { el = e; best = t.length; } }
+              if (!el) continue;
+              let linkHref = null, n = el; const chain = [];
+              for (let i = 0; i < 8 && n && n.tagName; i++) { if (n.tagName === 'A' && n.getAttribute('role') === 'link' && !linkHref) linkHref = (n.getAttribute('href') || '').slice(0, 60); const cls = String(n.className || '').split(' ').filter(Boolean)[0] || ''; chain.push(`${n.tagName.toLowerCase()}${n.getAttribute('role') ? '[' + n.getAttribute('role') + ']' : ''}${cls ? '.' + cls.slice(0, 10) : ''}`); n = n.parentElement; }
+              return { counts, pageButtons, captionInLink: linkHref, chain, text: norm(el.textContent).slice(0, 80) };
             }
-            return { counts, note: 'caption not found anywhere in DOM' };
+            return { counts, pageButtons, note: 'caption not found' };
           }, capSnips, 10000).catch((e) => ({ err: e && e.message }));
           log(`🔬 [moderator] [${gname}] DIAG ${JSON.stringify(diag).slice(0, 700)}`);
         } catch (e) { log(`🔬 [moderator] [${gname}] DIAG failed: ${e.message}`); }
