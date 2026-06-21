@@ -624,6 +624,26 @@ async function checkPendingApproval(page) {
   } catch { return false; }
 }
 
+// POST-SPECIFIC pending signal: a genuinely moderated group shows a "will be reviewed / pending
+// approval" notice for OUR just-submitted post in a TOAST / ALERT / open DIALOG — NEVER inside a feed
+// article. We scan ONLY those notice surfaces (excluding [role="article"]) so this can't false-match
+// the OLD pending posts already sitting in the group's feed (the cause of the false "PENDING" verdict).
+// Must be called on the post-click page, right after publish, before navigating away.
+async function pendingNoticeForOurPost(page) {
+  try {
+    return await page.evaluate((pats) => {
+      const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+      const nodes = Array.from(document.querySelectorAll('[role="alert"], [role="status"], [role="dialog"]'));
+      for (const n of nodes) {
+        if (n.closest('[role="article"]')) continue; // never trust feed-post text
+        const t = norm(n.innerText || '');
+        if (t && pats.some((p) => t.includes(p))) return true;
+      }
+      return false;
+    }, FB.pending);
+  } catch { return false; }
+}
+
 // Human-like typing: type in chunks with a per-char delay and small randomized pauses
 // between chunks. Tuned for speed while staying human-plausible (FB doesn't scrutinize
 // keystroke timing in the composer the way it does navigation/IP/account signals).
@@ -1650,7 +1670,14 @@ async function runAccount(o) {
           step(`Post clicked but publish NOT confirmed (${publishResult})${snap ? ` — "${snap}"` : ''}; skipping group`);
           errors++; report(groupName, gid, 'error', `publish not confirmed (${publishResult})`, ''); continue;
         }
-        await sleepInterruptible(3000, shouldStop);
+        // POST-SPECIFIC pending capture: on THIS post-click page, BEFORE any navigation, scanning only
+        // toast/alert/dialog surfaces (never feed articles). A genuinely moderated group shows the
+        // "will be reviewed / pending" notice here for OUR post; the OLD pending posts the operator
+        // sees in the feed are ARTICLES and are excluded — so this can't false-positive. This is now
+        // the ONLY determinant of "pending" (the post-reload whole-page scan was the false-positive).
+        const pendingAtPublish = await pendingNoticeForOurPost(page);
+        if (pendingAtPublish) step('A pending/review notice appeared for this post — this group looks moderated (will confirm against the feed).');
+        await sleepInterruptible(humanDelay(3000, settings, 'settle'), shouldStop);
         await dismissPopups(page);
 
         // E-P3: emerging block/checkpoint check on the post-publish page (BEFORE we navigate away — the
@@ -1676,38 +1703,58 @@ async function runAccount(o) {
         // made the permalink capture miss. After a reload our post is at the TOP, so we can both confirm
         // it's live AND grab its verified permalink. It's only genuinely PENDING when our post is truly
         // absent from the feed and a pending notice is present.
-        const capSnip = (post.caption || '').replace(/\s+/g, ' ').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().slice(0, 25);
+        const capSnip = (post.caption || '').replace(/\s+/g, ' ').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().slice(0, 40);
         let postPermalink = null;
         step('Verifying the post landed (reloading the group)…');
         await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
         await page.waitForSelector('div[role="article"]', { timeout: 25000 }).catch(() => {});
-        await sleep(3000);
+        // Poll for the feed to actually render (slow feeds bury our fresh post) instead of a fixed 3s.
+        await page.waitForFunction(() => document.querySelectorAll('div[role="article"]').length >= 3, { timeout: 15000 }).catch(() => {});
         await dismissPopups(page);
-        const find = await evalTimed(page, (s) => {
-          const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-          const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 6)
-            .filter((a) => !/pinned|épinglé|rögzített/.test((a.innerText || '').slice(0, 200).toLowerCase()));
-          const linkOf = (a) => { const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); return (l && /\/(posts|permalink)\//.test(l.href || '')) ? l.href.split('?')[0] : null; };
-          if (s) for (const a of arts) { if (norm(a.textContent).includes(s) && linkOf(a)) return { href: linkOf(a), matched: true }; } // caption-matched = definitely OURS
-          for (const a of arts) { if (linkOf(a)) return { href: linkOf(a), matched: false }; } // else newest non-pinned (short/image)
-          return null;
-        }, capSnip, 8000).catch(() => null);
+        // Find OUR post and capture its verified permalink. Caption-match the TOP-3 ONLY (a match further
+        // down is an OLD duplicate, never our just-published post); scan top-8 for the newest-link
+        // fallback. Tolerate "See more" truncation. Poll up to ~12s so a slow render isn't read as "gone".
+        let find = null;
+        const findDeadline = Date.now() + 12000;
+        do {
+          find = await evalTimed(page, (s) => {
+            const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const linkOf = (a) => { const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); return (l && /\/(posts|permalink)\//.test(l.href || '')) ? l.href.split('?')[0] : null; };
+            const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 8)
+              .filter((a) => !/pinned|épingl|rögzít/.test((a.innerText || '').slice(0, 200).toLowerCase()));
+            if (s && s.length >= 12) {
+              for (const a of arts.slice(0, 3)) {
+                const body = norm(a.textContent);
+                if ((body.includes(s) || body.startsWith(s.slice(0, 20))) && linkOf(a)) return { href: linkOf(a), matched: true }; // = definitely OURS
+              }
+            }
+            for (const a of arts) { if (linkOf(a)) return { href: linkOf(a), matched: false }; } // newest non-pinned (short/image)
+            return null;
+          }, capSnip, 8000).catch(() => null);
+          if (find && find.matched) break;
+          await sleep(1500);
+        } while (Date.now() < findDeadline);
 
         if (find && find.matched) {
+          // LIVE OVERRIDE: our caption is in the PUBLIC feed → the post is approved/live. This wins even
+          // if a pending notice was seen at publish (auto-approved, or the notice was stale).
           postPermalink = find.href;
           step('Confirmed LIVE — our post is in the feed (verified). Commenting on it directly.');
-        } else if (capSnip.length >= 12 && await checkPendingApproval(page)) {
-          // Long caption, NOT found in the feed, AND a pending notice present → genuinely pending.
-          step('Post is PENDING ADMIN APPROVAL (not in the feed) — not counted, comment skipped');
+        } else if (capSnip.length >= 12 && pendingAtPublish) {
+          // The ONLY pending path now: a long-caption post that is NOT in the feed AND showed the
+          // POST-SPECIFIC pending notice at publish time → genuinely awaiting admin approval. We do NOT
+          // scan the reloaded feed for pending (that matched the OLD pending posts → false positives).
+          step('Post is PENDING ADMIN APPROVAL (moderated group — pending notice shown at publish, post not in feed) — not counted, comment skipped');
           pendingApproval++;
-          report(groupName, gid, 'pending', 'awaiting admin approval', 'skipped');
+          report(groupName, gid, 'pending', 'awaiting admin approval (immediate signal)', 'skipped');
           if (i < targetGroups.length - 1) await sleepInterruptible(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120), shouldStop, 1000); // T2: randomized inter-group gap (floor 120s)
           continue;
         } else {
-          // Publish was confirmed; either no pending notice, or a short/image caption we can't match —
-          // trust the publish. Use the newest link (if any) for the comment, else the feed fallback.
+          // Publish was confirmed and NO post-specific pending notice appeared → the post landed. A short
+          // or image-only caption we couldn't match, or a slow feed, does NOT mean pending — trust the
+          // confirmed publish and use the newest link (if found) for the comment, else the feed fallback.
           postPermalink = find ? find.href : null;
-          step(`Posted (publish confirmed)${postPermalink ? ' — using the post link for the comment' : ' — comment will use the feed fallback'}`);
+          step(`Posted (publish confirmed)${postPermalink ? ' — using the newest post link for the comment' : ' — comment will use the feed fallback'}`);
         }
 
         // Success log — keep caption snippet for the renderer's auto-delete tracker.
