@@ -1488,9 +1488,24 @@ async function runAccount(o) {
       try {
         const fbName = await evalTimed(page, () => {
           const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-          const el = document.querySelector('a[href="/me/"] span, a[href*="/me/"] span, [aria-label*="profile" i] span, [aria-label*="profil" i] span');
-          let n = clean(el && (el.getAttribute('aria-label') || el.textContent));
-          return n.slice(0, 60);
+          // Reject UI chrome that loose selectors used to grab (e.g. "Share", "Home").
+          const BAD = new Set(['share', 'home', 'menu', 'profile', 'profil', 'friends', 'amis', 'watch', 'video',
+            'marketplace', 'groups', 'groupes', 'notifications', 'messenger', 'settings', 'paramètres', 'see more',
+            'voir plus', 'like', 'comment', 'commenter', 'facebook', 'reels', 'pages', 'events']);
+          const ok = (n) => n && n.length >= 2 && n.length <= 80 && !BAD.has(n.toLowerCase()) && /[a-zA-ZÀ-ɏ؀-ۿ]/.test(n) && !/^https?:/.test(n);
+          // PRIMARY: FB embeds the logged-in viewer's full name in CurrentUserInitialData.NAME — the
+          // authoritative source, and exactly the name shown as the post author in the moderation queue.
+          try {
+            const html = document.documentElement.innerHTML;
+            const m = html.match(/CurrentUserInitialData"[\s\S]{0,400}?"NAME":"([^"]{2,80})"/) || html.match(/"USER":\{"[^}]*?"NAME":"([^"]{2,80})"/);
+            if (m) { let n = clean(m[1]); try { n = JSON.parse('"' + n + '"'); } catch {} if (ok(n)) return n.slice(0, 80); }
+          } catch {}
+          // FALLBACK: an accessible profile link in the nav/left rail.
+          for (const s of ['a[href*="/me/"][aria-label]', 'a[aria-current="page"][aria-label]', '[role="navigation"] a[aria-label]']) {
+            const el = document.querySelector(s); const n = clean(el && el.getAttribute('aria-label'));
+            if (ok(n)) return n.slice(0, 80);
+          }
+          return '';
         }, null, 6000).catch(() => '');
         if (fbName && fbName.length >= 2) {
           account.fbDisplayName = fbName;
