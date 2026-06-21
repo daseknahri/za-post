@@ -1130,6 +1130,16 @@ function renderAccounts() {
           <small style="display: block; margin-top: 6px; font-size: 11px; color: #6b7280;">One stable proxy per account (recommended). Leave blank to use the global pool / your IP.</small>
         </div>
 
+        <!-- Moderator role: approves held ("Spam potentiel") posts so post+comment go live (needs "Enable moderator approval" in Settings) -->
+        <div class="account-moderator" style="margin: 12px 0; padding: 10px; background: #1e293b; border-radius: 8px;">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:12px; color:#94a3b8;">
+            <input type="checkbox" ${account.isModerator ? 'checked' : ''} onchange="toggleModerator('${account.name}', this.checked)" style="width:16px;height:16px;accent-color:#6366f1;">
+            🛡️ Group moderator (auto-approves held posts) — set ONE admin account
+          </label>
+          <input type="text" value="${escapeHtml(account.fbDisplayName || '')}" placeholder="FB display name (e.g. Abdo Abdo) — how this account appears as a post author" onchange="updateFbDisplayName('${account.name}', this.value)" style="width:100%; margin-top:8px; padding:8px 12px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:13px; box-sizing:border-box;">
+          <small style="display:block; margin-top:6px; font-size:11px; color:#6b7280;">Auto-captured at login; set manually if approval can't match this account's posts.</small>
+        </div>
+
         <div class="account-actions" style="display: flex; gap: 6px;">
           <button class="btn-primary" onclick="loginAccount('${account.name}')">
             🔐 Login
@@ -1251,6 +1261,22 @@ async function updateAccountProxy(accountName, proxyValue) {
   account.proxy = (proxyValue || '').trim();
   await saveData();
   showNotification(account.proxy ? `Proxy set for ${accountName}` : `Proxy cleared for ${accountName}`, 'success');
+}
+
+// MOD: designate the single group-moderator account (approves held posts). Exactly one moderator.
+async function toggleModerator(name, checked) {
+  (appData.accounts || []).forEach((a) => { a.isModerator = (a.name === name) ? !!checked : false; });
+  await saveData();
+  showNotification(checked ? `🛡️ ${name} is the group moderator (approves held posts)` : 'Moderator role cleared', 'success');
+  try { renderAccounts(); } catch {}
+}
+// MOD: the FB display name used to recognise this account's posts in the moderation queue.
+async function updateFbDisplayName(name, value) {
+  const a = (appData.accounts || []).find((x) => x.name === name);
+  if (!a) return;
+  a.fbDisplayName = (value || '').trim();
+  await saveData();
+  showNotification(`FB display name ${a.fbDisplayName ? 'set' : 'cleared'} for ${name}`, 'success');
 }
 
 // Edit account name and alias
@@ -1936,6 +1962,7 @@ function loadSettings() {
   document.getElementById('setting-group-delay-max').value = appData.settings.groupDelayMax !== undefined ? appData.settings.groupDelayMax : 300;
   document.getElementById('setting-max-cycles').value = appData.settings.maxCycles !== undefined ? appData.settings.maxCycles : 0;
   document.getElementById('setting-enable-tunnel').checked = appData.settings.enableTunnel || false;
+  { const el = document.getElementById('setting-moderation-enabled'); if (el) el.checked = appData.settings.moderationEnabled === true; }
   document.getElementById('setting-loop-campaign').checked = appData.settings.loopCampaign || false;
   document.getElementById('setting-resume-on-startup').checked = appData.settings.resumeOnStartup === true;
   document.getElementById('setting-launch-on-startup').checked = appData.settings.launchOnStartup || false;
@@ -2097,6 +2124,7 @@ async function saveSettings() {
     groupDelayMax: intOr('setting-group-delay-max', 300),
     maxCycles: intOr('setting-max-cycles', 0),
     enableTunnel: document.getElementById('setting-enable-tunnel').checked,
+    moderationEnabled: (document.getElementById('setting-moderation-enabled') || {}).checked || false,
     loopCampaign: document.getElementById('setting-loop-campaign').checked,
     resumeOnStartup: document.getElementById('setting-resume-on-startup').checked,
     launchOnStartup: document.getElementById('setting-launch-on-startup').checked,

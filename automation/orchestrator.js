@@ -370,6 +370,20 @@ class Orchestrator {
           // lost. A pending post (admin may reject) also stays (never enters postedIds).
           if (r && (r.posted || 0) > 0) { progressed = true; if (post.id) { if (r.fullyPosted) postedIds.push(post.id); dealtIds.push(post.id); } }
           else if (r && (r.pendingApproval || 0) > 0) { progressed = true; if (post.id) dealtIds.push(post.id); }
+          // MOD: persist held posts (deduped) so the moderator phase can approve them. Gated on the
+          // opt-in flag — when off, this is a no-op and behavior is identical to before.
+          if (data.settings.moderationEnabled && r && r.heldRecords && r.heldRecords.length) {
+            try {
+              const ms = store.loadModeration();
+              for (const h of r.heldRecords) {
+                if (!ms.held.some((x) => x.postId === h.postId && x.gid === h.gid && x.status === 'held')) {
+                  ms.held.push({ ...h, status: 'held', permalink: null, heldAt: Date.now(), approvedAt: null, commentedAt: null });
+                }
+              }
+              store.saveModeration(ms);
+              this.log(`📥 [${account.name}] ${r.heldRecords.length} post(s) held for moderator approval`);
+            } catch (e) { this.log(`⚠️ could not persist held-post state: ${e.message}`); }
+          }
           // Persist flag to account status so the UI shows it (serialized via store.update).
           if (r && r.flag) {
             accountFlag = r.flag;
@@ -679,6 +693,25 @@ class Orchestrator {
       // left to mark or save here. (Round-robin invariant, for reference: each post is dealt once;
       // a failed account's post stays un-dealt and is re-dealt next cycle.)
       if (this._shouldStop()) break;
+
+      // ── PHASE 2: MODERATOR APPROVAL (opt-in, behind settings.moderationEnabled) ──────────────────
+      // FB holds poster accounts' posts in the group "Spam potentiel" / pending queue (not the public
+      // feed), so the first comment can't attach. A designated MODERATOR account (admin of the groups)
+      // approves OUR held posts so they go live. DRY-RUN for now: it scans the queues and LOGS what it
+      // would approve (no clicks) so we refine the queue DOM live, then enable the click. No-op when off.
+      if (settings.moderationEnabled && !this._shouldStop()) {
+        try {
+          const heldNow = (store.loadModeration().held || []).filter((h) => h.status === 'held');
+          const mod = (data.accounts || []).find((a) => a.isModerator);
+          if (heldNow.length && !mod) {
+            this.log('⚠️ Moderation is ON but no moderator account is set — held posts will NOT be approved. Toggle a logged-in admin account as the moderator on the Accounts tab.');
+          } else if (heldNow.length && mod) {
+            const posterNames = [...new Set((data.accounts || []).filter((a) => !a.isModerator && a.fbDisplayName && String(a.fbDisplayName).trim()).map((a) => String(a.fbDisplayName).trim()))];
+            const { runModerator } = require('./moderator');
+            await runModerator({ account: mod, groups: data.groups, settings, held: heldNow, posterNames, log: (m) => this.log(m), shouldStop: () => this._shouldStop() });
+          }
+        } catch (e) { this.log(`⚠️ moderator phase error: ${e.message}`); }
+      }
 
       // One-time campaign: remove the posts PUBLISHED this cycle so each post is used
       // exactly once (and the run ends when the library empties). Pending-approval posts

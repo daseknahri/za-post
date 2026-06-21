@@ -1310,6 +1310,7 @@ async function runAccount(o) {
     try { const proc = browser && browser.process && browser.process(); if (proc) proc.kill(); } catch {}
   };
   let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false;
+  const heldRecords = []; // MOD: posts FB held in the moderation queue this run (for the moderator phase)
   try {
     const hidden = settings.hideBrowser !== false; // default: hidden
     // ALWAYS headful — Facebook's composer (clipboard, typing focus, publish) misbehaves in true
@@ -1477,6 +1478,26 @@ async function runAccount(o) {
       }
     } else if (profileAuthed) {
       log(`🔑 [${name}] using existing profile session`);
+    }
+
+    // MOD: capture this account's FB DISPLAY NAME once (the author-match key the moderator uses to
+    // recognise OUR held posts in the queue). Best-effort, non-blocking; on failure stay silent and
+    // leave it empty (approval is fail-closed on an empty name — the operator can set it in the UI).
+    // Mutates the in-memory account so THIS run's held records carry the name, and persists for next.
+    if (settings.moderationEnabled && !(account.fbDisplayName && String(account.fbDisplayName).trim())) {
+      try {
+        const fbName = await evalTimed(page, () => {
+          const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+          const el = document.querySelector('a[href="/me/"] span, a[href*="/me/"] span, [aria-label*="profile" i] span, [aria-label*="profil" i] span');
+          let n = clean(el && (el.getAttribute('aria-label') || el.textContent));
+          return n.slice(0, 60);
+        }, null, 6000).catch(() => '');
+        if (fbName && fbName.length >= 2) {
+          account.fbDisplayName = fbName;
+          await store.update((d) => { const a = (d.accounts || []).find((x) => x.name === name); if (a && !(a.fbDisplayName && String(a.fbDisplayName).trim())) a.fbDisplayName = fbName; }).catch(() => {});
+          log(`🪪 [${name}] captured FB display name: "${fbName}"`);
+        } else { log(`🪪 [${name}] could not read FB display name — set it on the account card for moderator approval`); }
+      } catch {}
     }
 
     // New-account WARM-UP (opt-in): before its first few posts, an account browses the feed like a
@@ -1904,6 +1925,9 @@ async function runAccount(o) {
           // scan the reloaded feed for pending (that matched the OLD pending posts → false positives).
           step('Post is PENDING ADMIN APPROVAL (moderated group — pending notice shown at publish, post not in feed) — not counted, comment skipped');
           pendingApproval++;
+          // MOD: record the held post so the moderator phase can approve it (then a later comment pass
+          // adds the first comment). captionSnip is the same normalized 40-char key the queue scan uses.
+          heldRecords.push({ postId: basePost.id || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip, groupName });
           report(groupName, gid, 'pending', 'awaiting admin approval (immediate signal)', 'skipped');
           if (i < targetGroups.length - 1) await sleepInterruptible(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120), shouldStop, 1000); // T2: randomized inter-group gap (floor 120s)
           continue;
@@ -2023,7 +2047,7 @@ async function runAccount(o) {
   }
   // fullyPosted = the post landed in EVERY targeted group, none pending, no errors — only then is it
   // safe to auto-delete from the library (a partial publish must be kept). See orchestrator deal gate.
-  return { posted, errors, pendingApproval, noRetry, flag, offline, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length };
+  return { posted, errors, pendingApproval, noRetry, flag, offline, heldRecords, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length };
 }
 
 // Strip fields Puppeteer's setCookie rejects; coerce sameSite.

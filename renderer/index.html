@@ -627,6 +627,14 @@
             <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, a Cloudflare tunnel is started so you can monitor and control the app remotely from any device. Takes effect on next app restart.</small>
           </div>
 
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-accent/20 rounded-2xl p-5">
+            <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+              <input type="checkbox" id="setting-moderation-enabled" class="w-5 h-5 rounded-md accent-accent">
+              <span class="text-sm font-semibold text-gray-200">🛡️ Enable moderator approval (your own groups)</span>
+            </label>
+            <small class="block mt-2 text-xs text-gray-500 ml-8">For groups you ADMIN: a designated moderator account (toggle it on an account) approves posts Facebook holds in "Spam potentiel"/pending, so the post goes live and its comment can land. Currently a safe DRY-RUN — it scans the queue and logs what it would approve (no clicks) so we confirm it targets only your posts; clicking is enabled after that.</small>
+          </div>
+
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
             <label class="checkbox-label flex items-center gap-3 cursor-pointer">
               <input type="checkbox" id="setting-loop-campaign" class="w-5 h-5 rounded-md accent-accent">
