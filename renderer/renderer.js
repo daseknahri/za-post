@@ -1304,33 +1304,49 @@ function renderModeratorPanel() {
   const el = document.getElementById('moderator-panel');
   if (!el) return;
   const accts = appData.accounts || [];
+  const mods = accts.filter((a) => a.isModerator);
   const enabled = appData.settings && appData.settings.moderationEnabled === true;
-  const rows = accts.map((a) => {
-    const isMod = !!a.isModerator;
-    const badge = isMod ? (a.status === 'logged_in' ? '<span style="color:#34d399;">● logged in</span>' : `<span style="color:#fbbf24;">● ${escapeHtml(a.status || 'not logged in')}</span>`) : '';
-    return `<div style="display:flex; align-items:center; gap:10px; padding:7px 0; border-bottom:1px solid rgba(255,255,255,0.06);">
-      <label style="display:flex; align-items:center; gap:6px; min-width:170px; cursor:pointer; font-size:13px; color:#e5e7eb;">
-        <input type="checkbox" ${isMod ? 'checked' : ''} onchange="toggleModerator('${escapeHtml(a.name)}', this.checked)" style="width:15px;height:15px;accent-color:#6366f1;">
-        ${escapeHtml(a.alias || a.name)}
-      </label>
-      ${isMod
-        ? `<span style="font-size:12px;">${badge}</span> <a href="#" onclick="loginAccount('${escapeHtml(a.name)}');return false;" style="color:#818cf8; font-size:12px;">log in</a>
-           <input type="text" value="${escapeHtml(a.fbDisplayName || '')}" placeholder="FB display name (skip its own posts)" onchange="updateFbDisplayName('${escapeHtml(a.name)}', this.value)" style="flex:1; min-width:140px; padding:6px 8px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:12px;">`
-        : '<span style="font-size:12px; color:#6b7280;">(poster account)</span>'}
+  const rows = mods.map((a) => {
+    const badge = a.status === 'logged_in' ? '<span style="color:#34d399;">● logged in</span>' : `<span style="color:#fbbf24;">● ${escapeHtml(a.status || 'not logged in')}</span>`;
+    return `<div style="display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.06);">
+      <span style="min-width:120px; font-size:13px; color:#e5e7eb; font-weight:600;">🛡️ ${escapeHtml(a.alias || a.name)}</span>
+      <span style="font-size:12px;">${badge}</span>
+      <a href="#" onclick="loginAccount('${escapeHtml(a.name)}');return false;" style="color:#818cf8; font-size:12px;">log in / re-login</a>
+      <input type="text" value="${escapeHtml(a.fbDisplayName || '')}" placeholder="FB display name (to skip its own posts)" onchange="updateFbDisplayName('${escapeHtml(a.name)}', this.value)" style="flex:1; min-width:140px; padding:6px 8px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:12px;">
+      <button onclick="toggleModerator('${escapeHtml(a.name)}', false)" title="Remove as moderator" style="background:none; border:none; color:#f87171; cursor:pointer; font-size:14px;">✕</button>
     </div>`;
   }).join('');
-  const modCount = accts.filter((a) => a.isModerator).length;
   el.innerHTML = `
     <div style="padding:16px; background:linear-gradient(135deg, rgba(99,102,241,0.10), rgba(21,27,48,0.55)); border:1px solid rgba(99,102,241,0.28); border-radius:16px;">
       <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap;">
         <div>
-          <div style="font-weight:700; color:#e2e8f0;">🛡️ Group Moderators</div>
-          <div style="font-size:12px; color:#94a3b8; margin-top:2px; max-width:620px;">Tick each admin account that approves held ("Spam potentiel"/pending) posts so they go live and their comments can land. Moderators <b>never post</b>. ${modCount >= 2 ? 'Assign each group to a moderator in its row below.' : 'With one moderator it covers all your groups automatically.'}</div>
+          <div style="font-weight:700; color:#e2e8f0;">🛡️ Group Moderators (admins)</div>
+          <div style="font-size:12px; color:#94a3b8; margin-top:2px; max-width:560px;">Admin accounts that approve held ("Spam potentiel"/pending) posts so they go live and their comments can land. They only need a login + which groups — they <b>never post</b>, and don't appear in the posting Accounts tab. ${mods.length >= 2 ? 'Assign each group to a moderator in its row below.' : 'One moderator covers all your groups automatically.'}</div>
         </div>
-        <div style="font-size:12px; color:${enabled ? '#34d399' : '#fbbf24'};">${enabled ? '✓ approval ON' : '⚠ enable in Settings'}</div>
+        <div style="display:flex; flex-direction:column; align-items:flex-end; gap:6px;">
+          <button onclick="addModeratorAccount()" style="background:#6366f1; color:#fff; border:none; border-radius:8px; padding:7px 12px; font-size:13px; font-weight:600; cursor:pointer;">➕ Add admin</button>
+          <span style="font-size:11px; color:${enabled ? '#34d399' : '#fbbf24'};">${enabled ? '✓ approval ON' : '⚠ enable in Settings'}</span>
+        </div>
       </div>
-      <div style="margin-top:10px;">${rows || '<div style="font-size:12px; color:#6b7280;">No accounts yet — add them on the Accounts tab, then tick the admin one here.</div>'}</div>
+      <div style="margin-top:10px;">${rows || '<div style="font-size:12px; color:#6b7280;">No moderators yet — click “➕ Add admin”, log it in, and (if 2+) assign groups below.</div>'}</div>
     </div>`;
+}
+// MOD: add an admin/moderator account straight from the Groups page — create + flag as moderator +
+// open the login browser. It never enters the posting Accounts list.
+async function addModeratorAccount() {
+  const accountName = (prompt('Name for the admin/moderator account (letters, numbers, _ only):') || '').trim();
+  if (!accountName) return;
+  if (!/^[a-zA-Z0-9_]+$/.test(accountName)) { showNotification('Name can only contain letters, numbers, and underscores', 'error'); return; }
+  if ((appData.accounts || []).some((a) => a.name === accountName)) { showNotification('An account with that name already exists', 'error'); return; }
+  showNotification('Creating moderator account…', 'info');
+  const result = await window.electronAPI.createAccount(accountName, '');
+  if (!result || !result.success) { showNotification('Failed to create: ' + ((result && result.error) || 'unknown'), 'error'); return; }
+  await loadData();
+  const a = (appData.accounts || []).find((x) => x.name === accountName);
+  if (a) { a.isModerator = true; await saveData(); }
+  try { renderModeratorPanel(); renderAccounts(); } catch {}
+  showNotification(`🛡️ ${accountName} added as moderator — opening the login window…`, 'success');
+  loginAccount(accountName);
 }
 
 // Edit account name and alias
