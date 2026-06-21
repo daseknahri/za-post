@@ -783,6 +783,60 @@ class Orchestrator {
         } catch (e) { this.log(`⚠️ moderator phase error: ${e.message}`); }
       }
 
+      // ── PHASE 3: COMMENT RESCUE ───────────────────────────────────────────────────────────────────
+      // Place orphaned link-comments — posts that went LIVE but couldn't get their comment from their own
+      // account (a comment rate-limit, or a transient feed miss) — using a HEALTHY account that is a
+      // member of the group (preferably a reserve). So a post is NEVER left without its link. No-op when
+      // the queue is empty. (Held-in-spam posts are handled by the moderator phase above, not here.)
+      if (!this._shouldStop()) {
+        try {
+          const cs = store.loadComments();
+          const pending = (cs.pending || []).filter((c) => c.status === 'pending' && (c.attempts || 0) < 3);
+          if (pending.length) {
+            const now = Date.now();
+            const inGroup = (a, gid) => (data.groups || []).some((g) => (g.groupId || g.id) === gid && (a.assignedGroups || []).some((x) => x === g.id || x === g.groupId));
+            const reserveNames = new Set((this._reserve || []).map((a) => a.name));
+            const eligibleFor = (c) => (data.accounts || []).filter((a) =>
+              a.enabled !== false && !a.isModerator && a.status === 'logged_in' &&
+              (Number(a.rateLimitedUntil) || 0) <= now && a.name !== c.posterAccount && inGroup(a, c.gid))
+              .sort((a, b) => (reserveNames.has(b.name) ? 1 : 0) - (reserveNames.has(a.name) ? 1 : 0)); // reserve first
+            const PER_RESCUER = 5; // cap per rescuer per cycle so it doesn't burst-comment links and get itself blocked
+            const byAccount = new Map(); const unassigned = [];
+            for (const c of pending) {
+              const pick = eligibleFor(c).find((a) => ((byAccount.get(a.name) || { tasks: [] }).tasks.length) < PER_RESCUER);
+              if (!pick) { unassigned.push(c); continue; }
+              if (!byAccount.has(pick.name)) byAccount.set(pick.name, { account: pick, tasks: [] });
+              byAccount.get(pick.name).tasks.push(c);
+            }
+            if (unassigned.length) this.log(`⚠️ ${unassigned.length} orphaned comment(s) have no free healthy in-group account this cycle — they stay queued (assign a reserve account to those groups, or they retry next cycle).`);
+            if (byAccount.size) {
+              const { runRescue } = require('./rescue');
+              const hidden = settings.hideBrowser !== false;
+              const markResult = (task, outcome) => {
+                try {
+                  const d2 = store.loadComments();
+                  const rec = d2.pending.find((x) => x.gid === task.gid && (x.postId && task.postId ? x.postId === task.postId : x.captionSnip === task.captionSnip) && x.status === 'pending');
+                  if (rec) {
+                    rec.attempts = (rec.attempts || 0) + 1;
+                    if (outcome === 'done') { rec.status = 'done'; rec.commentedAt = Date.now(); }
+                    else if (outcome === 'notfound') { rec.status = 'held_suspected'; rec.note = 'not in public feed on rescue — may be held in Spam potentiel'; }
+                    else if (rec.attempts >= 3) { rec.status = 'failed'; }
+                  }
+                  store.saveComments(d2);
+                } catch {}
+              };
+              this.log(`💬 Comment rescue: ${pending.length - unassigned.length} orphaned comment(s) across ${byAccount.size} healthy account(s)…`);
+              for (const { account, tasks } of byAccount.values()) {
+                if (this._shouldStop()) break;
+                await runRescue({ account, tasks, settings, hidden, log: (m) => this.log(m), shouldStop: () => this._shouldStop(), onResult: markResult });
+              }
+              // Prune resolved records so the queue file doesn't grow unbounded.
+              try { const d3 = store.loadComments(); d3.pending = (d3.pending || []).filter((c) => c.status === 'pending' || c.status === 'held_suspected'); store.saveComments(d3); } catch {}
+            }
+          }
+        } catch (e) { this.log(`⚠️ comment-rescue phase error: ${e.message}`); }
+      }
+
       // One-time campaign: remove the posts PUBLISHED this cycle so each post is used
       // exactly once (and the run ends when the library empties). Pending-approval posts
       // are NOT in cyclePostedIds, so they survive. Serialized via store.update so a
