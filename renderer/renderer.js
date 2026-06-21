@@ -1908,13 +1908,16 @@ function openLogsFolder() {
 // Settings
 function loadSettings() {
   document.getElementById('setting-parallel-accounts').value = appData.settings.parallelAccounts;
-  document.getElementById('setting-wait-interval').value = appData.settings.waitInterval;
-  document.getElementById('setting-account-delay').value = appData.settings.accountDelay || 1;
+  document.getElementById('setting-wait-interval-min').value = appData.settings.waitIntervalMin !== undefined ? appData.settings.waitIntervalMin : 90;
+  document.getElementById('setting-wait-interval-max').value = appData.settings.waitIntervalMax !== undefined ? appData.settings.waitIntervalMax : 180;
+  document.getElementById('setting-account-delay-min').value = appData.settings.accountDelayMin !== undefined ? appData.settings.accountDelayMin : 1;
+  document.getElementById('setting-account-delay-max').value = appData.settings.accountDelayMax !== undefined ? appData.settings.accountDelayMax : 4;
   document.getElementById('setting-posts-per-group').value = appData.settings.postsPerGroup;
   document.getElementById('setting-comment-with-image').checked = appData.settings.commentWithImage || false;
   document.getElementById('setting-auto-delete-posted').checked = appData.settings.autoDeletePosted || false;
   document.getElementById('setting-hide-browser').checked = appData.settings.hideBrowser !== false;
-  document.getElementById('setting-group-delay').value = appData.settings.groupDelay !== undefined ? appData.settings.groupDelay : 60;
+  document.getElementById('setting-group-delay-min').value = appData.settings.groupDelayMin !== undefined ? appData.settings.groupDelayMin : 120;
+  document.getElementById('setting-group-delay-max').value = appData.settings.groupDelayMax !== undefined ? appData.settings.groupDelayMax : 300;
   document.getElementById('setting-max-cycles').value = appData.settings.maxCycles !== undefined ? appData.settings.maxCycles : 0;
   document.getElementById('setting-enable-tunnel').checked = appData.settings.enableTunnel || false;
   document.getElementById('setting-loop-campaign').checked = appData.settings.loopCampaign || false;
@@ -1930,6 +1933,14 @@ function loadSettings() {
   document.getElementById('setting-enable-warmup').checked = appData.settings.enableWarmup || false;
   document.getElementById('setting-warmup-runs').value = appData.settings.warmupRuns !== undefined ? appData.settings.warmupRuns : 5;
   document.getElementById('setting-cooldown-hours').value = appData.settings.rateLimitCooldownHours !== undefined ? appData.settings.rateLimitCooldownHours : 4;
+  // Humanization (anti-detection) controls
+  document.getElementById('setting-humanize-master').checked = appData.settings.humanizeMaster !== false;
+  document.getElementById('setting-page-dwell-min').value = appData.settings.pageScrollDwellSecMin !== undefined ? appData.settings.pageScrollDwellSecMin : 3;
+  document.getElementById('setting-page-dwell-max').value = appData.settings.pageScrollDwellSecMax !== undefined ? appData.settings.pageScrollDwellSecMax : 15;
+  document.getElementById('setting-prepublish-dwell-min').value = appData.settings.prePublishDwellSecMin !== undefined ? appData.settings.prePublishDwellSecMin : 3;
+  document.getElementById('setting-prepublish-dwell-max').value = appData.settings.prePublishDwellSecMax !== undefined ? appData.settings.prePublishDwellSecMax : 8;
+  document.getElementById('setting-comment-dwell-min').value = appData.settings.commentDwellSecMin !== undefined ? appData.settings.commentDwellSecMin : 1;
+  document.getElementById('setting-comment-dwell-max').value = appData.settings.commentDwellSecMax !== undefined ? appData.settings.commentDwellSecMax : 4;
 }
 
 async function saveSettings() {
@@ -1939,13 +1950,16 @@ async function saveSettings() {
   const settings = {
     ...appData.settings, // preserve settings that have no form input
     parallelAccounts: intOr('setting-parallel-accounts', 2),
-    waitInterval: intOr('setting-wait-interval', 120),
-    accountDelay: intOr('setting-account-delay', 2),
+    waitIntervalMin: intOr('setting-wait-interval-min', 90),
+    waitIntervalMax: intOr('setting-wait-interval-max', 180),
+    accountDelayMin: intOr('setting-account-delay-min', 1),
+    accountDelayMax: intOr('setting-account-delay-max', 4),
     postsPerGroup: intOr('setting-posts-per-group', 1),
     commentWithImage: document.getElementById('setting-comment-with-image').checked,
     autoDeletePosted: document.getElementById('setting-auto-delete-posted').checked,
     hideBrowser: document.getElementById('setting-hide-browser').checked,
-    groupDelay: intOr('setting-group-delay', 60),
+    groupDelayMin: intOr('setting-group-delay-min', 120),
+    groupDelayMax: intOr('setting-group-delay-max', 300),
     maxCycles: intOr('setting-max-cycles', 0),
     enableTunnel: document.getElementById('setting-enable-tunnel').checked,
     loopCampaign: document.getElementById('setting-loop-campaign').checked,
@@ -1961,6 +1975,13 @@ async function saveSettings() {
     enableWarmup: document.getElementById('setting-enable-warmup').checked,
     warmupRuns: intOr('setting-warmup-runs', 5),
     rateLimitCooldownHours: intOr('setting-cooldown-hours', 4),
+    humanizeMaster: document.getElementById('setting-humanize-master').checked,
+    pageScrollDwellSecMin: intOr('setting-page-dwell-min', 3),
+    pageScrollDwellSecMax: intOr('setting-page-dwell-max', 15),
+    prePublishDwellSecMin: intOr('setting-prepublish-dwell-min', 3),
+    prePublishDwellSecMax: intOr('setting-prepublish-dwell-max', 8),
+    commentDwellSecMin: intOr('setting-comment-dwell-min', 1),
+    commentDwellSecMax: intOr('setting-comment-dwell-max', 4),
   };
 
   const result = await window.electronAPI.saveSettings(settings);

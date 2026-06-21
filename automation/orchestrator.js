@@ -21,6 +21,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Jitter a delay by ±pct so batch/cycle gaps are never metronomic (a fixed cadence is a bot signal).
 const jitter = (ms, pct = 0.25) => Math.round(Math.max(0, Number(ms) || 0) * (1 - pct + Math.random() * pct * 2));
+// A random integer in [min,max] — the primitive for unpredictable, never-constant cadence.
+const rand = (min, max) => { let lo = Math.max(0, Math.floor(Number(min) || 0)), hi = Math.max(0, Math.floor(Number(max) || 0)); if (hi < lo) { const t = lo; lo = hi; hi = t; } return lo + Math.floor(Math.random() * (hi - lo + 1)); };
+// Random ms drawn from a settings min/max range (in the given unit ms-per-unit; floor keeps it safe).
+const rangeMs = (settings, minKey, maxKey, defMin, defMax, unitMs = 1000, floorUnit = 0) => {
+  settings = settings || {};
+  const lo = Number.isFinite(settings[minKey]) ? settings[minKey] : defMin;
+  const hi = Number.isFinite(settings[maxKey]) ? settings[maxKey] : defMax;
+  return rand(Math.max(floorUnit, Math.min(lo, hi)) * unitMs, Math.max(floorUnit, Math.max(lo, hi)) * unitMs);
+};
 
 let axios; try { axios = require('axios'); } catch {}
 const https = require('https');
@@ -145,7 +154,7 @@ class Orchestrator {
         this.log('🌐 No internet connection — holding until it returns...');
         if (this._progress) { this._progress.offline = true; this.emit('automation-progress', { ...this._progress }); }
       }
-      await this._interruptibleSleep(15000); // re-check every 15s, but break instantly on Stop
+      await this._interruptibleSleep(jitter(15000, 0.4)); // T15: re-check ~9-21s (jittered), break instantly on Stop
     }
     return false;
   }
@@ -378,7 +387,7 @@ class Orchestrator {
           this.log(`❌ [${account.name}] crashed (attempt ${attempt}/${MAX}): ${e.message}`);
           if (attempt >= MAX) crashedOut = true;
           if (attempt >= MAX || this._shouldStop()) break;
-          await this._interruptibleSleep(5000); // observe Stop during the retry backoff
+          await this._interruptibleSleep(jitter(5000, 0.5)); // T16: ~2.5-7.5s jittered crash-retry backoff
         }
       }
       // M3-09: if this post exhausted its retries with a CRASH, count it. After 2 crashed posts in a
@@ -559,8 +568,13 @@ class Orchestrator {
         // launches are completion-triggered and already spread out in time. E-N4: halve per retry.
         if (settings.staggerAccounts !== false && myLaunch > 0 && myLaunch < poolSize && !this._shouldStop() && !stopPool) {
           const retries = (this._retryCount && this._retryCount[account.name]) || 0;
-          const base = Math.max(0, Math.min(myLaunch * 35000 * Math.pow(0.5, retries), 35000));
-          if (base > 0) await this._interruptibleSleep(jitter(base, 0.5));
+          // T4: stagger the initial fill by a randomized per-launch gap from the accountDelay range
+          // (cumulative across launches, capped at accountDelayMax, decayed on retries) so concurrent
+          // accounts never start in a synchronized burst.
+          const staggerBase = rangeMs(settings, 'accountDelayMin', 'accountDelayMax', 1, 4, 60000, 0);
+          const capMs = (Number.isFinite(settings.accountDelayMax) ? settings.accountDelayMax : 4) * 60000;
+          const base = Math.round(Math.min(staggerBase * myLaunch, capMs) * Math.pow(0.5, retries));
+          if (base > 0) await this._interruptibleSleep(base);
         }
         if (this._shouldStop() || stopPool || this._finish) return;
         // Mid-run toggle: if the user turned this account OFF since the cycle began, skip it now.
@@ -686,8 +700,9 @@ class Orchestrator {
       if ((settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {
         this.log(`🏁 Reached maxCycles (${settings.maxCycles}) — finishing.`); break;
       }
-      this.log(`✅ Cycle ${cycle} complete. Waiting ~${Number.isFinite(settings.waitInterval) ? settings.waitInterval : 120} min (±20%) before next cycle…`);
-      await this._waitWithCountdown(jitter((Number.isFinite(settings.waitInterval) ? settings.waitInterval : 120) * 60000, 0.2), 'Next cycle');
+      const cycleWaitMs = rangeMs(settings, 'waitIntervalMin', 'waitIntervalMax', 90, 180, 60000, 1); // T3: randomized inter-cycle wait
+      this.log(`✅ Cycle ${cycle} complete. Waiting ~${Math.round(cycleWaitMs / 60000)} min (randomized) before next cycle…`);
+      await this._waitWithCountdown(cycleWaitMs, 'Next cycle');
     }
   }
 

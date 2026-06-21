@@ -58,6 +58,35 @@ function jitter(ms, pct = 0.3) {
   return Math.round(base * (1 - pct + Math.random() * pct * 2));
 }
 
+// A random integer in [min, max] — the primitive for making EVERY human-facing pause a fresh value
+// in a range (never a constant), so the posting cadence is never metronomic (a top spam signal).
+// Order-tolerant and non-negative; if max<min they're swapped. Pure (exported for tests).
+function rand(min, max) {
+  let lo = Math.max(0, Math.floor(Number(min) || 0));
+  let hi = Math.max(0, Math.floor(Number(max) || 0));
+  if (hi < lo) { const t = lo; lo = hi; hi = t; }
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
+
+const _VARIANCE = { interact: 0.4, settle: 0.35, pause: 0.3, wait: 0.25 };
+// Pull a settings min/max range (in SECONDS) and return a random ms value in it, with a hard floor
+// so a mis-set/low value can never produce a sub-safe (burst-signal) gap. Falls back to defaults.
+function rangeMs(settings, minKey, maxKey, defMin, defMax, floorSec = 0) {
+  settings = settings || {};
+  const lo = Number.isFinite(settings[minKey]) ? settings[minKey] : defMin;
+  const hi = Number.isFinite(settings[maxKey]) ? settings[maxKey] : defMax;
+  return rand(Math.max(floorSec, Math.min(lo, hi)) * 1000, Math.max(floorSec, Math.max(lo, hi)) * 1000);
+}
+// Jitter a base delay by the per-class variance (interact/settle/pause/wait). Honors humanizeMaster:
+// when explicitly false (tests/deterministic), returns the exact base. The post->comment anti-spam
+// window is NOT routed through here — it stays randomized regardless of the master switch.
+function humanDelay(base, settings = {}, variant = 'settle') {
+  if (settings && settings.humanizeMaster === false) return Math.max(0, Math.floor(Number(base) || 0));
+  const tv = (settings && settings.timingVariance) || _VARIANCE;
+  const pct = Number.isFinite(tv[variant]) ? tv[variant] : _VARIANCE[variant];
+  return jitter(base, pct);
+}
+
 // Move the cursor to (x,y) along a short multi-step path instead of teleport-clicking. FB's
 // integrity JS expects a real mouse trajectory before a click; a click with no preceding
 // mousemove is non-human. Best-effort — never throws into the caller.
@@ -71,16 +100,20 @@ async function moveMouseTo(page, x, y) {
 
 // Land on a group and behave like a human reading before composing: a little mouse drift and a
 // few wheel scrolls with pauses, total ~5-13s. Reduces the "instant composer open" bot pattern.
-async function humanDwell(page, shouldStop = () => false) {
+async function humanDwell(page, shouldStop = () => false, settings = {}) {
   try {
+    // T5: total browse time is a random draw from the configurable pageScrollDwell range (0/0 = skip).
+    const dwellMs = rangeMs(settings, 'pageScrollDwellSecMin', 'pageScrollDwellSecMax', 3, 15, 0);
+    if (dwellMs <= 0) return;
     await moveMouseTo(page, 380 + Math.random() * 240, 280 + Math.random() * 160);
     const scrolls = 2 + Math.floor(Math.random() * 3);
+    const perStep = Math.max(300, Math.floor(dwellMs / (scrolls + 1)));
     for (let s = 0; s < scrolls && !shouldStop(); s++) {
       try { await page.mouse.wheel({ deltaY: 200 + Math.random() * 320 }); } catch {}
-      await sleep(700 + Math.floor(Math.random() * 1500));
+      await sleep(jitter(perStep, 0.4));
     }
     if (!shouldStop()) { try { await page.mouse.wheel({ deltaY: -(150 + Math.random() * 200) }); } catch {} }
-    await sleepInterruptible(1500 + Math.floor(Math.random() * 3000), shouldStop, 500);
+    await sleepInterruptible(jitter(perStep, 0.4), shouldStop, 500);
   } catch {}
 }
 
@@ -428,12 +461,34 @@ async function openComposerByText(page) {
 // (the text lives in a placeholder span), so target the SHORT-text placeholder, walk
 // up to its clickable [role=button], real-mouse-click it, and WAIT for the composer
 // dialog's editable to actually appear. Retries — returns true only when it opened.
-async function openComposer(page, log, name) {
+async function openComposer(page, log, name, settings = {}) {
+  // R1: a focused search/"type ahead" box (the "Exit typeahead" seen in failures) steals keyboard
+  // focus and obscures the composer trigger — blur it + Escape. R2: scroll to top, clear popups, and
+  // WAIT for the feed to actually render (an article or the "Write something" placeholder) ONCE before
+  // the attempt loop — scanning a half-rendered page was the cause of the "Could not open composer"
+  // skips. All pre-publish + read-only (no double-post path).
+  try {
+    const hadSearch = await page.evaluate(() => {
+      const el = document.activeElement; if (!el) return false;
+      const tag = (el.tagName || '').toLowerCase();
+      const lbl = ((el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('aria-placeholder') || el.getAttribute('placeholder'))) || '').toLowerCase();
+      if ((tag === 'input' || tag === 'textarea' || el.getAttribute('contenteditable') === 'true') && /search|type ?ahead|rechercher|buscar|suchen|keres/.test(lbl)) { try { el.blur(); } catch {} return true; }
+      return false;
+    }).catch(() => false);
+    if (hadSearch) { if (log) log('Composer: blurred a focused search/type-ahead box first'); await page.keyboard.press('Escape').catch(() => {}); await sleep(humanDelay(500, settings, 'pause')); }
+  } catch {}
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await dismissPopups(page);
+  await page.waitForFunction(() => {
+    if (document.querySelectorAll('div[role="article"]').length > 0) return true;
+    return Array.from(document.querySelectorAll('[role="button"], span, div')).some((e) => /write something|what'?s on your mind|irj valamit|mi jar a fejedben|quoi de neuf|que estas pensando|was machst du/i.test(e.textContent || ''));
+  }, { timeout: 20000 }).catch(() => {}); // R2: feed-render gate (slow internet)
+
   for (let attempt = 1; attempt <= 4; attempt++) {
     if (log) log(`Opening composer (attempt ${attempt}/4)`);
     // The composer lives at the TOP of the feed — make sure we're there and nothing covers it.
     await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
-    await sleep(600);
+    await sleep(attempt === 1 ? humanDelay(Number.isFinite(settings.composerOpenInitialDelayMs) ? settings.composerOpenInitialDelayMs : 1500, settings, 'settle') : humanDelay(1500, settings, 'settle'));
     await dismissPopups(page);
     const pt = await page.evaluate(() => {
       const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
@@ -477,24 +532,35 @@ async function openComposer(page, log, name) {
       const r = btn.getBoundingClientRect();
       return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
     }).catch(() => null);
-    if (pt) await page.mouse.click(pt.x, pt.y, { delay: 50 }).catch(() => {});
+    if (pt) await page.mouse.click(pt.x, pt.y, { delay: rand(35, 75) }).catch(() => {});
     else await openComposerByText(page).catch(() => false);
-    const ok = await page.waitForSelector('div[role="dialog"] [contenteditable="true"], div[role="dialog"] [role="textbox"]', { timeout: 6000 }).then(() => true).catch(() => false);
+    const ok = await page.waitForSelector('div[role="dialog"] [contenteditable="true"], div[role="dialog"] [role="textbox"]', { timeout: attempt === 1 ? 6000 : 9000 }).then(() => true).catch(() => false); // R4: more patience on slow-net retries
     if (ok) { if (attempt > 1 && log) log(`Composer opened (attempt ${attempt})`); return true; }
     if (log) {
+      // R3: a read-only readiness probe so a not-yet-rendered feed isn't misdiagnosed as selector drift.
       const hint = await page.evaluate(() => {
+        const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
         const body = (document.body.innerText || '').replace(/\s+/g, ' ').trim();
         const buttons = Array.from(document.querySelectorAll('[role="button"], button, a')).slice(0, 12)
           .map((b) => (b.getAttribute('aria-label') || b.textContent || '').replace(/\s+/g, ' ').trim())
           .filter(Boolean)
           .slice(0, 8);
-        return { buttons, body: body.slice(0, 180) };
+        const articles = document.querySelectorAll('div[role="article"]').length;
+        const ae = document.activeElement;
+        const focused = ae ? `${(ae.tagName || '').toLowerCase()}${ae.getAttribute && ae.getAttribute('aria-label') ? '[' + ae.getAttribute('aria-label').slice(0, 30) + ']' : ''}` : '(none)';
+        const composerHits = Array.from(document.querySelectorAll('[role="button"], span, div')).filter((e) => /write something|what.s on your mind|irj valamit|mi jar a fejedben|quoi de neuf|que estas pensando|was machst du/i.test(norm(e.textContent || ''))).length;
+        return { buttons, body: body.slice(0, 180), articles, focused, composerHits };
       }).catch(() => null);
-      if (hint) log(`Composer not open yet; visible buttons: ${hint.buttons.join(' | ') || '(none)'}`);
+      if (hint) log(`Composer not open yet (feed readiness: ${hint.articles} articles, focused=${hint.focused}, ${hint.composerHits} composer-text matches); visible buttons: ${hint.buttons.join(' | ') || '(none)'}`);
     }
-    await sleep(1500);
+    await sleep(humanDelay(1500, settings, 'settle'));
   }
-  if (log) log('⚠️ SELECTOR DRIFT? Composer never opened after 4 attempts — Facebook may have changed the "Write something" trigger, or the page is in an unexpected locale/state. Run scripts/inspect-fb.js on this account to capture the current DOM.');
+  // Distinguish "page never rendered" from genuine selector drift using the last readiness read.
+  const ready = await page.evaluate(() => document.querySelectorAll('div[role="article"]').length).catch(() => 0);
+  if (log) {
+    if (!ready) log('⚠️ Composer never opened after 4 attempts and the group FEED never rendered — likely a slow/blocked network or this account can\'t view this group. Not selector drift.');
+    else log('⚠️ SELECTOR DRIFT? The feed rendered but the "Write something" trigger was not found after 4 attempts — Facebook may have changed it or the page is in an unexpected locale/state. Run scripts/inspect-fb.js to capture the current DOM.');
+  }
   return false;
 }
 
@@ -653,7 +719,7 @@ function withTimeout(promise, ms, fallback) {
 // Add the "first comment" (the link) to the JUST-published post. Reloads the group
 // so the new post renders, finds the article containing our caption, and types into
 // ITS "Write a public comment…" box. Returns true on success.
-async function addFirstComment(page, gid, post, commentImg, step, permalink) {
+async function addFirstComment(page, gid, post, commentImg, step, permalink, settings = {}) {
   let submitted = false; // once the submitting Enter is pressed, NEVER return false — the caller
                          // retries on false and would post a DUPLICATE comment.
   try {
@@ -763,6 +829,11 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink) {
     step(`Comment: ${boxes.length} comment box(es) found`);
 
     const target = boxes[0];
+    // H1 / commentDwell: a human reads the post before commenting — a randomized, configurable pause
+    // with an occasional micro-scroll. Pre-focus and pre-keystroke (the focus step below re-centers the
+    // box, correcting any scroll drift), so this never moves the box off-screen or touches the text.
+    await sleep(rangeMs(settings, 'commentDwellSecMin', 'commentDwellSecMax', 1, 4, 0));
+    if (Math.random() < 0.4) { try { await page.mouse.wheel({ deltaY: 50 + Math.random() * 90 }); await sleep(humanDelay(500, settings, 'pause')); await page.mouse.wheel({ deltaY: -(50 + Math.random() * 90) }); } catch {} }
     // Focus via in-page scroll+focus (ElementHandle.click can hang on re-rendering feeds).
     step('Comment: focusing the comment box');
     await withTimeout(target.evaluate((el) => { el.scrollIntoView({ block: 'center' }); el.focus(); }), 5000, null);
@@ -1205,7 +1276,7 @@ async function runAccount(o) {
     // Budget scales with the CONFIGURED per-group pacing (group delay + comment delay + ~150s of
     // work, +30% jitter headroom) so the new, intentionally-slower human timing never trips the
     // watchdog. The watchdog still probes liveness before aborting, so a generous budget is safe.
-    const _gd = (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 180) * 1.3;
+    const _gd = (Number.isFinite(settings.groupDelayMax) ? settings.groupDelayMax : (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 300)) * 1.3; // watchdog tracks the MAX-end group draw
     const _cd = Number.isFinite(settings.commentDelayMax) ? settings.commentDelayMax : 180;
     const perGroupMs = (_gd + _cd + 250) * 1000; // +250s work headroom (dwell + slow-typing fallback + upload + publish)
     const accountBudget = Math.max(600000, Math.round(targetGroups.length * perGroupMs));
@@ -1304,8 +1375,8 @@ async function runAccount(o) {
         await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
         await sleep(2000);
         await dismissPopups(page);
-        await humanDwell(page, shouldStop);
-        await humanDwell(page, shouldStop);
+        await humanDwell(page, shouldStop, settings);
+        await humanDwell(page, shouldStop, settings);
       } catch (e) { log(`⚠️ [${name}] warm-up skipped (${e.message})`); }
     }
 
@@ -1416,11 +1487,11 @@ async function runAccount(o) {
 
         // Dwell like a human reading the group feed (mouse drift + a few scrolls with pauses)
         // before composing, instead of opening the composer instantly on every visit (a bot tell).
-        await humanDwell(page, shouldStop);
+        await humanDwell(page, shouldStop, settings);
 
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
-        const opened = await openComposer(page, step, name);
+        const opened = await openComposer(page, step, name, settings);
         if (!opened) {
           // An account-level block can be WHY the composer won't open — confirm it and skip the
           // WHOLE account immediately rather than trying every remaining group.
@@ -1538,7 +1609,7 @@ async function runAccount(o) {
 
         // Publish — then CONFIRM it actually published (dialog closed / Post button gone).
         // Variable human "re-read before posting" pause (2-8s), not a fixed 1.5s on every post.
-        await sleepInterruptible(2000 + Math.floor(Math.random() * 6000), shouldStop, 500);
+        await sleepInterruptible(rangeMs(settings, 'prePublishDwellSecMin', 'prePublishDwellSecMax', 3, 8, 2), shouldStop, 500); // T1: randomized "re-read before posting"
         step('Waiting for Post button to enable');
         const dialogCountBefore = await page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length).catch(() => 1);
         // Log what the Post-button scan sees (dialogs open, found label) — mirrors original's "🔍 Dialogs: N".
@@ -1630,7 +1701,7 @@ async function runAccount(o) {
           step('Post is PENDING ADMIN APPROVAL (not in the feed) — not counted, comment skipped');
           pendingApproval++;
           report(groupName, gid, 'pending', 'awaiting admin approval', 'skipped');
-          if (i < targetGroups.length - 1) await sleepInterruptible(jitter((Number.isFinite(settings.groupDelay) ? settings.groupDelay : 180) * 1000), shouldStop, 1000);
+          if (i < targetGroups.length - 1) await sleepInterruptible(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120), shouldStop, 1000); // T2: randomized inter-group gap (floor 120s)
           continue;
         } else {
           // Publish was confirmed; either no pending notice, or a short/image caption we can't match —
@@ -1667,7 +1738,7 @@ async function runAccount(o) {
               step(`Comment: retry ${cAttempt}/3 (waiting ${Math.round(gap / 1000)}s — keeping the human cadence)`);
               await sleepInterruptible(gap, shouldStop);
             }
-            cres = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink);
+            cres = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink, settings);
           }
           commentResult = cres;
           if (cres === 'failed') step('Comment: could not place the comment after 3 attempts — left uncommented');
@@ -1705,7 +1776,7 @@ async function runAccount(o) {
       // Interruptible delay between groups (respects Stop + configurable groupDelay), jittered ±30%
       // so the cadence is never metronomic (a fixed gap is itself a bot signal).
       if (i < targetGroups.length - 1) {
-        const d = jitter((Number.isFinite(settings.groupDelay) ? settings.groupDelay : 180) * 1000);
+        const d = rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120); // T2: randomized inter-group gap (floor 120s)
         if (d > 0) {
           step(`Wait ${d >= 60000 ? Math.round(d / 60000) + 'min' : Math.round(d / 1000) + 's'} before next group`);
           await sleepInterruptible(d, shouldStop, 1000);
@@ -1763,6 +1834,6 @@ module.exports = {
   // exported for diagnostics — use the EXACT worker logic
   clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish,
   // exported for tests (no runtime effect)
-  jitter, varyLinks, retryAsync, downloadImage, isSafeImageUrl, proxyFormatHint, classifyGroupError,
+  jitter, rand, rangeMs, humanDelay, varyLinks, retryAsync, downloadImage, isSafeImageUrl, proxyFormatHint, classifyGroupError,
   FB, isRateLimitText, isCheckpointText, isPendingText, isPostButtonLabel, isCommentBoxLabel,
 };

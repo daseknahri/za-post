@@ -457,19 +457,25 @@
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label for="setting-wait-interval" class="block text-sm font-semibold text-gray-300 mb-2">Wait Interval
-              (minutes)</label>
-            <input type="number" id="setting-wait-interval" min="1" max="1440" value="60"
-              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-            <small class="block mt-2 text-xs text-gray-500">Minutes to wait between automation cycles</small>
+            <label class="block text-sm font-semibold text-gray-300 mb-2">Wait Between Cycles (minutes) — randomized</label>
+            <div class="grid grid-cols-2 gap-3">
+              <input type="number" id="setting-wait-interval-min" min="0" max="1440" value="90" placeholder="min"
+                class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+              <input type="number" id="setting-wait-interval-max" min="0" max="1440" value="180" placeholder="max"
+                class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+            </div>
+            <small class="block mt-2 text-xs text-gray-500">Each cycle waits a <em>random</em> duration in this range — a fixed interval is itself a spam signal.</small>
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label for="setting-account-delay" class="block text-sm font-semibold text-gray-300 mb-2">Delay Between
-              Accounts (minutes)</label>
-            <input type="number" id="setting-account-delay" min="0" value="1"
-              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-            <small class="block mt-2 text-xs text-gray-500">Minutes to wait between switching accounts</small>
+            <label class="block text-sm font-semibold text-gray-300 mb-2">Stagger Between Accounts (minutes) — randomized</label>
+            <div class="grid grid-cols-2 gap-3">
+              <input type="number" id="setting-account-delay-min" min="0" max="1440" value="1" placeholder="min"
+                class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+              <input type="number" id="setting-account-delay-max" min="0" max="1440" value="4" placeholder="max"
+                class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+            </div>
+            <small class="block mt-2 text-xs text-gray-500">Spreads concurrent account starts by a random gap so they never begin in a synchronized burst.</small>
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
@@ -480,10 +486,54 @@
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label for="setting-group-delay" class="block text-sm font-semibold text-gray-300 mb-2">Delay Between Groups (seconds)</label>
-            <input type="number" id="setting-group-delay" min="0" value="60"
-              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-            <small class="block mt-2 text-xs text-gray-500">Seconds to wait between posting to each group</small>
+            <label class="block text-sm font-semibold text-gray-300 mb-2">Delay Between Groups (seconds) — randomized</label>
+            <div class="grid grid-cols-2 gap-3">
+              <input type="number" id="setting-group-delay-min" min="0" max="3600" value="120" placeholder="min"
+                class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+              <input type="number" id="setting-group-delay-max" min="0" max="3600" value="300" placeholder="max"
+                class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+            </div>
+            <small class="block mt-2 text-xs text-gray-500">A <em>random</em> wait in this range between each group. Below ~120s is high-risk; the engine enforces a 120s floor.</small>
+          </div>
+
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-accent/20 rounded-2xl p-5 md:col-span-2">
+            <div class="flex items-center justify-between mb-3">
+              <label class="block text-sm font-semibold text-gray-200">Humanized timing (anti-detection)</label>
+              <label class="inline-flex items-center cursor-pointer">
+                <input type="checkbox" id="setting-humanize-master" checked class="sr-only peer">
+                <div class="relative w-11 h-6 bg-dark-900 peer-checked:bg-accent rounded-full transition-all after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-5"></div>
+              </label>
+            </div>
+            <small class="block mb-4 text-xs text-gray-500">When on, every pause is a fresh random value (never a fixed cadence). The post→comment delay below stays randomized regardless.</small>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div>
+                <label class="block text-xs font-semibold text-gray-400 mb-1">Feed browse before posting (sec)</label>
+                <div class="grid grid-cols-2 gap-2">
+                  <input type="number" id="setting-page-dwell-min" min="0" max="600" value="3" placeholder="min"
+                    class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+                  <input type="number" id="setting-page-dwell-max" min="0" max="600" value="15" placeholder="max"
+                    class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+                </div>
+              </div>
+              <div>
+                <label class="block text-xs font-semibold text-gray-400 mb-1">Re-read before posting (sec)</label>
+                <div class="grid grid-cols-2 gap-2">
+                  <input type="number" id="setting-prepublish-dwell-min" min="0" max="60" value="3" placeholder="min"
+                    class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+                  <input type="number" id="setting-prepublish-dwell-max" min="0" max="60" value="8" placeholder="max"
+                    class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+                </div>
+              </div>
+              <div>
+                <label class="block text-xs font-semibold text-gray-400 mb-1">Pause on post before comment (sec)</label>
+                <div class="grid grid-cols-2 gap-2">
+                  <input type="number" id="setting-comment-dwell-min" min="0" max="300" value="1" placeholder="min"
+                    class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+                  <input type="number" id="setting-comment-dwell-max" min="0" max="300" value="4" placeholder="max"
+                    class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+                </div>
+              </div>
+            </div>
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
