@@ -492,7 +492,7 @@ async function openComposer(page, log, name, settings = {}) {
   await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
   await dismissPopups(page);
   await page.waitForFunction(() => {
-    if (document.querySelectorAll('div[role="article"]').length > 0) return true;
+    if (document.querySelectorAll('[aria-posinset], div[role="article"]').length > 0) return true;
     return Array.from(document.querySelectorAll('[role="button"], span, div')).some((e) => /write something|what'?s on your mind|irj valamit|mi jar a fejedben|quoi de neuf|que estas pensando|was machst du/i.test(e.textContent || ''));
   }, { timeout: 20000 }).catch(() => {}); // R2: feed-render gate (slow internet)
 
@@ -557,7 +557,7 @@ async function openComposer(page, log, name, settings = {}) {
           .map((b) => (b.getAttribute('aria-label') || b.textContent || '').replace(/\s+/g, ' ').trim())
           .filter(Boolean)
           .slice(0, 8);
-        const articles = document.querySelectorAll('div[role="article"]').length;
+        const articles = document.querySelectorAll('[aria-posinset], div[role="article"]').length;
         const ae = document.activeElement;
         const focused = ae ? `${(ae.tagName || '').toLowerCase()}${ae.getAttribute && ae.getAttribute('aria-label') ? '[' + ae.getAttribute('aria-label').slice(0, 30) + ']' : ''}` : '(none)';
         const composerHits = Array.from(document.querySelectorAll('[role="button"], span, div')).filter((e) => /write something|what.s on your mind|irj valamit|mi jar a fejedben|quoi de neuf|que estas pensando|was machst du/i.test(norm(e.textContent || ''))).length;
@@ -568,7 +568,7 @@ async function openComposer(page, log, name, settings = {}) {
     await sleep(humanDelay(1500, settings, 'settle'));
   }
   // Distinguish "page never rendered" from genuine selector drift using the last readiness read.
-  const ready = await page.evaluate(() => document.querySelectorAll('div[role="article"]').length).catch(() => 0);
+  const ready = await page.evaluate(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length).catch(() => 0);
   if (log) {
     if (!ready) log('⚠️ Composer never opened after 4 attempts and the group FEED never rendered — likely a slow/blocked network or this account can\'t view this group. Not selector drift.');
     else log('⚠️ SELECTOR DRIFT? The feed rendered but the "Write something" trigger was not found after 4 attempts — Facebook may have changed it or the page is in an unexpected locale/state. Run scripts/inspect-fb.js to capture the current DOM.');
@@ -792,7 +792,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       const dl = Date.now() + ms;
       while (Date.now() < dl) {
         const ready = await evalTimed(page, () => {
-          const arts = Array.from(document.querySelectorAll('div[role="article"]'));
+          const arts = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]'));
           return arts.length > 0 && arts.some((a) => a.querySelector('[contenteditable="true"], [role="textbox"]'));
         }, null, 4000).catch(() => false);
         if (ready) return true;
@@ -822,7 +822,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       const navOk = await page.goto(permalink, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
       if (!navOk) { permalinkFailed = true; step('Comment: could not open the post link — falling back to the group feed'); }
       else {
-        await page.waitForSelector('div[role="article"], [aria-label*="omment"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
+        await page.waitForSelector('[aria-posinset], div[role="article"], [aria-label*="omment"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
         const ready = await waitInteractive(10000);
         step(ready ? 'Comment: post page ready' : 'Comment: post page not fully interactive (timeout) — trying anyway');
         await dismissPopups(page);
@@ -835,10 +835,10 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         if (expectedPostId && urlId && urlId !== expectedPostId) {
           permalinkFailed = true; step('Comment: post link did not resolve to OUR post (id mismatch) — falling back to the group feed');
         } else if (expectedPostId && !urlId) {
-          const domId = await evalTimed(page, () => { const a = document.querySelector('div[role="article"]'); const l = a && a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; }, null, 5000).catch(() => null);
+          const domId = await evalTimed(page, () => { const a = document.querySelector('[aria-posinset], div[role="article"]'); const l = a && a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; }, null, 5000).catch(() => null);
           if (domId && domId !== expectedPostId) { permalinkFailed = true; step('Comment: post link did not resolve to OUR post (id mismatch) — falling back to the group feed'); }
         } else if (!expectedPostId && snip.length >= 12) {
-          const capOk = await evalTimed(page, (s) => { const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase(); const a = document.querySelector('div[role="article"]'); if (!a) return true; const body = norm(a.textContent); const sn = norm(s); return body.includes(sn) || body.startsWith(sn.slice(0, 20)); }, snip.slice(0, 40), 5000).catch(() => true);
+          const capOk = await evalTimed(page, (s) => { const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase(); const a = document.querySelector('[aria-posinset], div[role="article"]'); if (!a) return true; const body = norm(a.textContent); const sn = norm(s); return body.includes(sn) || body.startsWith(sn.slice(0, 20)); }, snip.slice(0, 40), 5000).catch(() => true);
           if (!capOk) { permalinkFailed = true; step('Comment: post link page caption does not match OUR post — falling back to the group feed'); }
         }
         if (!permalinkFailed) {
@@ -860,7 +860,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         ? 'Comment: post page had no usable comment box — falling back to the group feed (top-3 + caption match)'
         : 'Comment: locating the post in the group feed (fallback)');
       await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
-      await page.waitForSelector('div[role="article"], [aria-label*="omment"], [aria-label*="ommentaire"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
+      await page.waitForSelector('[aria-posinset], div[role="article"], [aria-label*="omment"], [aria-label*="ommentaire"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
       await waitInteractive(10000);
       await dismissPopups(page);
       const authBad = await withTimeout(page.evaluate(() => /continue as|use another profile/i.test(document.body.innerText || '')), 8000, false);
@@ -879,7 +879,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           if (!sn && !want) return { clicked: false, reason: 'short' }; // nothing to match on
           const idOf = (a) => { const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; };
           try { document.querySelectorAll('[data-zp-ctarget]').forEach((e) => e.removeAttribute('data-zp-ctarget')); } catch {}
-          const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 8)
+          const arts = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 8)
             .filter((a) => !/pinned|épingl|rögzít/.test((a.innerText || '').slice(0, 200).toLowerCase()));
           for (let i = 0; i < arts.length; i++) { // top→bottom, RETURN on first hit → newest, never an older dup
             const a = arts[i];
@@ -906,7 +906,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         if (!res.clicked && res.reason === 'nomatch') {
           step('Comment: our post not in top-8 — scrolling once to load more, then re-checking');
           await page.evaluate(() => window.scrollBy(0, 900)).catch(() => {});
-          await page.waitForFunction(() => document.querySelectorAll('div[role="article"]').length > 8, { timeout: 8000 }).catch(() => {});
+          await page.waitForFunction(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length > 8, { timeout: 8000 }).catch(() => {});
           await waitInteractive(6000);
           res = await scanFeed();
         }
@@ -916,7 +916,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         // lives INSIDE our marked article; never an unscoped feed box (which could be a different post).
         if (res.clicked || res.reason === 'nobtn') {
           if (res.clicked) await sleep(2500);
-          const scoped = await page.$('div[role="article"][data-zp-ctarget="1"] [contenteditable="true"], div[role="article"][data-zp-ctarget="1"] [role="textbox"]').catch(() => null);
+          const scoped = await page.$('[data-zp-ctarget="1"] [contenteditable="true"], [data-zp-ctarget="1"] [role="textbox"]').catch(() => null);
           if (scoped) { boxes = [scoped]; step(`Comment: our post found in feed (id=${res.postId || '?'}, pos=${res.pos + 1}) — using its comment box`); }
           else if (res.pos === 0) { const all = await withTimeout(commentBoxes(), 15000, []); if (all.length) { boxes = [all[0]]; step('Comment: our post is the TOP post — using the top comment box'); } else step('Comment: our post is top but no comment box rendered — not commenting'); }
           else step('Comment: found OUR post but its scoped comment box did not render — not commenting (avoids a wrong-post)');
@@ -943,7 +943,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       // Scope the file input to the comment box's container ONLY (the document-level
       // input is the feed composer — never fall back to it or we'd mis-attach).
       const cInput = await target.evaluateHandle((el) => {
-        const c = el.closest('[role="article"], form, [data-pagelet]') || document;
+        const c = el.closest('[aria-posinset], [role="article"], form, [data-pagelet]') || document;
         return c.querySelector('input[type="file"]');
       }).then((h) => h.asElement()).catch(() => null);
       if (cInput) {
@@ -1009,7 +1009,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
     const commentSnip = String(post.comment || '').replace(/\s+/g, ' ').trim().slice(0, 30);
     if (commentSnip.length >= 6) {
       const seen = await evalTimed(page, (s) => {
-        const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 3);
+        const arts = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 3);
         return arts.some((a) => (a.innerText || '').includes(s));
       }, commentSnip, 6000).catch(() => null);
       if (seen === true) outcome = 'posted';
@@ -1756,10 +1756,10 @@ async function runAccount(o) {
           if (_landSnip.length >= 12) {
             step('Publish wait timed out — rescanning the feed (read-only) to see if it landed anyway…');
             await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
-            await page.waitForSelector('div[role="article"]', { timeout: 20000 }).catch(() => {});
+            await page.waitForSelector('[aria-posinset], div[role="article"]', { timeout: 20000 }).catch(() => {});
             const landed = await evalTimed(page, (s) => {
               const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-              return Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 5)
+              return Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 5)
                 .some((a) => { const b = norm(a.textContent); return b.includes(s) || b.startsWith(s.slice(0, 20)); });
             }, _landSnip, 8000).catch(() => false);
             if (landed) { step('Publish confirmed via feed rescan — the post landed (slow publish, not a failure)'); publishResult = 'published'; }
@@ -1812,9 +1812,9 @@ async function runAccount(o) {
         let postPermalink = null;
         step('Verifying the post landed (reloading the group)…');
         await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
-        await page.waitForSelector('div[role="article"]', { timeout: 25000 }).catch(() => {});
+        await page.waitForSelector('[aria-posinset], div[role="article"]', { timeout: 25000 }).catch(() => {});
         // Poll for the feed to actually render (slow feeds bury our fresh post) instead of a fixed 3s.
-        await page.waitForFunction(() => document.querySelectorAll('div[role="article"]').length >= 3, { timeout: 15000 }).catch(() => {});
+        await page.waitForFunction(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length >= 3, { timeout: 15000 }).catch(() => {});
         await dismissPopups(page);
         // Find OUR post and capture its verified permalink. Caption-match the TOP-3 ONLY (a match further
         // down is an OLD duplicate, never our just-published post); scan top-8 for the newest-link
@@ -1835,7 +1835,7 @@ async function runAccount(o) {
               if (fb) { const raw = atobSafe(fb.getAttribute('data-feedback-id')); m = raw && raw.match(/(\d{8,})/); if (m) return m[1]; }
               m = (a.innerHTML || '').match(/"(?:post_id|story_fbid|top_level_post_id)":"?(\d{8,})/); return m ? m[1] : null;
             };
-            const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 8)
+            const arts = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 8)
               .filter((a) => !/pinned|épingl|rögzít/.test((a.innerText || '').slice(0, 200).toLowerCase()));
             try { document.querySelectorAll('[data-zp-target]').forEach((e) => e.removeAttribute('data-zp-target')); } catch {}
             // Caption-match TOP-8, TOPMOST (newest) match wins (E-R7). Right after publishing OUR post
@@ -1857,7 +1857,7 @@ async function runAccount(o) {
           // If matched but the timestamp <a href> hasn't lazily rendered, hover it FROM NODE (synthetic
           // in-page events don't trigger FB's hover-render) to force the real href, then re-read.
           if (find && find.matched && !find.href) {
-            const box = await page.$('div[role="article"][data-zp-target="1"]').catch(() => null);
+            const box = await page.$('[data-zp-target="1"]').catch(() => null);
             if (box) {
               try {
                 await box.evaluate((el) => el.scrollIntoView({ block: 'center' })).catch(() => {});
@@ -1866,7 +1866,7 @@ async function runAccount(o) {
               } catch {}
               await sleep(700);
               const rh = await evalTimed(page, () => {
-                const a = document.querySelector('div[role="article"][data-zp-target="1"]'); if (!a) return null;
+                const a = document.querySelector('[data-zp-target="1"]'); if (!a) return null;
                 const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]');
                 return (l && /\/(posts|permalink)\//.test(l.href || '')) ? l.href.split('?')[0] : null;
               }, null, 4000).catch(() => null);
