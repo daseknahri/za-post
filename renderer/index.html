@@ -75,6 +75,9 @@
     /* Flip above when near the bottom of the panel (JS adds .help-up). */
     .help.help-up .help-tip { top: auto; bottom: calc(100% + 8px); transform: translateY(4px); }
     .help.help-up:hover .help-tip, .help.help-up:focus-within .help-tip { transform: translateY(0); }
+    /* Posting-speed preset buttons */
+    .speed-btn.active { background: #6366f1; color: #fff; border-color: #6366f1; box-shadow: 0 0 20px rgba(99, 102, 241, 0.28); }
+    .speed-btn.active:hover { border-color: #6366f1; }
   </style>
 </head>
 
@@ -475,6 +478,17 @@
         </div>
 
         <div class="settings-form max-w-xl space-y-5">
+          <!-- One-click pacing preset: fills every timing range below at once so the operator doesn't tune each number. -->
+          <div class="form-group bg-gradient-to-br from-accent/10 to-dark-700/40 backdrop-blur-sm border border-accent/25 rounded-2xl p-5">
+            <label class="block text-sm font-semibold text-gray-200 mb-1">Posting speed</label>
+            <small class="block mb-3 text-xs text-gray-400">One click sets all the timing ranges below. <b class="text-cyber-green">Slow</b> = safest (most human, lowest spam risk) · <b class="text-cyber-blue">Normal</b> = balanced · <b class="text-cyber-amber">Fast</b> = quickest still-safe pacing. You can still fine-tune any value afterward.</small>
+            <div class="grid grid-cols-3 gap-3">
+              <button type="button" data-speed="fast" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">⚡ Fast</button>
+              <button type="button" data-speed="normal" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">⚖️ Normal</button>
+              <button type="button" data-speed="slow" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">🐢 Slow</button>
+            </div>
+          </div>
+
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
             <label for="setting-parallel-accounts" class="block text-sm font-semibold text-gray-300 mb-2">Parallel
               Accounts</label>

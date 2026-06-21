@@ -63,3 +63,9 @@ test('migration: a legacy single timing key derives the min/max range on load', 
   assert.equal(s.groupDelay, 200, 'legacy key kept for back-compat');
   fs.rmSync(tmp, { recursive: true, force: true });
 });
+
+test('clampSettings: speedMode is coerced to a valid preset name', () => {
+  assert.equal(store.clampSettings({ speedMode: 'slow' }).speedMode, 'slow');
+  assert.equal(store.clampSettings({ speedMode: 'fast' }).speedMode, 'fast');
+  assert.equal(store.clampSettings({ speedMode: 'bogus' }).speedMode, 'normal', 'invalid → normal');
+});

@@ -1941,6 +1941,7 @@ function loadSettings() {
   document.getElementById('setting-prepublish-dwell-max').value = appData.settings.prePublishDwellSecMax !== undefined ? appData.settings.prePublishDwellSecMax : 8;
   document.getElementById('setting-comment-dwell-min').value = appData.settings.commentDwellSecMin !== undefined ? appData.settings.commentDwellSecMin : 1;
   document.getElementById('setting-comment-dwell-max').value = appData.settings.commentDwellSecMax !== undefined ? appData.settings.commentDwellSecMax : 4;
+  try { highlightSpeed(appData.settings.speedMode || 'normal'); } catch {}
 }
 
 // Attach a hover "?" help badge to every Settings label explaining what the control does and how to
@@ -1998,9 +1999,51 @@ function injectSettingsHelp() {
   }
   form.dataset.helpInjected = '1';
 }
+
+// ---- One-click pacing presets (Fast / Normal / Slow) -------------------------------------------
+// Each preset fills EVERY timing range at once so the operator never tunes numbers by hand. Normal =
+// the verified defaults; Slow = safest (most human, lowest spam risk); Fast = quickest STILL-SAFE
+// pacing (group delay never goes below the engine's 120s floor). The operator can fine-tune after.
+const SPEED_PRESETS = {
+  fast:   { waitIntervalMin: 45,  waitIntervalMax: 90,  accountDelayMin: 1, accountDelayMax: 2, groupDelayMin: 120, groupDelayMax: 180, commentDelayMin: 45,  commentDelayMax: 90,  pageScrollDwellSecMin: 2, pageScrollDwellSecMax: 6,  prePublishDwellSecMin: 1, prePublishDwellSecMax: 4,  commentDwellSecMin: 1, commentDwellSecMax: 3, composerOpenInitialDelayMs: 1000 },
+  normal: { waitIntervalMin: 90,  waitIntervalMax: 180, accountDelayMin: 1, accountDelayMax: 4, groupDelayMin: 120, groupDelayMax: 300, commentDelayMin: 60,  commentDelayMax: 180, pageScrollDwellSecMin: 3, pageScrollDwellSecMax: 15, prePublishDwellSecMin: 3, prePublishDwellSecMax: 8,  commentDwellSecMin: 1, commentDwellSecMax: 4, composerOpenInitialDelayMs: 1500 },
+  slow:   { waitIntervalMin: 180, waitIntervalMax: 360, accountDelayMin: 3, accountDelayMax: 8, groupDelayMin: 300, groupDelayMax: 600, commentDelayMin: 120, commentDelayMax: 300, pageScrollDwellSecMin: 8, pageScrollDwellSecMax: 25, prePublishDwellSecMin: 5, prePublishDwellSecMax: 12, commentDwellSecMin: 3, commentDwellSecMax: 8, composerOpenInitialDelayMs: 2500 },
+};
+const SPEED_INPUT_IDS = {
+  waitIntervalMin: 'setting-wait-interval-min', waitIntervalMax: 'setting-wait-interval-max',
+  accountDelayMin: 'setting-account-delay-min', accountDelayMax: 'setting-account-delay-max',
+  groupDelayMin: 'setting-group-delay-min', groupDelayMax: 'setting-group-delay-max',
+  commentDelayMin: 'setting-comment-delay-min', commentDelayMax: 'setting-comment-delay-max',
+  pageScrollDwellSecMin: 'setting-page-dwell-min', pageScrollDwellSecMax: 'setting-page-dwell-max',
+  prePublishDwellSecMin: 'setting-prepublish-dwell-min', prePublishDwellSecMax: 'setting-prepublish-dwell-max',
+  commentDwellSecMin: 'setting-comment-dwell-min', commentDwellSecMax: 'setting-comment-dwell-max',
+};
+function highlightSpeed(mode) {
+  document.querySelectorAll('.speed-btn').forEach((b) => b.classList.toggle('active', b.dataset.speed === mode));
+}
+function applySpeedPreset(mode) {
+  const p = SPEED_PRESETS[mode];
+  if (!p) return;
+  for (const [key, id] of Object.entries(SPEED_INPUT_IDS)) {
+    const el = document.getElementById(id);
+    if (el && p[key] !== undefined) el.value = p[key];
+  }
+  // composerOpenInitialDelayMs has no dedicated input — set it directly so saveSettings preserves it.
+  if (appData && appData.settings) { appData.settings.composerOpenInitialDelayMs = p.composerOpenInitialDelayMs; appData.settings.speedMode = mode; }
+  highlightSpeed(mode);
+  saveSettings(); // one-click: fill the ranges AND apply immediately
+}
+function wireSpeedButtons() {
+  document.querySelectorAll('.speed-btn').forEach((b) => {
+    if (b.dataset.wired) return; b.dataset.wired = '1';
+    b.addEventListener('click', () => applySpeedPreset(b.dataset.speed));
+  });
+  highlightSpeed((appData && appData.settings && appData.settings.speedMode) || 'normal');
+}
+function initSettingsUI() { try { injectSettingsHelp(); } catch {} try { wireSpeedButtons(); } catch {} }
 if (typeof document !== 'undefined') {
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', injectSettingsHelp);
-  else injectSettingsHelp();
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initSettingsUI);
+  else initSettingsUI();
 }
 
 async function saveSettings() {
