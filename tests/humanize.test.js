@@ -24,10 +24,16 @@ test('rangeMs: draws within the settings range (sec→ms) and respects the floor
     const ms = w.rangeMs(s, 'groupDelayMin', 'groupDelayMax', 120, 300, 0);
     assert.ok(ms >= 120000 && ms <= 300000, `out of range: ${ms}`);
   }
-  // A dangerously-low setting can't breach the safe floor.
+  // An EXPLICIT operator setting now APPLIES (down to a 1s floor) — they can deliberately post fast.
   for (let i = 0; i < 200; i++) {
-    assert.ok(w.rangeMs({ groupDelayMin: 5, groupDelayMax: 5 }, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) >= 120000);
+    assert.equal(w.rangeMs({ groupDelayMin: 5, groupDelayMax: 5 }, 'groupDelayMin', 'groupDelayMax', 120, 300, 120), 5000, 'explicit fast value applies, not floored to the safety default');
   }
+  // The safety floor still guards UNSET values (a fresh install can't accidentally burst-post).
+  for (let i = 0; i < 50; i++) {
+    assert.ok(w.rangeMs({}, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) >= 120000, 'unset → safety floor applies');
+  }
+  // A 1s absolute floor still prevents a zero/instant gap even on an explicit 0.
+  assert.ok(w.rangeMs({ groupDelayMin: 0, groupDelayMax: 0 }, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) >= 1000);
 });
 
 test('humanDelay: master=false → exact base; else within ±variance, never negative', () => {

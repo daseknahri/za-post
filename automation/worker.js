@@ -73,9 +73,15 @@ const _VARIANCE = { interact: 0.4, settle: 0.35, pause: 0.3, wait: 0.25 };
 // so a mis-set/low value can never produce a sub-safe (burst-signal) gap. Falls back to defaults.
 function rangeMs(settings, minKey, maxKey, defMin, defMax, floorSec = 0) {
   settings = settings || {};
-  const lo = Number.isFinite(settings[minKey]) ? settings[minKey] : defMin;
-  const hi = Number.isFinite(settings[maxKey]) ? settings[maxKey] : defMax;
-  return rand(Math.max(floorSec, Math.min(lo, hi)) * 1000, Math.max(floorSec, Math.max(lo, hi)) * 1000);
+  const hasLo = Number.isFinite(settings[minKey]);
+  const hasHi = Number.isFinite(settings[maxKey]);
+  const lo = hasLo ? settings[minKey] : defMin;
+  const hi = hasHi ? settings[maxKey] : defMax;
+  // Honor an EXPLICIT operator setting down to a 1s absolute floor, so deliberately-fast values actually
+  // take effect (e.g. "post like a fast real user"). The larger safety floor only guards the built-in
+  // DEFAULTS (when the value was left unset) so a fresh install can't accidentally burst-post.
+  const eff = (hasLo || hasHi) ? 1 : floorSec;
+  return rand(Math.max(eff, Math.min(lo, hi)) * 1000, Math.max(eff, Math.max(lo, hi)) * 1000);
 }
 // Jitter a base delay by the per-class variance (interact/settle/pause/wait). Honors humanizeMaster:
 // when explicitly false (tests/deterministic), returns the exact base. The post->comment anti-spam
