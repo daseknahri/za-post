@@ -702,13 +702,30 @@ class Orchestrator {
       if (settings.moderationEnabled && !this._shouldStop()) {
         try {
           const heldNow = (store.loadModeration().held || []).filter((h) => h.status === 'held');
-          const mod = (data.accounts || []).find((a) => a.isModerator);
-          if (heldNow.length && !mod) {
-            this.log('⚠️ Moderation is ON but no moderator account is set — held posts will NOT be approved. Toggle a logged-in admin account as the moderator on the Accounts tab.');
-          } else if (heldNow.length && mod) {
+          const moderators = (data.accounts || []).filter((a) => a.isModerator);
+          if (heldNow.length && !moderators.length) {
+            this.log('⚠️ Moderation is ON but NO moderator account is set — held posts will NOT be approved. Designate one in the Groups tab → 🛡️ Group Moderator.');
+          } else if (heldNow.length) {
+            // Route each held post to the moderator that covers ITS group. group.moderatedBy names the
+            // moderator account; if a group has none and there's exactly one moderator, that one covers
+            // it (backward-compatible single-moderator default). Supports N moderators, each its groups.
+            const modByName = new Map(moderators.map((m) => [m.name, m]));
+            const groupModerator = (gid) => {
+              const g = (data.groups || []).find((x) => (x.groupId || x.id) === gid);
+              const named = g && g.moderatedBy ? modByName.get(g.moderatedBy) : null;
+              return named || (moderators.length === 1 ? moderators[0] : null);
+            };
+            const byMod = new Map(); const unassigned = [];
+            for (const h of heldNow) { const m = groupModerator(h.gid); if (!m) { unassigned.push(h); continue; } if (!byMod.has(m.name)) byMod.set(m.name, { mod: m, held: [] }); byMod.get(m.name).held.push(h); }
+            if (unassigned.length) this.log(`⚠️ ${unassigned.length} held post(s) are in groups with no assigned moderator — set each group's moderator in the Groups tab.`);
             const posterNames = [...new Set((data.accounts || []).filter((a) => !a.isModerator && a.fbDisplayName && String(a.fbDisplayName).trim()).map((a) => String(a.fbDisplayName).trim()))];
             const { runModerator } = require('./moderator');
-            await runModerator({ account: mod, groups: data.groups, settings, held: heldNow, posterNames, log: (m) => this.log(m), shouldStop: () => this._shouldStop() });
+            for (const { mod, held } of byMod.values()) {
+              if (this._shouldStop()) break;
+              const gids = new Set(held.map((h) => h.gid));
+              const modGroups = (data.groups || []).filter((g) => gids.has(g.groupId || g.id));
+              await runModerator({ account: mod, groups: modGroups, settings, held, posterNames, log: (m) => this.log(m), shouldStop: () => this._shouldStop() });
+            }
           }
         } catch (e) { this.log(`⚠️ moderator phase error: ${e.message}`); }
       }

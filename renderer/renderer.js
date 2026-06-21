@@ -883,6 +883,14 @@ function renderGroups() {
     return;
   }
 
+  // When there are 2+ moderators, let each group pick which one approves its held posts.
+  const mods = (appData.accounts || []).filter((a) => a.isModerator);
+  const modSelect = (group) => {
+    if (mods.length < 2) return '';
+    const opts = ['<option value="">Mod: Auto</option>']
+      .concat(mods.map((m) => `<option value="${escapeHtml(m.name)}" ${group.moderatedBy === m.name ? 'selected' : ''}>🛡️ ${escapeHtml(m.alias || m.name)}</option>`)).join('');
+    return `<select title="Which moderator approves this group's held posts" onchange="updateGroupModerator('${group.id}', this.value)" style="margin-right:8px; padding:5px 8px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:12px;">${opts}</select>`;
+  };
   container.innerHTML = appData.groups.map(group => `
     <div class="group-item">
       <div class="group-icon">👥</div>
@@ -891,6 +899,7 @@ function renderGroups() {
         <div class="group-id">ID: ${escapeHtml(group.groupId)}</div>
       </div>
       <div class="group-actions">
+        ${modSelect(group)}
         <button class="icon-btn" onclick="deleteGroup('${group.id}')" title="Delete">🗑️</button>
       </div>
     </div>
@@ -1262,13 +1271,24 @@ async function updateAccountProxy(accountName, proxyValue) {
   showNotification(account.proxy ? `Proxy set for ${accountName}` : `Proxy cleared for ${accountName}`, 'success');
 }
 
-// MOD: designate the single group-moderator account (approves held posts). Selecting '' clears it.
-async function toggleModerator(name) {
-  (appData.accounts || []).forEach((a) => { a.isModerator = (!!name && a.name === name); });
+// MOD: toggle an account's moderator role. MULTIPLE moderators are allowed (each covers its groups);
+// a moderator never posts. Each group is routed to its moderator via group.moderatedBy (or, with one
+// moderator, automatically).
+async function toggleModerator(name, makeMod) {
+  const a = (appData.accounts || []).find((x) => x.name === name);
+  if (!a) return;
+  a.isModerator = (makeMod === undefined) ? !a.isModerator : !!makeMod;
   await saveData();
-  const set = (appData.accounts || []).find((a) => a.isModerator);
-  showNotification(set ? `🛡️ ${set.name} is the group moderator (approves held posts; it won't post)` : 'Moderator cleared', 'success');
-  try { renderModeratorPanel(); renderAccounts(); } catch {}
+  showNotification(a.isModerator ? `🛡️ ${a.name} is now a group moderator (it won't post)` : `${a.name} is no longer a moderator`, 'success');
+  try { renderModeratorPanel(); renderGroups(); renderAccounts(); } catch {}
+}
+// MOD: assign which moderator account covers a group's held posts ('' = auto / the only moderator).
+async function updateGroupModerator(groupId, accountName) {
+  const g = (appData.groups || []).find((x) => (x.id === groupId) || (x.groupId === groupId));
+  if (!g) return;
+  g.moderatedBy = (accountName || '').trim() || undefined;
+  await saveData();
+  showNotification(g.moderatedBy ? `Moderator for "${g.name || groupId}" set to ${g.moderatedBy}` : `Moderator for "${g.name || groupId}" set to auto`, 'success');
 }
 // MOD: the FB display name used to recognise this account's posts in the moderation queue.
 async function updateFbDisplayName(name, value) {
@@ -1284,34 +1304,32 @@ function renderModeratorPanel() {
   const el = document.getElementById('moderator-panel');
   if (!el) return;
   const accts = appData.accounts || [];
-  const mod = accts.find((a) => a.isModerator);
   const enabled = appData.settings && appData.settings.moderationEnabled === true;
-  const opts = ['<option value="">— None —</option>']
-    .concat(accts.map((a) => `<option value="${escapeHtml(a.name)}" ${a.isModerator ? 'selected' : ''}>${escapeHtml(a.alias || a.name)}</option>`)).join('');
-  const badge = mod ? (mod.status === 'logged_in'
-    ? '<span style="color:#34d399;">● logged in</span>'
-    : `<span style="color:#fbbf24;">● ${escapeHtml(mod.status || 'not logged in')}</span>`) : '';
+  const rows = accts.map((a) => {
+    const isMod = !!a.isModerator;
+    const badge = isMod ? (a.status === 'logged_in' ? '<span style="color:#34d399;">● logged in</span>' : `<span style="color:#fbbf24;">● ${escapeHtml(a.status || 'not logged in')}</span>`) : '';
+    return `<div style="display:flex; align-items:center; gap:10px; padding:7px 0; border-bottom:1px solid rgba(255,255,255,0.06);">
+      <label style="display:flex; align-items:center; gap:6px; min-width:170px; cursor:pointer; font-size:13px; color:#e5e7eb;">
+        <input type="checkbox" ${isMod ? 'checked' : ''} onchange="toggleModerator('${escapeHtml(a.name)}', this.checked)" style="width:15px;height:15px;accent-color:#6366f1;">
+        ${escapeHtml(a.alias || a.name)}
+      </label>
+      ${isMod
+        ? `<span style="font-size:12px;">${badge}</span> <a href="#" onclick="loginAccount('${escapeHtml(a.name)}');return false;" style="color:#818cf8; font-size:12px;">log in</a>
+           <input type="text" value="${escapeHtml(a.fbDisplayName || '')}" placeholder="FB display name (skip its own posts)" onchange="updateFbDisplayName('${escapeHtml(a.name)}', this.value)" style="flex:1; min-width:140px; padding:6px 8px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:12px;">`
+        : '<span style="font-size:12px; color:#6b7280;">(poster account)</span>'}
+    </div>`;
+  }).join('');
+  const modCount = accts.filter((a) => a.isModerator).length;
   el.innerHTML = `
     <div style="padding:16px; background:linear-gradient(135deg, rgba(99,102,241,0.10), rgba(21,27,48,0.55)); border:1px solid rgba(99,102,241,0.28); border-radius:16px;">
       <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap;">
         <div>
-          <div style="font-weight:700; color:#e2e8f0;">🛡️ Group Moderator</div>
-          <div style="font-size:12px; color:#94a3b8; margin-top:2px; max-width:560px;">Approves posts Facebook holds in "Spam potentiel" / pending across the groups you admin, so the post goes live and its comment can land. This account <b>never posts</b>.</div>
+          <div style="font-weight:700; color:#e2e8f0;">🛡️ Group Moderators</div>
+          <div style="font-size:12px; color:#94a3b8; margin-top:2px; max-width:620px;">Tick each admin account that approves held ("Spam potentiel"/pending) posts so they go live and their comments can land. Moderators <b>never post</b>. ${modCount >= 2 ? 'Assign each group to a moderator in its row below.' : 'With one moderator it covers all your groups automatically.'}</div>
         </div>
-        <div style="font-size:12px; color:${enabled ? '#34d399' : '#fbbf24'};">${enabled ? '✓ approval ON' : '⚠ turn ON “moderator approval” in Settings'}</div>
+        <div style="font-size:12px; color:${enabled ? '#34d399' : '#fbbf24'};">${enabled ? '✓ approval ON' : '⚠ enable in Settings'}</div>
       </div>
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px;">
-        <div>
-          <label style="font-size:11px; color:#94a3b8;">Moderator account (your group admin)</label>
-          <select onchange="toggleModerator(this.value)" style="width:100%; margin-top:4px; padding:8px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:13px;">${opts}</select>
-          ${mod ? `<div style="font-size:11px; margin-top:6px; color:#94a3b8;">${badge} · <a href="#" onclick="loginAccount('${escapeHtml(mod.name)}');return false;" style="color:#818cf8;">log in / re-login</a></div>` : '<div style="font-size:11px; margin-top:6px; color:#6b7280;">Add your admin account on the Accounts tab and log it in, then pick it here.</div>'}
-        </div>
-        <div>
-          <label style="font-size:11px; color:#94a3b8;">Its FB display name (to skip its own posts)</label>
-          <input type="text" value="${mod ? escapeHtml(mod.fbDisplayName || '') : ''}" ${mod ? '' : 'disabled'} placeholder="${mod ? 'e.g. your admin name' : 'select a moderator first'}" ${mod ? `onchange="updateFbDisplayName('${escapeHtml(mod.name)}', this.value)"` : ''} style="width:100%; margin-top:4px; padding:8px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:13px; box-sizing:border-box;">
-          <div style="font-size:11px; color:#6b7280; margin-top:6px;">Covers all groups you admin — held posts are approved wherever they appear.</div>
-        </div>
-      </div>
+      <div style="margin-top:10px;">${rows || '<div style="font-size:12px; color:#6b7280;">No accounts yet — add them on the Accounts tab, then tick the admin one here.</div>'}</div>
     </div>`;
 }
 
