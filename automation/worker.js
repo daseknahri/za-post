@@ -746,7 +746,7 @@ function withTimeout(promise, ms, fallback) {
 // Add the "first comment" (the link) to the JUST-published post. Reloads the group
 // so the new post renders, finds the article containing our caption, and types into
 // ITS "Write a public comment…" box. Returns true on success.
-async function addFirstComment(page, gid, post, commentImg, step, permalink, settings = {}) {
+async function addFirstComment(page, gid, post, commentImg, step, permalink, settings = {}, expectedPostId = null) {
   let submitted = false; // once the submitting Enter is pressed, NEVER return false — the caller
                          // retries on false and would post a DUPLICATE comment.
   try {
@@ -803,7 +803,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
 
     // PRIMARY: comment on the post's OWN page (it's the only article there → unambiguous = right post).
     if (permalink) {
-      step('Comment: opening the post directly via its link (primary — guarantees the right post)');
+      step(`Comment: opening the post directly via its link (primary — id=${expectedPostId || '?'} — guarantees the right post)`);
       const navOk = await page.goto(permalink, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
       if (!navOk) { permalinkFailed = true; step('Comment: could not open the post link — falling back to the group feed'); }
       else {
@@ -813,10 +813,25 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         await dismissPopups(page);
         const authBad = await withTimeout(page.evaluate(() => /continue as|use another profile|log in to facebook/i.test(document.body.innerText || '')), 8000, false);
         if (authBad) { step('Comment: session expired after posting — skipped (re-login needed)'); return 'failed'; }
-        boxes = await withTimeout(commentBoxes(), 15000, []);
-        if (!boxes.length) {
-          step('Comment: no inline box on the post page — clicking "Leave a comment"');
-          if (await clickLeaveComment()) { step('Comment: comment box opened (post page)'); await sleep(2500); boxes = await withTimeout(commentBoxes(), 15000, []); }
+        // CT-3 identity guard: confirm the page actually resolved to OUR post before commenting here
+        // (a captured link can be stale or redirect). Mismatch → demote to the id-checked feed fallback,
+        // never a blind comment on the wrong post.
+        const urlId = (page.url().match(/\/(?:posts|permalink)\/(\d+)/) || [])[1] || null;
+        if (expectedPostId && urlId && urlId !== expectedPostId) {
+          permalinkFailed = true; step('Comment: post link did not resolve to OUR post (id mismatch) — falling back to the group feed');
+        } else if (expectedPostId && !urlId) {
+          const domId = await evalTimed(page, () => { const a = document.querySelector('div[role="article"]'); const l = a && a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; }, null, 5000).catch(() => null);
+          if (domId && domId !== expectedPostId) { permalinkFailed = true; step('Comment: post link did not resolve to OUR post (id mismatch) — falling back to the group feed'); }
+        } else if (!expectedPostId && snip.length >= 12) {
+          const capOk = await evalTimed(page, (s) => { const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase(); const a = document.querySelector('div[role="article"]'); if (!a) return true; const body = norm(a.textContent); const sn = norm(s); return body.includes(sn) || body.startsWith(sn.slice(0, 20)); }, snip.slice(0, 40), 5000).catch(() => true);
+          if (!capOk) { permalinkFailed = true; step('Comment: post link page caption does not match OUR post — falling back to the group feed'); }
+        }
+        if (!permalinkFailed) {
+          boxes = await withTimeout(commentBoxes(), 15000, []);
+          if (!boxes.length) {
+            step('Comment: no inline box on the post page — clicking "Leave a comment"');
+            if (await clickLeaveComment()) { step('Comment: comment box opened (post page)'); await sleep(2500); boxes = await withTimeout(commentBoxes(), 15000, []); }
+          }
         }
       }
     }
@@ -837,21 +852,44 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       if (authBad) { step('Comment: session expired after posting — skipped (re-login needed)'); return 'failed'; }
       boxes = await withTimeout(commentBoxes(), 15000, []);
       if (!boxes.length) {
-        step('Comment: no inline box — clicking "Leave a comment" on OUR post (top-3 + caption match)');
-        const clicked = await evalTimed(page, (s) => {
-          // A just-published post is at the TOP — only the top 3 articles can be ours. A snippet match
-          // further down is almost certainly a different (older) post — never comment there.
-          const top = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 3);
-          const mine = (s && s.length >= 12) ? top.find((a) => (a.textContent || '').includes(s)) : null;
-          if (!mine) return false;
-          const b = Array.from(mine.querySelectorAll('[role="button"]')).find((e) => {
-            const norm = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-            return /leave a comment|^comment$|hozzaszolas|commenter|comentar|kommentar/.test(norm);
-          });
-          if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return true; }
-          return false;
-        }, snip.slice(0, 25), 12000).catch(() => false);
-        if (clicked) { step('Comment: comment box opened'); await sleep(2500); boxes = await withTimeout(commentBoxes(), 15000, []); }
+        step('Comment: locating OUR post in the feed (top-8, caption + post-id check)');
+        // Find OUR post and open its comment box. Window widened to TOP-8 because other users posting
+        // during the 60-180s wait can push ours down — but kept safe: FIRST (topmost = newest) caption
+        // match wins (never an older duplicate), and when expectedPostId is known a same-caption article
+        // whose id differs is REFUSED. A 40-char normalized snippet keeps the wider window strict.
+        const scanFeed = () => evalTimed(page, (arg) => {
+          const { s, want } = arg;
+          const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+          const sn = (s && s.length >= 12) ? norm(s) : null; if (!sn) return { clicked: false, reason: 'short' };
+          const idOf = (a) => { const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; };
+          const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 8)
+            .filter((a) => !/pinned|épingl|rögzít/.test((a.innerText || '').slice(0, 200).toLowerCase()));
+          for (let i = 0; i < arts.length; i++) { // top→bottom, RETURN on first hit → newest, never an older dup
+            const a = arts[i];
+            const body = norm(a.textContent);
+            if (!(body.includes(sn) || body.startsWith(sn.slice(0, 20)))) continue;
+            const id = idOf(a);
+            if (want && id && id !== want) return { clicked: false, reason: 'idmismatch', postId: id, pos: i };
+            const b = Array.from(a.querySelectorAll('[role="button"]')).find((e) => {
+              const n = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+              return /leave a comment|^comment$|hozzaszolas|commenter|comentar|kommentar|commenta/.test(n);
+            });
+            if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return { clicked: true, postId: id, pos: i }; }
+            return { clicked: false, reason: 'nobtn', postId: id, pos: i };
+          }
+          return { clicked: false, reason: 'nomatch' };
+        }, { s: snip.slice(0, 40), want: expectedPostId }, 12000).catch(() => ({ clicked: false, reason: 'err' }));
+
+        let res = await scanFeed();
+        if (!res.clicked && res.reason === 'nomatch') {
+          step('Comment: our post not in top-8 — scrolling once to load more, then re-checking');
+          await page.evaluate(() => window.scrollBy(0, 900)).catch(() => {});
+          await page.waitForFunction(() => document.querySelectorAll('div[role="article"]').length > 8, { timeout: 8000 }).catch(() => {});
+          await waitInteractive(6000);
+          res = await scanFeed();
+        }
+        if (res.clicked) { step(`Comment: our post found in feed (id=${res.postId || '?'}, pos=${res.pos + 1}) — opening box`); await sleep(2500); boxes = await withTimeout(commentBoxes(), 15000, []); }
+        else if (res.reason === 'idmismatch') { step(`Comment: a same-caption post in feed is NOT ours (found id=${res.postId}, expected=${expectedPostId}) — NOT commenting (avoids a wrong-post)`); return 'skipped'; }
         else step('Comment: could not confidently find OUR post in the feed — not commenting (avoids a wrong-post)');
       }
     }
@@ -1726,31 +1764,65 @@ async function runAccount(o) {
         // down is an OLD duplicate, never our just-published post); scan top-8 for the newest-link
         // fallback. Tolerate "See more" truncation. Poll up to ~12s so a slow render isn't read as "gone".
         let find = null;
+        let expectedPostId = null; // OUR post's stable id — the trust anchor for commenting (CT-4)
         const findDeadline = Date.now() + 12000;
         do {
           find = await evalTimed(page, (s) => {
             const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
             const linkOf = (a) => { const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); return (l && /\/(posts|permalink)\//.test(l.href || '')) ? l.href.split('?')[0] : null; };
+            const atobSafe = (x) => { try { return atob(x); } catch { return x || ''; } };
+            // Extract a stable numeric post id even when the timestamp <a> hasn't rendered yet:
+            // rendered href → data-feedback-id (base64 contains it) → embedded React props JSON.
+            const idOf = (a) => {
+              const href = linkOf(a); let m = href && href.match(/\/(?:posts|permalink)\/(\d+)/); if (m) return m[1];
+              const fb = a.querySelector('[data-feedback-id]');
+              if (fb) { const raw = atobSafe(fb.getAttribute('data-feedback-id')); m = raw && raw.match(/(\d{8,})/); if (m) return m[1]; }
+              m = (a.innerHTML || '').match(/"(?:post_id|story_fbid|top_level_post_id)":"?(\d{8,})/); return m ? m[1] : null;
+            };
             const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 8)
               .filter((a) => !/pinned|épingl|rögzít/.test((a.innerText || '').slice(0, 200).toLowerCase()));
+            try { document.querySelectorAll('[data-zp-target]').forEach((e) => e.removeAttribute('data-zp-target')); } catch {}
+            // Caption-match the TOP-3 ONLY (a match further down is an OLD duplicate, never our fresh post).
             if (s && s.length >= 12) {
-              for (const a of arts.slice(0, 3)) {
-                const body = norm(a.textContent);
-                if ((body.includes(s) || body.startsWith(s.slice(0, 20))) && linkOf(a)) return { href: linkOf(a), matched: true }; // = definitely OURS
+              for (let i = 0; i < Math.min(3, arts.length); i++) {
+                const a = arts[i]; const body = norm(a.textContent);
+                if (body.includes(s) || body.startsWith(s.slice(0, 20))) {
+                  a.setAttribute('data-zp-target', '1'); // mark so a Node-side hover can target this exact article
+                  return { href: linkOf(a), postId: idOf(a), matched: true };
+                }
               }
             }
-            for (const a of arts) { if (linkOf(a)) return { href: linkOf(a), matched: false }; } // newest non-pinned (short/image)
-            return null;
+            return null; // NEVER claim a stranger's newest post as ours
           }, capSnip, 8000).catch(() => null);
-          if (find && find.matched) break;
+          // If matched but the timestamp <a href> hasn't lazily rendered, hover it FROM NODE (synthetic
+          // in-page events don't trigger FB's hover-render) to force the real href, then re-read.
+          if (find && find.matched && !find.href) {
+            const box = await page.$('div[role="article"][data-zp-target="1"]').catch(() => null);
+            if (box) {
+              try {
+                await box.evaluate((el) => el.scrollIntoView({ block: 'center' })).catch(() => {});
+                const ts = await box.$('a[href*="/posts/"], a[href*="/permalink/"], abbr, time, a[role="link"]').catch(() => null);
+                if (ts) await ts.hover().catch(() => {}); else await box.hover().catch(() => {});
+              } catch {}
+              await sleep(700);
+              const rh = await evalTimed(page, () => {
+                const a = document.querySelector('div[role="article"][data-zp-target="1"]'); if (!a) return null;
+                const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]');
+                return (l && /\/(posts|permalink)\//.test(l.href || '')) ? l.href.split('?')[0] : null;
+              }, null, 4000).catch(() => null);
+              if (rh) { find.href = rh; const m = rh.match(/\/(?:posts|permalink)\/(\d+)/); if (m) find.postId = m[1]; }
+            }
+          }
+          if (find && find.matched && (find.href || find.postId)) break;
           await sleep(1500);
         } while (Date.now() < findDeadline);
 
         if (find && find.matched) {
-          // LIVE OVERRIDE: our caption is in the PUBLIC feed → the post is approved/live. This wins even
-          // if a pending notice was seen at publish (auto-approved, or the notice was stale).
-          postPermalink = find.href;
-          step('Confirmed LIVE — our post is in the feed (verified). Commenting on it directly.');
+          // LIVE OVERRIDE: our caption is in the PUBLIC feed → the post is approved/live (wins over any
+          // pending notice). The post-id is the trust anchor for commenting on exactly this post.
+          expectedPostId = find.postId || null;
+          postPermalink = find.href || (find.postId ? `https://www.facebook.com/groups/${gid}/posts/${find.postId}/` : null);
+          step(`Confirmed LIVE — our post is in the feed (id=${expectedPostId || '?'}). Commenting on it directly.`);
         } else if (capSnip.length >= 12 && pendingAtPublish) {
           // The ONLY pending path now: a long-caption post that is NOT in the feed AND showed the
           // POST-SPECIFIC pending notice at publish time → genuinely awaiting admin approval. We do NOT
@@ -1761,11 +1833,11 @@ async function runAccount(o) {
           if (i < targetGroups.length - 1) await sleepInterruptible(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120), shouldStop, 1000); // T2: randomized inter-group gap (floor 120s)
           continue;
         } else {
-          // Publish was confirmed and NO post-specific pending notice appeared → the post landed. A short
-          // or image-only caption we couldn't match, or a slow feed, does NOT mean pending — trust the
-          // confirmed publish and use the newest link (if found) for the comment, else the feed fallback.
-          postPermalink = find ? find.href : null;
-          step(`Posted (publish confirmed)${postPermalink ? ' — using the newest post link for the comment' : ' — comment will use the feed fallback'}`);
+          // Publish confirmed, no pending notice, caption not matched (short/image caption or slow feed).
+          // Do NOT borrow the newest post's link — it could be a STRANGER'S post (they may have posted
+          // during our wait). The comment flow's id/caption-checked feed fallback will find ours or skip.
+          postPermalink = null;
+          step('Posted (publish confirmed) — caption not matched in feed yet; comment will use the id/caption-checked feed fallback');
         }
 
         // Success log — keep caption snippet for the renderer's auto-delete tracker.
@@ -1796,7 +1868,7 @@ async function runAccount(o) {
               step(`Comment: retry ${cAttempt}/3 (waiting ${Math.round(gap / 1000)}s — keeping the human cadence)`);
               await sleepInterruptible(gap, shouldStop);
             }
-            cres = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink, settings);
+            cres = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink, settings, expectedPostId);
           }
           commentResult = cres;
           if (cres === 'failed') step('Comment: could not place the comment after 3 attempts — left uncommented');
