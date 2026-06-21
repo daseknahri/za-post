@@ -562,7 +562,7 @@ class Orchestrator {
       for (const h of safe) {
         if (!(h.comment && String(h.comment).trim())) continue; // nothing to comment (caption-only post) — skip
         if (cs.pending.some((x) => x.status !== 'done' && same(x, h))) continue; // already queued (orphan or earlier approve) — no double-comment
-        cs.pending.push({ gid: h.gid, postId: h.postId || null, posterAccount: h.posterAccount || null, groupName: h.groupName || null, captionSnip: h.captionSnip || null, postCaption: h.postCaption || h.captionSnip || null, comment: h.comment, commentImg: h.commentImg || null, postPermalink: h.permalink || h.postPermalink || null, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null, source: 'approved' });
+        cs.pending.push({ gid: h.gid, postId: h.postId || null, posterAccount: h.posterAccount || null, fbDisplayName: h.fbDisplayName || null, groupName: h.groupName || null, captionSnip: h.captionSnip || null, postCaption: h.postCaption || h.captionSnip || null, comment: h.comment, commentImg: h.commentImg || null, postPermalink: h.permalink || h.postPermalink || null, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null, source: 'approved' });
         added++;
       }
       if (added) store.saveComments(cs);

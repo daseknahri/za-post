@@ -59,9 +59,12 @@ async function runRescue(o) {
       const label = t.groupName || t.gid;
       try {
         const post = { comment: t.comment || '', caption: t.postCaption || '' };
+        // Pass the original POSTER's display name as the expected author — the rescue account is different,
+        // but the post was authored by the poster, so the author-gate confirms we comment on the right post
+        // (and addFirstComment ignores a non-FB local postId). Fail-closed: it skips if it can't confirm.
         const res = await addFirstComment(page, t.gid, post, t.commentImg || null,
           (m) => log(`💬 [rescue:${name}] [${label}] ${m}`),
-          t.postPermalink || null, settings, t.postId || null);
+          t.postPermalink || null, settings, t.postId || null, t.fbDisplayName || '');
         if (res === 'posted' || res === 'unconfirmed' || res === 'not_visible') {
           out.placed++; o.onResult && o.onResult(t, 'done');
           log(`💬 [rescue:${name}] ✅ link-comment placed on a "${label}" post (${res})`);

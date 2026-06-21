@@ -787,7 +787,15 @@ function withTimeout(promise, ms, fallback) {
 // Add the "first comment" (the link) to the JUST-published post. Reloads the group
 // so the new post renders, finds the article containing our caption, and types into
 // ITS "Write a public comment…" box. Returns true on success.
-async function addFirstComment(page, gid, post, commentImg, step, permalink, settings = {}, expectedPostId = null) {
+async function addFirstComment(page, gid, post, commentImg, step, permalink, settings = {}, expectedPostId = null, expectedAuthor = '') {
+  // WRONG-POST GUARD inputs: a real FB post id is a long digit string; reject a LOCAL library id (e.g.
+  // "post-1718…") passed as expectedPostId so it can't poison the id check (and silently degrade to
+  // caption-only). expectedAuthor = the poster's FB display name → used to confirm a same-caption article
+  // is actually OURS (or the right account's), so a comment never lands on another account's/stranger's
+  // identical-caption post when no FB post id is available.
+  const fbId = /^\d{8,}$/.test(String(expectedPostId || '')) ? String(expectedPostId) : null;
+  const expAuthor = String(expectedAuthor || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  expectedPostId = fbId; // from here on, only a verified FB id counts as a post-id anchor
   let submitted = false; // once the submitting Enter is pressed, NEVER return false — the caller
                          // retries on false and would post a DUPLICATE comment.
   // RES-1: never start/continue the comment flow on a dead browser — it would just burn a retry.
@@ -869,9 +877,27 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         } else if (expectedPostId && !urlId) {
           const domId = await evalTimed(page, () => { const a = document.querySelector('[aria-posinset], div[role="article"]'); const l = a && a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; }, null, 5000).catch(() => null);
           if (domId && domId !== expectedPostId) { permalinkFailed = true; step('Comment: post link did not resolve to OUR post (id mismatch) — falling back to the group feed'); }
-        } else if (!expectedPostId && snip.length >= 12) {
-          const capOk = await evalTimed(page, (s) => { const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase(); const a = document.querySelector('[aria-posinset], div[role="article"]'); if (!a) return true; const body = norm(a.textContent); const sn = norm(s); return body.includes(sn) || body.startsWith(sn.slice(0, 20)); }, snip.slice(0, 40), 5000).catch(() => true);
-          if (!capOk) { permalinkFailed = true; step('Comment: post link page caption does not match OUR post — falling back to the group feed'); }
+        } else if (!expectedPostId) {
+          // No FB post-id to verify against → confirm by caption AND author on the post's own page. The
+          // loose 20-char prefix is dropped (it passed for DIFFERENT posts), and an inconclusive read
+          // (timeout / no article) now DEMOTES to the author+ambiguity-checked feed fallback instead of
+          // commenting blind (capOk no longer defaults to true). Author mismatch = a same-caption stranger.
+          const chk = await evalTimed(page, (arg) => {
+            const { s, author } = arg;
+            const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const a = document.querySelector('[aria-posinset], div[role="article"]');
+            if (!a) return { found: false };
+            const sn = norm(s);
+            const capOk = (s && s.length >= 12) ? norm(a.textContent).includes(sn) : null; // null = nothing to check
+            const c = a.querySelector('h2 a, h3 a, h4 a, strong a, a strong, a[aria-label][href*="/user/"], a[aria-label][role="link"]');
+            const auth = norm(c ? (c.getAttribute('aria-label') || c.textContent) : '').slice(0, 60);
+            return { found: true, capOk, auth };
+          }, { s: snip.slice(0, 40), author: expAuthor }, 5000).catch(() => ({ found: false }));
+          const authMismatch = !!(expAuthor && chk.auth && chk.auth !== expAuthor);
+          if (!chk.found || authMismatch || chk.capOk === false) {
+            permalinkFailed = true;
+            step(`Comment: post page does not confirm OUR post (${!chk.found ? 'unreadable' : authMismatch ? 'author mismatch' : 'caption mismatch'}) — falling back to the group feed`);
+          }
         }
         if (!permalinkFailed) {
           boxes = await withTimeout(commentBoxes(), 15000, []);
@@ -905,34 +931,51 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         // match wins (never an older duplicate), and when expectedPostId is known a same-caption article
         // whose id differs is REFUSED. A 40-char normalized snippet keeps the wider window strict.
         const scanFeed = () => evalTimed(page, (arg) => {
-          const { s, want } = arg;
+          const { s, want, author } = arg;
           const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
           const sn = (s && s.length >= 12) ? norm(s) : null;
           if (!sn && !want) return { clicked: false, reason: 'short' }; // nothing to match on
           const idOf = (a) => { const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; };
+          // The post's AUTHOR (actor) from the article header — the disambiguator when no FB post-id renders.
+          const authorOf = (a) => { const c = a.querySelector('h2 a, h3 a, h4 a, strong a, a strong, a[aria-label][href*="/user/"], a[aria-label][role="link"]'); return norm(c ? (c.getAttribute('aria-label') || c.textContent) : '').slice(0, 60); };
           try { document.querySelectorAll('[data-zp-ctarget]').forEach((e) => e.removeAttribute('data-zp-ctarget')); } catch {}
           const arts = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 8)
             .filter((a) => !/pinned|épingl|rögzít/.test((a.innerText || '').slice(0, 200).toLowerCase()));
-          for (let i = 0; i < arts.length; i++) { // top→bottom, RETURN on first hit → newest, never an older dup
-            const a = arts[i];
-            const id = idOf(a);
-            if (sn) { // caption is the anchor (with id-mismatch refusal)
-              const body = norm(a.textContent);
-              if (!(body.includes(sn) || body.startsWith(sn.slice(0, 20)))) continue;
-              if (want && id && id !== want) return { clicked: false, reason: 'idmismatch', postId: id, pos: i };
-            } else { // VER-1: short/image caption → match by post-id ONLY (exact), never a guess
-              if (!id || id !== want) continue;
-            }
-            a.setAttribute('data-zp-ctarget', '1'); // VER-3: mark so we take the box INSIDE this exact article
-            const b = Array.from(a.querySelectorAll('[role="button"]')).find((e) => {
-              const n = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-              return /leave a comment|^comment$|hozzaszolas|commenter|comentar|kommentar|commenta/.test(n);
-            });
-            if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return { clicked: true, postId: id, pos: i }; }
-            return { clicked: false, reason: 'nobtn', postId: id, pos: i };
+          // Collect ALL candidate articles (full-caption contain — the loose 20-char prefix is dropped, it
+          // matched different posts), so we can disambiguate by author/id instead of blindly taking topmost.
+          const cands = [];
+          for (let i = 0; i < arts.length; i++) {
+            const a = arts[i]; const id = idOf(a);
+            const capHit = sn ? norm(a.textContent).includes(sn) : false;
+            const idHit = !!(want && id && id === want);
+            if (capHit || idHit) cands.push({ a, i, id, capHit, idHit, auth: authorOf(a) });
           }
-          return { clicked: false, reason: 'nomatch' };
-        }, { s: snip.slice(0, 40), want: expectedPostId }, 12000).catch(() => ({ clicked: false, reason: 'err' }));
+          if (!cands.length) return { clicked: false, reason: 'nomatch' };
+          // Pick OUR post safely WITHOUT over-blocking the normal case:
+          //  (1) an exact FB post-id match is definitive;
+          //  (2) else a SINGLE caption match is unambiguous → it's ours (don't let a flaky author read block it);
+          //  (3) else MULTIPLE same-caption posts → the article authored by US (author disambiguates the bug case);
+          //  (4) else REFUSE (idmismatch / ambiguous) — never guess between indistinguishable same-caption posts.
+          let pick = cands.find((m) => m.idHit);
+          if (!pick) {
+            const idmis = cands.find((m) => m.capHit && want && m.id && m.id !== want);
+            const caps = cands.filter((m) => m.capHit && !(want && m.id && m.id !== want)); // caption hits not contradicted by a differing id
+            if (caps.length === 1) pick = caps[0];
+            else if (caps.length > 1 && author) { const ours = caps.filter((m) => m.auth && m.auth === author); if (ours.length) pick = ours[0]; }
+            if (!pick) {
+              if (idmis && !caps.length) return { clicked: false, reason: 'idmismatch', postId: idmis.id, pos: idmis.i };
+              return { clicked: false, reason: 'ambiguous', count: caps.length || cands.length };
+            }
+          }
+          const a = pick.a;
+          a.setAttribute('data-zp-ctarget', '1'); // VER-3: mark so we take the box INSIDE this exact article
+          const b = Array.from(a.querySelectorAll('[role="button"]')).find((e) => {
+            const n = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+            return /leave a comment|^comment$|hozzaszolas|commenter|comentar|kommentar|commenta/.test(n);
+          });
+          if (b) { b.scrollIntoView({ block: 'center' }); b.click(); return { clicked: true, postId: pick.id, pos: pick.i, auth: pick.auth }; }
+          return { clicked: false, reason: 'nobtn', postId: pick.id, pos: pick.i };
+        }, { s: snip.slice(0, 40), want: expectedPostId, author: expAuthor }, 12000).catch(() => ({ clicked: false, reason: 'err' }));
 
         let res = await scanFeed();
         // FB renders the top posts as EMPTY [aria-posinset] shells until the page scrolls (lazy content)
@@ -949,6 +992,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           _cs++;
         }
         if (res.reason === 'idmismatch') { step(`Comment: a same-caption post in feed is NOT ours (found id=${res.postId}, expected=${expectedPostId}) — NOT commenting (avoids a wrong-post)`); return 'skipped'; }
+        if (res.reason === 'ambiguous') { step(`Comment: ${res.count} same-caption post(s) in the feed and can't confirm which is OURS (no post-id, author not matched) — NOT commenting (avoids landing the link on another account's/stranger's post)`); return 'skipped'; }
         // We matched OUR article (scanFeed marked it via data-zp-ctarget) — either it clicked the
         // "comment" button, or the box was already open (reason 'nobtn'). EITHER WAY take the box that
         // lives INSIDE our marked article; never an unscoped feed box (which could be a different post).
@@ -1553,7 +1597,7 @@ async function runAccount(o) {
     // recognise OUR held posts in the queue). Best-effort, non-blocking; on failure stay silent and
     // leave it empty (approval is fail-closed on an empty name — the operator can set it in the UI).
     // Mutates the in-memory account so THIS run's held records carry the name, and persists for next.
-    if (settings.moderationEnabled && !(account.fbDisplayName && String(account.fbDisplayName).trim())) {
+    if (!(account.fbDisplayName && String(account.fbDisplayName).trim())) { // ALWAYS capture: the comment author-gate (wrong-post guard) needs it, not just moderation
       try {
         const fbName = await evalTimed(page, () => {
           const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -1945,10 +1989,13 @@ async function runAccount(o) {
         // fallback. Tolerate "See more" truncation. Poll up to ~12s so a slow render isn't read as "gone".
         let find = null;
         let expectedPostId = null; // OUR post's stable id — the trust anchor for commenting (CT-4)
+        // Our FB display name (normalized) — the capture binds the permalink of OUR post, not a same-caption stranger's.
+        const _capAuthor = String(account.fbDisplayName || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
         const findDeadline = Date.now() + 16000;
         let _renderScrolls = 0;
         do {
-          find = await evalTimed(page, (s) => {
+          find = await evalTimed(page, (arg) => {
+            const { s, author } = arg;
             const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
             const linkOf = (a) => { const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); return (l && /\/(posts|permalink)\//.test(l.href || '')) ? l.href.split('?')[0] : null; };
             const atobSafe = (x) => { try { return atob(x); } catch { return x || ''; } };
@@ -1968,17 +2015,23 @@ async function runAccount(o) {
             // other users posted in the seconds before this reload and pushed ours to pos 3-7 (without
             // it those live posts were mislabeled "pending"). An older duplicate, if any, is lower than
             // our fresh post, so first-match-wins never picks it. Caption stays the gate (no stranger).
+            // AUTHOR-aware capture (wrong-post guard): collect full-caption matches (drop the loose 20-char
+            // prefix that matched DIFFERENT posts), then bind the permalink of the article authored by US —
+            // not a stranger's / another account's same-caption post. Only accept a caption-only match when
+            // there's exactly ONE and its author can't be read (unambiguous); otherwise return null → the
+            // (author+ambiguity-checked) feed-scan fallback handles it. Never claim someone else's post.
+            const authorOf = (a) => { const c = a.querySelector('h2 a, h3 a, h4 a, strong a, a strong, a[aria-label][href*="/user/"], a[aria-label][role="link"]'); return norm(c ? (c.getAttribute('aria-label') || c.textContent) : '').slice(0, 60); };
             if (s && s.length >= 12) {
-              for (let i = 0; i < Math.min(8, arts.length); i++) {
-                const a = arts[i]; const body = norm(a.textContent);
-                if (body.includes(s) || body.startsWith(s.slice(0, 20))) {
-                  a.setAttribute('data-zp-target', '1'); // mark so a Node-side hover can target this exact article
-                  return { href: linkOf(a), postId: idOf(a), matched: true, pos: i };
-                }
-              }
+              const caps = [];
+              for (let i = 0; i < Math.min(8, arts.length); i++) { const a = arts[i]; if (norm(a.textContent).includes(s)) caps.push({ a, i, auth: authorOf(a) }); }
+              // SINGLE caption match → ours (unambiguous); MULTIPLE → bind only the one authored by us.
+              let pick = null;
+              if (caps.length === 1) pick = caps[0];
+              else if (caps.length > 1 && author) { const ours = caps.filter((c) => c.auth && c.auth === author); if (ours.length) pick = ours[0]; }
+              if (pick) { pick.a.setAttribute('data-zp-target', '1'); return { href: linkOf(pick.a), postId: idOf(pick.a), matched: true, pos: pick.i }; }
             }
-            return null; // NEVER claim a stranger's newest post as ours
-          }, capSnip, 8000).catch(() => null);
+            return null; // ambiguous / not-ours → don't bind a permalink; the feed fallback decides
+          }, { s: capSnip, author: _capAuthor }, 8000).catch(() => null);
           // If matched but the timestamp <a href> hasn't lazily rendered, hover it FROM NODE (synthetic
           // in-page events don't trigger FB's hover-render) to force the real href, then re-read.
           if (find && find.matched && !find.href) {
@@ -2067,7 +2120,7 @@ async function runAccount(o) {
               step(`Comment: retry ${cAttempt}/3 (waiting ${Math.round(gap / 1000)}s — keeping the human cadence)`);
               await sleepInterruptible(gap, shouldStop);
             }
-            cres = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink, settings, expectedPostId);
+            cres = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink, settings, expectedPostId, account.fbDisplayName);
           }
           commentResult = cres;
           // Did the comment actually land (or get submitted)? 'unconfirmed'/'not_visible' = Enter WAS
@@ -2098,7 +2151,7 @@ async function runAccount(o) {
             // The post is LIVE but its link-comment did not land. Queue it so a healthy reserve account
             // that is a member of this group places the comment later — a post is NEVER left without its
             // link. (postPermalink locates it directly; captionSnip is the feed-scan fallback.)
-            commentQueue.push({ gid, groupName, postPermalink: postPermalink || null, postId: (basePost && basePost.id) || expectedPostId || null, captionSnip: capSnip || '', postCaption: (post.caption || '').slice(0, 220), comment: post.comment || '', commentImg: groupCommentImg || null, posterAccount: name, reason: cres });
+            commentQueue.push({ gid, groupName, postPermalink: postPermalink || null, postId: (basePost && basePost.id) || expectedPostId || null, captionSnip: capSnip || '', postCaption: (post.caption || '').slice(0, 220), comment: post.comment || '', commentImg: groupCommentImg || null, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), reason: cres });
             step('Comment: 📌 queued for rescue by a healthy account — this post will NOT be left without its link');
           }
           if (cres === 'blocked_account' || cres === 'blocked_comment') {
