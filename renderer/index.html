@@ -460,11 +460,21 @@
               title="Open the logs folder in Explorer">
               📁 Open Logs Folder
             </button>
+            <button id="btn-log-group" onclick="toggleLogGrouping()"
+              class="flex items-center gap-1.5 px-3 py-1.5 bg-dark-600 rounded-lg text-gray-400 text-xs font-medium hover:bg-dark-500 hover:text-gray-200 transition-all duration-200 border border-white/5"
+              title="Group the log per agent (collapsible) vs the raw stream">
+              🧑 By agent
+            </button>
           </div>
           <div
             class="logs-container bg-dark-900/80 backdrop-blur-sm border border-white/5 rounded-2xl p-4 h-[500px] overflow-y-auto font-mono text-xs"
             id="logs-container">
             <div class="log-entry text-gray-500">Waiting for automation to start...</div>
+          </div>
+          <div
+            class="logs-container bg-dark-900/80 backdrop-blur-sm border border-white/5 rounded-2xl p-4 h-[500px] overflow-y-auto font-mono text-xs"
+            id="logs-by-account" style="display:none;">
+            <div class="log-entry text-gray-500">Per-agent logs appear here once a run starts — each agent is a collapsible section with its action count and per-group tally.</div>
           </div>
         </div>
       </div>

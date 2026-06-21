@@ -2008,6 +2008,76 @@ async function resumeAutomation() {
 
 function clearLogs() {
   document.getElementById('logs-container').innerHTML = '';
+  _resetGroupedLogs(); // also clear the per-agent grouped view (fresh per run = per day for a daily run)
+}
+
+// ───────────── PER-AGENT GROUPED LOGS (collapsible) ─────────────
+// Logs are tagged "[agent] …", "[agent] [group] NN …", "💬 [rescue:agent] …" or "🛡️ [moderator:agent] …".
+// We mirror the flat stream into a collapsible section PER AGENT so the operator can read each agent's day
+// in isolation, with its action count + per-assigned-group tally. Renderer-only; no backend cost.
+const _agentEls = new Map(); // agent -> { details, body, countEl, actions, groups: Map }
+let _logGroupedView = false;
+
+function parseLogAgent(text) {
+  const m = String(text).match(/\[([^\]]+)\]/);
+  if (!m) return { agent: null, group: null };
+  let tok = m[1].trim();
+  const role = tok.match(/^(?:rescue|moderator)\s*:\s*(.+)$/i);
+  const agent = role ? role[1].trim() : tok;
+  const m2 = String(text).match(/\][^\[]*\[([^\]]+)\]/); // second bracket = group on step logs
+  return { agent, group: m2 ? m2[1].trim() : null };
+}
+
+function _agentSection(agent) {
+  let e = _agentEls.get(agent);
+  if (e) return e;
+  const container = document.getElementById('logs-by-account');
+  if (!container) return null;
+  const details = document.createElement('details');
+  details.style.cssText = 'margin-bottom:6px;border:1px solid rgba(255,255,255,0.06);border-radius:8px;background:rgba(0,0,0,0.25);';
+  const summary = document.createElement('summary');
+  summary.style.cssText = 'cursor:pointer;padding:7px 10px;font-weight:600;color:#e5e7eb;';
+  const nameSpan = document.createElement('span'); nameSpan.textContent = '🧑 ' + agent + ' ';
+  const countEl = document.createElement('span'); countEl.style.cssText = 'color:#9ca3af;font-weight:400;font-size:11px;';
+  summary.appendChild(nameSpan); summary.appendChild(countEl);
+  const body = document.createElement('div'); body.style.cssText = 'padding:4px 10px 8px 18px;border-top:1px solid rgba(255,255,255,0.05);max-height:280px;overflow-y:auto;';
+  details.appendChild(summary); details.appendChild(body);
+  container.appendChild(details);
+  e = { details, body, countEl, actions: 0, groups: new Map() };
+  _agentEls.set(agent, e);
+  return e;
+}
+
+function _recordGrouped(text) {
+  const { agent, group } = parseLogAgent(text);
+  if (!agent) return; // system line (cycle header, pool stats) — only in the raw stream
+  const sec = _agentSection(agent);
+  if (!sec) return;
+  sec.actions += 1;
+  if (group) sec.groups.set(group, (sec.groups.get(group) || 0) + 1);
+  const line = document.createElement('div'); line.className = 'log-entry'; line.style.fontSize = '11px';
+  line.textContent = text;
+  sec.body.appendChild(line);
+  while (sec.body.childElementCount > 200) sec.body.removeChild(sec.body.firstChild); // per-agent cap
+  const gt = Array.from(sec.groups.entries()).slice(0, 8).map(([g, c]) => `${g}:${c}`).join('  ');
+  sec.countEl.textContent = `— ${sec.actions} action${sec.actions === 1 ? '' : 's'}` + (gt ? `  ·  ${gt}` : '');
+  if (_logGroupedView) sec.body.scrollTop = sec.body.scrollHeight;
+}
+
+function _resetGroupedLogs() {
+  _agentEls.clear();
+  const c = document.getElementById('logs-by-account');
+  if (c) c.innerHTML = '';
+}
+
+function toggleLogGrouping() {
+  _logGroupedView = !_logGroupedView;
+  const flat = document.getElementById('logs-container');
+  const grouped = document.getElementById('logs-by-account');
+  const btn = document.getElementById('btn-log-group');
+  if (flat) flat.style.display = _logGroupedView ? 'none' : '';
+  if (grouped) grouped.style.display = _logGroupedView ? '' : 'none';
+  if (btn) btn.textContent = _logGroupedView ? '📜 Raw stream' : '🧑 By agent';
 }
 
 function addLog(text) {
@@ -2050,6 +2120,7 @@ function addLog(text) {
   }
 
   container.scrollTop = container.scrollHeight;
+  try { _recordGrouped(text); } catch {} // mirror into the per-agent collapsible view
 }
 
 function openLogsFolder() {
