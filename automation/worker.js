@@ -41,9 +41,18 @@ function sendWindowToBackground(pid) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function sleepInterruptible(ms, shouldStop = () => false, step = 500) {
+// Stop- AND Pause-aware sleep. isPaused/onPause are OPTIONAL + trailing so the dozens of existing
+// 3-arg callers are unchanged. When paused, it HOLDS (paused time does NOT count against the wait) and
+// invokes onPause() — the caller passes a hold that suspends+re-arms the time-budget watchdog so a long
+// pause can't make the watchdog abort the browser (the mid-cycle "Pause keeps going" fix).
+async function sleepInterruptible(ms, shouldStop = () => false, step = 500, isPaused = null, onPause = null) {
   let waited = 0;
   while (waited < ms && !shouldStop()) {
+    if (isPaused && isPaused()) {
+      if (onPause) await onPause(); else await sleep(step);
+      if (shouldStop()) break;
+      continue; // re-check; do NOT advance `waited` while paused
+    }
     const chunk = Math.min(step, ms - waited);
     await sleep(chunk);
     waited += chunk;
@@ -108,18 +117,26 @@ async function moveMouseTo(page, x, y) {
 // few wheel scrolls with pauses, total ~5-13s. Reduces the "instant composer open" bot pattern.
 async function humanDwell(page, shouldStop = () => false, settings = {}) {
   try {
+    // humanizeMaster off / fast speed → skip the human-reading dwell entirely (deterministic + fast).
+    if (settings.humanizeMaster === false || settings.speedMode === 'fast') return;
     // T5: total browse time is a random draw from the configurable pageScrollDwell range (0/0 = skip).
     const dwellMs = rangeMs(settings, 'pageScrollDwellSecMin', 'pageScrollDwellSecMax', 3, 15, 0);
     if (dwellMs <= 0) return;
+    // timingVariance.pause governs dwell jitter (was a hardcoded 0.4); store clamps it to 0–0.6.
+    const vpct = (settings.timingVariance && Number.isFinite(settings.timingVariance.pause)) ? settings.timingVariance.pause : 0.3;
     await moveMouseTo(page, 380 + Math.random() * 240, 280 + Math.random() * 160);
     const scrolls = 2 + Math.floor(Math.random() * 3);
     const perStep = Math.max(300, Math.floor(dwellMs / (scrolls + 1)));
     for (let s = 0; s < scrolls && !shouldStop(); s++) {
       try { await page.mouse.wheel({ deltaY: 200 + Math.random() * 320 }); } catch {}
-      await sleep(jitter(perStep, 0.4));
+      // Drift the cursor to a random feed coord between scrolls — a static cursor during scrolling is a
+      // bot tell. Fold the move's latency INTO the per-step wait so total dwell stays within range.
+      const _t0 = Date.now();
+      try { await moveMouseTo(page, 340 + Math.random() * 320, 240 + Math.random() * 260); } catch {}
+      await sleepInterruptible(Math.max(0, jitter(perStep, vpct) - (Date.now() - _t0)), shouldStop, 500);
     }
     if (!shouldStop()) { try { await page.mouse.wheel({ deltaY: -(150 + Math.random() * 200) }); } catch {} }
-    await sleepInterruptible(jitter(perStep, 0.4), shouldStop, 500);
+    await sleepInterruptible(jitter(perStep, vpct), shouldStop, 500);
   } catch {}
 }
 
@@ -689,6 +706,19 @@ async function humanType(page, text, settings = {}) {
   const perKey = fast ? 0 : 35 + Math.floor(Math.random() * 70); // ~35-105ms/key ≈ 50 WPM; 0 = machine-fast
   const chunks = String(text).match(/.{1,12}/gs) || [];
   for (const c of chunks) {
+    // ~10% of chunks: fumble a stray letter then correct it (Backspace) before typing the real chunk — a
+    // strong human tell. Only when NOT fast; exactly 1 stray + 1 Backspace so the final text is unchanged
+    // (a mismatch would trigger a needless caption clear+retype). Never on the paste path (this is the
+    // typed fallback only).
+    if (!fast && Math.random() < 0.1) {
+      try {
+        const stray = 'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)];
+        await page.keyboard.type(stray, { delay: perKey });
+        await sleep(120 + Math.floor(Math.random() * 240));
+        await page.keyboard.press('Backspace');
+        await sleep(80 + Math.floor(Math.random() * 160));
+      } catch {}
+    }
     // Cap each chunk at 15s so a hung CDP connection can't block for the full protocolTimeout (90s) per
     // chunk; the group-level catch then skips this group instead of freezing the queue. Timer always cleared.
     let timer;
@@ -1027,8 +1057,10 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
     // H1 / commentDwell: a human reads the post before commenting — a randomized, configurable pause
     // with an occasional micro-scroll. Pre-focus and pre-keystroke (the focus step below re-centers the
     // box, correcting any scroll drift), so this never moves the box off-screen or touches the text.
-    await sleep(rangeMs(settings, 'commentDwellSecMin', 'commentDwellSecMax', 1, 4, 0));
-    if (Math.random() < 0.4) { try { await page.mouse.wheel({ deltaY: 50 + Math.random() * 90 }); await sleep(humanDelay(500, settings, 'pause')); await page.mouse.wheel({ deltaY: -(50 + Math.random() * 90) }); } catch {} }
+    if (!(settings.humanizeMaster === false || settings.speedMode === 'fast')) { // fast/humanize-off → no reading dwell
+      await sleep(rangeMs(settings, 'commentDwellSecMin', 'commentDwellSecMax', 1, 4, 0));
+      if (Math.random() < 0.4) { try { await page.mouse.wheel({ deltaY: 50 + Math.random() * 90 }); await sleep(humanDelay(500, settings, 'pause')); await page.mouse.wheel({ deltaY: -(50 + Math.random() * 90) }); } catch {} }
+    }
     // Focus via in-page scroll+focus (ElementHandle.click can hang on re-rendering feeds).
     step('Comment: focusing the comment box');
     await withTimeout(target.evaluate((el) => { el.scrollIntoView({ block: 'center' }); el.focus(); }), 5000, null);
@@ -1147,6 +1179,34 @@ async function focusEditable(page) {
     if (pt) { await page.mouse.click(pt.x, pt.y, { delay: 40 }).catch(() => {}); await sleep(400); return true; }
   } catch {}
   return false;
+}
+
+// Normalized length of the MAIN composer editor's text (0 = empty). Used to decide whether a paste
+// landed and to confirm the editor is empty before typing — so a re-type can never DOUBLE the text.
+async function editableLen(page) {
+  return page.evaluate(() => {
+    const dlg = document.querySelector('div[role="dialog"]') || document;
+    const cands = Array.from(dlg.querySelectorAll('[contenteditable="true"], [role="textbox"]'));
+    const labeled = cands.find((e) => /create (a )?public post|what'?s on your mind|write something|start a discussion|^post$/i.test((e.getAttribute('aria-label') || '') + ' ' + (e.getAttribute('aria-placeholder') || '')));
+    const el = labeled || cands.find((e) => { const r = e.getBoundingClientRect(); return r.width > 120 && r.height > 20; }) || cands[0];
+    if (!el) return 0;
+    return String(el.innerText || el.textContent || '').replace(/\s+/g, '').length;
+  }).catch(() => 0);
+}
+
+// Robustly EMPTY the focused composer editor and CONFIRM it's empty before any typing — so typing can
+// never append to (and thus DOUBLE) text that's already there (e.g. a paste that landed but couldn't be
+// verified). Loops select-all + Delete/Backspace until the editor reads empty (or attempts run out).
+async function clearEditable(page, attempts = 4) {
+  for (let i = 0; i < attempts; i++) {
+    await focusEditable(page);
+    await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
+    await page.keyboard.press('Delete').catch(() => {});
+    await page.keyboard.press('Backspace').catch(() => {});
+    await sleep(120);
+    if ((await editableLen(page)) === 0) return true;
+  }
+  return (await editableLen(page)) === 0;
 }
 
 function normalizeForCompare(text) {
@@ -1285,7 +1345,7 @@ async function credentialLogin(page, email, password, log, name) {
  * @param {()=>boolean} o.shouldStop
  */
 async function runAccount(o) {
-  const { account, post: basePost, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused, maxThisRun } = o;
+  const { account, post: basePost, groups, settings, useProxies, proxies, log, shouldStop, isLoginOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused, isDisabled, maxThisRun } = o;
   const reportProxy = typeof o.reportProxy === 'function' ? o.reportProxy : () => {}; // E-X3: proxy health (no-op if absent)
   const name = account.name;
   // Per-account successful-run counter (file-based) — drives the new-account WARM-UP gate below.
@@ -1527,6 +1587,30 @@ async function runAccount(o) {
     };
     function armWatchdog() { watchdog = setTimeout(onWatchdogTick, accountBudget); }
     armWatchdog();
+    // Pause hold usable INSIDE waits (passed as sleepInterruptible's onPause): suspend the time-budget
+    // watchdog, hold while paused, re-arm on resume — so a pause during a long wait can't let the
+    // watchdog abort the browser. Mirrors the between-groups idiom so the whole run honors Pause.
+    const pauseHold = async () => {
+      if (typeof isPaused !== 'function' || !isPaused()) return;
+      if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+      if (typeof waitIfPaused === 'function') await waitIfPaused();
+      armWatchdog();
+    };
+    // The user turned THIS account OFF mid-run. isDisabled() reads disk fresh (so a UI toggle is seen
+    // mid-cycle); THROTTLE to one check per 4s so a per-second wait loop doesn't re-read the file constantly.
+    let _disChk = { t: 0, v: false };
+    const isDisabledNow = () => {
+      try {
+        const now = Date.now();
+        if (now - _disChk.t < 4000) return _disChk.v;
+        _disChk = { t: now, v: typeof isDisabled === 'function' && !!isDisabled() };
+        return _disChk.v;
+      } catch { return false; }
+    };
+    // Soft stop = hard Stop OR just-disabled. Ends mid-cycle WAITS early so a disabled/paused account
+    // doesn't sit idle; the clean break happens at the next group boundary (a just-published post still
+    // gets its comment attempt → no orphan).
+    const softStop = () => shouldStop() || isDisabledNow();
     // Fallback auth path if proxy-chain wasn't used. E-X1: log the outcome (it was silently
     // swallowed before) so a 407 storm is diagnosable. We still continue either way.
     if (proxyAuth && proxyAuth.username && !anonLocal) {
@@ -1855,21 +1939,22 @@ async function runAccount(o) {
           }
           if (captionState.matched) {
             step(`Caption pasted and verified (${captionState.len} chars)`);
-          } else { // paste blocked or not detected → clear + type
-            step(`Caption paste not verified${captionState.len ? ` (${captionState.len} chars detected)` : ''}; typing caption`);
-            await focusEditable(page);
-            await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
-            await page.keyboard.press('Backspace'); await sleep(150);
+          } else if ((await editableLen(page)) > 0) {
+            // Text IS in the EDITOR (editableLen reads ONLY the composer editable — NOT captionState.len,
+            // which folds in dialog chrome/placeholder and is always >0). The paste landed but our matcher
+            // can't read it (FB hides editor text) — typing now would DOUBLE the caption. Accept it; publish
+            // confirmation verifies. A genuinely-empty editor (failed paste) falls through to type below.
+            step(`Caption present in composer but not directly readable — accepting the paste (NOT retyping, avoids doubling)`);
+          } else {
+            // Editor is genuinely EMPTY → the paste did not land. Clear-and-verify-empty, then type ONCE.
+            step('Caption paste did not land (editor empty); typing caption');
+            await clearEditable(page); // confirms empty first → typing can't double
             await humanType(page, post.caption, settings);
             captionState = await waitForCaptionState(page, post.caption, 2500);
-            // Only RE-TYPE if nothing landed (editor still empty). If text IS present but our
-            // readability check can't match it (common — FB hides the editor's text), accept it
-            // and let the publish confirmation verify. Avoids a pointless ~10s full re-type.
-            if (!captionState.matched && (captionState.len || 0) === 0) {
-              step('Caption did not land — retyping once');
-              await focusEditable(page);
-              await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
-              await page.keyboard.press('Backspace'); await sleep(150);
+            // Retype only if STILL empty (nothing landed). If text is present but unmatched, accept it.
+            if (!captionState.matched && (captionState.len || 0) === 0 && (await editableLen(page)) === 0) {
+              step('Caption did not land — clearing and retyping once');
+              await clearEditable(page);
               await humanType(page, post.caption, settings);
               captionState = await waitForCaptionState(page, post.caption, 2500);
             }
@@ -1885,7 +1970,9 @@ async function runAccount(o) {
 
         // Publish — then CONFIRM it actually published (dialog closed / Post button gone).
         // Variable human "re-read before posting" pause (2-8s), not a fixed 1.5s on every post.
-        await sleepInterruptible(rangeMs(settings, 'prePublishDwellSecMin', 'prePublishDwellSecMax', 3, 8, 2), shouldStop, 500); // T1: randomized "re-read before posting"
+        // humanizeMaster off / fast speed → skip the dwell (deterministic). Pause/disable honored mid-dwell.
+        const _ppDwell = (settings.humanizeMaster === false || settings.speedMode === 'fast') ? 0 : rangeMs(settings, 'prePublishDwellSecMin', 'prePublishDwellSecMax', 3, 8, 2);
+        await sleepInterruptible(_ppDwell, softStop, 500, isPaused, pauseHold); // T1: randomized "re-read before posting"
         step('Waiting for Post button to enable');
         const dialogCountBefore = await withTimeout(page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length), 8000, 1).catch(() => 1);
         // Log what the Post-button scan sees (dialogs open, found label) — mirrors original's "🔍 Dialogs: N".
@@ -1950,7 +2037,7 @@ async function runAccount(o) {
         // the ONLY determinant of "pending" (the post-reload whole-page scan was the false-positive).
         const pendingAtPublish = await pendingNoticeForOurPost(page);
         if (pendingAtPublish) step('A pending/review notice appeared for this post — this group looks moderated (will confirm against the feed).');
-        await sleepInterruptible(humanDelay(3000, settings, 'settle'), shouldStop);
+        await sleepInterruptible(humanDelay(3000, settings, 'settle'), softStop, 500, isPaused, pauseHold);
         await dismissPopups(page);
 
         // E-P3: emerging block/checkpoint check on the post-publish page (BEFORE we navigate away — the
@@ -2079,7 +2166,7 @@ async function runAccount(o) {
           // adds the first comment). captionSnip is the same normalized 40-char key the queue scan uses.
           heldRecords.push({ postId: basePost.id || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip, postCaption: (post.caption || '').slice(0, 220), groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: postPermalink || null, source: 'pending_at_publish' });
           report(groupName, gid, 'pending', 'awaiting admin approval (immediate signal)', 'skipped');
-          if (i < targetGroups.length - 1) await sleepInterruptible(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120), shouldStop, 1000); // T2: randomized inter-group gap (floor 120s)
+          if (i < targetGroups.length - 1) await sleepInterruptible(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120), softStop, 1000, isPaused, pauseHold); // T2: randomized inter-group gap (floor 120s)
           continue;
         } else {
           // Publish confirmed, no pending notice, caption not matched (short/image caption or slow feed).
@@ -2105,7 +2192,11 @@ async function runAccount(o) {
           const lo = Number.isFinite(settings.commentDelayMin) ? settings.commentDelayMin : 60;
           const hi = Number.isFinite(settings.commentDelayMax) ? settings.commentDelayMax : 180;
           const cd = Math.round((Math.min(lo, hi) + Math.random() * Math.abs(hi - lo)) * 1000);
-          if (cd > 0 && !shouldStop()) { step(`Comment: waiting ${Math.round(cd / 1000)}s before commenting (avoids the instant post→link spam pattern)`); await sleepInterruptible(cd, shouldStop, 1000); }
+          if (cd > 0 && !softStop()) { step(`Comment: waiting ${Math.round(cd / 1000)}s before commenting (avoids the instant post→link spam pattern)`); await sleepInterruptible(cd, softStop, 1000, isPaused, pauseHold); }
+          // PAUSE/DISABLE BOUNDARY: the post is already published (safe), the comment is a SEPARATE action.
+          // If paused now, HOLD here (watchdog-safe) so Pause stops BEFORE the comment fires even when the
+          // wait already elapsed; this is the load-bearing "Pause keeps going" fix for the comment step.
+          if (isPaused && isPaused()) { if (watchdog) { clearTimeout(watchdog); watchdog = null; } if (waitIfPaused) await waitIfPaused(); armWatchdog(); }
           // Retry up to 3× — addFirstComment only returns the retryable 'failed' BEFORE it presses
           // Enter (no box found, stalled renderer; 'skipped' for short-caption-no-link), so a retry
           // (it re-navigates each time) can NEVER duplicate an already-sent comment. C2: keep a per-
@@ -2118,7 +2209,7 @@ async function runAccount(o) {
               const _fast = settings.humanizeMaster === false || settings.speedMode === 'fast';
               const gap = Math.max(_fast ? 300 : 2500, Math.round(Math.min(lo, hi) * 1000 * 0.25));
               step(`Comment: retry ${cAttempt}/3 (waiting ${Math.round(gap / 1000)}s — keeping the human cadence)`);
-              await sleepInterruptible(gap, shouldStop);
+              await sleepInterruptible(gap, softStop, 500, isPaused, pauseHold);
             }
             cres = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink, settings, expectedPostId, account.fbDisplayName);
           }
@@ -2196,7 +2287,7 @@ async function runAccount(o) {
         const d = rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120); // T2: randomized inter-group gap (floor 120s)
         if (d > 0) {
           step(`Wait ${d >= 60000 ? Math.round(d / 60000) + 'min' : Math.round(d / 1000) + 's'} before next group`);
-          await sleepInterruptible(d, shouldStop, 1000);
+          await sleepInterruptible(d, softStop, 1000, isPaused, pauseHold);
         }
         // H-2: over a long run on a laptop in use, a hidden window can drift on-screen (Windows re-clamp
         // / heavy window activity). Every 3rd group, cheaply check its position and re-park it off-screen

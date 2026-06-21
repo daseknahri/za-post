@@ -18,6 +18,8 @@ const store = require('../lib/store');
 const { chromiumPath } = require('../lib/chromium');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Jitter a base delay ±pct so a trusted admin account doesn't browse the spam queue on a metronomic cadence.
+const jitter = (base, pct = 0.3) => Math.max(0, Math.round(base * (1 + (Math.random() * 2 - 1) * pct)));
 const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
 async function evalTimed(page, fn, arg, ms = 8000) {
   let t; const p = page.evaluate(fn, arg); p.catch(() => {});
@@ -52,7 +54,7 @@ async function runModerator(o) {
 
     // Probe the moderator session — NEVER auto-login (it's the operator's trusted admin account).
     await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-    await sleep(2500);
+    await sleep(jitter(2500, 0.3));
     const loggedIn = await evalTimed(page, () => {
       const t = (document.body.innerText || '').slice(0, 500).toLowerCase();
       const loginGate = /log in to facebook|connexion|create new account|cr[ée]er un compte/.test(t) && document.querySelector('input[name="email"], input[name="pass"]');
@@ -89,8 +91,8 @@ async function runModerator(o) {
       for (const url of urls) {
         if (shouldStop()) break;
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-        await sleep(2500);
-        for (let s = 0; s < 3; s++) { await page.evaluate((y) => window.scrollBy(0, y), 800).catch(() => {}); await sleep(1200); } // nudge lazy render before testing for our caption
+        await sleep(jitter(2500, 0.3));
+        for (let s = 0; s < 3; s++) { await page.evaluate((y) => window.scrollBy(0, y), 600 + Math.floor(Math.random() * 400)).catch(() => {}); await sleep(jitter(1200, 0.35)); } // nudge lazy render before testing for our caption
         const info = await evalTimed(page, (snips) => {
           const norm = (x) => String(x || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
           const t = (document.body.innerText || '').toLowerCase();
@@ -246,7 +248,7 @@ async function approveCard(page, zpTag) {
   // first ("Publier ?") — accept it. Poll until the tagged button is gone.
   const deadline = Date.now() + 12000;
   while (Date.now() < deadline) {
-    await sleep(1200);
+    await sleep(jitter(1200, 0.3));
     await evalTimed(page, () => {
       const nm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
       const dlg = document.querySelector('[role="dialog"]'); if (!dlg) return;

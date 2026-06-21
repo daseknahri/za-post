@@ -208,6 +208,7 @@ class Orchestrator {
     this._runStats = {}; // per-account totals across the whole run (for the end-of-run summary)
     this._runFlags = {}; // accountName -> flag set THIS run (rate_limited/checkpoint/etc.)
     this._claimed = new Set(); // post ids claimed by an account this cycle (reset each cycle)
+    this._lastReserveKey = null; // force this run's first cycle to log its reserve set + uncovered-group warning
     this.emit('automation-started');
     this.emit('automation-progress', { ...this._progress });
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
@@ -368,6 +369,8 @@ class Orchestrator {
             reportProxy: (p, ok, reason) => this.reportProxy(p, ok, reason), // E-X3: per-proxy health from the worker
             waitIfPaused: () => this._waitWhilePaused(), // Pause holds between groups, mid-account
             isPaused: () => this._paused,                // so the worker can suspend its watchdog while paused
+            isDisabled: () => { try { const a = store.load().accounts.find((x) => x.name === account.name); return !!(a && a.enabled === false); } catch { return false; } }, // user turned this account OFF mid-run (read DISK fresh — this._data is frozen per cycle) → end its waits early
+
             // Per-(account,group,post) outcome → append to the persistent audit trail.
             onResult: (rec) => { try { if (!store.appendReport(rec) && !this._auditWarned) { this._auditWarned = true; this.log('⚠️ Could not write an audit-log row (disk full / permissions?) — the run continues but run-report.jsonl/.csv may be incomplete. Fix disk/permissions to restore the audit trail.'); } } catch {} },
           });
@@ -486,20 +489,28 @@ class Orchestrator {
   // they go public and their comment can land. Routes each held post to the moderator that covers its
   // group (group.moderatedBy, or the lone moderator). Runs both inside the cycle (end of pool) and ON
   // DEMAND via approveHeldNow(). shouldStop lets the cycle version abort on a Stop.
+  // Lifecycle hygiene for the held queue so it can't wedge/grow forever: expire held posts we've never
+  // been able to approve (FB removed/auto-approved them, or they're unmatchable) so the concurrent loop
+  // stops relaunching a browser for them every cycle; prune old approved/failed records so the file stays
+  // small. Runs UNCONDITIONALLY each _loop cycle (even when moderation is OFF) so toggling moderation off
+  // doesn't freeze stale residue forever. Early-returns when the queue is empty (no needless load+save).
+  _pruneModeration() {
+    try {
+      const ms0 = store.loadModeration();
+      if (!ms0.held || !ms0.held.length) return;
+      const now0 = Date.now(); let changed0 = false;
+      const STALE = 30 * 60 * 1000, PRUNE = 24 * 3600 * 1000;
+      const before = ms0.held.length;
+      for (const h of ms0.held) { if (h.status === 'held' && h.heldAt && (now0 - h.heldAt) > STALE) { h.status = 'failed'; h.note = 'not approvable within 30min (removed/auto-approved/unmatchable)'; changed0 = true; } }
+      ms0.held = ms0.held.filter((h) => h.status === 'held' || ((h.approvedAt || h.heldAt || 0) > now0 - PRUNE));
+      if (changed0 || ms0.held.length !== before) store.saveModeration(ms0);
+    } catch {}
+  }
+
   async _runModeratorApproval(data, shouldStop) {
     shouldStop = shouldStop || (() => false);
     const settings = data.settings || {};
-    // Lifecycle hygiene FIRST so the queue can't wedge/grow forever: expire held posts we've never been
-    // able to approve (FB removed/auto-approved them, or they're unmatchable) so the concurrent loop stops
-    // relaunching a browser for them every cycle; and prune old approved records so the file stays small.
-    try {
-      const ms0 = store.loadModeration(); const now0 = Date.now(); let changed0 = false;
-      const STALE = 30 * 60 * 1000, PRUNE = 24 * 3600 * 1000;
-      let before = (ms0.held || []).length;
-      for (const h of (ms0.held || [])) { if (h.status === 'held' && h.heldAt && (now0 - h.heldAt) > STALE) { h.status = 'failed'; h.note = 'not approvable within 30min (removed/auto-approved/unmatchable)'; changed0 = true; } }
-      ms0.held = (ms0.held || []).filter((h) => h.status === 'held' || ((h.approvedAt || h.heldAt || 0) > now0 - PRUNE));
-      if (changed0 || ms0.held.length !== before) store.saveModeration(ms0);
-    } catch {}
+    this._pruneModeration(); // hygiene FIRST so the queue can't wedge/grow
     const heldNow = (store.loadModeration().held || []).filter((h) => h.status === 'held');
     const moderators = (data.accounts || []).filter((a) => a.isModerator);
     if (!heldNow.length) { return { held: 0, moderators: moderators.length }; } // quiet — callers decide whether to announce
@@ -688,7 +699,7 @@ class Orchestrator {
   _persistDealt(cycleDealtIds) {
     if (!cycleDealtIds || !cycleDealtIds.length) return true;
     const merged = [...new Set([...this._dealt, ...cycleDealtIds])];
-    if (store.saveRotation({ dealt: merged, roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0 })) {
+    if (store.saveRotation({ dealt: merged, roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null })) {
       this._dealt = new Set(merged);
       return true;
     }
@@ -706,6 +717,7 @@ class Orchestrator {
     this._auditWarned = false;    // one-time per-run "audit-log write failed" warning
     this._roundOffset = _st.roundOffset || 0; // rotates account↔post mapping across Loop-campaign recycles
     this._staggerRotation = _st.staggerRotation || 0; // E-N3: rotates account START order each cycle (fairness)
+    this._lastDailyRunDate = _st.lastDailyRunDate || null; // 'daily' schedule: local day-key of the last run (same-day-restart dedupe)
     this._retryCount = {}; // E-N4: per-account consecutive rate-limit retries → stagger decay (in-memory)
     try { this._proxyHealth.load(this._proxyHealthFile()); } catch {} // E-X3: restore proxy health (prunes >1h)
     let cycle = 0;
@@ -716,6 +728,19 @@ class Orchestrator {
       if (!posts.length) { this.log('⚠️ No posts configured — stopping.'); break; }
       const allPosters = accounts.filter((a) => a.enabled !== false && !a.isModerator); // MOD: the moderator only approves, never posts
       if (!allPosters.length) { this.log('⚠️ No enabled accounts — stopping.'); break; }
+      // DAILY SCHEDULE: run exactly ONE cycle/day at the local dailyPostTime (the operator's "1 post/day
+      // per account into its groups; next day the next post" model — pair with sequence mode + Loop). Wait
+      // until the fire time; if today's run already happened, wait until tomorrow. Survives a same-day
+      // restart via the persisted lastDailyRunDate. continuous mode is unchanged (no gate).
+      if (settings.scheduleMode === 'daily') {
+        const waitMs = this._msUntilDailyFire(settings.dailyPostTime, this._lastDailyRunDate);
+        if (waitMs > 0) {
+          this.log(`📅 Daily mode — next run at ${settings.dailyPostTime} (in ~${Math.round(waitMs / 360000) / 10}h).`);
+          await this._waitWithCountdown(waitMs, `Daily run at ${settings.dailyPostTime}`);
+          if (this._shouldStop() || this._finish) break;
+          continue; // re-enter: now it's fire time → falls through and runs one cycle
+        }
+      }
       // RESERVE POOL: never run the whole fleet. Hold back `reserveAccounts` healthy accounts — they stay
       // available to RESCUE orphaned link-comments (a post whose own account got blocked before commenting)
       // and to take over a cooled-down account's slot. Always leaves ≥1 account posting.
@@ -801,11 +826,11 @@ class Orchestrator {
           this.log('🔁 All posts distributed — looping (recycling, rotating content across accounts)...');
           this._dealt.clear();
           this._roundOffset = (this._roundOffset || 0) + 1;
-          try { store.saveRotation({ dealt: [], roundOffset: this._roundOffset }); } catch {}
+          try { store.saveRotation({ dealt: [], roundOffset: this._roundOffset, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null }); } catch {} // keep the daily marker so a same-day restart can't double-run
           // fall through: this cycle now re-deals the full library
         } else {
           this.log('✅ All posts have been distributed — campaign complete.');
-          this._dealt.clear(); try { store.saveRotation({ dealt: [], roundOffset: 0 }); } catch {}
+          this._dealt.clear(); try { store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null }); } catch {}
           break;
         }
       }
@@ -900,6 +925,10 @@ class Orchestrator {
         const usedToday = (cap > 0 && live) ? store.dailyUsed(live.daily) : 0;
         if (cap > 0 && usedToday >= cap) return idle(`📵 [${account.name}] daily cap reached (${usedToday}/${cap} group-posts today) — skipping until tomorrow`);
         const maxThisRun = cap > 0 ? (cap - usedToday) : Infinity;
+        // Advisory (once/account/run): dailyCap counts GROUP-POSTS, not distinct posts — so a cap below the
+        // account's assigned-group count silently leaves some groups un-posted each day. Warn so it's not a footgun.
+        const _grp = (account.assignedGroups || []).length;
+        if (cap > 0 && _grp > cap) { this._capWarned = this._capWarned || {}; if (!this._capWarned[account.name]) { this._capWarned[account.name] = 1; this.log(`⚠️ [${account.name}] daily cap ${cap} < its ${_grp} assigned groups — it won't reach all groups in a day (the cap counts group-posts, not distinct posts). Raise the cap to ≥${_grp} to cover all groups daily.`); } }
 
         const t0 = Date.now(); if (!firstStart) firstStart = t0;
         this.log(`[${account.name}] Starting with ${(account.assignedGroups || []).length} groups`);
@@ -940,6 +969,52 @@ class Orchestrator {
       }
       await Promise.allSettled([...inFlight]); // drain whatever is still running before the cycle ends
 
+      // RESERVE TAKEOVER (unique/sequence modes only): if an active account DROPPED this cycle
+      // (rate-limit, logout, checkpoint, block, disabled, bad proxy), its post(s) were released and are
+      // still UNDEALT — coverage would otherwise be lost until the next cycle/day. Pull idle HEALTHY
+      // reserve members that (a) have daily headroom and (b) actually have an undealt post to deliver,
+      // and run a BOUNDED second pass through the SAME pool machinery (so claims, dealt-persist, daily-cap
+      // and stagger all apply unchanged). Reused reserves are removed from this._reserve so Phase-3 rescue
+      // can't double-use them. Continuous/non-unique modes have no dealt-set, so this is a no-op there.
+      const _dropFlags = new Set(['rate_limited', 'needs_login', 'needs_verification', 'account_disabled', 'likely_blocked', 'proxy_invalid']);
+      const _uniqueMode = active.some((a) => { const o = a.postingOrder || 'post-centric'; return o.includes('unique') || o === 'sequence'; });
+      if (!sawOffline && !stopPool && !this._shouldStop() && !this._finish && _uniqueMode && cycleFlags.some((f) => _dropFlags.has(f)) && (this._reserve || []).length) {
+        const nowT = Date.now();
+        const capT = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
+        // Bound promotions to roughly the number of accounts that DROPPED (each released ~1 post), capped at 3.
+        const maxTakeover = Math.min(3, Math.max(1, cycleFlags.filter((f) => _dropFlags.has(f)).length));
+        // Healthy, in-headroom reserve candidates.
+        const cand = (this._reserve || []).filter((a) =>
+          a.enabled !== false && !a.isModerator && a.status === 'logged_in' && (Number(a.rateLimitedUntil) || 0) <= nowT &&
+          (capT <= 0 || store.dailyUsed(((getData().accounts || []).find((x) => x.name === a.name) || a).daily) < capT));
+        // CRITICAL: _postsForAccount finds an account's index in this._active and returns [] otherwise — so a
+        // reserve must be IN this._active to be probed/claimed for. Temporarily include all candidates, probe,
+        // then narrow this._active to the chosen takeovers (their appended index falls back to remaining[0]).
+        this._active = active.concat(cand);
+        const takeovers = [];
+        for (const a of cand) {
+          if (takeovers.length >= maxTakeover) break;
+          if (this._postsForAccount(a, cycle, false).length > 0) takeovers.push(a); // an undealt post exists for it to deliver
+        }
+        this._active = active.concat(takeovers);
+        if (takeovers.length) {
+          const tnames = new Set(takeovers.map((a) => a.name));
+          this._reserve = (this._reserve || []).filter((a) => !tnames.has(a.name)); // don't also use them for Phase-3 rescue
+          this._progress.accountsTotal += takeovers.length; this.emit('automation-progress', { ...this._progress });
+          this.log(`🔁 Reserve takeover: ${takeovers.length} healthy reserve account(s) delivering posts a dropped account left undealt — ${takeovers.map((a) => a.alias || a.name).join(', ')}`);
+          for (const a of takeovers) queue.push(a);
+          while ((queue.length || inFlight.size) && !this._shouldStop()) {
+            await this._waitWhilePaused(); if (this._shouldStop()) break;
+            while (inFlight.size < poolSize && queue.length && !stopPool && !this._finish && !this._shouldStop()) launchNext();
+            if (!inFlight.size) break;
+            await Promise.race([...inFlight]);
+          }
+          await Promise.allSettled([...inFlight]);
+        } else {
+          this._active = active; // no takeover → restore the unmodified active set
+        }
+      }
+
       // E-N2: pool-utilization metric — how busy the slots were kept (cpu busy time vs the wall-clock
       // span × slots). Low util ⇒ the pool was starved (few eligible accounts) or accounts were uneven.
       if (ranCount > 0) {
@@ -967,6 +1042,7 @@ class Orchestrator {
       // feed), so the first comment can't attach. A designated MODERATOR account (admin of the groups)
       // approves OUR held posts so they go live. DRY-RUN for now: it scans the queues and LOGS what it
       // would approve (no clicks) so we refine the queue DOM live, then enable the click. No-op when off.
+      this._pruneModeration(); // hygiene runs EVERY cycle, even when moderation is OFF (no frozen residue)
       if (settings.moderationEnabled && !this._shouldStop() && !this._approving) {
         this._approving = true;
         try { await this._runModeratorApproval(data, () => this._shouldStop()); }
@@ -1033,9 +1109,11 @@ class Orchestrator {
                 if (this._shouldStop()) break;
                 await runRescue({ account, tasks, settings, hidden, log: (m) => this.log(m), shouldStop: () => this._shouldStop(), onResult: markResult });
               }
-              // Prune resolved records (done/failed/rehomed) so the queue keeps only retryable 'pending'.
-              try { const d3 = store.loadComments(); d3.pending = (d3.pending || []).filter((c) => c.status === 'pending'); store.saveComments(d3); } catch {}
             }
+            // Prune resolved records (done/failed/rehomed) so the queue keeps ONLY retryable 'pending'.
+            // OUTSIDE the byAccount block → done/failed records are reaped even on cycles where no rescuer
+            // was assigned (else pending-comments.json grows unbounded across days).
+            try { const d3 = store.loadComments(); d3.pending = (d3.pending || []).filter((c) => c.status === 'pending'); store.saveComments(d3); } catch {}
           }
         } catch (e) { this.log(`⚠️ comment-rescue phase error: ${e.message}`); }
       }
@@ -1063,6 +1141,32 @@ class Orchestrator {
         this.log('🛑 No account could post this cycle — accounts need attention (logged out, disabled, or identity-verification required). Stopping. Fix the flagged accounts, then Start again.');
         break;
       }
+      // DAILY-CAP HOLD: if every active poster simply hit today's cap (not cooling, not flagged), the run
+      // is DONE FOR TODAY — wait for the UTC day to roll over and resume, instead of tripping the stall-
+      // breaker and STOPPING (which would leave the app dead hours before tomorrow). A rate-limited or
+      // flagged fleet is NOT a cap-hold (those still fall through to the real stop below).
+      const _cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
+      if (cycleDealtIds.length === 0 && _cap > 0 && settings.scheduleMode !== 'daily') { // daily mode's gate already waits a day
+        const _now = Date.now();
+        const _liveAccts = (getData().accounts || []);
+        const _activePosters = (this._active || []).filter((a) => a.enabled !== false && !a.isModerator);
+        const _allCapped = _activePosters.length > 0 && _activePosters.every((a) => {
+          const live = _liveAccts.find((x) => x.name === a.name) || a;
+          if ((Number(live.rateLimitedUntil) || 0) > _now) return false; // cooling down → not a cap-only stall
+          if (this._runFlags && this._runFlags[a.name]) return false;     // flagged → not a cap-only stall
+          return store.dailyUsed(live.daily) >= _cap;
+        });
+        if (_allCapped) {
+          const d = new Date(_now);
+          const nextMidnightUtc = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 30); // +30s past the UTC rollover
+          const waitMs = Math.max(60000, nextMidnightUtc - _now);
+          this._zeroProgressCycles = 0; // a deliberate cap hold is NOT a stall
+          this.log(`📵 All active accounts hit today's daily cap (${_cap}/day) — waiting ~${Math.round(waitMs / 360000) / 10}h for the next day, then resuming automatically.`);
+          await this._waitWithCountdown(waitMs, 'Next day (daily cap)');
+          if (this._shouldStop() || this._finish) break;
+          continue; // resume next day with fresh daily counts
+        }
+      }
       // Dead-fleet / stall breaker: if the run dealt NOTHING for several cycles in a row (every account
       // rate-limited, likely-blocked, group-less, or disabled), STOP instead of relaunching browsers
       // forever unattended. This catches the zero-progress cases the flag-specific guard above doesn't
@@ -1076,8 +1180,11 @@ class Orchestrator {
         const rl = active.filter((a) => (Number(a.rateLimitedUntil) || 0) > now).length;
         const noGroups = active.filter((a) => !(a.assignedGroups && a.assignedGroups.length)).length;
         const flagged = Object.keys(this._runFlags || {}).length;
+        const capN = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
+        const capped = capN > 0 ? active.filter((a) => { const live = (getData().accounts || []).find((x) => x.name === a.name) || a; return store.dailyUsed(live.daily) >= capN; }).length : 0;
         let cause;
-        if (active.length && rl === active.length) cause = `all ${active.length} active account(s) are rate-limited and cooling down — wait for the cool-down to elapse, then Start again`;
+        if (active.length && capped === active.length) cause = `all ${active.length} active account(s) have hit today's daily cap (${capN}/day) — they will resume automatically after midnight UTC (no action needed)`;
+        else if (active.length && rl === active.length) cause = `all ${active.length} active account(s) are rate-limited and cooling down — wait for the cool-down to elapse, then Start again`;
         else if (active.length && noGroups === active.length) cause = 'no active account has any groups assigned — assign groups in the Accounts tab';
         else if (flagged) cause = `${flagged} account(s) need attention (logged out, checkpoint, or blocked) — fix the flagged accounts, then Start again`;
         else cause = 'check your accounts/groups (rate-limited, blocked, logged out, or no groups assigned)';
@@ -1086,6 +1193,14 @@ class Orchestrator {
       }
       if ((settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {
         this.log(`🏁 Reached maxCycles (${settings.maxCycles}) — finishing.`); break;
+      }
+      if (settings.scheduleMode === 'daily') {
+        // Mark today's run done + persist (survives a same-day restart) so the top-of-loop daily gate now
+        // waits until TOMORROW's fire time. The continuous inter-cycle wait below is skipped in daily mode.
+        this._lastDailyRunDate = this._localDayKey();
+        try { const _r = store.loadRotation(); _r.lastDailyRunDate = this._lastDailyRunDate; store.saveRotation(_r); } catch {}
+        this.log(`📅 Daily run complete — next run tomorrow at ${settings.dailyPostTime}.`);
+        continue; // the top-of-loop daily gate performs the ~24h wait until the next fire
       }
       const cycleWaitMs = rangeMs(settings, 'waitIntervalMin', 'waitIntervalMax', 90, 180, 60000, 1); // T3: randomized inter-cycle wait
       this.log(`✅ Cycle ${cycle} complete. Waiting ~${Math.round(cycleWaitMs / 60000)} min (randomized) before next cycle…`);
@@ -1125,6 +1240,20 @@ class Orchestrator {
       await sleep(1000);
     }
     if (this._progress) { this._progress.waitingLabel = null; this._progress.waitRemainingSec = 0; this.emit('automation-progress', { ...this._progress }); }
+  }
+
+  // LOCAL calendar-day key (the 'daily' schedule fires at a LOCAL wall-clock time, so the de-dupe key
+  // must be local too — UTC would be off-by-one near midnight).
+  _localDayKey(d = new Date()) { const z = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`; }
+  // ms until the next 'daily' fire for dailyPostTime ('HH:MM' local). 0 = fire NOW (today's time has
+  // arrived and we haven't run today). If we already ran today, returns ms until tomorrow's time.
+  _msUntilDailyFire(timeStr, lastRunDateKey) {
+    const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(timeStr || '09:00')) || [null, '9', '0'];
+    const hh = parseInt(m[1], 10) || 0, mm = parseInt(m[2], 10) || 0;
+    const now = new Date();
+    const fireToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hh, mm, 0, 0);
+    if (lastRunDateKey === this._localDayKey(now)) { const t = new Date(fireToday.getTime()); t.setDate(t.getDate() + 1); return t.getTime() - now.getTime(); }
+    return Math.max(0, fireToday.getTime() - now.getTime());
   }
 }
 

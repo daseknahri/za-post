@@ -690,7 +690,24 @@
                 <label for="setting-daily-cap" class="block text-sm font-semibold text-gray-300 mb-2">Daily post cap per account (0 = off)</label>
                 <input type="number" id="setting-daily-cap" min="0" value="0"
                   class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-                <small class="block mt-2 text-xs text-gray-500">Maximum posts per account per day; 0 means no cap</small>
+                <small class="block mt-2 text-xs text-gray-500">Max GROUP-posts per account per day (counts each group). 0 = no cap. For "1 post into all my groups daily" set this to the number of groups each account has (or leave 0 and use Daily mode).</small>
+              </div>
+
+              <div>
+                <label for="setting-schedule-mode" class="block text-sm font-semibold text-gray-300 mb-2">Schedule</label>
+                <select id="setting-schedule-mode"
+                  class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                  <option value="continuous">Continuous — cycle repeatedly (every wait-interval)</option>
+                  <option value="daily">Daily — one run per day at a set time</option>
+                </select>
+                <small class="block mt-2 text-xs text-gray-500">Daily mode runs ONE cycle per day: each account posts its next post into its own groups, then waits until tomorrow. Pair with Sequence posting order + Loop Campaign so each day advances to the next post.</small>
+              </div>
+
+              <div>
+                <label for="setting-daily-post-time" class="block text-sm font-semibold text-gray-300 mb-2">Daily run time (local)</label>
+                <input type="time" id="setting-daily-post-time" value="09:00"
+                  class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">When "Daily" is selected, the run fires at this local time each day.</small>
               </div>
 
               <div>

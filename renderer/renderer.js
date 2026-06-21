@@ -2079,6 +2079,8 @@ function loadSettings() {
   document.getElementById('setting-comment-delay-min').value = appData.settings.commentDelayMin !== undefined ? appData.settings.commentDelayMin : 60;
   document.getElementById('setting-comment-delay-max').value = appData.settings.commentDelayMax !== undefined ? appData.settings.commentDelayMax : 180;
   document.getElementById('setting-daily-cap').value = appData.settings.dailyCap !== undefined ? appData.settings.dailyCap : 0;
+  { const el = document.getElementById('setting-schedule-mode'); if (el) el.value = appData.settings.scheduleMode === 'daily' ? 'daily' : 'continuous'; }
+  { const el = document.getElementById('setting-daily-post-time'); if (el) el.value = appData.settings.dailyPostTime || '09:00'; }
   document.getElementById('setting-vary-content').checked = appData.settings.varyContent !== false;
   document.getElementById('setting-vary-images').checked = appData.settings.varyImages !== false;
   document.getElementById('setting-randomize-links').checked = appData.settings.randomizeLinks !== false;
@@ -2242,6 +2244,8 @@ async function saveSettings() {
     commentDelayMin: intOr('setting-comment-delay-min', 60),
     commentDelayMax: intOr('setting-comment-delay-max', 180),
     dailyCap: intOr('setting-daily-cap', 0),
+    scheduleMode: ((document.getElementById('setting-schedule-mode') || {}).value === 'daily') ? 'daily' : 'continuous',
+    dailyPostTime: (document.getElementById('setting-daily-post-time') || {}).value || '09:00',
     varyContent: document.getElementById('setting-vary-content').checked,
     varyImages: document.getElementById('setting-vary-images').checked,
     randomizeLinks: document.getElementById('setting-randomize-links').checked,

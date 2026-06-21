@@ -78,10 +78,13 @@ async function runRescue(o) {
         }
       } catch (e) { out.failed++; o.onResult && o.onResult(t, 'error'); log(`💬 [rescue:${name}] error on a "${label}" post: ${e.message}`); }
       // Human gap between rescue comments so the rescuer doesn't burst-comment links (its own anti-spam).
+      // Interruptible so Stop wakes the rescuer within ~1s instead of after the full (up to 180s) gap.
       if (i < tasks.length - 1 && !shouldStop() && !out.blocked) {
         const lo = Number.isFinite(settings.commentDelayMin) ? settings.commentDelayMin : 60;
         const hi = Number.isFinite(settings.commentDelayMax) ? settings.commentDelayMax : 180;
-        await sleep(rand(Math.min(lo, hi), Math.max(lo, hi)) * 1000);
+        const ms = rand(Math.min(lo, hi), Math.max(lo, hi)) * 1000;
+        let waited = 0;
+        while (waited < ms && !shouldStop() && !out.blocked) { const chunk = Math.min(1000, ms - waited); await sleep(chunk); waited += chunk; }
       }
     }
     log(`💬 [rescue:${name}] done — placed=${out.placed} failed=${out.failed}${out.blocked ? ' (stopped: rate-limited)' : ''}`);

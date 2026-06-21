@@ -76,6 +76,17 @@ test('clampSettings: speedMode is coerced to a valid preset name', () => {
   assert.equal(store.clampSettings({ speedMode: 'bogus' }).speedMode, 'normal', 'invalid → normal');
 });
 
+test('clampSettings: scheduleMode + dailyPostTime are validated (daily-schedule feature)', () => {
+  assert.equal(store.clampSettings({ scheduleMode: 'daily' }).scheduleMode, 'daily');
+  assert.equal(store.clampSettings({ scheduleMode: 'continuous' }).scheduleMode, 'continuous');
+  assert.equal(store.clampSettings({ scheduleMode: 'bogus' }).scheduleMode, 'continuous', 'invalid → continuous');
+  assert.equal(store.clampSettings({ dailyPostTime: '07:30' }).dailyPostTime, '07:30');
+  assert.equal(store.clampSettings({ dailyPostTime: '23:59' }).dailyPostTime, '23:59');
+  assert.equal(store.clampSettings({ dailyPostTime: '9:05' }).dailyPostTime, '9:05', 'single-digit hour ok');
+  assert.equal(store.clampSettings({ dailyPostTime: '25:99' }).dailyPostTime, '09:00', 'out-of-range → default');
+  assert.equal(store.clampSettings({ dailyPostTime: 'garbage' }).dailyPostTime, '09:00', 'invalid → default');
+});
+
 test('moderation: state round-trips, fail-closed defaults, fbDisplayName trimmed (MOD-1)', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zpost-mod-'));
   store.init(tmp);
