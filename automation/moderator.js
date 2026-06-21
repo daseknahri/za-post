@@ -40,11 +40,15 @@ async function runModerator(o) {
   let browser = null;
   try {
     log(`🛡️ [moderator:${name}] approval phase starting — ${dryRun ? 'DRY-RUN (scan + log, NO clicks)' : 'LIVE (will click Approve/Publier on matched cards)'}. our names: [${ourNames.join(', ') || '(none captured — set fbDisplayName on the accounts)'}]`);
+    // Off-screen by default; but when the operator turns OFF "hide browser" (Settings) the moderator window
+    // is shown ON-screen too, so they can SEE which account is approving + watch the Spam-potentiel pass.
+    const hideMod = ((o.settings && o.settings.hideBrowser) !== false);
+    if (!hideMod) log(`🛡️ [moderator:${name}] running VISIBLE (hide-browser is off) — watch this window approve the held posts.`);
     browser = await puppeteer.launch({
       headless: false,
       executablePath: chromiumPath(),
       userDataDir: store.profileDir(name),
-      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--window-position=-32000,-32000',
+      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', (hideMod ? '--window-position=-32000,-32000' : '--window-position=60,60'),
         '--disable-features=CalculateNativeWinOcclusion', '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding', '--mute-audio'],
       defaultViewport: { width: 1280, height: 900 },
       protocolTimeout: 90000,

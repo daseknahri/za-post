@@ -211,6 +211,7 @@ class Orchestrator {
     this._runFlags = {}; // accountName -> flag set THIS run (rate_limited/checkpoint/etc.)
     this._claimed = new Set(); // post ids claimed by an account this cycle (reset each cycle)
     this._lastReserveKey = null; // force this run's first cycle to log its reserve set + uncovered-group warning
+    this._heldCount = {}; this._warmWarned = {}; // per-run held-post tallies → "account needs warming" alert
     this.emit('automation-started');
     this.emit('automation-progress', { ...this._progress });
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
@@ -428,7 +429,19 @@ class Orchestrator {
                 }
               }
               if (store.saveModeration(ms)) {
-                this.log(`📥 [${account.name}] ${r.heldRecords.length} post(s) held in "Spam potentiel" — queued for moderator approval (then the comment is added once they're public)`);
+                this.log(`📥 [${account.name}] ${r.heldRecords.length} post(s) held in "Spam potentiel" — moderator will try to approve (fallback; the comment lands once they're public)`);
+                // A hold is a TRUST signal, not the routine path: FB's Spam-potentiel is account-signal-driven
+                // (admin role does NOT bypass it), so the durable fix is account trust, not the scrape. Track
+                // per-account holds and, once an account is held repeatedly this run, surface a clear, actionable alert.
+                this._heldCount = this._heldCount || {};
+                this._heldCount[account.name] = (this._heldCount[account.name] || 0) + r.heldRecords.length;
+                if (this._heldCount[account.name] >= 2) {
+                  this._warmWarned = this._warmWarned || {};
+                  if (!this._warmWarned[account.name]) {
+                    this._warmWarned[account.name] = 1;
+                    this.log(`⚠️ [${account.name}] held ${this._heldCount[account.name]}× this run → FB doesn't trust it yet. Fix at the SOURCE (don't rely on the moderator): give it a DEDICATED proxy, ENABLE Warm-up, slow its cadence, and lead with your trusted accounts. Holds should be the exception, not the norm.`);
+                  }
+                }
                 // EVENT TRIGGER: don't wait for the periodic loop — kick an approval pass NOW (guarded).
                 this._kickApproval(data);
               } else {
