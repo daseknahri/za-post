@@ -2015,7 +2015,7 @@ async function runAccount(o) {
           pendingApproval++;
           // MOD: record the held post so the moderator phase can approve it (then a later comment pass
           // adds the first comment). captionSnip is the same normalized 40-char key the queue scan uses.
-          heldRecords.push({ postId: basePost.id || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip, groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: postPermalink || null, source: 'pending_at_publish' });
+          heldRecords.push({ postId: basePost.id || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip, postCaption: (post.caption || '').slice(0, 220), groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: postPermalink || null, source: 'pending_at_publish' });
           report(groupName, gid, 'pending', 'awaiting admin approval (immediate signal)', 'skipped');
           if (i < targetGroups.length - 1) await sleepInterruptible(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120), shouldStop, 1000); // T2: randomized inter-group gap (floor 120s)
           continue;
@@ -2080,7 +2080,7 @@ async function runAccount(o) {
             // public. (NOT the comment-rescue queue, which can't reach a non-public post.)
             posted = Math.max(0, posted - 1); pendingApproval++;
             step('Comment: ⚠️ post is HELD in "Spam potentiel" (published but not public) → routing to MODERATOR APPROVAL (a held post can\'t be commented by any account until it\'s approved)');
-            heldRecords.push({ postId: (basePost && basePost.id) || expectedPostId || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip || '', groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: postPermalink || null, source: 'comment_notfound' });
+            heldRecords.push({ postId: (basePost && basePost.id) || expectedPostId || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip || '', postCaption: (post.caption || '').slice(0, 220), groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: postPermalink || null, source: 'comment_notfound' });
             report(groupName, gid, 'pending', 'held in Spam potentiel — awaiting moderator approval', 'skipped');
           } else if (!_commentLanded) {
             // The post is LIVE but its link-comment did not land. Queue it so a healthy reserve account

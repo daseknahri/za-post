@@ -385,6 +385,9 @@ class Orchestrator {
               }
               store.saveModeration(ms);
               this.log(`📥 [${account.name}] ${r.heldRecords.length} post(s) held in "Spam potentiel" — queued for moderator approval (then the comment is added once they're public)`);
+              // EVENT TRIGGER: don't wait up to ~2 min for the periodic loop — kick an approval pass NOW.
+              // Fire-and-forget + guarded so it can't overlap the periodic loop / end-of-cycle sweep.
+              this._kickApproval(data);
             } catch (e) { this.log(`⚠️ could not persist held-post state: ${e.message}`); }
           } else if (r && r.heldRecords && r.heldRecords.length) {
             // Posts are held in spam but moderator approval is OFF — a held post is not public, so NO
@@ -490,13 +493,52 @@ class Orchestrator {
     if (unassigned.length) this.log(`⚠️ ${unassigned.length} held post(s) are in groups with no assigned moderator — set each group's moderator in the Groups tab.`);
     const posterNames = [...new Set((data.accounts || []).filter((a) => !a.isModerator && a.fbDisplayName && String(a.fbDisplayName).trim()).map((a) => String(a.fbDisplayName).trim()))];
     const { runModerator } = require('./moderator');
+    let queued = 0;
     for (const { mod, held } of byMod.values()) {
       if (shouldStop()) break;
       const gids = new Set(held.map((h) => h.gid));
       const modGroups = (data.groups || []).filter((g) => gids.has(g.groupId || g.id));
-      await runModerator({ account: mod, groups: modGroups, settings, held, posterNames, log: (m) => this.log(m), shouldStop });
+      const r = await runModerator({ account: mod, groups: modGroups, settings, held, posterNames, log: (m) => this.log(m), shouldStop });
+      // APPROVE → COMMENT HANDOFF: for every post the moderator actually APPROVED (now public), mark its
+      // moderation record approved (so it's never re-approved) and move its comment payload into the
+      // pending-comments queue so the existing Phase-3 rescue runner adds the link-comment via a healthy
+      // in-group account. Gated on !dryRun (a "would approve" must NOT queue anything).
+      if (r && r.dryRun === false && Array.isArray(r.approvedRecords) && r.approvedRecords.length) {
+        try { queued += this._handoffApprovedToComments(r.approvedRecords); }
+        catch (e) { this.log(`⚠️ approve→comment handoff failed: ${e.message}`); }
+      }
     }
-    return { held: heldNow.length, moderators: moderators.length };
+    if (queued) this.log(`✅ ${queued} approved post(s) handed to comment-rescue — a healthy account will add their link-comment.`);
+    return { held: heldNow.length, moderators: moderators.length, queued };
+  }
+
+  // APPROVE → COMMENT HANDOFF. Given the held records the moderator just APPROVED (now public): (1) flip
+  // each moderation record to 'approved' (so it's never re-approved — Phase-2/the picker only act on
+  // status:'held'), and (2) enqueue its comment payload into the pending-comments queue so the existing
+  // Phase-3 rescue runner places the link-comment via a healthy in-group account. Dedup is captionSnip-
+  // PRIMARY (held cards usually have no postId, while an orphan-path entry may carry one — keying on
+  // postId-first could miss a cross-path duplicate and double-comment). Returns the # of NEW comment tasks.
+  _handoffApprovedToComments(approvedRecords) {
+    const recs = (approvedRecords || []).filter((h) => h && h.gid);
+    if (!recs.length) return 0;
+    const same = (x, h) => x.gid === h.gid && ((h.captionSnip && x.captionSnip) ? x.captionSnip === h.captionSnip : (!!x.postId && !!h.postId && x.postId === h.postId));
+    try {
+      const ms = store.loadModeration(); let changed = false;
+      for (const h of recs) { const rec = (ms.held || []).find((x) => x.status === 'held' && same(x, h)); if (rec) { rec.status = 'approved'; rec.approvedAt = Date.now(); changed = true; } }
+      if (changed) store.saveModeration(ms);
+    } catch (e) { this.log(`⚠️ could not mark approved held record(s): ${e.message}`); }
+    let added = 0;
+    try {
+      const cs = store.loadComments();
+      for (const h of recs) {
+        if (!(h.comment && String(h.comment).trim())) continue; // nothing to comment (caption-only post) — skip
+        if (cs.pending.some((x) => x.status !== 'done' && same(x, h))) continue; // already queued (orphan or earlier approve) — no double-comment
+        cs.pending.push({ gid: h.gid, postId: h.postId || null, posterAccount: h.posterAccount || null, groupName: h.groupName || null, captionSnip: h.captionSnip || null, postCaption: h.postCaption || h.captionSnip || null, comment: h.comment, commentImg: h.commentImg || null, postPermalink: h.permalink || h.postPermalink || null, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null, source: 'approved' });
+        added++;
+      }
+      if (added) store.saveComments(cs);
+    } catch (e) { this.log(`⚠️ could not queue approved post comment(s): ${e.message}`); }
+    return added;
   }
 
   // Interruptible wait that wakes early when the run stops (used by the concurrent moderator loop).
@@ -535,6 +577,26 @@ class Orchestrator {
       }
       this._modLoop = false;
     })();
+  }
+
+  // EVENT-DRIVEN KICK — fire an approval pass the MOMENT new posts are held, instead of waiting for the
+  // periodic _startModeratorLoop tick (~2 min). Non-blocking; the posting flow is never delayed. Fully
+  // guarded against double-approve: shares the _approving flag with the periodic loop, the end-of-cycle
+  // sweep, and approveHeldNow (set SYNCHRONOUSLY before any await, so two near-simultaneous kicks can't
+  // both pass), self-gates on moderationEnabled + a moderator existing + run live/not-paused, and can
+  // never throw an unhandled rejection.
+  _kickApproval(data) {
+    data = data || this._data || {};
+    if (this._approving || this._paused || this._stop || !this.running) return;
+    if (!(data.settings && data.settings.moderationEnabled)) return;
+    if (!(data.accounts || []).some((a) => a.isModerator)) return;
+    this._approving = true; // claim the guard synchronously so the periodic loop / a 2nd kick can't overlap
+    (async () => {
+      this.log('🛡️ Held post(s) just detected — kicking a moderator-approval pass now (posting continues)…');
+      try { await this._runModeratorApproval(data, () => this._stop); }
+      catch (e) { this.log(`⚠️ moderator kick error: ${e.message}`); }
+      finally { this._approving = false; }
+    })().catch(() => { this._approving = false; });
   }
 
   // On-demand moderator approval (force a pass now). Callable from the UI/IPC; guarded so two passes
@@ -620,24 +682,60 @@ class Orchestrator {
     let cycle = 0;
     while (!this._shouldStop()) {
       this._data = getData(); // re-read each cycle so mid-run edits take effect
+      const data = this._data; // the moderator/rescue phases below reference `data` — bind it (was a latent ReferenceError swallowed by their try/catch, silently disabling rescue + the end-of-cycle approval sweep)
       const { posts, accounts, settings } = this._data;
       if (!posts.length) { this.log('⚠️ No posts configured — stopping.'); break; }
       const allPosters = accounts.filter((a) => a.enabled !== false && !a.isModerator); // MOD: the moderator only approves, never posts
       if (!allPosters.length) { this.log('⚠️ No enabled accounts — stopping.'); break; }
-      // RESERVE POOL: never run the whole fleet. Hold back `reserveAccounts` healthy accounts (rotating
-      // each cycle so every account is used over time) — they stay available to RESCUE orphaned link-
-      // comments (a post whose own account got blocked before commenting) and to take over a cooled-down
-      // account's slot. Always leaves ≥1 account posting.
+      // RESERVE POOL: never run the whole fleet. Hold back `reserveAccounts` healthy accounts — they stay
+      // available to RESCUE orphaned link-comments (a post whose own account got blocked before commenting)
+      // and to take over a cooled-down account's slot. Always leaves ≥1 account posting.
+      //
+      // GROUP-AWARE selection: a group-BLIND rotating window can hold back accounts that aren't members of
+      // the group that ends up needing a rescuer, so rescue then finds NO free in-group account. Instead we
+      // first try to keep, for EACH active group, at least one HEALTHY (enabled, logged-in, not rate-limited)
+      // member in reserve — rotating WHICH member is held back across cycles so coverage stays fair. Any
+      // reserve slots left over are filled by the same rotating window as before. Coverage is best-effort:
+      // the reserve count and the “≥1 posting” floor always win, so a group whose only healthy member is the
+      // last poster is left posting (not reserved).
       const reserveN = Math.max(0, Math.min(Math.round(Number(settings.reserveAccounts) || 0), allPosters.length - 1));
       let active = allPosters, reserve = [];
       if (reserveN > 0) {
-        const rot = (this._reserveRot = (this._reserveRot || 0) + 1) % allPosters.length;
-        const rotated = allPosters.slice(rot).concat(allPosters.slice(0, rot));
-        reserve = rotated.slice(0, reserveN);
-        const rset = new Set(reserve.map((a) => a.name));
-        active = allPosters.filter((a) => !rset.has(a.name));
+        const nowR = Date.now();
+        const healthy = (a) => a.enabled !== false && a.status === 'logged_in' && (Number(a.rateLimitedUntil) || 0) <= nowR;
+        const isMember = (a, g) => (a.assignedGroups || []).some((x) => x === g.id || x === g.groupId);
+        const assignedIds = new Set();
+        for (const a of allPosters) for (const gid of (a.assignedGroups || [])) assignedIds.add(gid);
+        const activeGroups = (data.groups || []).filter((g) => assignedIds.has(g.id) || assignedIds.has(g.groupId));
+        const rot = (this._reserveRot = (this._reserveRot || 0) + 1);
+        const reserveSet = new Set();
+        // Pass 1 — group coverage: reserve ONE healthy member per active group (rotating the pick), while
+        // leaving ≥1 healthy account posting overall and not exceeding reserveN.
+        for (const g of activeGroups) {
+          if (reserveSet.size >= reserveN) break;
+          const members = allPosters.filter((a) => healthy(a) && isMember(a, g) && !reserveSet.has(a.name));
+          if (!members.length) continue;
+          if (allPosters.filter((a) => healthy(a) && !reserveSet.has(a.name)).length <= 1) break; // keep ≥1 healthy poster
+          reserveSet.add(members[rot % members.length].name);
+        }
+        // Pass 2 — fill any remaining reserve slots with the original fair rotating window.
+        const baseRot = rot % allPosters.length;
+        const rotated = allPosters.slice(baseRot).concat(allPosters.slice(0, baseRot));
+        for (const a of rotated) {
+          if (reserveSet.size >= reserveN) break;
+          if (reserveSet.has(a.name)) continue;
+          if (allPosters.filter((x) => !reserveSet.has(x.name)).length <= 1) break; // keep ≥1 posting
+          reserveSet.add(a.name);
+        }
+        reserve = allPosters.filter((a) => reserveSet.has(a.name));
+        active = allPosters.filter((a) => !reserveSet.has(a.name));
+        const uncovered = activeGroups.filter((g) => !reserve.some((a) => isMember(a, g) && healthy(a)));
         const rkey = reserve.map((a) => a.name).sort().join(',');
-        if (rkey !== this._lastReserveKey) { this._lastReserveKey = rkey; this.log(`🧰 Reserve this cycle: ${reserve.map((a) => a.alias || a.name).join(', ')} held back from posting (kept healthy to rescue orphaned comments); ${active.length} posting.`); }
+        if (rkey !== this._lastReserveKey) {
+          this._lastReserveKey = rkey;
+          this.log(`🧰 Reserve this cycle: ${reserve.map((a) => a.alias || a.name).join(', ') || '(none)'} held back from posting (kept healthy to rescue held/orphaned posts); ${active.length} posting.`);
+          if (uncovered.length) this.log(`⚠️ No healthy reserve member for group(s): ${uncovered.map((g) => g.name || g.groupId || g.id).join(', ')} — a rescuer there may have to wait (assign more accounts to those groups, or raise Reserve Accounts).`);
+        }
       }
       this._active = active;
       this._reserve = reserve;
