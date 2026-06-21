@@ -903,12 +903,18 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         }, { s: snip.slice(0, 40), want: expectedPostId }, 12000).catch(() => ({ clicked: false, reason: 'err' }));
 
         let res = await scanFeed();
-        if (!res.clicked && res.reason === 'nomatch') {
-          step('Comment: our post not in top-8 — scrolling once to load more, then re-checking');
-          await page.evaluate(() => window.scrollBy(0, 900)).catch(() => {});
-          await page.waitForFunction(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length > 8, { timeout: 8000 }).catch(() => {});
-          await waitInteractive(6000);
+        // FB renders the top posts as EMPTY [aria-posinset] shells until the page scrolls (lazy content)
+        // — the SAME reason the verify needed render-nudges. The old single scroll wasn't enough (the
+        // verify confirmed LIVE but the comment then couldn't find the post). Nudge a few times so OUR
+        // post's content renders, re-scanning each time, before giving up.
+        let _cs = 0;
+        while (!res.clicked && res.reason === 'nomatch' && _cs < 3) {
+          step(`Comment: our post not matched yet — nudging the feed to render (try ${_cs + 1}/3)`);
+          await page.evaluate((y) => window.scrollBy(0, y), 600 + _cs * 250).catch(() => {});
+          await page.waitForFunction(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length >= 3, { timeout: 6000 }).catch(() => {});
+          await sleep(1500);
           res = await scanFeed();
+          _cs++;
         }
         if (res.reason === 'idmismatch') { step(`Comment: a same-caption post in feed is NOT ours (found id=${res.postId}, expected=${expectedPostId}) — NOT commenting (avoids a wrong-post)`); return 'skipped'; }
         // We matched OUR article (scanFeed marked it via data-zp-ctarget) — either it clicked the
