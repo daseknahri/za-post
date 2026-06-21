@@ -859,7 +859,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       step(permalink && !permalinkFailed
         ? 'Comment: post page had no usable comment box — falling back to the group feed (top-3 + caption match)'
         : 'Comment: locating the post in the group feed (fallback)');
-      await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+      await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
       await page.waitForSelector('div[role="article"], [aria-label*="omment"], [aria-label*="ommentaire"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
       await waitInteractive(10000);
       await dismissPopups(page);
@@ -1755,7 +1755,7 @@ async function runAccount(o) {
           const _landSnip = (post.caption || '').replace(/\s+/g, ' ').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().slice(0, 40);
           if (_landSnip.length >= 12) {
             step('Publish wait timed out — rescanning the feed (read-only) to see if it landed anyway…');
-            await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+            await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
             await page.waitForSelector('div[role="article"]', { timeout: 20000 }).catch(() => {});
             const landed = await evalTimed(page, (s) => {
               const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -1811,7 +1811,7 @@ async function runAccount(o) {
         const capSnip = (post.caption || '').replace(/\s+/g, ' ').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().slice(0, 40);
         let postPermalink = null;
         step('Verifying the post landed (reloading the group)…');
-        await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+        await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
         await page.waitForSelector('div[role="article"]', { timeout: 25000 }).catch(() => {});
         // Poll for the feed to actually render (slow feeds bury our fresh post) instead of a fixed 3s.
         await page.waitForFunction(() => document.querySelectorAll('div[role="article"]').length >= 3, { timeout: 15000 }).catch(() => {});
