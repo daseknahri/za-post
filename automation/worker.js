@@ -118,7 +118,12 @@ async function humanDwell(page, shouldStop = () => false, settings = {}) {
 }
 
 // Give each link in the text a unique query param so the SAME url isn't posted verbatim to every
-// group (FB dedups exact URLs across groups). Adds ?ref=/&ref=<short per-account+group hash>.
+// group (FB dedups exact URLs across groups) — WITHOUT changing where the link goes.
+// We use `utm_content`, a standard analytics param that site routing/CMS universally IGNORE, so the
+// link resolves to the exact same article. We must NOT reuse 's' or 'ref': '?s=' is WordPress's SEARCH
+// query (recipe blogs are nearly all WordPress) — appending it turns the article URL into a search
+// page, and the comment's link preview then shows a DIFFERENT article. We also never overwrite the
+// user's own query params or fragment.
 function varyLinks(text, seedStr) {
   if (!text) return text;
   let n = 0;
@@ -130,12 +135,14 @@ function varyLinks(text, seedStr) {
   return String(text).replace(/https?:\/\/[^\s]+/g, (url) => {
     const clean = url.replace(/[).,]+$/, ''); // don't swallow trailing punctuation
     const trail = url.slice(clean.length);
-    // Use a neutral key 's' (NOT 'ref', which collides with Facebook's own ?ref= params), and
-    // REPLACE an existing s=/ref= rather than appending a second one.
-    let u = clean;
-    if (/[?&](?:s|ref)=[^&]*/.test(u)) u = u.replace(/([?&])(?:s|ref)=[^&]*/, `$1s=${tag()}`);
-    else u += (u.includes('?') ? '&' : '?') + `s=${tag()}`;
-    return `${u}${trail}`;
+    // Keep any #fragment after the query untouched.
+    const hashAt = clean.indexOf('#');
+    const frag = hashAt >= 0 ? clean.slice(hashAt) : '';
+    let u = hashAt >= 0 ? clean.slice(0, hashAt) : clean;
+    // Replace only OUR own previous utm_content (idempotent across groups); never the user's params.
+    if (/[?&]utm_content=[^&]*/.test(u)) u = u.replace(/([?&])utm_content=[^&]*/, `$1utm_content=${tag()}`);
+    else u += (u.includes('?') ? '&' : '?') + `utm_content=${tag()}`;
+    return `${u}${frag}${trail}`;
   });
 }
 
