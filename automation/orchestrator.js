@@ -557,9 +557,9 @@ class Orchestrator {
   _startModeratorLoop(getData) {
     if (this._modLoop) return;
     this._modLoop = true;
-    const CHECK_MS = 120000;
+    const CHECK_MS = 75000;
     (async () => {
-      await this._modSleep(45000); // let the first posts land/hold before the first scan
+      await this._modSleep(8000); // brief settle, then approve early — also catches posts held on a PRIOR run before this one even produces a hold
       while (this.running && !this._stop) {
         try {
           const data = (typeof getData === 'function') ? getData() : (this._data || {});
