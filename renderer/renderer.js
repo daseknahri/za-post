@@ -1337,12 +1337,27 @@ function renderModeratorPanel() {
           <div style="font-size:12px; color:#94a3b8; margin-top:2px; max-width:560px;">Admin accounts that approve held ("Spam potentiel"/pending) posts so they go live and their comments can land. They only need a login + which groups — they <b>never post</b>, and don't appear in the posting Accounts tab. ${mods.length >= 2 ? 'Assign each group to a moderator in its row below.' : 'One moderator covers all your groups automatically.'}</div>
         </div>
         <div style="display:flex; flex-direction:column; align-items:flex-end; gap:6px;">
-          <button onclick="addModeratorAccount()" style="background:#6366f1; color:#fff; border:none; border-radius:8px; padding:7px 12px; font-size:13px; font-weight:600; cursor:pointer;">➕ Add admin</button>
-          <span style="font-size:11px; color:${enabled ? '#34d399' : '#fbbf24'};">${enabled ? '✓ approval ON' : '⚠ enable in Settings'}</span>
+          <div style="display:flex; gap:6px;">
+            <button onclick="approveHeldNowUI(this)" title="Run the moderator now to approve any posts currently held in Spam potentiel (normally automatic; this forces it immediately)" style="background:#0f766e; color:#fff; border:none; border-radius:8px; padding:7px 12px; font-size:13px; font-weight:600; cursor:pointer;">🛡️ Approve held now</button>
+            <button onclick="addModeratorAccount()" style="background:#6366f1; color:#fff; border:none; border-radius:8px; padding:7px 12px; font-size:13px; font-weight:600; cursor:pointer;">➕ Add admin</button>
+          </div>
+          <span style="font-size:11px; color:${enabled ? '#34d399' : '#fbbf24'};">${enabled ? '✓ approval ON (also runs automatically during a run)' : '⚠ enable in Settings'}</span>
         </div>
       </div>
       <div style="margin-top:10px;">${rows || '<div style="font-size:12px; color:#6b7280;">No moderators yet — click “➕ Add admin”, log it in, and (if 2+) assign groups below.</div>'}</div>
     </div>`;
+}
+// MOD: force a moderator-approval pass NOW on whatever's currently held in Spam potentiel (normally this
+// runs automatically during a run; this lets you trigger it on demand — also handy for testing).
+async function approveHeldNowUI(btn) {
+  try {
+    if (btn) { btn.disabled = true; btn.textContent = '🛡️ Approving…'; }
+    showNotification('🛡️ Running moderator approval on held posts… watch the log.', 'info');
+    const r = await window.electronAPI.invoke('approve-held-now');
+    if (!r || r.ok === false) showNotification('Moderator: ' + ((r && (r.reason || r.error)) || 'could not run') + ' — see the log.', 'error');
+    else showNotification(`🛡️ Moderator pass done — ${r.held || 0} held reviewed${r.queued ? `, ${r.queued} comment(s) queued` : ''}. See the log.`, 'success');
+  } catch (e) { showNotification('Moderator error: ' + e.message, 'error'); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = '🛡️ Approve held now'; } }
 }
 // MOD: add an admin/moderator account straight from the Groups page. Opens a modal (Electron's
 // renderer does NOT support window.prompt — it returns null — so a modal is required).
