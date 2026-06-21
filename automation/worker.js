@@ -287,6 +287,16 @@ const FB = {
     'bloqueado temporariamente', 'voce esta temporariamente bloqueado',                      // PT
     'atmenetileg letiltottuk', 'tul gyakran', 'tul gyorsan',                                 // HU
   ],
+  // SEVERE subset of rateLimit — an ACCOUNT-LEVEL temporary block ("the big one"), distinct from a
+  // per-action posting/comment rate-limit. Matching one of these → a much longer cooldown.
+  blockSevere: [
+    "you're temporarily blocked", 'temporarily blocked', 'temporarily restricted',
+    "you can't use this feature right now", 'you cant use this feature right now', 'this feature for a while',
+    'temporairement bloque', 'temporalmente bloqueado', 'bloqueado temporalmente',
+    'estas bloqueado temporalmente', 'has estado bloqueado', 'voruebergehend gesperrt', 'vorubergehend gesperrt',
+    'temporaneamente bloccato', 'bloccato temporaneamente', 'bloqueado temporariamente',
+    'voce esta temporariamente bloqueado', 'atmenetileg letiltottuk',
+  ],
   // Identity / human checkpoint text.
   checkpoint: [
     'confirm that you are a real person', "confirm that you're a real person",
@@ -714,6 +724,21 @@ async function checkRateLimit(page) {
   } catch { return false; }
 }
 
+// Classify a rate-limit / block wall by SEVERITY so the caller picks a proportionate cooldown:
+//   'severe' = an ACCOUNT-LEVEL temporary block ("the big one"); 'limit' = a per-action rate-limit
+//   (posting/commenting too often); null = no wall. The caller adds the action (post vs comment) from
+//   WHERE it was detected, yielding the three tiers: account-block / posting-limit / comment-limit.
+async function classifyRateLimit(page) {
+  try {
+    return await page.evaluate((arg) => {
+      const t = (document.body.innerText || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+      if (arg.severe.some((p) => t.includes(p))) return 'severe';
+      if (arg.all.some((p) => t.includes(p))) return 'limit';
+      return null;
+    }, { severe: FB.blockSevere, all: FB.rateLimit });
+  } catch { return null; }
+}
+
 // Detect Facebook's "confirm you are a real person" / identity checkpoint, which blocks the
 // account from posting until the user completes it. Text (FB.checkpoint, multi-locale) OR a
 // checkpoint URL OR a captcha/challenge structure in the DOM — any one is enough.
@@ -934,8 +959,8 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
 
     if (!boxes.length) {
       // The comment box often fails to render because FB threw a comment-side rate-limit / "action
-      // blocked" wall. Detect it so the caller cools the account down instead of retrying into the block.
-      if (await checkRateLimit(page)) { step('Comment: ⛔ Facebook blocked commenting (rate-limit / "You can\'t use this feature right now") — cooling this account down'); return 'blocked'; }
+      // blocked" wall. Detect + classify it so the caller cools the account down instead of retrying.
+      { const _rl = await classifyRateLimit(page); if (_rl) { step(_rl === 'severe' ? 'Comment: ⛔ Facebook TEMPORARILY BLOCKED this account — stopping it (long cooldown)' : 'Comment: ⛔ commenting rate-limited ("You can\'t use this feature right now") — cooling this account down'); return _rl === 'severe' ? 'blocked_account' : 'blocked_comment'; } }
       step('Comment: no comment box found — comment not sent'); return 'failed';
     }
     step(`Comment: ${boxes.length} comment box(es) found`);
@@ -1017,7 +1042,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
     // throttled action). Detect it AFTER submit so we COOL THE ACCOUNT DOWN instead of mislabeling a
     // refused comment as sent and then posting+commenting into more groups (which deepens the block and
     // gets the account flagged). The comment was NOT delivered when this wall is up.
-    if (await checkRateLimit(page)) { step('Comment: ⛔ Facebook blocked this comment (rate-limit / "You can\'t use this feature right now") — cooling this account down'); return 'blocked'; }
+    { const _rl = await classifyRateLimit(page); if (_rl) { step(_rl === 'severe' ? 'Comment: ⛔ Facebook TEMPORARILY BLOCKED this account — stopping it (long cooldown)' : 'Comment: ⛔ commenting rate-limited ("You can\'t use this feature right now") — cooling this account down'); return _rl === 'severe' ? 'blocked_account' : 'blocked_comment'; } }
     // C9: landing verification (READ-ONLY) — did our comment text actually appear under the post?
     // We never re-type or re-submit here; this only LABELS the outcome so the operator can tell a
     // confirmed comment from an at-risk one. Outcome: posted / not_visible / unconfirmed.
@@ -1319,7 +1344,7 @@ async function runAccount(o) {
     try { await Promise.race([browser.close().catch(() => {}), sleep(10000)]); } catch {}
     try { const proc = browser && browser.process && browser.process(); if (proc) proc.kill(); } catch {}
   };
-  let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false;
+  let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false, rlKind = null;
   const heldRecords = []; // MOD: posts FB held in the moderation queue this run (for the moderator phase)
   try {
     const hidden = settings.hideBrowser !== false; // default: hidden
@@ -1658,7 +1683,7 @@ async function runAccount(o) {
 
         // Clear cookie/notification banners, then bail out of this account if rate-limited.
         await dismissPopups(page);
-        if (await checkRateLimit(page)) { step('🛑 Rate-limited by Facebook — skipping this account immediately'); errors++; noRetry = true; flag = 'rate_limited'; report(groupName, gid, 'error', 'rate-limited by Facebook', ''); break; }
+        { const _rl = await classifyRateLimit(page); if (_rl) { const _k = _rl === 'severe' ? 'account' : 'post'; step(_k === 'account' ? '🛑 Facebook TEMPORARILY BLOCKED this account — stopping it (long cooldown)' : '🛑 Posting rate-limited by Facebook — cooling this account down'); errors++; noRetry = true; flag = 'rate_limited'; rlKind = _k; report(groupName, gid, 'error', _k === 'account' ? 'account temporarily blocked' : 'posting rate-limited', ''); break; } }
 
         // Dwell like a human reading the group feed (mouse drift + a few scrolls with pauses)
         // before composing, instead of opening the composer instantly on every visit (a bot tell).
@@ -1670,7 +1695,7 @@ async function runAccount(o) {
         if (!opened) {
           // An account-level block can be WHY the composer won't open — confirm it and skip the
           // WHOLE account immediately rather than trying every remaining group.
-          if (await checkRateLimit(page)) { step('🛑 Rate-limited by Facebook (composer blocked) — skipping this account immediately'); errors++; noRetry = true; flag = 'rate_limited'; report(groupName, gid, 'error', 'rate-limited — composer blocked', ''); break; }
+          { const _rl = await classifyRateLimit(page); if (_rl) { const _k = _rl === 'severe' ? 'account' : 'post'; step(_k === 'account' ? '🛑 Facebook TEMPORARILY BLOCKED this account (composer) — stopping it (long cooldown)' : '🛑 Posting rate-limited by Facebook (composer blocked) — cooling this account down'); errors++; noRetry = true; flag = 'rate_limited'; rlKind = _k; report(groupName, gid, 'error', _k === 'account' ? 'account temporarily blocked' : 'rate-limited — composer blocked', ''); break; } }
           if (await checkVerification(page)) { step('🔐 Facebook wants identity/human verification — skipping this account immediately'); errors++; noRetry = true; flag = 'needs_verification'; report(groupName, gid, 'error', 'identity verification required', ''); break; }
           // Name the likely cause so the operator can act (and knows it's not a generic bug).
           const why = await page.evaluate(() => {
@@ -1849,7 +1874,7 @@ async function runAccount(o) {
         if (publishResult !== 'published') {
           // The post failed — find out WHY so the account can be flagged for the operator.
           // Facebook's spam/rate-limit message appears in the composer right after clicking Post.
-          if (await checkRateLimit(page)) { step('🛑 Facebook is rate-limiting this account ("you can try again later") — skipping this account immediately'); errors++; noRetry = true; flag = 'rate_limited'; report(groupName, gid, 'error', 'rate-limited — Facebook blocked the post', ''); break; }
+          { const _rl = await classifyRateLimit(page); if (_rl) { const _k = _rl === 'severe' ? 'account' : 'post'; step(_k === 'account' ? '🛑 Facebook TEMPORARILY BLOCKED this account (post) — stopping it (long cooldown)' : '🛑 Posting rate-limited by Facebook — cooling this account down'); errors++; noRetry = true; flag = 'rate_limited'; rlKind = _k; report(groupName, gid, 'error', _k === 'account' ? 'account temporarily blocked' : 'rate-limited — Facebook blocked the post', ''); break; } }
           if (await checkVerification(page)) { step('🔐 Facebook wants identity/human verification — skipping this account immediately'); errors++; noRetry = true; flag = 'needs_verification'; report(groupName, gid, 'error', 'identity verification required', ''); break; }
           // Otherwise it's an unexplained failure — snapshot the dialog so it's diagnosable.
           const snap = await page.evaluate(() => { const d = document.querySelector('div[role="dialog"]'); return ((d && d.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 120); }).catch(() => '');
@@ -2026,13 +2051,14 @@ async function runAccount(o) {
           commentResult = cres;
           if (cres === 'failed') step('Comment: could not place the comment after 3 attempts — left uncommented');
           else if (cres === 'skipped') step('Comment: skipped (could not safely identify our post)');
-          else if (cres === 'blocked') {
-            // FB threw a comment-side rate-limit wall. STOP this account now — posting+commenting into
-            // more groups only deepens the block and risks the account being flagged. Mirrors the
-            // post-side rate-limit handling (flag='rate_limited' → orchestrator applies a cooldown).
-            step('🛑 Comment blocked by Facebook (rate-limit) — stopping this account to cool it down');
-            flag = 'rate_limited'; noRetry = true;
-            report(groupName, gid, 'posted', 'comment rate-limited — account cooled down', commentResult);
+          else if (cres === 'blocked_account' || cres === 'blocked_comment') {
+            // FB threw a rate-limit wall while commenting. STOP this account now — posting+commenting
+            // into more groups only deepens the block and risks the account being flagged. Classify it
+            // so the orchestrator applies a proportionate cooldown (account-block = long; comment = short).
+            const _k = cres === 'blocked_account' ? 'account' : 'comment';
+            step(_k === 'account' ? '🛑 Facebook temporarily blocked this account — stopping it (long cooldown)' : '🛑 Commenting rate-limited — stopping this account to cool it down');
+            flag = 'rate_limited'; rlKind = _k; noRetry = true;
+            report(groupName, gid, 'posted', _k === 'account' ? 'account temporarily blocked' : 'comment rate-limited — account cooled down', commentResult);
             break;
           }
         }
@@ -2119,7 +2145,7 @@ async function runAccount(o) {
   }
   // fullyPosted = the post landed in EVERY targeted group, none pending, no errors — only then is it
   // safe to auto-delete from the library (a partial publish must be kept). See orchestrator deal gate.
-  return { posted, errors, pendingApproval, noRetry, flag, offline, heldRecords, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length };
+  return { posted, errors, pendingApproval, noRetry, flag, rlKind, offline, heldRecords, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length };
 }
 
 // Strip fields Puppeteer's setCookie rejects; coerce sameSite.

@@ -451,6 +451,7 @@ class Orchestrator {
   async _recordAccountOutcome(name, res, settings) {
     const today = store.todayKey();
     const baseHours = Number.isFinite(settings.rateLimitCooldownHours) ? settings.rateLimitCooldownHours : 4;
+    let note = null;
     try {
       await store.update((d) => {
         const acc = d.accounts.find((a) => a.name === name);
@@ -462,13 +463,22 @@ class Orchestrator {
         acc.daily.count = (Number(acc.daily.count) || 0) + (res.posted || 0);
         if (res.flag === 'rate_limited') {
           acc.rlStrikes = (acc.rlStrikes || 0) + 1;
-          const hours = Math.min(48, baseHours * Math.pow(2, acc.rlStrikes - 1));
+          // THREE tiers, proportionate to what Facebook actually blocked (× the exponential per-strike
+          // backoff, capped 48h): an ACCOUNT-LEVEL temporary block ("the big one") rests longest; a
+          // POSTING limit rests at the base; a COMMENT limit (mildest, account can still post) rests
+          // shortest. The worker classifies which via res.rlKind.
+          const kind = res.rlKind || 'post';
+          const mult = kind === 'account' ? 3 : kind === 'comment' ? 0.5 : 1;
+          const hours = Math.min(48, Math.max(0.5, baseHours * mult) * Math.pow(2, acc.rlStrikes - 1));
           acc.rateLimitedUntil = Date.now() + Math.round(hours * 3600000);
+          const human = hours >= 1 ? `${Math.round(hours)}h` : `${Math.round(hours * 60)}min`;
+          note = `⏸️ ${name}: ${kind === 'account' ? 'ACCOUNT temporarily blocked by Facebook (the big one)' : kind === 'comment' ? 'COMMENT rate-limit' : 'POSTING rate-limit'} — resting it ${human} (strike ${acc.rlStrikes}); skipped until then, others keep working.`;
         } else if (((res.posted || 0) + (res.pendingApproval || 0)) > 0 && !res.flag && (acc.rateLimitedUntil || acc.rlStrikes)) {
           // Recovered (posted OR queued for approval with no flag) — clear the cool-down.
           acc.rateLimitedUntil = 0; acc.rlStrikes = 0;
         }
       });
+      if (note) this.log(note);
     } catch {}
   }
 
