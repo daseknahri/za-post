@@ -134,7 +134,8 @@ function startServer(port, injected) {
   // ---- accounts / groups (parity with original server) -----------------
   app.get('/api/accounts', (_req, res) => {
     // Never expose credentials/cookies over the network — map to display-safe fields only.
-    const accounts = (hooks.getData().accounts || []).map((a) => ({
+    // Moderators are not posting accounts — keep them out of the remote poster list (parity with the local UI).
+    const accounts = (hooks.getData().accounts || []).filter((a) => !a.isModerator).map((a) => ({
       name: a.name, alias: a.alias, status: a.status, lastMessage: a.lastMessage,
       enabled: a.enabled !== false, assignedGroups: a.assignedGroups || [],
       fbName: a.fbName, lastChecked: a.lastChecked,

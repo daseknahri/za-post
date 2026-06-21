@@ -380,7 +380,7 @@ app.whenReady().then(async () => {
   // Only resume if there is actually work left — a stale run-active flag (e.g. a crash just after the
   // campaign completed) must not resurrect a finished run.
   const _rd = store.load();
-  const _hasWork = (_rd.posts || []).length > 0 && (_rd.accounts || []).some((a) => a.enabled !== false && (a.assignedGroups || []).length > 0);
+  const _hasWork = (_rd.posts || []).length > 0 && (_rd.accounts || []).some((a) => a.enabled !== false && !a.isModerator && (a.assignedGroups || []).length > 0);
   if (wasInterrupted && !_hasWork) { try { setRunActive(false); } catch {} }
   if (wasInterrupted && _hasWork && _rd.settings.resumeOnStartup === true && mainWindow) {
     let resumeFired = false; // guard: fire exactly once
@@ -555,14 +555,18 @@ function extractGroupId(input) {
 // =======================================================================
 // IPC: ACCOUNTS
 // =======================================================================
-ipcMain.handle('create-account', (_e, accountName, alias) => {
+ipcMain.handle('create-account', (_e, accountName, alias, opts) => {
   const data = getData();
   if (!accountName) return fail('Account name required');
   if (data.accounts.some((a) => a.name === accountName)) return fail('Account already exists');
   const over = overLimit('accounts', data.accounts.length); if (over) return over; // M1-05 backend enforcement
+  // A moderator is born flagged + disabled-as-poster so it can NEVER be selected into the posting pool,
+  // even in the brief window before the renderer would set the flag (no race; no one-frame-as-poster).
+  const isMod = !!(opts && opts.isModerator);
   data.accounts.push({
     name: accountName, alias: alias || '', status: 'not_logged_in', lastMessage: '',
-    assignedGroups: [], postFilter: 'all', postingOrder: 'post-centric-unique', enabled: true,
+    assignedGroups: [], postFilter: 'all', postingOrder: 'post-centric-unique',
+    enabled: !isMod, isModerator: isMod,
   });
   store.profileDir(accountName); // create profile dir
   store.save(data); send('data-updated'); return ok();

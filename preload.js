@@ -19,7 +19,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   addGroupsBulk: (items) => ipcRenderer.invoke('add-groups-bulk', items),
 
   // Account operations
-  createAccount: (accountName, alias) => ipcRenderer.invoke('create-account', accountName, alias),
+  createAccount: (accountName, alias, opts) => ipcRenderer.invoke('create-account', accountName, alias, opts),
   loginAccount: (accountName) => ipcRenderer.invoke('login-account', accountName),
   checkAccountStatus: (accountName) => ipcRenderer.invoke('check-account-status', accountName),
   deleteAccount: (accountName) => ipcRenderer.invoke('delete-account', accountName),

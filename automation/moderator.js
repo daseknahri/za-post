@@ -27,7 +27,7 @@ async function runModerator(o) {
   const { account, groups, held, log } = o;
   const shouldStop = o.shouldStop || (() => false);
   const name = account.name;
-  const out = { approved: 0, scanned: 0, notMine: 0, errors: 0, noRetry: false, flag: null, dryRun: true };
+  const out = { approved: 0, scanned: 0, notMine: 0, errors: 0, unmatched: 0, noRetry: false, flag: null, dryRun: true };
   const ourNames = [...new Set((o.posterNames || []).map(norm).filter((n) => n && n.length >= 2))];
   const groupName = (gid) => { const g = (groups || []).find((x) => (x.groupId || x.id) === gid); return (g && g.name) || gid; };
   let browser = null;
@@ -63,8 +63,9 @@ async function runModerator(o) {
 
     for (const gid of targetGids) {
       if (shouldStop()) break;
-      const capSnips = heldByGid[gid].map((h) => norm(h.captionSnip)).filter((s) => s && s.length >= 12);
+      const capSnips = heldByGid[gid].map((h) => norm(h.captionSnip)).filter(Boolean); // worker already gated length≥12
       const gname = groupName(gid);
+      if (!capSnips.length) { log(`🛡️ [moderator] [${gname}] ${heldByGid[gid].length} held record(s) but no usable caption snippet — skipping (cannot match safely)`); out.errors++; continue; }
       // Best-effort queue URLs (refine from the logs). Validate a queue indicator before scanning so
       // we NEVER fall through to the public feed and approve there.
       const urls = [
@@ -101,7 +102,7 @@ async function runModerator(o) {
           author = nm(author).slice(0, 50);
           const body = nm(txt);
           const authorOurs = !!author && ours.includes(author); // strict normalized equality, never substring
-          const capMatch = snips.some((s) => s && (body.includes(s) || body.startsWith(s.slice(0, 20))));
+          const capMatch = snips.some((s) => s && (body.includes(s) || (s.length >= 28 && body.startsWith(s.slice(0, 28))))); // full-snip contains, or a long (≥28ch) prefix — avoids boilerplate-prefix collisions
           const hasApprove = Array.from(c.querySelectorAll('[role="button"], button')).some((b) => /publ|appro/.test(nm(b.getAttribute('aria-label') || b.textContent)));
           results.push({ author, authorOurs, capMatch, hasApprove, snippet: txt.slice(0, 70) });
         }
@@ -111,13 +112,22 @@ async function runModerator(o) {
       if (!scan) { log(`🛡️ [moderator] [${gname}] scan failed (selector/timeout) — dumping nothing; refine selectors`); out.errors++; continue; }
       out.scanned += scan.count;
       log(`🛡️ [moderator] [${gname}] scanned ${scan.count} card(s)`);
+      let matchedThisGroup = 0;
       for (let i = 0; i < scan.results.length; i++) {
         const r = scan.results[i];
-        if (r.authorOurs && r.capMatch) { out.approved++; log(`🛡️ [moderator] [${gname}] card ${i + 1}: author="${r.author}" ours=✓ caption=✓ approveBtn=${r.hasApprove} → WOULD APPROVE (dry-run): "${r.snippet}"`); }
+        if (r.authorOurs && r.capMatch) { out.approved++; matchedThisGroup++; log(`🛡️ [moderator] [${gname}] card ${i + 1}: author="${r.author}" ours=✓ caption=✓ approveBtn=${r.hasApprove} → WOULD APPROVE (dry-run): "${r.snippet}"`); }
         else { out.notMine++; log(`🛡️ [moderator] [${gname}] card ${i + 1}: author="${r.author}" ours=${r.authorOurs} caption=${r.capMatch} → skip: "${r.snippet}"`); }
       }
+      // Reconcile against the held records we were handed: surface any held post we could NOT find a card
+      // for (FB already approved/removed it, it's past the first 25 scanned, or it never rendered) so a
+      // dropped held post is visible, not silent.
+      const heldCount = heldByGid[gid].length;
+      if (matchedThisGroup < heldCount) {
+        const miss = heldCount - matchedThisGroup; out.unmatched += miss;
+        log(`⚠️ [moderator] [${gname}] ${miss} of ${heldCount} held post(s) had NO matching card in the queue (already approved/removed, beyond the first 25 scanned, or not rendered) — they remain 'held'.`);
+      }
     }
-    log(`🛡️ [moderator:${name}] DRY-RUN complete — scanned=${out.scanned} would-approve=${out.approved} skipped=${out.notMine} errors=${out.errors}. (No posts were approved — this is the dry run; review the lines above, then we enable the click.)`);
+    log(`🛡️ [moderator:${name}] DRY-RUN complete — scanned=${out.scanned} would-approve=${out.approved} skipped=${out.notMine} unmatched=${out.unmatched} errors=${out.errors}. (No posts were approved — this is the dry run; review the lines above, then we enable the click.)`);
     return out;
   } catch (e) {
     log(`❌ [moderator:${name}] ${e.message}`); out.errors++; return out;

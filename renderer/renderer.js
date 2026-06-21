@@ -571,7 +571,7 @@ function updateDashboard() {
   const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
   set('stat-posts', appData.posts.length);
   set('stat-groups', appData.groups.length);
-  set('stat-accounts', appData.accounts.length);
+  set('stat-accounts', appData.accounts.filter(a => !a.isModerator).length);
 
   const statusEl = document.getElementById('stat-status');
   const statusIconEl = document.getElementById('stat-status-icon');
@@ -589,7 +589,8 @@ function updateDashboard() {
 
 // Render account health card from appData.accounts
 function renderHealth() {
-  const accounts = appData.accounts || [];
+  // Moderators are not part of the posting fleet — keep them out of the health counts/chips.
+  const accounts = (appData.accounts || []).filter(a => !a.isModerator);
   let loggedIn = 0, needsLogin = 0, rateLimited = 0, other = 0;
   for (const a of accounts) {
     if (a.status === 'logged_in') loggedIn++;
@@ -1277,9 +1278,20 @@ async function updateAccountProxy(accountName, proxyValue) {
 async function toggleModerator(name, makeMod) {
   const a = (appData.accounts || []).find((x) => x.name === name);
   if (!a) return;
-  a.isModerator = (makeMod === undefined) ? !a.isModerator : !!makeMod;
+  const becomingMod = (makeMod === undefined) ? !a.isModerator : !!makeMod;
+  // Demotion guard: a moderator carries a trusted admin session and was never meant to post. If we just
+  // cleared the flag it would resurrect as an ENABLED poster. Confirm + disable it so it can't post
+  // unattended from the admin account; the operator re-enables it on the Accounts tab if they really want.
+  if (!becomingMod && a.isModerator) {
+    if (!confirm(`Remove "${a.name}" as moderator?\n\nIt becomes a normal account and will be DISABLED (so it can't post from your admin session). Re-enable it on the Accounts tab if you want it to post.`)) {
+      try { renderModeratorPanel(); } catch {}
+      return;
+    }
+    a.enabled = false;
+  }
+  a.isModerator = becomingMod;
   await saveData();
-  showNotification(a.isModerator ? `🛡️ ${a.name} is now a group moderator (it won't post)` : `${a.name} is no longer a moderator`, 'success');
+  showNotification(a.isModerator ? `🛡️ ${a.name} is now a group moderator (it won't post)` : `${a.name} removed as moderator (disabled — re-enable on Accounts to post)`, 'success');
   try { renderModeratorPanel(); renderGroups(); renderAccounts(); } catch {}
 }
 // MOD: assign which moderator account covers a group's held posts ('' = auto / the only moderator).
@@ -1349,11 +1361,10 @@ async function submitAddModerator() {
   if ((appData.accounts || []).some((a) => a.name === accountName)) { showNotification('An account with that name already exists', 'error'); return; }
   closeModal('modal-add-admin');
   showNotification('Creating moderator account…', 'info');
-  const result = await window.electronAPI.createAccount(accountName, '');
+  // Born flagged (isModerator) + disabled-as-poster in the backend, so it is never eligible to post.
+  const result = await window.electronAPI.createAccount(accountName, '', { isModerator: true });
   if (!result || !result.success) { showNotification('Failed to create: ' + ((result && result.error) || 'unknown'), 'error'); return; }
   await loadData();
-  const a = (appData.accounts || []).find((x) => x.name === accountName);
-  if (a) { a.isModerator = true; await saveData(); }
   try { renderModeratorPanel(); renderAccounts(); } catch {}
   showNotification(`🛡️ ${accountName} added as moderator — authenticate it with “🔐 log in” or “🍪 cookies” in its row.`, 'success');
 }
@@ -1823,22 +1834,25 @@ async function startAutomation() {
   // Effective-campaign preflight: an account can only post if it is ENABLED + LOGGED IN +
   // has ≥1 assigned group. If none qualify, the run would post nothing for hours while
   // showing "Running" — hard-block with a clear, actionable reason instead.
-  const eligible = appData.accounts.filter(a => a.enabled !== false && a.status === 'logged_in' && (a.assignedGroups || []).length > 0);
+  // Moderators approve held posts; they never post — exclude them from every posting preflight check
+  // (otherwise a correctly-configured moderator with no groups trips these warnings on every Start).
+  const posters = appData.accounts.filter(a => !a.isModerator);
+  const eligible = posters.filter(a => a.enabled !== false && a.status === 'logged_in' && (a.assignedGroups || []).length > 0);
   if (eligible.length === 0) {
     showNotification('No account can post yet — each needs to be enabled, logged in, and assigned at least 1 group. Fix accounts, then Start.', 'error');
     addLog('🛑 Start blocked: no eligible account (need enabled + logged-in + ≥1 assigned group).\n');
     return;
   }
 
-  // Pre-flight: warn if any account is not logged in
-  const notLoggedIn = appData.accounts.filter(a => a.status !== 'logged_in');
+  // Pre-flight: warn if any poster is not logged in
+  const notLoggedIn = posters.filter(a => a.status !== 'logged_in');
   if (notLoggedIn.length > 0) {
-    const total = appData.accounts.length;
+    const total = posters.length;
     if (!confirm(`${notLoggedIn.length} of ${total} account(s) are not logged in and will be skipped. Continue?`)) return;
   }
 
-  // Pre-flight: warn if any ENABLED account has no assigned groups (it will post nothing)
-  const noGroups = appData.accounts.filter(a => a.enabled !== false && (!a.assignedGroups || a.assignedGroups.length === 0));
+  // Pre-flight: warn if any ENABLED poster has no assigned groups (it will post nothing)
+  const noGroups = posters.filter(a => a.enabled !== false && (!a.assignedGroups || a.assignedGroups.length === 0));
   if (noGroups.length > 0) {
     if (!confirm(`${noGroups.length} enabled account(s) have NO assigned groups and will post nothing:\n${noGroups.map(a => a.name).join(', ')}\n\nContinue anyway?`)) return;
   }
