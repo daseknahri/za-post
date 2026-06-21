@@ -982,7 +982,7 @@ function renderAccounts() {
     return;
   }
 
-  container.innerHTML = appData.accounts.filter((a) => !a.isModerator).map(account => {
+  container.innerHTML = `<div style="margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;"><button onclick="openBatchGroupModal()" title="Assign the SAME groups to several agents at once — they become one Campaign Plan team that splits the library across those groups" style="background:rgba(59,130,246,0.15);color:#93c5fd;border:1px solid rgba(59,130,246,0.35);border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer;">🧩 Assign groups to a batch of agents</button><span style="font-size:11px;color:#6b7280;">Give a team of agents the same groups → in Campaign Plan they split the library across those groups.</span></div>` + appData.accounts.filter((a) => !a.isModerator).map(account => {
     const isEnabled = account.enabled !== false; // treat missing/undefined as true
 
     let statusClass = '';
@@ -1223,6 +1223,53 @@ async function toggleGroupAssignment(accountName, groupId) {
       }
     }
   });
+}
+
+// BATCH group assignment: assign the SAME group-set to several agents at once. The point is Campaign Plan —
+// agents that share an identical assignedGroups set form ONE "team" (cluster) that splits the whole library
+// across those groups. Setting them one-by-one is tedious and easy to get subtly different (which would
+// break the clustering); this guarantees an identical set across the selected agents.
+function openBatchGroupModal() {
+  const groups = (appData && appData.groups) || [];
+  const posters = ((appData && appData.accounts) || []).filter((a) => !a.isModerator);
+  if (!groups.length) { showNotification('Add some groups first (Groups tab).', 'error'); return; }
+  if (!posters.length) { showNotification('Add posting accounts first.', 'error'); return; }
+  const old = document.getElementById('batch-group-overlay'); if (old) old.remove();
+  const groupRows = groups.map((g) => `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;color:#e5e7eb;cursor:pointer;"><input type="checkbox" class="bg-group" value="${escapeHtml(g.id)}" style="accent-color:#3b82f6;"> ${escapeHtml(g.name || g.id)}</label>`).join('');
+  const agentRows = posters.map((a) => { const gc = (a.assignedGroups || []).length; return `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;color:#e5e7eb;cursor:pointer;"><input type="checkbox" class="bg-agent" value="${escapeHtml(a.name)}" style="accent-color:#3b82f6;"> ${escapeHtml(a.alias || a.name)} <span style="color:#6b7280;font-size:11px;">(${gc} group${gc === 1 ? '' : 's'} now)</span></label>`; }).join('');
+  const ov = document.createElement('div');
+  ov.id = 'batch-group-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:9999;';
+  ov.innerHTML = `
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.12);border-radius:16px;padding:20px;width:700px;max-width:94vw;max-height:88vh;overflow:auto;">
+      <div style="font-weight:700;color:#e2e8f0;font-size:16px;">🧩 Assign groups to a batch of agents</div>
+      <div style="font-size:12px;color:#94a3b8;margin:6px 0 14px;line-height:1.5;">Tick the groups (left) and the agents (right), then Apply. Every selected agent gets the <b>same</b> group-set — so in <b>Campaign Plan</b> they form one team that splits the whole library across those groups. Repeat with a different group-set + agents to build the next team. <span style="color:#fbbf24;">This REPLACES each selected agent's current groups.</span></div>
+      <div style="display:flex;gap:16px;">
+        <div style="flex:1;min-width:0;"><div style="font-weight:600;color:#cbd5e1;margin-bottom:6px;">Groups <a href="#" onclick="document.querySelectorAll('#batch-group-overlay .bg-group').forEach(c=>c.checked=true);return false;" style="color:#818cf8;font-size:11px;margin-left:6px;">all</a> · <a href="#" onclick="document.querySelectorAll('#batch-group-overlay .bg-group').forEach(c=>c.checked=false);return false;" style="color:#818cf8;font-size:11px;">none</a></div><div style="max-height:46vh;overflow:auto;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:8px;">${groupRows}</div></div>
+        <div style="flex:1;min-width:0;"><div style="font-weight:600;color:#cbd5e1;margin-bottom:6px;">Agents <a href="#" onclick="document.querySelectorAll('#batch-group-overlay .bg-agent').forEach(c=>c.checked=true);return false;" style="color:#818cf8;font-size:11px;margin-left:6px;">all</a> · <a href="#" onclick="document.querySelectorAll('#batch-group-overlay .bg-agent').forEach(c=>c.checked=false);return false;" style="color:#818cf8;font-size:11px;">none</a></div><div style="max-height:46vh;overflow:auto;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:8px;">${agentRows}</div></div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">
+        <button onclick="document.getElementById('batch-group-overlay').remove()" style="background:#374151;color:#e5e7eb;border:none;border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer;">Cancel</button>
+        <button onclick="submitBatchGroupAssign()" style="background:#3b82f6;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer;">Apply to selected agents</button>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+}
+
+async function submitBatchGroupAssign() {
+  const groupIds = Array.from(document.querySelectorAll('#batch-group-overlay .bg-group:checked')).map((c) => c.value);
+  const agentNames = Array.from(document.querySelectorAll('#batch-group-overlay .bg-agent:checked')).map((c) => c.value);
+  if (!agentNames.length) { showNotification('Select at least one agent.', 'error'); return; }
+  const fresh = await window.electronAPI.getData(); // work against fresh backend data
+  if (!fresh || !Array.isArray(fresh.accounts)) return;
+  let n = 0;
+  for (const name of agentNames) { const a = fresh.accounts.find((x) => x.name === name); if (a) { a.assignedGroups = groupIds.slice(); n++; } }
+  const res = await window.electronAPI.saveData(fresh);
+  if (res && res.success === false) { showNotification('Failed to save: ' + res.error, 'error'); return; }
+  appData = fresh;
+  const ov = document.getElementById('batch-group-overlay'); if (ov) ov.remove();
+  renderAccounts();
+  showNotification(`✅ Assigned ${groupIds.length} group${groupIds.length === 1 ? '' : 's'} to ${n} agent${n === 1 ? '' : 's'} — in Campaign Plan they now form one team that splits the library across those groups.`, 'success');
 }
 
 // Update post filter for an account
