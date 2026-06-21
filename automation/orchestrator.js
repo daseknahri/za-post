@@ -100,6 +100,19 @@ class Orchestrator {
     this._progress = { running: false, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0 };
   }
   isRunning() { return this.running; }
+  // F4: operator "start fresh" — clear the dealt-state + rotation so the next Start re-deals every post
+  // from #1. Guarded to the STOPPED state (so it can't race a live cycle) and routes through the same
+  // checked saveRotation; if the write fails we report it and the next Start re-reads disk (no silent
+  // re-post across restart). Does NOT delete posts.
+  resetRotation() {
+    if (this.isRunning()) return { ok: false, error: 'Stop the automation before resetting the rotation.' };
+    this._dealt = new Set();
+    this._roundOffset = 0;
+    const wrote = store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: this._staggerRotation || 0 });
+    if (!wrote) return { ok: false, error: 'Could not write rotation state (disk full / permissions).' };
+    this.log('🔄 Campaign rotation reset — the next Start re-deals all posts from #1.');
+    return { ok: true };
+  }
   stop() {
     this._stop = true;
     this._paused = false;
@@ -252,7 +265,7 @@ class Orchestrator {
   // Choose the posts a given account publishes this cycle. `claim`=true (at run time) reserves
   // the post for this account so a parallel account can't grab the same one; failed claims are
   // released so another account picks them up (see _runAccount).
-  _postsForAccount(account, cycle, claim = false) {
+  _postsForAccount(account, cycle, claim = false, claimedSet = this._claimed) {
     const data = this._data;
     const filtered = data.posts.filter((p) => matchesFilter(p, account.postFilter || 'all'));
     if (!filtered.length) return [];
@@ -274,7 +287,7 @@ class Orchestrator {
 
     // UNIQUE / SEQUENCE -> deal each post exactly ONCE across the active accounts, round-robin.
     // `remaining` = posts not yet dealt AND not already claimed by another account this cycle.
-    let remaining = filtered.filter((p) => !this._dealt.has(p.id) && !(this._claimed && this._claimed.has(p.id)));
+    let remaining = filtered.filter((p) => !this._dealt.has(p.id) && !(claimedSet && claimedSet.has(p.id)));
     if (!remaining.length) return [];
     if (order.includes('random')) remaining = seededShuffle(remaining, (cycle + 1) * 7919); // randomized deal order (consistent within the cycle)
     const activeList = this._active || data.accounts.filter((a) => a.enabled !== false);
@@ -282,11 +295,14 @@ class Orchestrator {
     if (i < 0) return [];
     // roundOffset rotates which account gets which post across Loop-campaign recycles.
     const k = (i + (this._roundOffset || 0)) % activeList.length;
-    // Take the positional post; if this account's slot is past the posts left (e.g. earlier
-    // accounts were BLOCKED and freed their post), pick up the FIRST still-available post so a
-    // healthy account is never idle while un-posted content waits.
+    // Positional deal; if this slot is past the posts left (earlier accounts claimed/freed theirs),
+    // pick up the FIRST still-available post so a healthy account is never idle while content waits.
+    // Genuine surplus — MORE accounts than undealt posts — idles naturally: once the pool is claimed,
+    // `remaining` empties and the `!remaining.length` guard above returns [] for the rest. (This is why
+    // the fix for the "all → Post #10" plan is purely the dry-run-CLAIM in the display, not the picker:
+    // a claimless display let every account see the same single remaining post.)
     const pick = remaining[k < remaining.length ? k : 0];
-    if (claim && this._claimed) this._claimed.add(pick.id);
+    if (claim && claimedSet) claimedSet.add(pick.id);
     return [pick];
   }
 
@@ -523,11 +539,22 @@ class Orchestrator {
       const cycleOrder = (active[0] && active[0].postingOrder) || 'post-centric';
       const cycleModeLabel = this._modeLabel(cycleOrder);
       if (anyUnique) {
+        // F3: in unique modes each post is dealt ONCE — if undealt posts < active accounts, the
+        // surplus accounts idle this cycle. Warn LOUDLY so the operator knows why (and how to fix it).
+        const filtered0 = this._data.posts.filter((p) => matchesFilter(p, (active[0] && active[0].postFilter) || 'all'));
+        const undealtCount = filtered0.filter((p) => !this._dealt.has(p.id)).length;
+        if (undealtCount > 0 && undealtCount < active.length) {
+          const idle = active.length - undealtCount;
+          this.log(`⚠️ EXHAUSTION: only ${undealtCount} undealt post(s) remain for ${active.length} active account(s) — ${idle} account(s) will idle this cycle. Enable "Loop Campaign" (Settings) to recycle the library, reduce active accounts, or click "Reset Campaign Rotation" to re-deal all posts from the start.`);
+        }
         this.log(`🎯🔒 ${cycleModeLabel}: ${active.length} accounts, cycle ${cycle}`);
-        // Print the plan: one line listing all account → post assignments.
+        // F2: TRUTHFUL plan — dry-run the claim into a THROWAWAY set so the printed plan equals what the
+        // run will actually do (distinct posts; "(waits — pool exhausted)" for surplus accounts). The
+        // temp set is discarded at scope exit — this._claimed and disk are NEVER touched (read-only).
+        const tempClaimed = new Set();
         const planParts = active.map((a) => {
-          const ap = this._postsForAccount(a, cycle);
-          if (!ap.length) return `[${a.name}] → (waits this cycle)`;
+          const ap = this._postsForAccount(a, cycle, true, tempClaimed);
+          if (!ap.length) return `[${a.name}] → (waits — pool exhausted)`;
           const idx = this._data.posts.findIndex((p) => p.id === ap[0].id);
           return `[${a.name}] → Post #${idx + 1}`;
         });
@@ -536,7 +563,7 @@ class Orchestrator {
           this.log(planParts.slice(pi, pi + 3).join('   '));
         }
       } else {
-        this.log(`🎯 ${cycleModeLabel}: ${active.length} accounts — each posts all eligible posts`);
+        this.log(`🎯 ${cycleModeLabel}: ${active.length} accounts — each posts all its eligible posts (same set; per-group variation only)`);
       }
 
       await this._waitWhilePaused(); if (this._shouldStop()) break;

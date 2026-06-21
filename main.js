@@ -911,6 +911,10 @@ ipcMain.handle('stop-automation', () => {
   setRunActive(false); // explicit Stop clears the flag — no auto-resume on next launch
   return ok();
 });
+// F4: clear the dealt-state/rotation so the next Start re-deals every post from #1 (guarded to stopped).
+ipcMain.handle('reset-rotation', () => {
+  try { return orchestrator.resetRotation(); } catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+});
 ipcMain.handle('pause-automation', () => {
   if (!orchestrator) return fail('Orchestrator not ready');
   if (!orchestrator.isRunning()) return fail('Automation is not running');

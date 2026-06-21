@@ -481,6 +481,7 @@ function initializeEventListeners() {
   // Automation
   document.getElementById('btn-start-automation').addEventListener('click', startAutomation);
   document.getElementById('btn-stop-automation').addEventListener('click', stopAutomation);
+  { const rb = document.getElementById('btn-reset-rotation'); if (rb) rb.addEventListener('click', resetRotation); }
   document.getElementById('btn-pause-automation').addEventListener('click', togglePauseAutomation);
   const finishBtn = document.getElementById('btn-finish-automation');
   if (finishBtn) finishBtn.addEventListener('click', finishAutomation);
@@ -1107,7 +1108,9 @@ function renderAccounts() {
         <!-- Posting Method Section -->
         <div class="account-posting-method" style="margin: 12px 0; padding: 10px; background: #1e293b; border-radius: 8px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-            <span style="font-size: 12px; color: #94a3b8;">🔄 Posting Method:</span>
+            <span style="font-size: 12px; color: #94a3b8;">🔄 Posting Method:
+              <span class="help"><span class="help-q" tabindex="0" role="button" aria-label="Help">?</span><span class="help-tip"><b>Posting Method — how posts are assigned to this account each cycle.</b><br><b>🎯 Post to All Groups:</b> posts EVERY eligible post (capped by Posts Per Group) to all its groups. All accounts post the same set — use to blanket many groups from each account.<br><b>🔀 Random (Shuffle):</b> same, but post order is shuffled (same shuffle for all accounts that cycle).<br><b>🎯🔒 One Post Per Account (Unique):</b> exactly ONE post per cycle, dealt round-robin so each post is published once across all accounts. Spreads a library across accounts with no repeats. If undealt posts are fewer than active accounts, the surplus accounts wait that cycle (the plan shows "waits — pool exhausted") — enable Loop Campaign to recycle, or click Reset Campaign Rotation.<br><b>🔀🔒 Random (No Repeat):</b> like Unique, but the deal order is shuffled.<br><b>📋 Progressive (Sequential):</b> one post per cycle in declared order, rotating which account gets which across loops.<br><i>Distinct content per account only happens when posts ≥ accounts (the 🔒 modes).</i></span></span>
+            </span>
           </div>
           <select id="posting-order-${account.name}" onchange="updatePostingOrder('${account.name}', this.value)" style="width: 100%; padding: 8px 12px; background: #1f2937; border: 1px solid #374151; border-radius: 6px; color: #e5e7eb; font-size: 13px; cursor: pointer;">
             <option value="post-centric" ${(account.postingOrder || 'post-centric') === 'post-centric' ? 'selected' : ''}>🎯 Post to All Groups (One Post at a Time)</option>
@@ -1626,6 +1629,8 @@ function updateAutomationControls() {
     btn.classList.toggle('cursor-not-allowed', !enabled);
   };
   const show = (btn, visible) => { if (btn) btn.style.display = visible ? '' : 'none'; };
+  // F4: Reset Rotation is destructive to dealt-state — enabled ONLY when fully stopped (double-post-safe).
+  setEnabled(document.getElementById('btn-reset-rotation'), !isAutomationRunning);
   // Finish is available while a run is active (running or paused), disabled once requested or stopping.
   const applyFinish = () => {
     show(finishBtn, true);
@@ -1757,6 +1762,17 @@ async function startAutomation() {
   } finally {
     setTimeout(() => { localStartInFlight = false; }, 500);
   }
+}
+
+// F4: clear the dealt-state/rotation so the next Start re-deals every post from #1. Stopped-only.
+async function resetRotation() {
+  if (isAutomationRunning) { showNotification('Stop the automation before resetting the rotation.', 'error'); return; }
+  if (!confirm('Reset campaign rotation?\n\nThis re-deals EVERY post from the start (#1) on the next Start. Posts already published this campaign may be posted again to their groups. It does NOT delete any posts.\n\nMake sure automation is stopped.')) return;
+  try {
+    const r = await window.electronAPI.invoke('reset-rotation');
+    if (r && r.ok) { showNotification('Campaign rotation reset — next Start re-deals all posts from #1.', 'success'); addLog('🔄 Campaign rotation reset.\n'); }
+    else showNotification('Reset failed: ' + ((r && r.error) || 'unknown') + ' — ensure the app can write to the data folder.', 'error');
+  } catch (e) { showNotification('Reset failed: ' + (e.message || e), 'error'); }
 }
 
 async function stopAutomation() {
@@ -1951,7 +1967,7 @@ const SETTINGS_HELP = [
   ['Parallel', '<b>Parallel Accounts.</b> How many accounts post at the same time. More is faster but heavier, and a stronger shared-IP footprint. Keep it at 1–3 unless each account has its own proxy (Accounts tab).'],
   ['Wait Between Cycles', '<b>Wait Between Cycles.</b> After an account finishes all its groups, it sleeps a <b>random</b> number of minutes in this range before the next full cycle. A wide gap (e.g. 90–180) looks human; a fixed interval is a spam signal.'],
   ['Stagger Between Accounts', '<b>Stagger Between Accounts.</b> When several accounts run together, each new one waits a random number of minutes (in this range) before starting — so they never hit Facebook in the same instant.'],
-  ['Posts Per Group', '<b>Posts Per Group.</b> How many posts to publish in each group per cycle. 0 = no limit. Unique posting modes always post exactly 1.'],
+  ['Posts Per Group', '<b>Posts Per Group (non-unique modes only).</b> How many posts to publish in EACH group, per cycle — not posts-per-cycle (e.g. 2 posts × 3 groups = 6 group-posts). 0 = no cap (all eligible). The unique modes (One Post Per Account, Random No-Repeat, Progressive) always post exactly 1 and ignore this.'],
   ['Delay Between Groups', '<b>Delay Between Groups.</b> A <b>random</b> wait (seconds) between posting to one group and the next, within the same account. The engine enforces a 120s floor — going faster is high spam-risk.'],
   ['Humanized timing', '<b>Humanized timing (master switch).</b> When ON, every pause in the process is a fresh random value so the rhythm is never mechanical. Leave it ON; turn off only for debugging. (The post→comment delay below stays randomized regardless.)'],
   ['Feed browse before posting', '<b>Feed browse before posting.</b> Seconds the bot scrolls and "reads" the group feed before opening the composer — like a real visitor landing on the page. Set both to 0 to skip browsing.'],
@@ -2040,7 +2056,23 @@ function wireSpeedButtons() {
   });
   highlightSpeed((appData && appData.settings && appData.settings.speedMode) || 'normal');
 }
-function initSettingsUI() { try { injectSettingsHelp(); } catch {} try { wireSpeedButtons(); } catch {} }
+function initSettingsUI() {
+  try { injectSettingsHelp(); } catch {}
+  try { wireSpeedButtons(); } catch {}
+  // Dynamic up/down flip for ALL help badges (Settings + dynamically-rendered account cards) so a
+  // tooltip low in a scroll area opens upward instead of clipping. One delegated listener.
+  try {
+    if (!document.body.dataset.helpFlipWired) {
+      document.body.dataset.helpFlipWired = '1';
+      document.addEventListener('mouseover', (e) => {
+        const w = e.target && e.target.closest && e.target.closest('.help');
+        if (!w) return;
+        const r = w.getBoundingClientRect();
+        w.classList.toggle('help-up', r.top > window.innerHeight * 0.55);
+      });
+    }
+  } catch {}
+}
 if (typeof document !== 'undefined') {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initSettingsUI);
   else initSettingsUI();
