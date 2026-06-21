@@ -384,6 +384,22 @@ class Orchestrator {
               this.log(`📥 [${account.name}] ${r.heldRecords.length} post(s) held for moderator approval`);
             } catch (e) { this.log(`⚠️ could not persist held-post state: ${e.message}`); }
           }
+          // Orphaned link-comments: posts that went LIVE but couldn't get their comment. Persist them
+          // (deduped) so a healthy reserve account that's a member of the group can place the comment in
+          // the rescue phase — a post is never left without its link.
+          if (r && r.commentQueue && r.commentQueue.length) {
+            try {
+              const cs = store.loadComments();
+              let added = 0;
+              for (const c of r.commentQueue) {
+                if (!cs.pending.some((x) => x.gid === c.gid && (x.postId && c.postId ? x.postId === c.postId : x.captionSnip === c.captionSnip) && x.status !== 'done')) {
+                  cs.pending.push({ ...c, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null }); added++;
+                }
+              }
+              store.saveComments(cs);
+              if (added) this.log(`📌 [${account.name}] ${added} post(s) live but uncommented — queued for comment-rescue by a healthy account`);
+            } catch (e) { this.log(`⚠️ could not persist comment-rescue queue: ${e.message}`); }
+          }
           // Persist flag to account status so the UI shows it (serialized via store.update).
           if (r && r.flag) {
             accountFlag = r.flag;
@@ -514,9 +530,25 @@ class Orchestrator {
       this._data = getData(); // re-read each cycle so mid-run edits take effect
       const { posts, accounts, settings } = this._data;
       if (!posts.length) { this.log('⚠️ No posts configured — stopping.'); break; }
-      const active = accounts.filter((a) => a.enabled !== false && !a.isModerator); // MOD: the moderator only approves, never posts
-      if (!active.length) { this.log('⚠️ No enabled accounts — stopping.'); break; }
+      const allPosters = accounts.filter((a) => a.enabled !== false && !a.isModerator); // MOD: the moderator only approves, never posts
+      if (!allPosters.length) { this.log('⚠️ No enabled accounts — stopping.'); break; }
+      // RESERVE POOL: never run the whole fleet. Hold back `reserveAccounts` healthy accounts (rotating
+      // each cycle so every account is used over time) — they stay available to RESCUE orphaned link-
+      // comments (a post whose own account got blocked before commenting) and to take over a cooled-down
+      // account's slot. Always leaves ≥1 account posting.
+      const reserveN = Math.max(0, Math.min(Math.round(Number(settings.reserveAccounts) || 0), allPosters.length - 1));
+      let active = allPosters, reserve = [];
+      if (reserveN > 0) {
+        const rot = (this._reserveRot = (this._reserveRot || 0) + 1) % allPosters.length;
+        const rotated = allPosters.slice(rot).concat(allPosters.slice(0, rot));
+        reserve = rotated.slice(0, reserveN);
+        const rset = new Set(reserve.map((a) => a.name));
+        active = allPosters.filter((a) => !rset.has(a.name));
+        const rkey = reserve.map((a) => a.name).sort().join(',');
+        if (rkey !== this._lastReserveKey) { this._lastReserveKey = rkey; this.log(`🧰 Reserve this cycle: ${reserve.map((a) => a.alias || a.name).join(', ')} held back from posting (kept healthy to rescue orphaned comments); ${active.length} posting.`); }
+      }
       this._active = active;
+      this._reserve = reserve;
       // Shared-IP warning (once per run): many accounts from ONE IP is a top coordinated-spam signal.
       if (!this._proxyWarned && active.length > 1) {
         this._proxyWarned = true;

@@ -2057,6 +2057,7 @@ function loadSettings() {
   document.getElementById('setting-max-cycles').value = appData.settings.maxCycles !== undefined ? appData.settings.maxCycles : 0;
   document.getElementById('setting-enable-tunnel').checked = appData.settings.enableTunnel || false;
   { const el = document.getElementById('setting-moderation-enabled'); if (el) el.checked = appData.settings.moderationEnabled === true; }
+  { const el = document.getElementById('setting-reserve-accounts'); if (el) el.value = (appData.settings.reserveAccounts != null ? appData.settings.reserveAccounts : 0); }
   document.getElementById('setting-loop-campaign').checked = appData.settings.loopCampaign || false;
   document.getElementById('setting-resume-on-startup').checked = appData.settings.resumeOnStartup === true;
   document.getElementById('setting-launch-on-startup').checked = appData.settings.launchOnStartup || false;
@@ -2219,6 +2220,7 @@ async function saveSettings() {
     maxCycles: intOr('setting-max-cycles', 0),
     enableTunnel: document.getElementById('setting-enable-tunnel').checked,
     moderationEnabled: (document.getElementById('setting-moderation-enabled') || {}).checked || false,
+    reserveAccounts: Math.max(0, Math.round(Number((document.getElementById('setting-reserve-accounts') || {}).value) || 0)),
     loopCampaign: document.getElementById('setting-loop-campaign').checked,
     resumeOnStartup: document.getElementById('setting-resume-on-startup').checked,
     launchOnStartup: document.getElementById('setting-launch-on-startup').checked,

@@ -637,6 +637,13 @@
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+            <label class="block text-sm font-semibold text-gray-200 mb-2">🧰 Reserve accounts</label>
+            <input type="number" id="setting-reserve-accounts" min="0" max="100" step="1"
+              class="w-28 px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+            <small class="block mt-2 text-xs text-gray-500">Keep this many healthy accounts OUT of posting each cycle (rotating). They're held in reserve so a healthy account can place the link-comment on any post whose own account got blocked (so no post is left without its link), and to take over a cooled-down account's slot. Always leaves at least 1 account posting. 0 = off.</small>
+          </div>
+
+          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
             <label class="checkbox-label flex items-center gap-3 cursor-pointer">
               <input type="checkbox" id="setting-loop-campaign" class="w-5 h-5 rounded-md accent-accent">
               <span class="text-sm font-semibold text-gray-300">🔁 Loop Campaign (unique modes)</span>

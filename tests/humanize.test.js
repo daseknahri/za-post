@@ -90,6 +90,22 @@ test('moderation: state round-trips, fail-closed defaults, fbDisplayName trimmed
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+test('reserve + comment-rescue store: reserveAccounts clamps; pending-comments round-trips fail-closed', () => {
+  // reserveAccounts is a non-negative integer (rounded, clamped 0–100).
+  assert.equal(store.clampSettings({ reserveAccounts: 3 }).reserveAccounts, 3);
+  assert.equal(store.clampSettings({ reserveAccounts: 2.7 }).reserveAccounts, 3, 'rounded');
+  assert.equal(store.clampSettings({ reserveAccounts: -5 }).reserveAccounts, 0, 'floored at 0');
+  assert.equal(store.clampSettings({ reserveAccounts: 999 }).reserveAccounts, 100, 'capped');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zpost-cq-'));
+  store.init(tmp);
+  assert.deepEqual(store.loadComments(), { pending: [] }, 'missing file → empty pending list');
+  store.saveComments({ pending: [{ gid: 'g1', captionSnip: 'abc', comment: 'link', status: 'pending' }] });
+  assert.equal(store.loadComments().pending.length, 1);
+  store.saveComments({ junk: true }); // invalid shape → coerced safe
+  assert.deepEqual(store.loadComments(), { pending: [] }, 'invalid shape → empty pending list');
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
 test('normalizeAccount: corrupt daily / rateLimitedUntil are sanitized on load (DI-3/DI-4)', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zpost-acc-'));
   store.init(tmp);

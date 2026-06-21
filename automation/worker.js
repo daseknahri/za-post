@@ -1346,6 +1346,7 @@ async function runAccount(o) {
   };
   let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false, rlKind = null;
   const heldRecords = []; // MOD: posts FB held in the moderation queue this run (for the moderator phase)
+  const commentQueue = []; // posts that went LIVE but whose link-comment couldn't be placed (for a healthy reserve account to rescue)
   try {
     const hidden = settings.hideBrowser !== false; // default: hidden
     // ALWAYS headful — Facebook's composer (clipboard, typing focus, publish) misbehaves in true
@@ -2049,6 +2050,10 @@ async function runAccount(o) {
             cres = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink, settings, expectedPostId);
           }
           commentResult = cres;
+          // Did the comment actually land (or get submitted)? 'unconfirmed'/'not_visible' = Enter WAS
+          // pressed (re-commenting would double-post), so those are NOT rescued. Only the pre-Enter
+          // outcomes (failed/skipped/blocked_*) leave a live post with no comment → rescue-eligible.
+          const _commentLanded = (cres === 'posted' || cres === 'unconfirmed' || cres === 'not_visible' || cres === 'none');
           if (cres === 'failed') step('Comment: could not place the comment after 3 attempts — left uncommented');
           else if (cres === 'skipped') step('Comment: skipped (could not safely identify our post)');
           else if (cres === 'blocked_account' || cres === 'blocked_comment') {
@@ -2058,7 +2063,16 @@ async function runAccount(o) {
             const _k = cres === 'blocked_account' ? 'account' : 'comment';
             step(_k === 'account' ? '🛑 Facebook temporarily blocked this account — stopping it (long cooldown)' : '🛑 Commenting rate-limited — stopping this account to cool it down');
             flag = 'rate_limited'; rlKind = _k; noRetry = true;
-            report(groupName, gid, 'posted', _k === 'account' ? 'account temporarily blocked' : 'comment rate-limited — account cooled down', commentResult);
+          }
+          if (!_commentLanded) {
+            // The post is LIVE but its link-comment did not land. Queue it so a healthy reserve account
+            // that is a member of this group places the comment later — a post is NEVER left without its
+            // link. (postPermalink locates it directly; captionSnip is the feed-scan fallback.)
+            commentQueue.push({ gid, groupName, postPermalink: postPermalink || null, postId: (basePost && basePost.id) || expectedPostId || null, captionSnip: capSnip || '', postCaption: (post.caption || '').slice(0, 220), comment: post.comment || '', commentImg: groupCommentImg || null, posterAccount: name, reason: cres });
+            step('Comment: 📌 queued for rescue by a healthy account — this post will NOT be left without its link');
+          }
+          if (cres === 'blocked_account' || cres === 'blocked_comment') {
+            report(groupName, gid, 'posted', cres === 'blocked_account' ? 'account temporarily blocked' : 'comment rate-limited — account cooled down', commentResult);
             break;
           }
         }
@@ -2145,7 +2159,7 @@ async function runAccount(o) {
   }
   // fullyPosted = the post landed in EVERY targeted group, none pending, no errors — only then is it
   // safe to auto-delete from the library (a partial publish must be kept). See orchestrator deal gate.
-  return { posted, errors, pendingApproval, noRetry, flag, rlKind, offline, heldRecords, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length };
+  return { posted, errors, pendingApproval, noRetry, flag, rlKind, offline, heldRecords, commentQueue, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length };
 }
 
 // Strip fields Puppeteer's setCookie rejects; coerce sameSite.
