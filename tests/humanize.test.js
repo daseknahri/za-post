@@ -70,6 +70,26 @@ test('clampSettings: speedMode is coerced to a valid preset name', () => {
   assert.equal(store.clampSettings({ speedMode: 'bogus' }).speedMode, 'normal', 'invalid → normal');
 });
 
+test('moderation: state round-trips, fail-closed defaults, fbDisplayName trimmed (MOD-1)', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zpost-mod-'));
+  store.init(tmp);
+  assert.deepEqual(store.loadModeration(), { held: [] }, 'missing file → empty held list');
+  store.saveModeration({ held: [{ postId: 'p1', gid: 'g1', status: 'held' }] });
+  assert.equal(store.loadModeration().held.length, 1);
+  store.saveModeration({ junk: true }); // invalid shape → coerced safe
+  assert.deepEqual(store.loadModeration(), { held: [] }, 'invalid shape → empty held list');
+  store.save({ posts: [], groups: [], proxies: [], useProxies: false, settings: {}, accounts: [{ name: 'm', isModerator: 1, fbDisplayName: '  Abdo Abdo  ' }, { name: 'p' }] });
+  const accts = store.load().accounts;
+  const m = accts.find((a) => a.name === 'm');
+  assert.equal(m.isModerator, true, 'truthy → moderator');
+  assert.equal(m.fbDisplayName, 'Abdo Abdo', 'display name trimmed');
+  const p = accts.find((a) => a.name === 'p');
+  assert.ok(!p.isModerator, 'absent → not moderator (fail-closed)');
+  assert.equal(store.clampSettings({ moderationEnabled: 1 }).moderationEnabled, true);
+  assert.equal(store.clampSettings({ moderationEnabled: 0 }).moderationEnabled, false);
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
 test('normalizeAccount: corrupt daily / rateLimitedUntil are sanitized on load (DI-3/DI-4)', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zpost-acc-'));
   store.init(tmp);
