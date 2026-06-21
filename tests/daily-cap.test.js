@@ -34,14 +34,17 @@ test('dailyUsed: rewinding the clock keeps the used count (cap cannot be cleared
 test('load() coerces account numeric fields so strings/NaN never reach the cap/cooldown math', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zpost-store-'));
   store.init(tmp);
+  // Use a VALID FUTURE cool-down so we test string→number coercion AND that DI-4 preserves a sane
+  // future value. (A past/absurd value is correctly reset to 0 — covered in humanize.test.js.)
+  const futureRl = Date.now() + 2 * 3600 * 1000;
   store.save({
     posts: [], groups: [],
-    accounts: [{ name: 'a', daily: { date: '2026-06-20', count: '5' }, rlStrikes: '2', rateLimitedUntil: '123' }],
+    accounts: [{ name: 'a', daily: { date: '2026-06-20', count: '5' }, rlStrikes: '2', rateLimitedUntil: String(futureRl) }],
     settings: {}, proxies: [], useProxies: false,
   });
   const a = store.load().accounts[0];
   assert.strictEqual(a.daily.count, 5);
   assert.strictEqual(a.rlStrikes, 2);
-  assert.strictEqual(a.rateLimitedUntil, 123);
+  assert.strictEqual(a.rateLimitedUntil, futureRl, 'coerced to a number and preserved (valid future cool-down)');
   fs.rmSync(tmp, { recursive: true, force: true });
 });

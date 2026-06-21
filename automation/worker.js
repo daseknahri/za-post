@@ -221,25 +221,29 @@ function isSafeImageUrl(url) {
   return true;
 }
 
-async function downloadImage(url) {
-  if (!axios || !url) return null;
-  if (!isSafeImageUrl(url)) return null; // SSRF guard — reject internal/private/non-http(s) targets
+async function downloadImage(url, log) {
+  // OBS-1: say WHY a download failed instead of returning a bare null that surfaces as a generic
+  // "could not resolve image". Optional logger; SSRF rejection is marked non-retryable.
+  const note = (m) => { try { if (typeof log === 'function') log(`⚠️ image download failed — ${m} (${String(url).slice(0, 90)})`); } catch {} };
+  if (!url) return null;
+  if (!axios) { note('axios unavailable'); return null; }
+  if (!isSafeImageUrl(url)) { note('blocked by SSRF guard (internal/private/non-http URL) — not retried'); return null; } // SSRF guard
   const r = await retryAsync(() => axios.get(url, {
     responseType: 'arraybuffer', timeout: 30000,
     maxRedirects: 1,                       // a redirect can't bounce us to an internal host past the guard
     maxContentLength: 15 * 1024 * 1024,    // cap the download so a giant/streaming URL can't exhaust memory
     maxBodyLength: 15 * 1024 * 1024,
   }), { attempts: 3, timeoutMs: 35000, baseDelayMs: 1500, label: 'image download' });
-  if (!r.ok) return null;
+  if (!r.ok) { const st = r.error && r.error.response && r.error.response.status; note(`request failed after retries${st ? ` (HTTP ${st})` : ''}: ${r.error && r.error.message}`); return null; }
   // Reject non-image responses (an HTML error page / unexpected content type isn't an image).
   const ct = String((r.result.headers && (r.result.headers['content-type'] || r.result.headers['Content-Type'])) || '').toLowerCase();
-  if (ct && !ct.startsWith('image/')) return null;
+  if (ct && !ct.startsWith('image/')) { note(`response is not an image (content-type: ${ct})`); return null; }
   try {
     const ext = (String(url).match(/\.(jpg|jpeg|png|gif|webp)/i) || [, 'jpg'])[1];
     const file = path.join(os.tmpdir(), `za-img-${Date.now()}-${Math.floor(Math.random() * 1e6)}.${ext}`);
     fs.writeFileSync(file, Buffer.from(r.result.data));
     return file;
-  } catch { return null; }
+  } catch (e) { note(`could not write temp file: ${e.message}`); return null; }
 }
 
 // Selector banks — FB changes these often, so we try several and take the first hit.
@@ -600,20 +604,25 @@ async function clickPostButton(page) {
 async function waitForPublish(page, dialogCountBefore, timeout = 45000, shouldStop = () => false) {
   await sleep(1500); // let the click take effect before the first check (avoid false positive)
   const deadline = Date.now() + timeout;
+  let timeouts = 0;
   while (Date.now() < deadline) {
     if (shouldStop()) return 'stopped'; // halt promptly on Stop instead of polling for 30s
-    const dialogCount = await page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length).catch(() => -1);
+    const dialogCount = await evalTimed(page, () => document.querySelectorAll('div[role="dialog"]').length, null, 8000).catch(() => -1);
     if (dialogCount >= 0 && dialogCountBefore > 0 && dialogCount < dialogCountBefore) return 'published';
-    const sig = await page.evaluate(() => {
+    const sig = await evalTimed(page, () => {
       const t = (document.body.innerText || '').toLowerCase();
       if (/pending|in review|will be reviewed|shared once approved|post is pending|posted to the group/.test(t)) return 'submitted';
-      // Explicit Facebook failure — return early instead of polling the full 30s, and never
+      // Explicit Facebook failure — return early instead of polling the full window, and never
       // count it as published (so the post is retried, not lost).
       if (/couldn.t post|can.t share|something went wrong|unable to post|failed to post|couldn.t share/.test(t)) return 'error';
       const hasEnabledPost = Array.from(document.querySelectorAll('div[role="dialog"] [role="button"]'))
         .some((b) => (b.getAttribute('aria-label') || b.textContent || '').trim().toLowerCase() === 'post' && b.getAttribute('aria-disabled') !== 'true');
       return hasEnabledPost ? 'open' : 'gone';
-    }).catch(() => 'open');
+    }, null, 8000).catch(() => 'timeout');
+    // POST-1: each probe is capped at 8s (a hung CDP would otherwise block up to protocolTimeout ~90s
+    // and blow the group budget). 3 consecutive dead probes (both evaluates failed) → bail as 'timeout'.
+    if (sig === 'timeout' && dialogCount === -1) { if (++timeouts >= 3) return 'timeout'; }
+    else timeouts = 0;
     if (sig === 'error') return 'error';
     if (sig === 'gone' || sig === 'submitted') return 'published';
     await sleep(2000);
@@ -750,7 +759,12 @@ function withTimeout(promise, ms, fallback) {
 async function addFirstComment(page, gid, post, commentImg, step, permalink, settings = {}, expectedPostId = null) {
   let submitted = false; // once the submitting Enter is pressed, NEVER return false — the caller
                          // retries on false and would post a DUPLICATE comment.
+  // RES-1: never start/continue the comment flow on a dead browser — it would just burn a retry.
+  // Pre-submit → 'failed' (safely retryable on a live browser); post-submit → 'unconfirmed' (never
+  // re-typed → no double-comment). Cheap liveness check reused at each navigation below.
+  const connected = () => { try { return page.browser().isConnected(); } catch { return false; } };
   try {
+    if (!connected()) { step('Comment: browser is disconnected — not commenting'); return submitted ? 'unconfirmed' : 'failed'; }
     // Header: state the comment configuration so each group's comment is self-explanatory.
     const hasText = !!(post.comment && post.comment.trim());
     const mode = hasText && commentImg ? 'text + image' : hasText ? 'text-only' : 'image-only';
@@ -797,7 +811,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
 
     const snip = (post.caption || '').replace(/\s+/g, ' ').trim();
     // C6: can't prove which post is ours (no link + nothing to match on) → SKIP, never guess.
-    if (snip.length < 12 && !permalink) { step('Comment: caption too short and no post link — skipping to avoid a wrong-post comment'); return 'skipped'; }
+    if (snip.length < 12 && !permalink && !expectedPostId) { step('Comment: caption too short, no post link, no post-id — skipping to avoid a wrong-post comment'); return 'skipped'; }
 
     let boxes = [];
     let permalinkFailed = false;
@@ -861,16 +875,23 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         const scanFeed = () => evalTimed(page, (arg) => {
           const { s, want } = arg;
           const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-          const sn = (s && s.length >= 12) ? norm(s) : null; if (!sn) return { clicked: false, reason: 'short' };
+          const sn = (s && s.length >= 12) ? norm(s) : null;
+          if (!sn && !want) return { clicked: false, reason: 'short' }; // nothing to match on
           const idOf = (a) => { const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; };
+          try { document.querySelectorAll('[data-zp-ctarget]').forEach((e) => e.removeAttribute('data-zp-ctarget')); } catch {}
           const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 8)
             .filter((a) => !/pinned|épingl|rögzít/.test((a.innerText || '').slice(0, 200).toLowerCase()));
           for (let i = 0; i < arts.length; i++) { // top→bottom, RETURN on first hit → newest, never an older dup
             const a = arts[i];
-            const body = norm(a.textContent);
-            if (!(body.includes(sn) || body.startsWith(sn.slice(0, 20)))) continue;
             const id = idOf(a);
-            if (want && id && id !== want) return { clicked: false, reason: 'idmismatch', postId: id, pos: i };
+            if (sn) { // caption is the anchor (with id-mismatch refusal)
+              const body = norm(a.textContent);
+              if (!(body.includes(sn) || body.startsWith(sn.slice(0, 20)))) continue;
+              if (want && id && id !== want) return { clicked: false, reason: 'idmismatch', postId: id, pos: i };
+            } else { // VER-1: short/image caption → match by post-id ONLY (exact), never a guess
+              if (!id || id !== want) continue;
+            }
+            a.setAttribute('data-zp-ctarget', '1'); // VER-3: mark so we take the box INSIDE this exact article
             const b = Array.from(a.querySelectorAll('[role="button"]')).find((e) => {
               const n = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
               return /leave a comment|^comment$|hozzaszolas|commenter|comentar|kommentar|commenta/.test(n);
@@ -889,7 +910,15 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           await waitInteractive(6000);
           res = await scanFeed();
         }
-        if (res.clicked) { step(`Comment: our post found in feed (id=${res.postId || '?'}, pos=${res.pos + 1}) — opening box`); await sleep(2500); boxes = await withTimeout(commentBoxes(), 15000, []); }
+        if (res.clicked) {
+          step(`Comment: our post found in feed (id=${res.postId || '?'}, pos=${res.pos + 1}) — opening box`);
+          await sleep(2500);
+          // VER-3: take the comment box INSIDE our matched article (marked data-zp-ctarget), NOT the
+          // first box in the whole feed — if ours isn't topmost, boxes[0] would be a DIFFERENT post.
+          const scoped = await page.$('div[role="article"][data-zp-ctarget="1"] [contenteditable="true"], div[role="article"][data-zp-ctarget="1"] [role="textbox"]').catch(() => null);
+          if (scoped) boxes = [scoped];
+          else { step('Comment: matched post box not found inside its article — re-scanning page'); boxes = await withTimeout(commentBoxes(), 15000, []); }
+        }
         else if (res.reason === 'idmismatch') { step(`Comment: a same-caption post in feed is NOT ours (found id=${res.postId}, expected=${expectedPostId}) — NOT commenting (avoids a wrong-post)`); return 'skipped'; }
         else step('Comment: could not confidently find OUR post in the feed — not commenting (avoids a wrong-post)');
       }
@@ -1460,7 +1489,7 @@ async function runAccount(o) {
     let resolvedImages = (basePost.imagePaths && basePost.imagePaths.length ? basePost.imagePaths : (basePost.imagePath ? [basePost.imagePath] : []))
       .filter((p) => p && fs.existsSync(p));
     if (!resolvedImages.length && basePost.imageUrl) {
-      const dl = await downloadImage(basePost.imageUrl);
+      const dl = await downloadImage(basePost.imageUrl, (m) => log(`[${name}] ${m}`));
       if (dl) { resolvedImages = [dl]; tempImages.push(dl); log(`⬇️ [${name}] image downloaded from URL`); }
       else log(`⚠️ [${name}] image URL set but download failed — posting without image`);
     }
@@ -1470,7 +1499,7 @@ async function runAccount(o) {
       if (fs.existsSync(basePost.commentImagePath)) { commentImg = basePost.commentImagePath; log(`🖼 [${name}] comment image: uploaded file`); }
       else log(`⚠️ [${name}] comment image file not found (${basePost.commentImagePath}) — comment will have no image`);
     } else if (basePost.commentImageUrl) {
-      const dl = await downloadImage(basePost.commentImageUrl);
+      const dl = await downloadImage(basePost.commentImageUrl, (m) => log(`[${name}] ${m}`));
       if (dl) { commentImg = dl; tempImages.push(dl); log(`🖼 [${name}] comment image: downloaded from URL`); }
       else log(`⚠️ [${name}] comment image URL set but download failed — comment will have no image`);
     } else if (settings.commentWithImage && resolvedImages.length) {

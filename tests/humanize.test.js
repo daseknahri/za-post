@@ -69,3 +69,26 @@ test('clampSettings: speedMode is coerced to a valid preset name', () => {
   assert.equal(store.clampSettings({ speedMode: 'fast' }).speedMode, 'fast');
   assert.equal(store.clampSettings({ speedMode: 'bogus' }).speedMode, 'normal', 'invalid → normal');
 });
+
+test('normalizeAccount: corrupt daily / rateLimitedUntil are sanitized on load (DI-3/DI-4)', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zpost-acc-'));
+  store.init(tmp);
+  const absurdFuture = Date.now() + 10 * 365 * 24 * 3600 * 1000; // 10 years out
+  store.save({
+    posts: [], groups: [], proxies: [], useProxies: false, settings: {},
+    accounts: [
+      { name: 'a1', daily: { date: 'garbage', count: -5 }, rateLimitedUntil: absurdFuture },
+      { name: 'a2', daily: { date: '2026-06-21', count: 3 }, rateLimitedUntil: Date.now() + 3600 * 1000 },
+    ],
+  });
+  const accts = store.load().accounts;
+  const a1 = accts.find((a) => a.name === 'a1');
+  assert.equal(a1.daily.count, 0, 'negative count floored to 0 (cap not skewed)');
+  assert.equal(a1.daily.date, '', 'garbage date reset (cap not frozen)');
+  assert.equal(a1.rateLimitedUntil, 0, 'absurd far-future cooldown reset (account not blocked forever)');
+  const a2 = accts.find((a) => a.name === 'a2');
+  assert.equal(a2.daily.count, 3, 'valid count preserved');
+  assert.equal(a2.daily.date, '2026-06-21', 'valid date preserved');
+  assert.ok(a2.rateLimitedUntil > Date.now(), 'valid near-future cooldown preserved');
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
