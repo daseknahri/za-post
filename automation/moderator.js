@@ -102,48 +102,42 @@ async function runModerator(o) {
       }
       if (!onQueue) { log(`🛡️ [moderator] [${gname}] our held post was NOT found on any known queue URL${fallbackUrl ? ` (last queue-looking: ${fallbackUrl})` : ''} — skipping (tell me the Spam-potentiel page URL from your browser if this persists)`); out.errors++; continue; }
 
-      // CAPTION-ANCHORED scan. The Spam-potentiel queue DOM is obfuscated (cards are <a role="link"> +
-      // nested divs with hashed classes, NOT [aria-posinset]/article, and the approve button is not a
-      // descendant of the posinset shells). So we anchor on OUR caption text: find the tightest element
-      // containing a held caption, then climb ancestors to the smallest one that ALSO contains an approve
-      // button — that ancestor is the card. We tag ONLY that card (data-zp-mod) so the click pass re-selects
-      // it exactly. nearbyBtns reports the button labels we saw (so the approve-label regex can be tuned).
+      // BUTTON-ANCHORED scan. The Spam-potentiel queue shows a per-post "Publier" (approve) + "Refuser"
+      // (decline) button, but those buttons are NOT in the post-caption's ancestor chain (the caption sits
+      // in a separate <a role=link> preview). So we anchor on the APPROVE button instead: for each Publier/
+      // approve button, climb to the row that ALSO contains one of our held captions — that's our post —
+      // and tag THAT button (data-zp-mod) to click. Refuser/decline/delete is explicitly excluded.
       const scan = await evalTimed(page, (arg) => {
         const { snips } = arg;
         const nm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-        const APPROVE = /\b(approve|approuver|publ|allow|autoriser|accepter|accept|admettre)\b|appro|autoris/; // multi-locale approve labels
-        const isApprove = (b) => APPROVE.test(nm((b.getAttribute && b.getAttribute('aria-label')) || b.textContent || ''));
-        const results = []; let tag = 0; const nearbyBtns = [];
-        const els = Array.from(document.querySelectorAll('div, span, a, li'));
-        for (const snip of snips) {
-          if (!snip || snip.length < 8) continue;
-          // tightest element whose text contains the caption (textContent = cheap, no layout)
-          let textEl = null, best = Infinity;
-          for (const e of els) { const t = nm(e.textContent || ''); if (t && (t.includes(snip) || (snip.length >= 28 && t.includes(snip.slice(0, 28)))) && t.length < best) { textEl = e; best = t.length; } }
-          if (!textEl) continue;
-          // climb to the smallest ancestor that contains an approve button → that's the card
-          let card = null, n = textEl;
-          for (let i = 0; i < 12 && n && n.tagName; i++) {
-            const btns = Array.from(n.querySelectorAll('[role="button"], button, [role="menuitem"], a[role="link"]'));
-            if (btns.length && nearbyBtns.length < 16) btns.slice(0, 16).forEach((b) => { const l = nm((b.getAttribute && b.getAttribute('aria-label')) || b.textContent || ''); if (l && l.length <= 28) nearbyBtns.push(l); });
-            if (btns.some(isApprove)) { card = n; break; }
+        const APPROVE = /\b(publier|publish|approve|approuver|allow|autoriser|accepter|accept|admettre|confirmer)\b|approuv|approv/; // includes "publier"
+        const DECLINE = /refus|decline|reject|delete|supprim|remove|spam|signaler|masquer|hide/; // never click these
+        const isApprove = (b) => { const l = nm((b.getAttribute && b.getAttribute('aria-label')) || b.textContent || ''); return !!l && APPROVE.test(l) && !DECLINE.test(l); };
+        const allBtns = Array.from(document.querySelectorAll('[role="button"], button'));
+        const approveBtns = allBtns.filter(isApprove);
+        const results = []; let tag = 0;
+        for (const btn of approveBtns) {
+          if (btn.getAttribute('data-zp-mod')) continue;
+          // climb from the approve button to the row that contains one of our held captions
+          let matched = null, rowText = '', n = btn;
+          for (let i = 0; i < 16 && n && n.tagName; i++) {
+            const t = nm(n.textContent || '');
+            const hit = snips.find((s) => s && (t.includes(s) || (s.length >= 28 && t.includes(s.slice(0, 28)))));
+            if (hit) { matched = hit; rowText = t; break; }
             n = n.parentElement;
           }
-          const snippet = (textEl.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 70);
-          if (card && !card.getAttribute('data-zp-mod')) {
-            const zpTag = String(tag++); card.setAttribute('data-zp-mod', zpTag);
-            const aEl = card.querySelector('a[href*="/user/"], a[href*="/groups/"], h3 a, h4 a, strong');
-            results.push({ author: nm(aEl ? aEl.textContent : '').slice(0, 50), authorOurs: false, capMatch: true, capSnipMatched: snip, hasApprove: true, zpTag, snippet });
-          } else {
-            results.push({ author: '', authorOurs: false, capMatch: true, capSnipMatched: snip, hasApprove: false, zpTag: null, snippet });
-          }
+          if (!matched) continue;
+          const zpTag = String(tag++); btn.setAttribute('data-zp-mod', zpTag);
+          results.push({ author: '', authorOurs: false, capMatch: true, capSnipMatched: matched, hasApprove: true, zpTag, snippet: rowText.slice(0, 70) });
         }
-        return { count: results.length, results, nearbyBtns: [...new Set(nearbyBtns)].slice(0, 16) };
+        // diagnostics: distinct labels of the approve-looking buttons we considered
+        const nearbyBtns = [...new Set(approveBtns.map((b) => nm((b.getAttribute && b.getAttribute('aria-label')) || b.textContent || '')).filter(Boolean))].slice(0, 12);
+        return { count: results.length, results, approveBtnCount: approveBtns.length, nearbyBtns };
       }, { snips: capSnips }, 14000).catch(() => null);
 
       if (!scan) { log(`🛡️ [moderator] [${gname}] scan failed (selector/timeout) — dumping nothing; refine selectors`); out.errors++; continue; }
       out.scanned += scan.count;
-      log(`🛡️ [moderator] [${gname}] matched ${scan.count} of our caption(s) in the queue; buttons seen near posts: [${(scan.nearbyBtns || []).join(' | ') || 'none'}]`);
+      log(`🛡️ [moderator] [${gname}] ${scan.approveBtnCount || 0} approve-button(s) on page, ${scan.count} matched OUR caption(s); approve labels: [${(scan.nearbyBtns || []).join(' | ') || 'none'}]`);
       let matchedThisGroup = 0;
       const handledSnips = new Set(); // snippets already acted on this group — never approve/queue one held post twice
       for (let i = 0; i < scan.results.length; i++) {
@@ -232,29 +226,32 @@ async function runModerator(o) {
 async function approveCard(page, zpTag) {
   const click = await evalTimed(page, (tag) => {
     const nm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-    const APPROVE = /\b(approve|approuver|publ|allow|autoriser|accepter|accept)\b|appro/;
-    const card = document.querySelector(`[data-zp-mod="${tag}"]`);
-    if (!card) return { clicked: false, reason: 'card-gone-before-click' };
-    const btn = Array.from(card.querySelectorAll('[role="button"], button')).find((b) => APPROVE.test(nm(b.getAttribute('aria-label') || b.textContent)));
+    const APPROVE = /\b(publier|publish|approve|approuver|allow|autoriser|accepter|accept|admettre|confirmer)\b|approuv|approv/;
+    const DECLINE = /refus|decline|reject|delete|supprim|remove|spam|signaler|masquer|hide/;
+    const isApprove = (b) => { const l = nm((b.getAttribute && b.getAttribute('aria-label')) || b.textContent || ''); return !!l && APPROVE.test(l) && !DECLINE.test(l); };
+    const node = document.querySelector(`[data-zp-mod="${tag}"]`);
+    if (!node) return { clicked: false, reason: 'tag-gone-before-click' };
+    // The tagged element IS the approve (Publier) button (button-anchored scan); fall back to one inside it.
+    const btn = isApprove(node) ? node : Array.from(node.querySelectorAll('[role="button"], button')).find(isApprove);
     if (!btn) return { clicked: false, reason: 'approve-btn-not-found' };
     const label = (btn.getAttribute('aria-label') || btn.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
     btn.scrollIntoView({ block: 'center' }); btn.click();
     return { clicked: true, reason: `clicked "${label}"` };
   }, zpTag, 8000).catch((e) => ({ clicked: false, reason: 'click-eval-error:' + (e && e.message) }));
   if (!click || !click.clicked) return { ok: false, clicked: false, detail: (click && click.reason) || 'no-click' };
-  // Confirm: poll for the tagged card to detach OR its approve button to disappear (handles a confirm dialog too).
+  // Confirm: the tagged button detaches once the post leaves the queue. A confirmation dialog may appear
+  // first ("Publier ?") — accept it. Poll until the tagged button is gone.
   const deadline = Date.now() + 12000;
   while (Date.now() < deadline) {
     await sleep(1200);
-    const gone = await evalTimed(page, (tag) => {
+    await evalTimed(page, () => {
       const nm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-      const APPROVE = /\b(approve|approuver|publ|allow|autoriser|accepter|accept)\b|appro/;
-      const card = document.querySelector(`[data-zp-mod="${tag}"]`);
-      if (!card || !card.isConnected) return { gone: true, how: 'card-detached' };
-      const stillHasBtn = Array.from(card.querySelectorAll('[role="button"], button')).some((b) => APPROVE.test(nm(b.getAttribute('aria-label') || b.textContent)));
-      return { gone: !stillHasBtn, how: stillHasBtn ? 'still-present' : 'approve-btn-gone' };
-    }, zpTag, 6000).catch(() => null);
-    if (gone && gone.gone) return { ok: true, clicked: true, detail: `${click.reason}; ${gone.how}` };
+      const dlg = document.querySelector('[role="dialog"]'); if (!dlg) return;
+      const b = Array.from(dlg.querySelectorAll('[role="button"], button')).find((x) => /\b(publier|approve|approuver|confirmer|confirm|ok|oui|yes)\b/.test(nm((x.getAttribute && x.getAttribute('aria-label')) || x.textContent || '')));
+      if (b) b.click();
+    }, null, 3000).catch(() => {});
+    const gone = await evalTimed(page, (tag) => { const node = document.querySelector(`[data-zp-mod="${tag}"]`); return { gone: !node || !node.isConnected }; }, zpTag, 5000).catch(() => null);
+    if (gone && gone.gone) return { ok: true, clicked: true, detail: `${click.reason}; button-detached` };
   }
   return { ok: false, clicked: true, detail: `${click.reason}; not-confirmed-within-timeout` };
 }
