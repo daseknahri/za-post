@@ -1710,8 +1710,21 @@ async function runAccount(o) {
             // fails the catch reports it and the group stays un-dealt for the next cycle.
             throw new Error('transient: image upload failed after retries');
           }
-          step('Image attached');
-          await sleepInterruptible(3500, shouldStop);
+          // Verify FB actually ATTACHED the image. uploadFile only resolves the CDP file transfer — FB
+          // can still silently reject the file, and EVERY downstream publish check matches caption text
+          // only, so an image-less post would pass as "published". Wait for the composer preview to
+          // render (mirrors the comment path); if it doesn't, throw transient so the group re-attempts
+          // (publishClicked is still false here → double-post-safe) rather than publishing caption-only.
+          const imgPreviewed = await page.waitForFunction(
+            () => !!document.querySelector('div[role="dialog"] img[src^="blob:"], [role="dialog"] img[src^="blob:"], div[role="dialog"] [aria-label*="Remove" i]'),
+            { timeout: 15000 }
+          ).then(() => true).catch(() => false);
+          if (!imgPreviewed) {
+            step('Image preview did not render — FB may have rejected the upload; re-attempting the group to avoid an image-less post');
+            throw new Error('transient: image attach not confirmed (no preview)');
+          }
+          step('Image attached (preview rendered)');
+          await sleepInterruptible(1500, shouldStop);
         }
 
         // Caption — PASTE it (clipboard + Ctrl+V, like the original "Caption pasted"); fast and
@@ -2043,8 +2056,17 @@ async function runAccount(o) {
     // Posted NOTHING across all its groups (errors, no specific reason) → flag the account so the
     // operator checks it, but we did NOT skip any group (avoids the per-group false positive).
     if (posted === 0 && pendingApproval === 0 && errors > 0 && !flag && !offline && !shouldStop()) flag = 'likely_blocked';
-    // Persist refreshed cookies for next run.
-    try { const cks = await withTimeout(page.cookies(), 8000, null); if (cks) store.writeCookies(name, cks); } catch {}
+    // Persist refreshed cookies for next run — but ONLY if the session is still valid. If the run ended
+    // on a logged-out/checkpoint wall (needs_login/needs_verification/account_disabled, or the jar lost
+    // its c_user), writing would overwrite the good cookies.json with a dead jar and the account couldn't
+    // recover next run. In that case leave the existing good cookies untouched.
+    try {
+      const authBroke = flag === 'needs_login' || flag === 'needs_verification' || flag === 'account_disabled';
+      const cks = await withTimeout(page.cookies(), 8000, null);
+      const stillAuthed = Array.isArray(cks) && cks.some((c) => c && c.name === 'c_user' && c.value);
+      if (cks && stillAuthed && !authBroke) store.writeCookies(name, cks);
+      else if (cks && !stillAuthed) log(`🔒 [${name}] session not valid at run end — keeping the existing saved cookies (not overwriting with a logged-out jar)`);
+    } catch {}
     fs.writeFileSync(require('path').join(store.accountDir(name), 'last-run-success.txt'),
       `${errors === 0 ? 'SUCCESS' : 'PARTIAL'}\nPosts: ${posted}\nPending: ${pendingApproval}\nTime: ${new Date().toISOString()}\n`);
     // Bump the warm-up run counter for any completed run (not only posted>0) so a new account that

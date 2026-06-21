@@ -12,10 +12,24 @@ const { execFile } = require('child_process');
 // ---- persistent log file (assigned in whenReady, guarded until then) --------
 let LOG_DIR = null;
 let LOG_FILE = null;
+let _logWrites = 0;
+
+// Rotate automation.log past 5MB. Called at boot AND periodically here, so a long CONTINUOUS run (the
+// intended mode — maxCycles defaults to 0) can't grow the log unbounded until the disk fills (which
+// would then make the atomic data.json / cookies writes fail).
+function rotateLogIfBig() {
+  try {
+    if (!LOG_FILE || !LOG_DIR) return;
+    if (fs.statSync(LOG_FILE).size <= 5 * 1024 * 1024) return;
+    try { fs.renameSync(path.join(LOG_DIR, 'automation.log.1'), path.join(LOG_DIR, 'automation.log.2')); } catch {}
+    fs.renameSync(LOG_FILE, path.join(LOG_DIR, 'automation.log.1'));
+  } catch {}
+}
 
 function appendLogFile(line) {
   try {
     if (!LOG_FILE) return;
+    if ((++_logWrites % 200) === 0) rotateLogIfBig(); // bound the log within a single long run, not only at boot
     fs.appendFile(LOG_FILE, '[' + new Date().toISOString() + '] ' + String(line) + '\n', { encoding: 'utf8' }, () => {});
   } catch {}
 }
@@ -304,13 +318,7 @@ app.whenReady().then(async () => {
   LOG_DIR = path.join(app.getPath('userData'), 'logs');
   fs.mkdirSync(LOG_DIR, { recursive: true });
   LOG_FILE = path.join(LOG_DIR, 'automation.log');
-  try {
-    const stat = fs.statSync(LOG_FILE);
-    if (stat.size > 5 * 1024 * 1024) {
-      try { fs.renameSync(path.join(LOG_DIR, 'automation.log.1'), path.join(LOG_DIR, 'automation.log.2')); } catch {}
-      fs.renameSync(LOG_FILE, path.join(LOG_DIR, 'automation.log.1'));
-    }
-  } catch {}
+  rotateLogIfBig();
   appendLogFile('--- session start ---');
   // ---------------------------------------------------------------------------
 

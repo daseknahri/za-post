@@ -522,6 +522,13 @@ class Orchestrator {
           }
         }
       }
+      // loopCampaign + autoDeletePosted contradict each other: the loop recycles the library forever,
+      // but auto-delete removes each fully-posted post — so after one pass the library empties and the
+      // "forever" loop ends. Warn once so the operator disables one of them.
+      if (!this._loopDelWarned && settings.loopCampaign && settings.autoDeletePosted) {
+        this._loopDelWarned = true;
+        this.log('⚠️ "Loop Campaign" + "Auto-delete posted" are BOTH on — they conflict: auto-delete removes each fully-posted post, so the loop recycles an emptying library and the campaign ends after one pass. Turn OFF one (keep Loop to run forever; keep Auto-delete to use each post once).');
+      }
 
       cycle++;
       this._claimed = new Set(); // fresh per-cycle claim ledger (released claims free a post for another account)
