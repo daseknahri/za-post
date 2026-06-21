@@ -4,10 +4,7 @@ let appData = {
   accounts: [],
   settings: {
     parallelAccounts: 3,
-    waitInterval: 60,
-    accountDelay: 1,
     postsPerGroup: 15,
-    groupDelay: 60,
     maxCycles: 0,
     commentWithImage: false,
     autoDeletePosted: false,
@@ -2389,6 +2386,9 @@ async function saveSettings() {
     commentDwellSecMin: intOr('setting-comment-dwell-min', 1),
     commentDwellSecMax: intOr('setting-comment-dwell-max', 4),
   };
+  // Purge the DEAD legacy single-value timing keys (superseded by the *Min/*Max ranges the loop actually
+  // reads). They could otherwise ride along via the spread above + a stale data.json and clutter the config.
+  delete settings.waitInterval; delete settings.accountDelay; delete settings.groupDelay;
 
   const result = await window.electronAPI.saveSettings(settings);
 

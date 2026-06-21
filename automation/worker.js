@@ -1560,7 +1560,7 @@ async function runAccount(o) {
     // Budget scales with the CONFIGURED per-group pacing (group delay + comment delay + ~150s of
     // work, +30% jitter headroom) so the new, intentionally-slower human timing never trips the
     // watchdog. The watchdog still probes liveness before aborting, so a generous budget is safe.
-    const _gd = (Number.isFinite(settings.groupDelayMax) ? settings.groupDelayMax : (Number.isFinite(settings.groupDelay) ? settings.groupDelay : 300)) * 1.3; // watchdog tracks the MAX-end group draw
+    const _gd = (Number.isFinite(settings.groupDelayMax) ? settings.groupDelayMax : 300) * 1.3; // watchdog tracks the MAX-end group draw
     const _cd = Number.isFinite(settings.commentDelayMax) ? settings.commentDelayMax : 180;
     const perGroupMs = (_gd + _cd + 250) * 1000; // +250s work headroom (dwell + slow-typing fallback + upload + publish)
     const accountBudget = Math.max(600000, Math.round(targetGroups.length * perGroupMs));
