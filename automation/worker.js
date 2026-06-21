@@ -840,6 +840,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
 
     let boxes = [];
     let permalinkFailed = false;
+    let postMissing = false; // set when our published post is NOT in the public feed → likely HELD in Spam potentiel
 
     // PRIMARY: comment on the post's OWN page (it's the only article there → unambiguous = right post).
     if (permalink) {
@@ -952,6 +953,11 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           else if (res.pos === 0) { const all = await withTimeout(commentBoxes(), 15000, []); if (all.length) { boxes = [all[0]]; step('Comment: our post is the TOP post — using the top comment box'); } else step('Comment: our post is top but no comment box rendered — not commenting'); }
           else step('Comment: found OUR post but its scoped comment box did not render — not commenting (avoids a wrong-post)');
         } else {
+          // 'nomatch' = our post is genuinely NOT in the public feed. After publish confirmed, that means
+          // FB held it in the "Spam potentiel"/pending queue (a delayed hold, ~10s after posting). Flag it
+          // so the caller routes it to MODERATOR APPROVAL (a held post isn't public, so no account can
+          // comment on it — only approval makes it public).
+          if (res.reason === 'nomatch') postMissing = true;
           step('Comment: could not confidently find OUR post in the feed — not commenting (avoids a wrong-post)');
         }
       }
@@ -961,6 +967,8 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       // The comment box often fails to render because FB threw a comment-side rate-limit / "action
       // blocked" wall. Detect + classify it so the caller cools the account down instead of retrying.
       { const _rl = await classifyRateLimit(page); if (_rl) { step(_rl === 'severe' ? 'Comment: ⛔ Facebook TEMPORARILY BLOCKED this account — stopping it (long cooldown)' : 'Comment: ⛔ commenting rate-limited ("You can\'t use this feature right now") — cooling this account down'); return _rl === 'severe' ? 'blocked_account' : 'blocked_comment'; } }
+      // Post published but not in the public feed (not a rate-limit) → it's HELD in Spam potentiel.
+      if (postMissing) { step('Comment: our post is NOT in the public feed — likely HELD in "Spam potentiel" (needs moderator approval)'); return 'notfound'; }
       step('Comment: no comment box found — comment not sent'); return 'failed';
     }
     step(`Comment: ${boxes.length} comment box(es) found`);
@@ -2007,7 +2015,7 @@ async function runAccount(o) {
           pendingApproval++;
           // MOD: record the held post so the moderator phase can approve it (then a later comment pass
           // adds the first comment). captionSnip is the same normalized 40-char key the queue scan uses.
-          heldRecords.push({ postId: basePost.id || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip, groupName });
+          heldRecords.push({ postId: basePost.id || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip, groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: postPermalink || null, source: 'pending_at_publish' });
           report(groupName, gid, 'pending', 'awaiting admin approval (immediate signal)', 'skipped');
           if (i < targetGroups.length - 1) await sleepInterruptible(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120), shouldStop, 1000); // T2: randomized inter-group gap (floor 120s)
           continue;
@@ -2041,7 +2049,7 @@ async function runAccount(o) {
           // (it re-navigates each time) can NEVER duplicate an already-sent comment. C2: keep a per-
           // attempt human gap so retries don't collapse into an instant burst.
           let cres = 'failed';
-          for (let cAttempt = 1; cAttempt <= 3 && cres === 'failed' && !shouldStop() && !aborted && browser && browser.isConnected(); cAttempt++) {
+          for (let cAttempt = 1; cAttempt <= 3 && (cres === 'failed' || cres === 'notfound') && !shouldStop() && !aborted && browser && browser.isConnected(); cAttempt++) {
             if (cAttempt > 1) {
               const gap = Math.max(2500, Math.round(Math.min(lo, hi) * 1000 * 0.25)); // ~25% of the min delay
               step(`Comment: retry ${cAttempt}/3 (waiting ${Math.round(gap / 1000)}s — keeping the human cadence)`);
@@ -2064,7 +2072,17 @@ async function runAccount(o) {
             step(_k === 'account' ? '🛑 Facebook temporarily blocked this account — stopping it (long cooldown)' : '🛑 Commenting rate-limited — stopping this account to cool it down');
             flag = 'rate_limited'; rlKind = _k; noRetry = true;
           }
-          if (!_commentLanded) {
+          if (cres === 'notfound') {
+            // Published but NEVER in the public feed after every retry → FB HELD it in "Spam potentiel".
+            // A held post isn't public, so NO account (not even a healthy reserve) can comment on it — the
+            // ONLY fix is MODERATOR APPROVAL. Re-count it as PENDING (not posted), record it as held (with
+            // its comment payload) so the moderator phase approves it and the comment is placed once it's
+            // public. (NOT the comment-rescue queue, which can't reach a non-public post.)
+            posted = Math.max(0, posted - 1); pendingApproval++;
+            step('Comment: ⚠️ post is HELD in "Spam potentiel" (published but not public) → routing to MODERATOR APPROVAL (a held post can\'t be commented by any account until it\'s approved)');
+            heldRecords.push({ postId: (basePost && basePost.id) || expectedPostId || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip || '', groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: postPermalink || null, source: 'comment_notfound' });
+            report(groupName, gid, 'pending', 'held in Spam potentiel — awaiting moderator approval', 'skipped');
+          } else if (!_commentLanded) {
             // The post is LIVE but its link-comment did not land. Queue it so a healthy reserve account
             // that is a member of this group places the comment later — a post is NEVER left without its
             // link. (postPermalink locates it directly; captionSnip is the feed-scan fallback.)
@@ -2076,7 +2094,9 @@ async function runAccount(o) {
             break;
           }
         }
-        report(groupName, gid, 'posted', '', commentResult);
+        // 'notfound' (held in Spam potentiel) already reported itself as 'pending' above — don't also
+        // report it as 'posted'.
+        if (commentResult !== 'notfound') report(groupName, gid, 'posted', '', commentResult);
       } catch (e) {
         // E-P1: retry the SAME group ONCE on a TRANSIENT failure that happened BEFORE the publish
         // click — so we reclaim groups lost to a CDP blip / nav timeout without any double-post risk.

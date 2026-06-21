@@ -381,8 +381,12 @@ class Orchestrator {
                 }
               }
               store.saveModeration(ms);
-              this.log(`📥 [${account.name}] ${r.heldRecords.length} post(s) held for moderator approval`);
+              this.log(`📥 [${account.name}] ${r.heldRecords.length} post(s) held in "Spam potentiel" — queued for moderator approval (then the comment is added once they're public)`);
             } catch (e) { this.log(`⚠️ could not persist held-post state: ${e.message}`); }
+          } else if (r && r.heldRecords && r.heldRecords.length) {
+            // Posts are held in spam but moderator approval is OFF — a held post is not public, so NO
+            // account can comment on it. Tell the operator the only fix (enable approval).
+            this.log(`⚠️ [${account.name}] ${r.heldRecords.length} post(s) HELD in "Spam potentiel" but Moderator Approval is OFF — they stay held + uncommented. Turn on 🛡️ Moderator Approval (Groups tab) so the app approves them and adds the comment.`);
           }
           // Orphaned link-comments: posts that went LIVE but couldn't get their comment. Persist them
           // (deduped) so a healthy reserve account that's a member of the group can place the comment in
