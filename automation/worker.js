@@ -865,8 +865,8 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       await dismissPopups(page);
       const authBad = await withTimeout(page.evaluate(() => /continue as|use another profile/i.test(document.body.innerText || '')), 8000, false);
       if (authBad) { step('Comment: session expired after posting — skipped (re-login needed)'); return 'failed'; }
-      boxes = await withTimeout(commentBoxes(), 15000, []);
-      if (!boxes.length) {
+      { // VER-3 (hardened): on the FEED, NEVER use a bare comment box — boxes[0] could be a DIFFERENT,
+        // topmost post. ALWAYS identify OUR post (id/caption-checked) and use the box inside ITS article.
         step('Comment: locating OUR post in the feed (top-8, caption + post-id check)');
         // Find OUR post and open its comment box. Window widened to TOP-8 because other users posting
         // during the 60-180s wait can push ours down — but kept safe: FIRST (topmost = newest) caption
@@ -910,17 +910,19 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           await waitInteractive(6000);
           res = await scanFeed();
         }
-        if (res.clicked) {
-          step(`Comment: our post found in feed (id=${res.postId || '?'}, pos=${res.pos + 1}) — opening box`);
-          await sleep(2500);
-          // VER-3: take the comment box INSIDE our matched article (marked data-zp-ctarget), NOT the
-          // first box in the whole feed — if ours isn't topmost, boxes[0] would be a DIFFERENT post.
+        if (res.reason === 'idmismatch') { step(`Comment: a same-caption post in feed is NOT ours (found id=${res.postId}, expected=${expectedPostId}) — NOT commenting (avoids a wrong-post)`); return 'skipped'; }
+        // We matched OUR article (scanFeed marked it via data-zp-ctarget) — either it clicked the
+        // "comment" button, or the box was already open (reason 'nobtn'). EITHER WAY take the box that
+        // lives INSIDE our marked article; never an unscoped feed box (which could be a different post).
+        if (res.clicked || res.reason === 'nobtn') {
+          if (res.clicked) await sleep(2500);
           const scoped = await page.$('div[role="article"][data-zp-ctarget="1"] [contenteditable="true"], div[role="article"][data-zp-ctarget="1"] [role="textbox"]').catch(() => null);
-          if (scoped) boxes = [scoped];
-          else { step('Comment: matched post box not found inside its article — re-scanning page'); boxes = await withTimeout(commentBoxes(), 15000, []); }
+          if (scoped) { boxes = [scoped]; step(`Comment: our post found in feed (id=${res.postId || '?'}, pos=${res.pos + 1}) — using its comment box`); }
+          else if (res.pos === 0) { const all = await withTimeout(commentBoxes(), 15000, []); if (all.length) { boxes = [all[0]]; step('Comment: our post is the TOP post — using the top comment box'); } else step('Comment: our post is top but no comment box rendered — not commenting'); }
+          else step('Comment: found OUR post but its scoped comment box did not render — not commenting (avoids a wrong-post)');
+        } else {
+          step('Comment: could not confidently find OUR post in the feed — not commenting (avoids a wrong-post)');
         }
-        else if (res.reason === 'idmismatch') { step(`Comment: a same-caption post in feed is NOT ours (found id=${res.postId}, expected=${expectedPostId}) — NOT commenting (avoids a wrong-post)`); return 'skipped'; }
-        else step('Comment: could not confidently find OUR post in the feed — not commenting (avoids a wrong-post)');
       }
     }
 
