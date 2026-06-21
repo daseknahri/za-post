@@ -71,27 +71,36 @@ async function runModerator(o) {
       const capSnips = heldByGid[gid].map((h) => norm(h.captionSnip)).filter(Boolean); // worker already gated length≥12
       const gname = groupName(gid);
       if (!capSnips.length) { log(`🛡️ [moderator] [${gname}] ${heldByGid[gid].length} held record(s) but no usable caption snippet — skipping (cannot match safely)`); out.errors++; continue; }
-      // Best-effort queue URLs (refine from the logs). Validate a queue indicator before scanning so
-      // we NEVER fall through to the public feed and approve there.
+      // The held "Spam potentiel" post lives in the group's SPAM queue, NOT pending_posts — and it could be
+      // in either, so we DON'T stop at the first queue-looking page. We try each candidate admin queue,
+      // scroll to render lazy content, and PICK the URL that actually CONTAINS one of our held captions.
+      // (Live diagnostic showed the caption was absent from /pending_posts → it's in the spam queue.)
       const urls = [
-        `https://www.facebook.com/groups/${gid}/pending_posts`,
-        `https://www.facebook.com/groups/${gid}/spam?sorting_setting=SPAM_POTENTIAL`,
+        `https://www.facebook.com/groups/${gid}/admin/spam`,
         `https://www.facebook.com/groups/${gid}/spam`,
+        `https://www.facebook.com/groups/${gid}/spam?sorting_setting=SPAM_POTENTIAL`,
+        `https://www.facebook.com/groups/${gid}/admin/pending_posts`,
+        `https://www.facebook.com/groups/${gid}/pending_posts`,
       ];
-      let onQueue = false;
+      let onQueue = false, fallbackUrl = null;
       for (const url of urls) {
         if (shouldStop()) break;
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-        await sleep(3000);
-        const info = await evalTimed(page, () => {
+        await sleep(2500);
+        for (let s = 0; s < 3; s++) { await page.evaluate((y) => window.scrollBy(0, y), 800).catch(() => {}); await sleep(1200); } // nudge lazy render before testing for our caption
+        const info = await evalTimed(page, (snips) => {
+          const norm = (x) => String(x || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
           const t = (document.body.innerText || '').toLowerCase();
-          const isQ = /pending|publications en attente|en attente|spam|potentiel|à vérifier|a verifier|to review|awaiting/.test(t);
-          return { isQ, title: (document.title || '').slice(0, 70), url: (location.href || '').slice(0, 95) };
-        }, null, 6000).catch(() => null);
-        if (info && info.isQ) { onQueue = true; log(`🛡️ [moderator] [${gname}] queue OK — ${info.url}`); break; }
-        log(`🛡️ [moderator] [${gname}] not a queue (${info ? info.url : url} · title="${info ? info.title : '?'}") — trying next URL`);
+          const isQ = /pending|publications en attente|en attente|spam|potentiel|à vérifier|a verifier|to review|awaiting|declined|filtr/.test(t);
+          const body = norm(document.body.innerText || '');
+          const capPresent = snips.some((s) => s && (body.includes(s) || (s.length >= 28 && body.includes(s.slice(0, 28)))));
+          return { isQ, capPresent, title: (document.title || '').slice(0, 70), url: (location.href || '').slice(0, 95) };
+        }, capSnips, 8000).catch(() => null);
+        if (info && info.capPresent) { onQueue = true; log(`🛡️ [moderator] [${gname}] queue WITH our post — ${info.url}`); break; }
+        if (info && info.isQ && !fallbackUrl) fallbackUrl = info.url;
+        log(`🛡️ [moderator] [${gname}] ${info ? (info.isQ ? 'queue but our post not present' : 'not a queue') : 'no info'} (${info ? info.url : url}) — trying next`);
       }
-      if (!onQueue) { log(`🛡️ [moderator] [${gname}] no queue page found — skipping (refine queue URLs from this log)`); out.errors++; continue; }
+      if (!onQueue) { log(`🛡️ [moderator] [${gname}] our held post was NOT found on any known queue URL${fallbackUrl ? ` (last queue-looking: ${fallbackUrl})` : ''} — skipping (tell me the Spam-potentiel page URL from your browser if this persists)`); out.errors++; continue; }
 
       // Scan held cards. Decide the (author AND caption AND approve-button) match. ONLY a card that passes
       // the FULL gate is tagged with a unique data-zp-mod="<idx>" so the click pass can re-select that EXACT
@@ -116,7 +125,11 @@ async function runModerator(o) {
           const capMatch = !!capSnipMatched;
           const hasApprove = Array.from(c.querySelectorAll('[role="button"], button')).some((b) => APPROVE.test(nm(b.getAttribute('aria-label') || b.textContent)));
           let zpTag = null;
-          if (authorOurs && capMatch && hasApprove) { zpTag = String(tag++); c.setAttribute('data-zp-mod', zpTag); } // ONLY full-gate cards get a clickable tag
+          // CAPTION-PRIMARY gate: our 40-char held caption is a unique signal and we only ever act in the
+          // admin's OWN spam queue, so match on caption + an approve button. Author is captured for the log
+          // but NOT required (the poster display-name capture is unreliable). A card is tagged (clickable)
+          // only when caption matches a held snippet AND it has an approve button.
+          if (capMatch && hasApprove) { zpTag = String(tag++); c.setAttribute('data-zp-mod', zpTag); }
           results.push({ author, authorOurs, capMatch, capSnipMatched, hasApprove, zpTag, snippet: txt.slice(0, 70) });
         }
         return { count: cards.length, results };
@@ -130,7 +143,7 @@ async function runModerator(o) {
       for (let i = 0; i < scan.results.length; i++) {
         if (shouldStop()) break;
         const r = scan.results[i];
-        const fullMatch = r.authorOurs && r.capMatch && r.hasApprove && r.zpTag != null;
+        const fullMatch = r.capMatch && r.hasApprove && r.zpTag != null; // caption-primary (author is a hint, not required)
         if (fullMatch && handledSnips.has(r.capSnipMatched)) {
           log(`🛡️ [moderator] [${gname}] card ${i + 1}: duplicate of an already-handled held post — skipping (no double-approve)`);
           continue;
@@ -140,11 +153,11 @@ async function runModerator(o) {
           const rec = (heldByGid[gid] || []).find((h) => norm(h.captionSnip) === r.capSnipMatched) || null;
           if (dryRun) {
             matchedThisGroup++; out.approved++;
-            log(`🛡️ [moderator] [${gname}] card ${i + 1}: author="${r.author}" ours=✓ caption=✓ approveBtn=✓ → WOULD APPROVE (dry-run): "${r.snippet}"`);
+            log(`🛡️ [moderator] [${gname}] card ${i + 1}: caption=✓ approveBtn=✓ author="${r.author}"(ours=${r.authorOurs}) → WOULD APPROVE (dry-run): "${r.snippet}"`);
             continue;
           }
           out.clicked++;
-          log(`🛡️ [moderator] [${gname}] card ${i + 1}: author="${r.author}" ours=✓ caption=✓ approveBtn=✓ → APPROVING: "${r.snippet}"`);
+          log(`🛡️ [moderator] [${gname}] card ${i + 1}: caption=✓ approveBtn=✓ author="${r.author}"(ours=${r.authorOurs}) → APPROVING: "${r.snippet}"`);
           const res = await approveCard(page, r.zpTag);
           if (res.ok) {
             matchedThisGroup++; out.approved++;
