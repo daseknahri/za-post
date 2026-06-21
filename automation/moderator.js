@@ -166,6 +166,31 @@ async function runModerator(o) {
       if (matchedThisGroup < heldCount) {
         const miss = heldCount - matchedThisGroup; out.unmatched += miss;
         log(`⚠️ [moderator] [${gname}] ${miss} of ${heldCount} held post(s) had NO matching card in the queue (already approved/removed, beyond the first 25 scanned, or not rendered) — they remain 'held'.`);
+        // DIAGNOSTIC: matched 0 while a held post IS in the queue → the pending-queue DOM differs from the
+        // public feed (cards/author aren't [aria-posinset]/article). Find the element actually holding OUR
+        // caption and dump its ancestor chain + author candidates so we can fix the selectors from real data.
+        try {
+          const diag = await evalTimed(page, (snips) => {
+            const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const counts = { posinset: document.querySelectorAll('[aria-posinset]').length, article: document.querySelectorAll('div[role="article"]').length, feed: document.querySelectorAll('[role="feed"]').length, main: document.querySelectorAll('[role="main"]').length };
+            const all = Array.from(document.querySelectorAll('div, article, li, section'));
+            for (const snip of snips) {
+              if (!snip || snip.length < 8) continue;
+              // smallest element whose text contains our caption (the post body), then climb to its card
+              const hits = all.filter((e) => norm(e.innerText || '').includes(snip));
+              if (!hits.length) continue;
+              const el = hits[hits.length - 1]; // deepest/smallest container holding the caption
+              const chain = []; let n = el;
+              for (let i = 0; i < 7 && n && n.tagName; i++) { const cls = String(n.className || '').split(' ').filter(Boolean)[0] || ''; chain.push(`${n.tagName.toLowerCase()}${n.getAttribute && n.getAttribute('role') ? '[role=' + n.getAttribute('role') + ']' : ''}${n.getAttribute && n.getAttribute('aria-posinset') != null ? '[posinset]' : ''}${cls ? '.' + cls.slice(0, 12) : ''}`); n = n.parentElement; }
+              // author candidates near the caption (look on the el + a few ancestors)
+              const aCand = [];
+              let scope = el; for (let i = 0; i < 4 && scope; i++) { Array.from(scope.querySelectorAll('a[href], h3, h4, strong, span')).slice(0, 40).forEach((a) => { const t = (a.textContent || '').replace(/\s+/g, ' ').trim(); const href = a.getAttribute && a.getAttribute('href'); if (t && t.length >= 2 && t.length <= 40 && (href || /^(H3|H4|STRONG)$/.test(a.tagName))) aCand.push(`${a.tagName.toLowerCase()}${href ? '@' + href.slice(0, 30) : ''}:${t.slice(0, 30)}`); }); scope = scope.parentElement; }
+              return { counts, chain, text: norm(el.innerText).slice(0, 100), authors: [...new Set(aCand)].slice(0, 8) };
+            }
+            return { counts, note: 'caption not found anywhere in DOM' };
+          }, capSnips, 10000).catch((e) => ({ err: e && e.message }));
+          log(`🔬 [moderator] [${gname}] DIAG ${JSON.stringify(diag).slice(0, 700)}`);
+        } catch (e) { log(`🔬 [moderator] [${gname}] DIAG failed: ${e.message}`); }
       }
     }
     if (dryRun) log(`🛡️ [moderator:${name}] DRY-RUN complete — scanned=${out.scanned} would-approve=${out.approved} skipped=${out.notMine} unmatched=${out.unmatched} errors=${out.errors}. (No posts were approved — dry run.)`);
