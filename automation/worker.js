@@ -1821,7 +1821,8 @@ async function runAccount(o) {
         // fallback. Tolerate "See more" truncation. Poll up to ~12s so a slow render isn't read as "gone".
         let find = null;
         let expectedPostId = null; // OUR post's stable id — the trust anchor for commenting (CT-4)
-        const findDeadline = Date.now() + 12000;
+        const findDeadline = Date.now() + 22000;
+        let _renderScrolls = 0;
         do {
           find = await evalTimed(page, (s) => {
             const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -1874,6 +1875,10 @@ async function runAccount(o) {
             }
           }
           if (find && find.matched && (find.href || find.postId)) break;
+          // Right after a reload FB renders the top posts as EMPTY [aria-posinset] shells until the page
+          // scrolls (lazy content) — which is why the verify saw empty posts and couldn't confirm LIVE.
+          // Nudge the feed a few times so our post's caption + permalink render, then re-scan.
+          if (_renderScrolls < 5) { try { await page.evaluate((y) => window.scrollBy(0, y), 450 + _renderScrolls * 150); } catch {} _renderScrolls++; }
           await sleep(1500);
         } while (Date.now() < findDeadline);
 
