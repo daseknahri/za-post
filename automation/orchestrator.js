@@ -193,6 +193,7 @@ class Orchestrator {
       'sequence': 'Sequence',
       'post-centric-unique': 'Post-Centric-Unique',
       'random-unique': 'Random-Unique',
+      'daily-rotation': 'Daily Rotation (1 new post/day per agent)',
     };
     return MAP[order] || order;
   }
@@ -286,6 +287,23 @@ class Orchestrator {
     if (!(account.assignedGroups && account.assignedGroups.length)) return [];
     const order = account.postingOrder || 'post-centric';
     const unique = order.includes('unique') || order === 'sequence';
+
+    // DAILY ROTATION (per-agent): this account posts ONE post per LOCAL DAY to its groups, advancing its
+    // OWN pointer one step each day (independent of other agents and of the shared dealt-set). Anti-repeat:
+    // the next pick is never the same post id it used yesterday. If the operator edits/reorders the library
+    // the agent simply continues from its last post (or restarts if that post is gone). The pointer +
+    // last-posted-date live in this._perAccountRotation (persisted), keyed by account name — so swapping an
+    // account in/out never disturbs the others. Returns [] once the agent has already posted today (1/day).
+    if (order === 'daily-rotation') {
+      const list = filtered; // stable library order = the rotation order
+      const rec = (this._perAccountRotation && this._perAccountRotation[account.name]) || {};
+      if (rec.lastPostedDate === this._localDayKey()) return []; // already posted today → one per day
+      const li = rec.lastPostId ? list.findIndex((p) => p.id === rec.lastPostId) : -1;
+      let nextIdx = li < 0 ? 0 : (li + 1) % list.length;
+      let pick = list[nextIdx];
+      if (list.length > 1 && pick && pick.id === rec.lastPostId) pick = list[(nextIdx + 1) % list.length]; // anti-repeat
+      return pick ? [pick] : [];
+    }
 
     if (!unique) {
       // post-centric / random -> account posts ALL its eligible posts each cycle.
@@ -699,7 +717,7 @@ class Orchestrator {
   _persistDealt(cycleDealtIds) {
     if (!cycleDealtIds || !cycleDealtIds.length) return true;
     const merged = [...new Set([...this._dealt, ...cycleDealtIds])];
-    if (store.saveRotation({ dealt: merged, roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null })) {
+    if (store.saveRotation({ dealt: merged, roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {} })) {
       this._dealt = new Set(merged);
       return true;
     }
@@ -718,6 +736,7 @@ class Orchestrator {
     this._roundOffset = _st.roundOffset || 0; // rotates account↔post mapping across Loop-campaign recycles
     this._staggerRotation = _st.staggerRotation || 0; // E-N3: rotates account START order each cycle (fairness)
     this._lastDailyRunDate = _st.lastDailyRunDate || null; // 'daily' schedule: local day-key of the last run (same-day-restart dedupe)
+    this._perAccountRotation = (_st.perAccountRotation && typeof _st.perAccountRotation === 'object') ? _st.perAccountRotation : {}; // daily-rotation: per-agent { lastPostId, lastPostedDate }
     this._retryCount = {}; // E-N4: per-account consecutive rate-limit retries → stagger decay (in-memory)
     try { this._proxyHealth.load(this._proxyHealthFile()); } catch {} // E-X3: restore proxy health (prunes >1h)
     let cycle = 0;
@@ -820,17 +839,20 @@ class Orchestrator {
       this._claimed = new Set(); // fresh per-cycle claim ledger (released claims free a post for another account)
       // Unique modes deal each post once across accounts. When every active account is unique
       // and no un-dealt posts remain, the campaign is complete — stop and reset for the next run.
-      if (active.reduce((s, a) => s + this._postsForAccount(a, cycle).length, 0) === 0) {
+      // Only FINITE modes (unique/sequence) can "complete"; daily-rotation and post-centric are ongoing
+      // (they loop by design), so they're excluded — a pure daily-rotation fleet never declares complete.
+      const finiteActive = active.filter((a) => { const o = a.postingOrder || 'post-centric'; return o.includes('unique') || o === 'sequence'; });
+      if (finiteActive.length && finiteActive.reduce((s, a) => s + this._postsForAccount(a, cycle).length, 0) === 0) {
         if (settings.loopCampaign) {
           // Loop campaign: re-distribute the whole library, rotating content across accounts.
           this.log('🔁 All posts distributed — looping (recycling, rotating content across accounts)...');
           this._dealt.clear();
           this._roundOffset = (this._roundOffset || 0) + 1;
-          try { store.saveRotation({ dealt: [], roundOffset: this._roundOffset, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null }); } catch {} // keep the daily marker so a same-day restart can't double-run
+          try { store.saveRotation({ dealt: [], roundOffset: this._roundOffset, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {} }); } catch {} // keep the daily + per-agent markers so a same-day restart can't double-run
           // fall through: this cycle now re-deals the full library
         } else {
           this.log('✅ All posts have been distributed — campaign complete.');
-          this._dealt.clear(); try { store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null }); } catch {}
+          this._dealt.clear(); try { store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {} }); } catch {}
           break;
         }
       }
@@ -842,10 +864,22 @@ class Orchestrator {
       // ── PLANNING HEADER ──────────────────────────────────────────────────────
       // Determine whether any account uses a unique/sequence mode (drives header style).
       const anyUnique = active.some((a) => { const o = a.postingOrder || 'post-centric'; return o.includes('unique') || o === 'sequence'; });
+      const anyDaily = active.some((a) => (a.postingOrder || '') === 'daily-rotation');
       // Use first active account's mode as the representative label (mixed-mode is rare).
       const cycleOrder = (active[0] && active[0].postingOrder) || 'post-centric';
       const cycleModeLabel = this._modeLabel(cycleOrder);
-      if (anyUnique) {
+      if (anyDaily) {
+        // Daily Rotation: print each agent's next post (truthful — the same selection the run will use).
+        this.log(`📅 ${cycleModeLabel}: ${active.length} agent(s) — each posts 1 new post/day to its groups`);
+        const dParts = active.map((a) => {
+          if ((a.postingOrder || '') !== 'daily-rotation') return `[${a.name}] → ${this._modeLabel(a.postingOrder || 'post-centric')}`;
+          const ap = this._postsForAccount(a, cycle, false);
+          if (!ap.length) return `[${a.name}] → ✓ already posted today`;
+          const idx = this._data.posts.findIndex((p) => p.id === ap[0].id);
+          return `[${a.name}] → Post #${idx + 1}`;
+        });
+        for (let pi = 0; pi < dParts.length; pi += 3) this.log(dParts.slice(pi, pi + 3).join('   '));
+      } else if (anyUnique) {
         // F3: in unique modes each post is dealt ONCE — if undealt posts < active accounts, the
         // surplus accounts idle this cycle. Warn LOUDLY so the operator knows why (and how to fix it).
         const filtered0 = this._data.posts.filter((p) => matchesFilter(p, (active[0] && active[0].postFilter) || 'all'));
@@ -947,10 +981,28 @@ class Orchestrator {
         const st = (this._runStats[account.name] = this._runStats[account.name] || { posted: 0, pending: 0, errors: 0 });
         st.posted += res.posted; st.pending += res.pendingApproval; st.errors += res.errors;
         this.emit('automation-progress', { ...this._progress });
-        cyclePostedIds.push(...res.postedIds); cycleDealtIds.push(...res.dealtIds); if (res.flag) cycleFlags.push(res.flag);
+        // DAILY ROTATION: advance + persist this agent's pointer ONLY on a successful post (dealtIds = the
+        // single pick if it published OR pended). A failure leaves the pointer so it retries the SAME post
+        // next day. Strip postedIds so rotation content is never auto-deleted (it recycles). Keep dealtIds
+        // for the cycle's progress/stall bookkeeping but do NOT let it pollute the shared dealt-set.
+        if ((account.postingOrder || '') === 'daily-rotation') {
+          if (res.dealtIds.length) {
+            this._perAccountRotation = this._perAccountRotation || {};
+            this._perAccountRotation[account.name] = { lastPostId: res.dealtIds[0], lastPostedDate: this._localDayKey() };
+            // This is the ONLY persist path for a pure daily-rotation fleet (_persistDealt is skipped), so a
+            // silent failure here would make the agent re-post the same content tomorrow — warn loudly.
+            try { const _r = store.loadRotation(); _r.perAccountRotation = this._perAccountRotation; if (!store.saveRotation(_r)) throw new Error('saveRotation returned false'); }
+            catch (e) { this.log(`⚠️ [${account.name}] could not persist its daily-rotation pointer (${e.message}) — it may re-post today's post tomorrow. Free disk space / fix data-folder permissions.`); }
+          }
+          cyclePostedIds.push(...[]); cycleDealtIds.push(...res.dealtIds); if (res.flag) cycleFlags.push(res.flag);
+        } else {
+          cyclePostedIds.push(...res.postedIds); cycleDealtIds.push(...res.dealtIds); if (res.flag) cycleFlags.push(res.flag);
+        }
         // Persist dealt-ids the MOMENT this account finishes so a crash can't re-deal (re-post) an
-        // already-published post. _persistDealt halts the run (sets _stop) on a write failure.
-        if (res.dealtIds.length && !this._persistDealt(res.dealtIds)) { stopPool = true; return; }
+        // already-published post. _persistDealt halts the run (sets _stop) on a write failure. SKIP for
+        // daily-rotation: it owns its per-agent pointer (persisted above) and must NOT grow the shared
+        // dealt-set (which is for finite unique/sequence distribution only).
+        if ((account.postingOrder || '') !== 'daily-rotation' && res.dealtIds.length && !this._persistDealt(res.dealtIds)) { stopPool = true; return; }
         if (res.offline) { sawOffline = true; stopPool = true; } // connection lost mid-flight → drain + hold
       };
 
@@ -1165,6 +1217,28 @@ class Orchestrator {
           await this._waitWithCountdown(waitMs, 'Next day (daily cap)');
           if (this._shouldStop() || this._finish) break;
           continue; // resume next day with fresh daily counts
+        }
+      }
+      // DAILY-ROTATION HOLD: in continuous schedule (no daily gate), once every active daily-rotation agent
+      // has posted its one-per-day, wait for the next LOCAL day instead of looping idle (which would trip the
+      // stall-breaker). Lets daily-rotation self-pace to 1/day even without the Daily schedule. (In Daily
+      // schedule mode the top-of-loop gate already does the waiting, so this is skipped there.)
+      if (cycleDealtIds.length === 0 && settings.scheduleMode !== 'daily' && (this._active || []).length > 0) {
+        const _today = this._localDayKey();
+        const _allRotatedToday = (this._active || []).every((a) => {
+          if ((a.postingOrder || '') !== 'daily-rotation') return false;
+          const rec = (this._perAccountRotation || {})[a.name] || {};
+          return rec.lastPostedDate === _today;
+        });
+        if (_allRotatedToday) {
+          const d = new Date();
+          const nextLocalMidnight = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 30).getTime();
+          const waitMs = Math.max(60000, nextLocalMidnight - Date.now());
+          this._zeroProgressCycles = 0; // a deliberate rotation hold is NOT a stall
+          this.log(`🔁 All daily-rotation agents have posted today — waiting ~${Math.round(waitMs / 360000) / 10}h for the next day, then each posts its next post.`);
+          await this._waitWithCountdown(waitMs, 'Next day (daily rotation)');
+          if (this._shouldStop() || this._finish) break;
+          continue;
         }
       }
       // Dead-fleet / stall breaker: if the run dealt NOTHING for several cycles in a row (every account

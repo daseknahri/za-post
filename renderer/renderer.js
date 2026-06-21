@@ -1129,6 +1129,7 @@ function renderAccounts() {
             <option value="random" ${account.postingOrder === 'random' ? 'selected' : ''}>🔀 Random (Shuffle)</option>
             <option value="random-unique" ${account.postingOrder === 'random-unique' ? 'selected' : ''}>🔀🔒 Random (No Repeat Across Accounts)</option>
             <option value="sequence" ${account.postingOrder === 'sequence' ? 'selected' : ''}>📋 Progressive (Sequential)</option>
+            <option value="daily-rotation" ${account.postingOrder === 'daily-rotation' ? 'selected' : ''}>📅 Daily Rotation — 1 new post/day, this agent advances on its own</option>
           </select>
         </div>
 
@@ -1258,7 +1259,8 @@ async function updatePostingOrder(accountName, orderValue) {
     'post-centric-unique': 'One Post Per Account (Unique, All Groups)',
     'random': 'Random (Shuffle)',
     'random-unique': 'Random (No Repeat Across Accounts)',
-    'sequence': 'Progressive (Sequential)'
+    'sequence': 'Progressive (Sequential)',
+    'daily-rotation': 'Daily Rotation (1 new post/day per agent)'
   };
   showNotification(`Posting method set to: ${orderLabels[orderValue]}`, 'success');
 }
