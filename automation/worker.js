@@ -680,22 +680,22 @@ async function pendingNoticeForOurPost(page) {
 // Human-like typing: type in chunks with a per-char delay and small randomized pauses
 // between chunks. Tuned for speed while staying human-plausible (FB doesn't scrutinize
 // keystroke timing in the composer the way it does navigation/IP/account signals).
-async function humanType(page, text) {
+async function humanType(page, text, settings = {}) {
   if (!text) return;
+  // FAST mode: when humanization is off (humanizeMaster===false) OR the operator set a very fast cadence
+  // (speedMode==='fast'), type near-instantly with no inter-chunk pause — so a deliberately-fast setting
+  // applies on the typed-caption fallback too (not just the paste path). Otherwise model a real typist.
+  const fast = settings.humanizeMaster === false || settings.speedMode === 'fast';
+  const perKey = fast ? 0 : 35 + Math.floor(Math.random() * 70); // ~35-105ms/key ≈ 50 WPM; 0 = machine-fast
   const chunks = String(text).match(/.{1,12}/gs) || [];
   for (const c of chunks) {
-    // Cap each chunk at 15s: a hung CDP connection otherwise blocks for the full
-    // protocolTimeout (90s) PER chunk, stalling the worker slot for many minutes. On
-    // timeout the group-level catch skips this group instead of freezing the queue.
-    // The timer is always cleared so it can't fire a stray rejection after success.
+    // Cap each chunk at 15s so a hung CDP connection can't block for the full protocolTimeout (90s) per
+    // chunk; the group-level catch then skips this group instead of freezing the queue. Timer always cleared.
     let timer;
     const cap = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('keyboard.type timeout')), 15000); });
-    try {
-      // ~35-105 ms/keystroke models a real typist (~50 WPM). The old 5-17 ms was machine-fast.
-      await Promise.race([page.keyboard.type(c, { delay: 35 + Math.floor(Math.random() * 70) }), cap]);
-    } finally { clearTimeout(timer); }
-    // Inter-chunk pause, with an occasional longer "thinking" beat.
-    await sleep(60 + Math.floor(Math.random() * 160) + (Math.random() < 0.1 ? 300 + Math.floor(Math.random() * 700) : 0));
+    try { await Promise.race([page.keyboard.type(c, { delay: perKey }), cap]); }
+    finally { clearTimeout(timer); }
+    if (!fast) await sleep(60 + Math.floor(Math.random() * 160) + (Math.random() < 0.1 ? 300 + Math.floor(Math.random() * 700) : 0)); // inter-chunk "thinking" beat
   }
 }
 
@@ -1020,7 +1020,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       const lines = commentText.split('\n');
       step(`Comment: typing text (${commentText.length} chars${lines.length > 1 ? `, ${lines.length} lines` : ''})`);
       for (let li = 0; li < lines.length; li++) {
-        if (lines[li]) await humanType(page, lines[li]);
+        if (lines[li]) await humanType(page, lines[li], settings);
         if (li < lines.length - 1) { await page.keyboard.down('Shift'); await page.keyboard.press('Enter'); await page.keyboard.up('Shift'); }
       }
       await sleep(500);
@@ -1464,19 +1464,22 @@ async function runAccount(o) {
     // which includes laptop sleep — so on resume the timer can fire immediately on a perfectly healthy
     // run. Before aborting, probe liveness: if the browser still answers a trivial evaluate it just
     // resumed from sleep → re-arm; only abort if it's truly unresponsive.
+    const _log = (m) => { try { log(m); } catch {} }; // never let a logger error leave the account un-watched
     const onWatchdogTick = async () => {
-      let alive = false;
       try {
-        if (browser && browser.isConnected()) {
-          await Promise.race([page.evaluate(() => 1), new Promise((_, r) => setTimeout(() => r(new Error('probe timeout')), 8000))]);
-          alive = true;
-        }
-      } catch { alive = false; }
-      if (alive) { log(`⏰ [${name}] budget elapsed but browser is alive (likely resumed from sleep) — extending`); armWatchdog(); return; }
-      log(`⏰ [${name}] time budget exceeded and browser unresponsive — aborting account`);
-      aborted = true;
-      await closeBrowserOnce();
-      watchdog = null;
+        let alive = false;
+        try {
+          if (browser && browser.isConnected()) {
+            await Promise.race([page.evaluate(() => 1), new Promise((_, r) => setTimeout(() => r(new Error('probe timeout')), 8000))]);
+            alive = true;
+          }
+        } catch { alive = false; }
+        if (alive) { _log(`⏰ [${name}] budget elapsed but browser is alive (likely resumed from sleep) — extending`); armWatchdog(); return; }
+        _log(`⏰ [${name}] time budget exceeded and browser unresponsive — aborting account`);
+        aborted = true;
+        await closeBrowserOnce();
+        watchdog = null;
+      } catch (e) { _log(`⏰ [${name}] watchdog tick error (${e && e.message}) — re-arming`); armWatchdog(); } // a throw must never silently stop the guard
     };
     function armWatchdog() { watchdog = setTimeout(onWatchdogTick, accountBudget); }
     armWatchdog();
@@ -1493,9 +1496,9 @@ async function runAccount(o) {
     const cookies = store.readCookies(name);
     await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
     await sleep(2500);
-    const profileAuthed = await page.evaluate(() =>
+    const profileAuthed = await withTimeout(page.evaluate(() =>
       !/login|checkpoint/.test(location.href) && !/continue as|use another profile/i.test(document.body.innerText || '')
-    ).catch(() => false);
+    ), 8000, false).catch(() => false);
     if (!profileAuthed && cookies.length) {
       // A2: resilient injection — batch first, fall back to one-by-one so one bad
       // cookie can't prevent all cookies from being set.
@@ -1509,9 +1512,9 @@ async function runAccount(o) {
       await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await sleep(2000);
       // Re-verify: confirm the cookie injection actually recovered the session.
-      const cookieAuthed = await page.evaluate(() =>
+      const cookieAuthed = await withTimeout(page.evaluate(() =>
         !/login|checkpoint/.test(location.href) && !/continue as|use another profile/i.test(document.body.innerText || '')
-      ).catch(() => false);
+      ), 8000, false).catch(() => false);
       const hasCUser = cookieAuthed && (await withTimeout(page.cookies(), 8000, [])).some((c) => c.name === 'c_user' && c.value);
       if (cookieAuthed && hasCUser) {
         log(`🔄 [${name}] session recovered with saved cookies`);
@@ -1813,7 +1816,7 @@ async function runAccount(o) {
             await focusEditable(page);
             await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
             await page.keyboard.press('Backspace'); await sleep(150);
-            await humanType(page, post.caption);
+            await humanType(page, post.caption, settings);
             captionState = await waitForCaptionState(page, post.caption, 2500);
             // Only RE-TYPE if nothing landed (editor still empty). If text IS present but our
             // readability check can't match it (common — FB hides the editor's text), accept it
@@ -1823,7 +1826,7 @@ async function runAccount(o) {
               await focusEditable(page);
               await page.keyboard.down('Control'); await page.keyboard.press('a'); await page.keyboard.up('Control');
               await page.keyboard.press('Backspace'); await sleep(150);
-              await humanType(page, post.caption);
+              await humanType(page, post.caption, settings);
               captionState = await waitForCaptionState(page, post.caption, 2500);
             }
           }
@@ -1840,7 +1843,7 @@ async function runAccount(o) {
         // Variable human "re-read before posting" pause (2-8s), not a fixed 1.5s on every post.
         await sleepInterruptible(rangeMs(settings, 'prePublishDwellSecMin', 'prePublishDwellSecMax', 3, 8, 2), shouldStop, 500); // T1: randomized "re-read before posting"
         step('Waiting for Post button to enable');
-        const dialogCountBefore = await page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length).catch(() => 1);
+        const dialogCountBefore = await withTimeout(page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length), 8000, 1).catch(() => 1);
         // Log what the Post-button scan sees (dialogs open, found label) — mirrors original's "🔍 Dialogs: N".
         const postBtnInfo = await page.evaluate((labels) => {
           const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -2057,7 +2060,10 @@ async function runAccount(o) {
           let cres = 'failed';
           for (let cAttempt = 1; cAttempt <= 3 && (cres === 'failed' || cres === 'notfound') && !shouldStop() && !aborted && browser && browser.isConnected(); cAttempt++) {
             if (cAttempt > 1) {
-              const gap = Math.max(2500, Math.round(Math.min(lo, hi) * 1000 * 0.25)); // ~25% of the min delay
+              // ~25% of the min comment delay, floored at 2.5s normally but only 0.3s when the operator
+              // chose fast (humanize off or speedMode fast) — so fast settings apply to retries too.
+              const _fast = settings.humanizeMaster === false || settings.speedMode === 'fast';
+              const gap = Math.max(_fast ? 300 : 2500, Math.round(Math.min(lo, hi) * 1000 * 0.25));
               step(`Comment: retry ${cAttempt}/3 (waiting ${Math.round(gap / 1000)}s — keeping the human cadence)`);
               await sleepInterruptible(gap, shouldStop);
             }

@@ -26,9 +26,14 @@ const rand = (min, max) => { let lo = Math.max(0, Math.floor(Number(min) || 0)),
 // Random ms drawn from a settings min/max range (in the given unit ms-per-unit; floor keeps it safe).
 const rangeMs = (settings, minKey, maxKey, defMin, defMax, unitMs = 1000, floorUnit = 0) => {
   settings = settings || {};
-  const lo = Number.isFinite(settings[minKey]) ? settings[minKey] : defMin;
-  const hi = Number.isFinite(settings[maxKey]) ? settings[maxKey] : defMax;
-  return rand(Math.max(floorUnit, Math.min(lo, hi)) * unitMs, Math.max(floorUnit, Math.max(lo, hi)) * unitMs);
+  const hasLo = Number.isFinite(settings[minKey]);
+  const hasHi = Number.isFinite(settings[maxKey]);
+  const lo = hasLo ? settings[minKey] : defMin;
+  const hi = hasHi ? settings[maxKey] : defMax;
+  // Honor an EXPLICIT operator value (collapse the safety floor to a near-zero unit so a deliberately-fast
+  // setting actually applies); the larger safety floor only guards the built-in DEFAULTS. Mirrors worker.js.
+  const eff = (hasLo || hasHi) ? 0 : floorUnit;
+  return rand(Math.max(eff, Math.min(lo, hi)) * unitMs, Math.max(eff, Math.max(lo, hi)) * unitMs);
 };
 
 let axios; try { axios = require('axios'); } catch {}
@@ -195,6 +200,8 @@ class Orchestrator {
   async start(getData) {
     if (this.running) return { success: false, error: 'Automation already running' };
     this._stop = false; this._paused = false; this._finish = false; this.running = true;
+    this._modLoop = false; // reset so a quick Stop→Start re-arms the concurrent moderator loop (a still-draining prior loop must not block the new one)
+    this._approving = false; // never start a run with a stuck approval guard
     this._aborters.clear();
     this._progress = { running: true, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0, offline: false };
     this._runStartedAt = Date.now();
@@ -383,12 +390,16 @@ class Orchestrator {
                   ms.held.push({ ...h, status: 'held', permalink: null, heldAt: Date.now(), approvedAt: null, commentedAt: null });
                 }
               }
-              store.saveModeration(ms);
-              this.log(`📥 [${account.name}] ${r.heldRecords.length} post(s) held in "Spam potentiel" — queued for moderator approval (then the comment is added once they're public)`);
-              // EVENT TRIGGER: don't wait up to ~2 min for the periodic loop — kick an approval pass NOW.
-              // Fire-and-forget + guarded so it can't overlap the periodic loop / end-of-cycle sweep.
-              this._kickApproval(data);
-            } catch (e) { this.log(`⚠️ could not persist held-post state: ${e.message}`); }
+              if (store.saveModeration(ms)) {
+                this.log(`📥 [${account.name}] ${r.heldRecords.length} post(s) held in "Spam potentiel" — queued for moderator approval (then the comment is added once they're public)`);
+                // EVENT TRIGGER: don't wait for the periodic loop — kick an approval pass NOW (guarded).
+                this._kickApproval(data);
+              } else {
+                // saveModeration returned false → the post is already counted dealt but its held record is
+                // NOT on disk; warn LOUDLY so it isn't silently lost (don't pretend it's queued).
+                this.log(`🛑 [${account.name}] could NOT persist ${r.heldRecords.length} held-post record(s) (disk full/locked?) — they risk staying held in "Spam potentiel" uncommented. Check disk/permissions.`);
+              }
+            } catch (e) { this.log(`🛑 [${account.name}] could not persist held-post state: ${e.message} — held post(s) at risk of being uncommented`); }
           } else if (r && r.heldRecords && r.heldRecords.length) {
             // Posts are held in spam but moderator approval is OFF — a held post is not public, so NO
             // account can comment on it. Tell the operator the only fix (enable approval).
@@ -406,9 +417,9 @@ class Orchestrator {
                   cs.pending.push({ ...c, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null }); added++;
                 }
               }
-              store.saveComments(cs);
-              if (added) this.log(`📌 [${account.name}] ${added} post(s) live but uncommented — queued for comment-rescue by a healthy account`);
-            } catch (e) { this.log(`⚠️ could not persist comment-rescue queue: ${e.message}`); }
+              if (added && store.saveComments(cs)) this.log(`📌 [${account.name}] ${added} post(s) live but uncommented — queued for comment-rescue by a healthy account`);
+              else if (added) this.log(`🛑 [${account.name}] could NOT persist ${added} orphaned-comment record(s) (disk full/locked?) — those posts risk staying without their link. Check disk/permissions.`);
+            } catch (e) { this.log(`🛑 [${account.name}] could not persist comment-rescue queue: ${e.message} — orphaned comment(s) at risk`); }
           }
           // Persist flag to account status so the UI shows it (serialized via store.update).
           if (r && r.flag) {
@@ -478,6 +489,17 @@ class Orchestrator {
   async _runModeratorApproval(data, shouldStop) {
     shouldStop = shouldStop || (() => false);
     const settings = data.settings || {};
+    // Lifecycle hygiene FIRST so the queue can't wedge/grow forever: expire held posts we've never been
+    // able to approve (FB removed/auto-approved them, or they're unmatchable) so the concurrent loop stops
+    // relaunching a browser for them every cycle; and prune old approved records so the file stays small.
+    try {
+      const ms0 = store.loadModeration(); const now0 = Date.now(); let changed0 = false;
+      const STALE = 30 * 60 * 1000, PRUNE = 24 * 3600 * 1000;
+      let before = (ms0.held || []).length;
+      for (const h of (ms0.held || [])) { if (h.status === 'held' && h.heldAt && (now0 - h.heldAt) > STALE) { h.status = 'failed'; h.note = 'not approvable within 30min (removed/auto-approved/unmatchable)'; changed0 = true; } }
+      ms0.held = (ms0.held || []).filter((h) => h.status === 'held' || ((h.approvedAt || h.heldAt || 0) > now0 - PRUNE));
+      if (changed0 || ms0.held.length !== before) store.saveModeration(ms0);
+    } catch {}
     const heldNow = (store.loadModeration().held || []).filter((h) => h.status === 'held');
     const moderators = (data.accounts || []).filter((a) => a.isModerator);
     if (!heldNow.length) { return { held: 0, moderators: moderators.length }; } // quiet — callers decide whether to announce
@@ -521,16 +543,23 @@ class Orchestrator {
   _handoffApprovedToComments(approvedRecords) {
     const recs = (approvedRecords || []).filter((h) => h && h.gid);
     if (!recs.length) return 0;
-    const same = (x, h) => x.gid === h.gid && ((h.captionSnip && x.captionSnip) ? x.captionSnip === h.captionSnip : (!!x.postId && !!h.postId && x.postId === h.postId));
+    // A record with NEITHER a captionSnip NOR a postId can't be deduped (every same() check would be
+    // false → repeated double-comments + a held record that never marks approved). Drop those up front.
+    const safe = recs.filter((h) => (h.captionSnip && String(h.captionSnip).trim()) || h.postId);
+    const same = (x, h) => x.gid === h.gid && (
+      (h.captionSnip && x.captionSnip) ? x.captionSnip === h.captionSnip
+      : (!!x.postId && !!h.postId) ? x.postId === h.postId
+      : (!!(h.postPermalink || h.permalink) && !!(x.postPermalink || x.permalink)) ? (h.postPermalink || h.permalink) === (x.postPermalink || x.permalink)
+      : false);
     try {
       const ms = store.loadModeration(); let changed = false;
-      for (const h of recs) { const rec = (ms.held || []).find((x) => x.status === 'held' && same(x, h)); if (rec) { rec.status = 'approved'; rec.approvedAt = Date.now(); changed = true; } }
+      for (const h of safe) { const rec = (ms.held || []).find((x) => x.status === 'held' && same(x, h)); if (rec) { rec.status = 'approved'; rec.approvedAt = Date.now(); changed = true; } }
       if (changed) store.saveModeration(ms);
     } catch (e) { this.log(`⚠️ could not mark approved held record(s): ${e.message}`); }
     let added = 0;
     try {
       const cs = store.loadComments();
-      for (const h of recs) {
+      for (const h of safe) {
         if (!(h.comment && String(h.comment).trim())) continue; // nothing to comment (caption-only post) — skip
         if (cs.pending.some((x) => x.status !== 'done' && same(x, h))) continue; // already queued (orphan or earlier approve) — no double-comment
         cs.pending.push({ gid: h.gid, postId: h.postId || null, posterAccount: h.posterAccount || null, groupName: h.groupName || null, captionSnip: h.captionSnip || null, postCaption: h.postCaption || h.captionSnip || null, comment: h.comment, commentImg: h.commentImg || null, postPermalink: h.permalink || h.postPermalink || null, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null, source: 'approved' });
@@ -981,7 +1010,19 @@ class Orchestrator {
                   if (rec) {
                     rec.attempts = (rec.attempts || 0) + 1;
                     if (outcome === 'done') { rec.status = 'done'; rec.commentedAt = Date.now(); }
-                    else if (outcome === 'notfound') { rec.status = 'held_suspected'; rec.note = 'not in public feed on rescue — may be held in Spam potentiel'; }
+                    else if (outcome === 'notfound') {
+                      // Live-but-not-in-public-feed → actually HELD in Spam potentiel. RE-HOME it into the
+                      // moderator queue (so the moderator approves it → the comment is re-queued), and close
+                      // this comment record so it can never sit in a status no phase ever reads.
+                      rec.status = 'rehomed'; rec.note = 're-homed to moderator approval (held in Spam potentiel)';
+                      if (task.captionSnip || task.postId) {
+                        try {
+                          const ms = store.loadModeration();
+                          const dup = (ms.held || []).some((x) => x.gid === task.gid && ((task.captionSnip && x.captionSnip) ? x.captionSnip === task.captionSnip : (!!x.postId && !!task.postId && x.postId === task.postId)) && (x.status === 'held' || x.status === 'approved'));
+                          if (!dup) { ms.held.push({ postId: task.postId || null, gid: task.gid, posterAccount: task.posterAccount || null, fbDisplayName: '', captionSnip: task.captionSnip || '', postCaption: task.postCaption || null, groupName: task.groupName || null, comment: task.comment || '', commentImg: task.commentImg || null, postPermalink: task.postPermalink || null, status: 'held', heldAt: Date.now(), approvedAt: null, source: 'rescue_notfound' }); store.saveModeration(ms); this.log(`🔁 [${task.groupName || task.gid}] orphaned comment looks HELD — re-homed to moderator approval`); }
+                        } catch {}
+                      }
+                    }
                     else if (rec.attempts >= 3) { rec.status = 'failed'; }
                   }
                   store.saveComments(d2);
@@ -992,8 +1033,8 @@ class Orchestrator {
                 if (this._shouldStop()) break;
                 await runRescue({ account, tasks, settings, hidden, log: (m) => this.log(m), shouldStop: () => this._shouldStop(), onResult: markResult });
               }
-              // Prune resolved records so the queue file doesn't grow unbounded.
-              try { const d3 = store.loadComments(); d3.pending = (d3.pending || []).filter((c) => c.status === 'pending' || c.status === 'held_suspected'); store.saveComments(d3); } catch {}
+              // Prune resolved records (done/failed/rehomed) so the queue keeps only retryable 'pending'.
+              try { const d3 = store.loadComments(); d3.pending = (d3.pending || []).filter((c) => c.status === 'pending'); store.saveComments(d3); } catch {}
             }
           }
         } catch (e) { this.log(`⚠️ comment-rescue phase error: ${e.message}`); }

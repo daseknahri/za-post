@@ -68,9 +68,12 @@ async function runModerator(o) {
 
     for (const gid of targetGids) {
       if (shouldStop()) break;
-      const capSnips = heldByGid[gid].map((h) => norm(h.captionSnip)).filter(Boolean); // worker already gated length≥12
+      // ENFORCE length ≥12 here (not all sources gate it — the comment_notfound held path can carry a
+      // short snippet). A short snippet would substring-match a STRANGER's pending post and wrong-approve
+      // it, so anything under 12 chars is dropped: we never approve on a weak/ambiguous caption key.
+      const capSnips = heldByGid[gid].map((h) => norm(h.captionSnip)).filter((s) => s && s.length >= 12);
       const gname = groupName(gid);
-      if (!capSnips.length) { log(`🛡️ [moderator] [${gname}] ${heldByGid[gid].length} held record(s) but no usable caption snippet — skipping (cannot match safely)`); out.errors++; continue; }
+      if (!capSnips.length) { log(`🛡️ [moderator] [${gname}] ${heldByGid[gid].length} held record(s) but no caption snippet ≥12 chars — skipping (cannot match safely; would risk approving the wrong post)`); out.errors++; continue; }
       // The held "Spam potentiel" post lives in the group's SPAM queue, NOT pending_posts — and it could be
       // in either, so we DON'T stop at the first queue-looking page. We try each candidate admin queue,
       // scroll to render lazy content, and PICK the URL that actually CONTAINS one of our held captions.
@@ -247,7 +250,8 @@ async function approveCard(page, zpTag) {
     await evalTimed(page, () => {
       const nm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
       const dlg = document.querySelector('[role="dialog"]'); if (!dlg) return;
-      const b = Array.from(dlg.querySelectorAll('[role="button"], button')).find((x) => /\b(publier|approve|approuver|confirmer|confirm|ok|oui|yes)\b/.test(nm((x.getAttribute && x.getAttribute('aria-label')) || x.textContent || '')));
+      const DECLINE = /refus|decline|reject|delete|supprim|remove|spam|signaler|masquer|hide|annuler|cancel/;
+      const b = Array.from(dlg.querySelectorAll('[role="button"], button')).find((x) => { const l = nm((x.getAttribute && x.getAttribute('aria-label')) || x.textContent || ''); return /\b(publier|approve|approuver|confirmer|confirm|oui|yes)\b/.test(l) && !DECLINE.test(l); });
       if (b) b.click();
     }, null, 3000).catch(() => {});
     const gone = await evalTimed(page, (tag) => { const node = document.querySelector(`[data-zp-mod="${tag}"]`); return { gone: !node || !node.isConnected }; }, zpTag, 5000).catch(() => null);
