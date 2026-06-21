@@ -932,7 +932,12 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       }
     }
 
-    if (!boxes.length) { step('Comment: no comment box found — comment not sent'); return 'failed'; }
+    if (!boxes.length) {
+      // The comment box often fails to render because FB threw a comment-side rate-limit / "action
+      // blocked" wall. Detect it so the caller cools the account down instead of retrying into the block.
+      if (await checkRateLimit(page)) { step('Comment: ⛔ Facebook blocked commenting (rate-limit / "You can\'t use this feature right now") — cooling this account down'); return 'blocked'; }
+      step('Comment: no comment box found — comment not sent'); return 'failed';
+    }
     step(`Comment: ${boxes.length} comment box(es) found`);
 
     const target = boxes[0];
@@ -1008,6 +1013,11 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       try { await page.keyboard.press('Enter'); } catch {} // no-op on an already-empty box (FB rejects empty) — can't double-post
       confirmed = await watchEmptied(3000);
     }
+    // A comment-side rate-limit / "You can't use this feature right now" wall (post→link is FB's most
+    // throttled action). Detect it AFTER submit so we COOL THE ACCOUNT DOWN instead of mislabeling a
+    // refused comment as sent and then posting+commenting into more groups (which deepens the block and
+    // gets the account flagged). The comment was NOT delivered when this wall is up.
+    if (await checkRateLimit(page)) { step('Comment: ⛔ Facebook blocked this comment (rate-limit / "You can\'t use this feature right now") — cooling this account down'); return 'blocked'; }
     // C9: landing verification (READ-ONLY) — did our comment text actually appear under the post?
     // We never re-type or re-submit here; this only LABELS the outcome so the operator can tell a
     // confirmed comment from an at-risk one. Outcome: posted / not_visible / unconfirmed.
@@ -2016,6 +2026,15 @@ async function runAccount(o) {
           commentResult = cres;
           if (cres === 'failed') step('Comment: could not place the comment after 3 attempts — left uncommented');
           else if (cres === 'skipped') step('Comment: skipped (could not safely identify our post)');
+          else if (cres === 'blocked') {
+            // FB threw a comment-side rate-limit wall. STOP this account now — posting+commenting into
+            // more groups only deepens the block and risks the account being flagged. Mirrors the
+            // post-side rate-limit handling (flag='rate_limited' → orchestrator applies a cooldown).
+            step('🛑 Comment blocked by Facebook (rate-limit) — stopping this account to cool it down');
+            flag = 'rate_limited'; noRetry = true;
+            report(groupName, gid, 'posted', 'comment rate-limited — account cooled down', commentResult);
+            break;
+          }
         }
         report(groupName, gid, 'posted', '', commentResult);
       } catch (e) {
