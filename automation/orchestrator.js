@@ -731,6 +731,7 @@ class Orchestrator {
     const _st = store.loadRotation();
     this._dealt = new Set(Array.isArray(_st.dealt) ? _st.dealt : []); // post-ids already dealt (unique modes)
     this._zeroProgressCycles = 0; // consecutive cycles that dealt nothing -> stall breaker
+    this._lastOutstanding = null; this._noDrain = 0; // completion engine: detect when drain stops progressing -> undeliverable
     this._proxyWarned = false;    // one-time per-run "proxies off / shared IP" warning
     this._auditWarned = false;    // one-time per-run "audit-log write failed" warning
     this._roundOffset = _st.roundOffset || 0; // rotates account↔post mapping across Loop-campaign recycles
@@ -842,7 +843,9 @@ class Orchestrator {
       // Only FINITE modes (unique/sequence) can "complete"; daily-rotation and post-centric are ongoing
       // (they loop by design), so they're excluded — a pure daily-rotation fleet never declares complete.
       const finiteActive = active.filter((a) => { const o = a.postingOrder || 'post-centric'; return o.includes('unique') || o === 'sequence'; });
-      if (finiteActive.length && finiteActive.reduce((s, a) => s + this._postsForAccount(a, cycle).length, 0) === 0) {
+      // In completion mode we do NOT stop/recycle at "all posts dealt" — we keep cycling to DRAIN the
+      // comment-rescue + moderator-approval queues; the completion check at the cycle's end decides the stop.
+      if (!settings.completionMode && finiteActive.length && finiteActive.reduce((s, a) => s + this._postsForAccount(a, cycle).length, 0) === 0) {
         if (settings.loopCampaign) {
           // Loop campaign: re-distribute the whole library, rotating content across accounts.
           this.log('🔁 All posts distributed — looping (recycling, rotating content across accounts)...');
@@ -1186,6 +1189,33 @@ class Orchestrator {
       }
 
       if (this._shouldStop() || this._finish) break;
+
+      // ── COMPLETION ENGINE ────────────────────────────────────────────────────────────────────────
+      // Finite campaign + completionMode: keep self-healing (reserve takeover, retries, comment rescue,
+      // moderator approval all already ran this cycle) until EVERYTHING is delivered, then auto-stop + report.
+      // Outstanding = posts not yet published + comments queued + posts held. Two phases:
+      //  • POSTING (undealt>0): fall through to the NORMAL guards below so a dead fleet is caught fast by the
+      //    stall-breaker (with its named cause); we only suppress the premature "all dealt → stop" (guarded above).
+      //  • DRAINING (undealt===0): posts are all out, only comments/held remain — loop FAST (≤3min) to place
+      //    them. Stuck items self-resolve (comment retry ×3, held→failed after 30min); backstop stops + reports
+      //    if NOTHING drains for ~12 cycles.
+      if (settings.completionMode) {
+        const out = this._outstandingWork(active); // computed ONCE per cycle
+        if (out.hasFinite) {
+          if (out.total === 0) { this._emitCompletionReport('completed'); break; }
+          if (out.undealt === 0 && (out.pending || out.held)) {
+            if (this._lastOutstanding != null && out.total >= this._lastOutstanding) this._noDrain = (this._noDrain || 0) + 1; else this._noDrain = 0;
+            this._lastOutstanding = out.total;
+            if (this._noDrain >= 12) { this._emitCompletionReport('undeliverable', out); break; }
+            this.log(`⏳ Completion mode: all posts published — placing ${out.pending} comment(s) + approving ${out.held} held post(s)…`);
+            await this._waitWithCountdown(Math.min(rangeMs(settings, 'waitIntervalMin', 'waitIntervalMax', 90, 180, 60000, 1), 180000), 'Completing campaign');
+            if (this._shouldStop() || this._finish) break;
+            continue; // drain phase governs the loop — skip the stall-breaker (which would misread 0 posts as a stall)
+          }
+          this._noDrain = 0; this._lastOutstanding = out.total; // still posting → reset drain tracker, use normal guards/wait below
+        }
+      }
+
       // All-sessions-invalid guard: if a whole cycle published/queued NOTHING and at least one
       // account reported it was logged out, looping again would just relaunch browsers that all
       // bail. Stop with a clear reason instead of spinning forever unattended.
@@ -1328,6 +1358,43 @@ class Orchestrator {
     const fireToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hh, mm, 0, 0);
     if (lastRunDateKey === this._localDayKey(now)) { const t = new Date(fireToday.getTime()); t.setDate(t.getDate() + 1); return t.getTime() - now.getTime(); }
     return Math.max(0, fireToday.getTime() - now.getTime());
+  }
+
+  // Completion engine: how much of a FINITE campaign is still outstanding — posts not yet published
+  // (unique/sequence undealt), link-comments still queued for rescue, and posts still held awaiting a
+  // moderator. total===0 ⇒ everything's delivered. Returns 0 undealt when there are no finite accounts
+  // (daily-rotation/post-centric are ongoing, not a finite campaign).
+  _outstandingWork(active) {
+    const data = this._data || {};
+    const finite = (active || []).filter((a) => { const o = a.postingOrder || 'post-centric'; return o.includes('unique') || o === 'sequence'; });
+    let undealt = 0;
+    if (finite.length) {
+      const seen = new Set();
+      for (const a of finite) for (const p of (data.posts || []).filter((p) => matchesFilter(p, a.postFilter || 'all'))) if (!this._dealt.has(p.id)) seen.add(p.id);
+      undealt = seen.size;
+    }
+    let pending = 0, held = 0;
+    try { pending = (store.loadComments().pending || []).filter((c) => c.status === 'pending' && (c.attempts || 0) < 3).length; } catch {}
+    try { held = (store.loadModeration().held || []).filter((h) => h.status === 'held').length; } catch {}
+    return { undealt, pending, held, total: undealt + pending + held, hasFinite: finite.length > 0 };
+  }
+
+  // Final report when a completion-mode run ends: what got delivered, what's left (if undeliverable), and
+  // which accounts went bad so the operator knows exactly which to replace.
+  _emitCompletionReport(reason, out) {
+    const data = this._data || {};
+    const stats = this._runStats || {};
+    let posted = 0, pending = 0, errors = 0;
+    for (const k of Object.keys(stats)) { posted += stats[k].posted || 0; pending += stats[k].pending || 0; errors += stats[k].errors || 0; }
+    const now = Date.now();
+    const bad = (data.accounts || []).filter((a) => !a.isModerator && (
+      (this._runFlags && this._runFlags[a.name]) || (Number(a.rateLimitedUntil) || 0) > now ||
+      (a.status && a.status !== 'logged_in' && a.status !== 'idle')));
+    if (reason === 'completed') this.log('🎉 Campaign complete — every post published and every comment delivered. Stopping.');
+    else this.log(`🏁 Stopping: ${out ? out.total : '?'} item(s) could not be delivered (${out ? `${out.undealt} unposted, ${out.pending} comments, ${out.held} held` : ''}) — see below.`);
+    this.log(`📊 Delivered this run: ${posted} published, ${pending} pending-approval, ${errors} error(s).`);
+    if (bad.length) this.log(`🔧 Accounts to REPLACE/check (went bad this run): ${bad.map((a) => `${a.alias || a.name}${(Number(a.rateLimitedUntil) || 0) > now ? ' (rate-limited)' : (this._runFlags && this._runFlags[a.name] ? ` (${this._runFlags[a.name]})` : '')}`).join(', ')}`);
+    else this.log('✅ No accounts went bad this run.');
   }
 }
 

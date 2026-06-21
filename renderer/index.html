@@ -711,6 +711,14 @@
               </div>
 
               <div>
+                <label class="flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-completion-mode" class="w-4 h-4 accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">Run to completion, then stop + report</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500">For a one-time push (Unique/Sequence modes): keep self-healing — swap in reserve accounts for ones that go bad, retry, rescue comments, approve held posts — until EVERY post is published and every comment placed, then auto-stop and report what was delivered and which accounts to replace. Ignored for Daily-Rotation (it runs ongoing).</small>
+              </div>
+
+              <div>
                 <label class="checkbox-label flex items-center gap-3 cursor-pointer">
                   <input type="checkbox" id="setting-vary-content" class="w-5 h-5 rounded-md accent-accent" checked>
                   <span class="text-sm font-semibold text-gray-300">Vary captions/comments with {a|b|c} spintax</span>
