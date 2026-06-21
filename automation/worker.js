@@ -393,6 +393,7 @@ function parseProxy(str) {
 // 'permanent' (missing group / no post button) means skip the group. Pure / unit-tested.
 function classifyGroupError(message) {
   const m = String(message || '').toLowerCase();
+  if (/^transient:/.test(m)) return 'transient'; // caller-tagged transient (e.g. a recoverable image-upload failure)
   if (/rate.?limit|temporarily blocked|action blocked|checkpoint|verification|too fast|too often/.test(m)) return 'block';
   if (/target closed|session closed|protocol error|detached|timeout|timed out|econnreset|socket hang up|net::err|navigation failed|cdp/.test(m)) return 'transient';
   return 'permanent';
@@ -596,7 +597,7 @@ async function clickPostButton(page) {
 
 // Confirm the post actually published: the composer dialog closes OR the enabled
 // "Post" button disappears. Returns 'published' or 'timeout'.
-async function waitForPublish(page, dialogCountBefore, timeout = 30000, shouldStop = () => false) {
+async function waitForPublish(page, dialogCountBefore, timeout = 45000, shouldStop = () => false) {
   await sleep(1500); // let the click take effect before the first check (avoid false positive)
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -1207,6 +1208,11 @@ async function runAccount(o) {
     '--disable-background-timer-throttling',
     '--disable-backgrounding-occluded-windows',
     '--disable-renderer-backgrounding',
+    // CRITICAL for posting while the laptop is IN USE: on Windows, native occlusion detection marks a
+    // window "not visible" when the user's apps cover it (or it's parked off-screen) and throttles its
+    // rendering/timers — Facebook then won't process the post. Disabling it (in addition to the flags
+    // above) keeps the hidden/background window rendering at full speed so posting works either way.
+    '--disable-features=CalculateNativeWinOcclusion',
     '--mute-audio',
     // ---- bound the on-disk caches so per-account profiles don't grow forever ----
     '--disk-cache-size=52428800',   // 50 MB
@@ -1292,7 +1298,7 @@ async function runAccount(o) {
     // force the window off-screen. Each CDP step has its OWN try/catch + log so a failure in one
     // (e.g. a CDP attach race) can't silently skip the others — the force-off-screen MUST run when
     // hidden even if focus-emulation throws, or a clamped window would stay visible undiagnosed.
-    let cdpSession = null;
+    let cdpSession = null, hiddenWindowId = null; // H-1: keep the windowId so we can re-park later (H-2)
     try { cdpSession = await page.target().createCDPSession(); }
     catch (e) { log(`⚠️ [${name}] CDP attach failed (${e.message}) — focus/hide setup skipped, window may be visible`); }
     if (cdpSession) {
@@ -1304,6 +1310,7 @@ async function runAccount(o) {
         // are ignored while maximized), then shove it far off the top-left corner.
         try {
           const { windowId } = await cdpSession.send('Browser.getWindowForTarget');
+          hiddenWindowId = windowId; // H-1: cache for the periodic re-park check
           await cdpSession.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
           await cdpSession.send('Browser.setWindowBounds', { windowId, bounds: { left: -32000, top: -32000, width: 1280, height: 900 } });
           const back = await cdpSession.send('Browser.getWindowBounds', { windowId });
@@ -1624,10 +1631,11 @@ async function runAccount(o) {
             onAttempt: (a, n, e) => step(`Image upload attempt ${a}/${n} failed (${e.message})${a < n ? ' — retrying' : ''}`),
           });
           if (!up.ok) {
-            // Retries exhausted. Do NOT click Post — a post without its intended image is silent
-            // data loss. Skip the group; it stays un-dealt and is retried next cycle.
-            step('Image upload failed after retries — skipping group (will retry next cycle)');
-            errors++; report(groupName, gid, 'error', 'image upload failed after retries', ''); continue;
+            // Retries exhausted. Do NOT click Post — a post without its intended image is silent data
+            // loss. Throw a TRANSIENT error so the pre-publish retry gate re-attempts the group THIS
+            // cycle (publishClicked is still false here → re-running is double-post-safe); if it still
+            // fails the catch reports it and the group stays un-dealt for the next cycle.
+            throw new Error('transient: image upload failed after retries');
           }
           step('Image attached');
           await sleepInterruptible(3500, shouldStop);
@@ -1707,8 +1715,25 @@ async function runAccount(o) {
         const clicked = await clickPostButton(page);
         if (!clicked) { step('Post button not found; skipping group'); errors++; report(groupName, gid, 'error', 'post button not found', ''); continue; }
         step('Post button clicked');
-        const publishResult = await waitForPublish(page, dialogCountBefore, 30000, shouldStop);
+        let publishResult = await waitForPublish(page, dialogCountBefore, 45000, shouldStop);
         if (publishResult === 'stopped') { step('Stop requested during publish wait — halting'); break; }
+        if (publishResult === 'timeout') {
+          // E-P5/E-P11: a genuine publish can take 35-40s on a slow connection or a hidden/occluded
+          // window and trip the wait. Do a READ-ONLY feed rescan (NEVER re-click Post — that would
+          // double-post): if OUR caption is already in the feed, the post landed → treat as published.
+          const _landSnip = (post.caption || '').replace(/\s+/g, ' ').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().slice(0, 40);
+          if (_landSnip.length >= 12) {
+            step('Publish wait timed out — rescanning the feed (read-only) to see if it landed anyway…');
+            await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+            await page.waitForSelector('div[role="article"]', { timeout: 20000 }).catch(() => {});
+            const landed = await evalTimed(page, (s) => {
+              const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+              return Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 5)
+                .some((a) => { const b = norm(a.textContent); return b.includes(s) || b.startsWith(s.slice(0, 20)); });
+            }, _landSnip, 8000).catch(() => false);
+            if (landed) { step('Publish confirmed via feed rescan — the post landed (slow publish, not a failure)'); publishResult = 'published'; }
+          }
+        }
         if (publishResult !== 'published') {
           // The post failed — find out WHY so the account can be flagged for the operator.
           // Facebook's spam/rate-limit message appears in the composer right after clicking Post.
@@ -1782,13 +1807,17 @@ async function runAccount(o) {
             const arts = Array.from(document.querySelectorAll('div[role="article"]')).slice(0, 8)
               .filter((a) => !/pinned|épingl|rögzít/.test((a.innerText || '').slice(0, 200).toLowerCase()));
             try { document.querySelectorAll('[data-zp-target]').forEach((e) => e.removeAttribute('data-zp-target')); } catch {}
-            // Caption-match the TOP-3 ONLY (a match further down is an OLD duplicate, never our fresh post).
+            // Caption-match TOP-8, TOPMOST (newest) match wins (E-R7). Right after publishing OUR post
+            // is newest → at the top, so the first match is ours; the wider window only matters when
+            // other users posted in the seconds before this reload and pushed ours to pos 3-7 (without
+            // it those live posts were mislabeled "pending"). An older duplicate, if any, is lower than
+            // our fresh post, so first-match-wins never picks it. Caption stays the gate (no stranger).
             if (s && s.length >= 12) {
-              for (let i = 0; i < Math.min(3, arts.length); i++) {
+              for (let i = 0; i < Math.min(8, arts.length); i++) {
                 const a = arts[i]; const body = norm(a.textContent);
                 if (body.includes(s) || body.startsWith(s.slice(0, 20))) {
                   a.setAttribute('data-zp-target', '1'); // mark so a Node-side hover can target this exact article
-                  return { href: linkOf(a), postId: idOf(a), matched: true };
+                  return { href: linkOf(a), postId: idOf(a), matched: true, pos: i };
                 }
               }
             }
@@ -1910,6 +1939,19 @@ async function runAccount(o) {
         if (d > 0) {
           step(`Wait ${d >= 60000 ? Math.round(d / 60000) + 'min' : Math.round(d / 1000) + 's'} before next group`);
           await sleepInterruptible(d, shouldStop, 1000);
+        }
+        // H-2: over a long run on a laptop in use, a hidden window can drift on-screen (Windows re-clamp
+        // / heavy window activity). Every 3rd group, cheaply check its position and re-park it off-screen
+        // if it drifted. HIDDEN-only and move-only (never touches publish state) → safe, no-op in VISIBLE.
+        if (hidden && cdpSession && hiddenWindowId && i % 3 === 2 && !shouldStop()) {
+          try {
+            const b = await cdpSession.send('Browser.getWindowBounds', { windowId: hiddenWindowId });
+            if (b && b.bounds && (b.bounds.left > -2000 || b.bounds.top > -2000)) {
+              await cdpSession.send('Browser.setWindowBounds', { windowId: hiddenWindowId, bounds: { windowState: 'normal' } });
+              await cdpSession.send('Browser.setWindowBounds', { windowId: hiddenWindowId, bounds: { left: -32000, top: -32000, width: 1280, height: 900 } });
+              log(`🙈 [${name}] hidden window had drifted on-screen — re-parked off-screen`);
+            }
+          } catch {}
         }
       }
     }
