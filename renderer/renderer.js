@@ -1943,6 +1943,66 @@ function loadSettings() {
   document.getElementById('setting-comment-dwell-max').value = appData.settings.commentDwellSecMax !== undefined ? appData.settings.commentDwellSecMax : 4;
 }
 
+// Attach a hover "?" help badge to every Settings label explaining what the control does and how to
+// use it. Data-driven (one place to edit), idempotent, and runs once on load. Matching is by a unique
+// substring of each label's text, in order, skipping labels that already have a badge.
+const SETTINGS_HELP = [
+  ['Parallel', '<b>Parallel Accounts.</b> How many accounts post at the same time. More is faster but heavier, and a stronger shared-IP footprint. Keep it at 1–3 unless each account has its own proxy (Accounts tab).'],
+  ['Wait Between Cycles', '<b>Wait Between Cycles.</b> After an account finishes all its groups, it sleeps a <b>random</b> number of minutes in this range before the next full cycle. A wide gap (e.g. 90–180) looks human; a fixed interval is a spam signal.'],
+  ['Stagger Between Accounts', '<b>Stagger Between Accounts.</b> When several accounts run together, each new one waits a random number of minutes (in this range) before starting — so they never hit Facebook in the same instant.'],
+  ['Posts Per Group', '<b>Posts Per Group.</b> How many posts to publish in each group per cycle. 0 = no limit. Unique posting modes always post exactly 1.'],
+  ['Delay Between Groups', '<b>Delay Between Groups.</b> A <b>random</b> wait (seconds) between posting to one group and the next, within the same account. The engine enforces a 120s floor — going faster is high spam-risk.'],
+  ['Humanized timing', '<b>Humanized timing (master switch).</b> When ON, every pause in the process is a fresh random value so the rhythm is never mechanical. Leave it ON; turn off only for debugging. (The post→comment delay below stays randomized regardless.)'],
+  ['Feed browse before posting', '<b>Feed browse before posting.</b> Seconds the bot scrolls and "reads" the group feed before opening the composer — like a real visitor landing on the page. Set both to 0 to skip browsing.'],
+  ['Re-read before posting', '<b>Re-read before posting.</b> Seconds it pauses after writing the caption, before clicking Post — a human re-reads what they wrote. A random value in this range.'],
+  ['Pause on post before comment', '<b>Pause on post before comment.</b> Seconds it waits on the post page before typing the first comment (a brief human "reading" pause). Separate from the longer anti-spam comment delay below.'],
+  ['Max Cycles', '<b>Max Cycles.</b> Stop automatically after this many full posting cycles. 0 = run indefinitely until you press Stop.'],
+  ['Comment with Post Image', '<b>Comment with Post Image.</b> Also attaches the post\'s image to its first comment. Only affects posts that have a comment configured.'],
+  ['Auto-Delete Posted', '<b>Auto-Delete Posted.</b> Removes a post from the app\'s library once it has posted successfully. Don\'t combine with Loop Campaign (which needs the library to recycle).'],
+  ['Hide Browser', '<b>Hide Browser.</b> Runs the automation browser off-screen (default) — invisible to you, but Facebook still treats it as active so posting works. Turn OFF to watch it run (it opens in the background and won\'t steal focus).'],
+  ['Enable Remote Access', '<b>Remote Access / Dashboard Tunnel.</b> Starts a Cloudflare tunnel so you can monitor and control the app from another device. Takes effect on the next app restart.'],
+  ['Loop Campaign', '<b>Loop Campaign (unique modes).</b> OFF = the campaign ends after each post has been sent once. ON = it recycles forever, re-distributing the library and rotating which account posts which content.'],
+  ['Resume interrupted run', '<b>Resume on startup.</b> If the app closed mid-run (crash or shutdown), it automatically continues the campaign the next time it launches.'],
+  ['Launch app automatically', '<b>Launch on Windows startup.</b> Registers the app as a Windows login item so it opens automatically when you sign in.'],
+  ['First-comment delay min', '<b>First-comment delay (min).</b> The shortest wait, in seconds, before the first comment (usually your link) is added after the post. Posting a link instantly is a top spam trigger — keep this at 60s+.'],
+  ['First-comment delay max', '<b>First-comment delay (max).</b> The longest wait, in seconds, before the first comment. The actual wait is random between min and max each time, so the post→link timing is never predictable.'],
+  ['Daily post cap', '<b>Daily cap per account.</b> Maximum posts per account per day. 0 = no cap. Use a low number (5–10) for new or sensitive accounts to stay under Facebook\'s radar.'],
+  ['Vary captions', '<b>Spintax variation.</b> Resolves {option1|option2|option3} blocks in captions/comments randomly per post, so every group gets slightly different text. The #1 defense against duplicate-content flags.'],
+  ['Vary image per group', '<b>Vary image per group.</b> Applies an invisible per-group pixel tweak so each uploaded image has a unique fingerprint, reducing duplicate-media detection.'],
+  ['Randomize links', '<b>Randomize links.</b> Appends a unique tracking parameter to links in the first comment, so the same URL isn\'t posted identically everywhere (harder to flag as repetitive spam).'],
+  ['Stagger account start', '<b>Stagger account starts.</b> Master toggle for the random gap between accounts beginning a cycle (the range is set in "Stagger Between Accounts" above). Keep it on.'],
+  ['Warm up new accounts', '<b>Warm up new accounts.</b> New accounts browse and scroll the feed for a while before their first post, so they look like real users instead of posting immediately.'],
+  ['Warm-up runs', '<b>Warm-up runs.</b> How many successful runs an account is treated as "new" and warmed up before posting. Only used when "Warm up new accounts" is on.'],
+  ['Rate-limit cool-down', '<b>Rate-limit cool-down.</b> Base hours a rate-limited account rests before being retried. It doubles with each repeat strike (capped at 48h) to back off safely.'],
+];
+
+function injectSettingsHelp() {
+  const form = document.querySelector('.settings-form');
+  if (!form || form.dataset.helpInjected) return;
+  const labels = Array.from(form.querySelectorAll('label'));
+  const makeIcon = (html) => {
+    const w = document.createElement('span'); w.className = 'help';
+    const q = document.createElement('span'); q.className = 'help-q'; q.textContent = '?';
+    q.tabIndex = 0; q.setAttribute('role', 'button'); q.setAttribute('aria-label', 'Help');
+    const tip = document.createElement('span'); tip.className = 'help-tip'; tip.innerHTML = html;
+    w.appendChild(q); w.appendChild(tip);
+    // Decide open-up vs open-down at hover time (the panel scrolls / may be hidden at load): if the
+    // badge is in the lower part of the viewport, flip the tooltip above so it never clips.
+    const setDir = () => { const r = w.getBoundingClientRect(); w.classList.toggle('help-up', r.top > window.innerHeight * 0.55); };
+    w.addEventListener('mouseenter', setDir); q.addEventListener('focus', setDir);
+    return w;
+  };
+  for (const [key, html] of SETTINGS_HELP) {
+    const lab = labels.find((l) => !l.querySelector('.help') && (l.textContent || '').includes(key));
+    if (lab) lab.appendChild(makeIcon(html));
+  }
+  form.dataset.helpInjected = '1';
+}
+if (typeof document !== 'undefined') {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', injectSettingsHelp);
+  else injectSettingsHelp();
+}
+
 async function saveSettings() {
   // Blank/invalid numeric inputs parse to NaN; fall back to sane defaults so a stray
   // NaN can't, e.g., silently disable the inter-group delay and trigger rate-limits.

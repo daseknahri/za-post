@@ -49,6 +49,33 @@
     }
   </script>
   <link rel="stylesheet" href="styles.css">
+  <style>
+    /* Settings help tooltips — a small "?" badge next to each setting; hover/focus to read what it
+       does and how to use it. Text lives in renderer.js (injectSettingsHelp). */
+    .help { position: relative; display: inline-flex; align-items: center; margin-left: 6px; vertical-align: middle; }
+    .help .help-q {
+      width: 16px; height: 16px; border-radius: 9999px; box-sizing: border-box;
+      background: rgba(255, 255, 255, 0.08); color: #cbd5e1; border: 1px solid rgba(255, 255, 255, 0.18);
+      font-size: 11px; font-weight: 700; line-height: 14px; text-align: center;
+      cursor: help; user-select: none; transition: all .12s ease; flex: 0 0 auto;
+    }
+    .help:hover .help-q, .help .help-q:focus-visible { background: #6366f1; color: #fff; border-color: #6366f1; outline: none; }
+    .help .help-tip {
+      position: absolute; top: calc(100% + 8px); left: 0; z-index: 1000;
+      width: 280px; max-width: 78vw;
+      background: #0b1020; color: #e2e8f0;
+      border: 1px solid rgba(99, 102, 241, 0.35); border-radius: 10px;
+      padding: 10px 12px; font-size: 12px; font-weight: 400; line-height: 1.55; text-align: left;
+      white-space: normal; box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+      opacity: 0; visibility: hidden; transform: translateY(-4px);
+      transition: opacity .12s ease, transform .12s ease; pointer-events: none;
+    }
+    .help .help-tip b { color: #a5b4fc; font-weight: 700; }
+    .help:hover .help-tip, .help:focus-within .help-tip { opacity: 1; visibility: visible; transform: translateY(0); }
+    /* Flip above when near the bottom of the panel (JS adds .help-up). */
+    .help.help-up .help-tip { top: auto; bottom: calc(100% + 8px); transform: translateY(4px); }
+    .help.help-up:hover .help-tip, .help.help-up:focus-within .help-tip { transform: translateY(0); }
+  </style>
 </head>
 
 <body class="bg-dark-900 text-gray-200 font-sans antialiased overflow-hidden h-screen">

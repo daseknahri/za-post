@@ -814,10 +814,14 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       }
     }
 
-    // FALLBACK: feed-scan — ONLY when there's no usable permalink. Requires a caption match AND top-3
-    // recency so we never comment on the wrong (older) post after the anti-spam wait pushed ours down.
-    if (!boxes.length && (!permalink || permalinkFailed)) {
-      step('Comment: locating the post in the group feed (fallback)');
+    // FALLBACK: feed-scan. Runs whenever the permalink path didn't yield a comment box — INCLUDING the
+    // case where the post's OWN page loaded but exposed no inline box (observed live on some groups),
+    // not only when navigation failed. Wrong-post-safe: it comments ONLY after a caption match in the
+    // TOP-3 most-recent posts, and skips entirely if it can't confidently match (never guesses).
+    if (!boxes.length) {
+      step(permalink && !permalinkFailed
+        ? 'Comment: post page had no usable comment box — falling back to the group feed (top-3 + caption match)'
+        : 'Comment: locating the post in the group feed (fallback)');
       await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
       await page.waitForSelector('div[role="article"], [aria-label*="omment"], [aria-label*="ommentaire"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
       await waitInteractive(10000);
