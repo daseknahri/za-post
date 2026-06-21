@@ -39,6 +39,25 @@ test('_outstandingWork: undealt finite posts + pending comments + held posts', (
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+test('_outstandingWork: failed_held (undeliverable-after-repost) is reported but does NOT block completion', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zpost-fh-'));
+  store.init(tmp);
+  const orch = new Orchestrator(() => {}, {});
+  orch._data = { posts: [{ id: 'p1' }], settings: {}, accounts: [] };
+  orch._dealt = new Set(['p1']); // the post is published
+  const acct = { name: 'a1', assignedGroups: ['g1'], postingOrder: 'post-centric-unique', postFilter: 'all' };
+  // one still-held, one failed_held (capped after re-post), one resolved-superseded
+  store.saveModeration({ held: [
+    { postId: 'p1', gid: 'g1', status: 'held' },
+    { postId: 'p1', gid: 'g2', status: 'failed_held' },
+    { postId: 'p1', gid: 'g3', status: 'superseded' },
+  ] });
+  const out = orch._outstandingWork([acct]);
+  assert.equal(out.held, 1, 'only the still-held one counts as held/outstanding');
+  assert.equal(out.failedHeld, 1, 'failed_held surfaced separately');
+  assert.equal(out.total, 1, 'failed_held + superseded are NOT in total → they cannot block completion');
+});
+
 test('_outstandingWork: a non-finite fleet (daily-rotation/post-centric) reports no finite campaign', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zpost-comp2-'));
   store.init(tmp);

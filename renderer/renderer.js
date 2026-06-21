@@ -2204,6 +2204,7 @@ function loadSettings() {
   { const el = document.getElementById('setting-schedule-mode'); if (el) el.value = appData.settings.scheduleMode === 'daily' ? 'daily' : 'continuous'; }
   { const el = document.getElementById('setting-daily-post-time'); if (el) el.value = appData.settings.dailyPostTime || '09:00'; }
   { const el = document.getElementById('setting-completion-mode'); if (el) el.checked = appData.settings.completionMode === true; }
+  { const el = document.getElementById('setting-repost-enabled'); if (el) el.checked = appData.settings.repostEnabled === true; }
   document.getElementById('setting-vary-content').checked = appData.settings.varyContent !== false;
   document.getElementById('setting-vary-images').checked = appData.settings.varyImages !== false;
   document.getElementById('setting-randomize-links').checked = appData.settings.randomizeLinks !== false;
@@ -2370,6 +2371,7 @@ async function saveSettings() {
     scheduleMode: ((document.getElementById('setting-schedule-mode') || {}).value === 'daily') ? 'daily' : 'continuous',
     dailyPostTime: (document.getElementById('setting-daily-post-time') || {}).value || '09:00',
     completionMode: (document.getElementById('setting-completion-mode') || {}).checked || false,
+    repostEnabled: (document.getElementById('setting-repost-enabled') || {}).checked || false,
     varyContent: document.getElementById('setting-vary-content').checked,
     varyImages: document.getElementById('setting-vary-images').checked,
     randomizeLinks: document.getElementById('setting-randomize-links').checked,

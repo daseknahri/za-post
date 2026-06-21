@@ -424,7 +424,10 @@ class Orchestrator {
             try {
               const ms = store.loadModeration();
               for (const h of r.heldRecords) {
-                if (!ms.held.some((x) => x.postId === h.postId && x.gid === h.gid && x.status === 'held')) {
+                // Skip if an ACTIVE or already-HANDLED record exists for this (post,group) — held (awaiting),
+                // superseded (a re-post was dispatched), or failed_held (re-post also held, capped). This stops
+                // a replacement's own hold (or a re-hold of the same post) from spawning a phantom fresh 'held'.
+                if (!ms.held.some((x) => x.postId === h.postId && x.gid === h.gid && (x.status === 'held' || x.status === 'superseded' || x.status === 'failed_held'))) {
                   ms.held.push({ ...h, status: 'held', permalink: null, heldAt: Date.now(), approvedAt: null, commentedAt: null });
                 }
               }
@@ -548,8 +551,8 @@ class Orchestrator {
       const now0 = Date.now(); let changed0 = false;
       const STALE = 30 * 60 * 1000, PRUNE = 24 * 3600 * 1000;
       const before = ms0.held.length;
-      for (const h of ms0.held) { if (h.status === 'held' && h.heldAt && (now0 - h.heldAt) > STALE) { h.status = 'failed'; h.note = 'not approvable within 30min (removed/auto-approved/unmatchable)'; changed0 = true; } }
-      ms0.held = ms0.held.filter((h) => h.status === 'held' || ((h.approvedAt || h.heldAt || 0) > now0 - PRUNE));
+      for (const h of ms0.held) { if (h.status === 'held' && h.heldAt && (now0 - h.heldAt) > STALE) { h.status = 'failed'; h.heldFailedAt = now0; h.note = 'not approvable within 30min (removed/auto-approved/unmatchable)'; changed0 = true; } } // heldFailedAt = repost-grace reference
+      ms0.held = ms0.held.filter((h) => h.status === 'held' || ((h.heldFailedAt || h.approvedAt || h.heldAt || 0) > now0 - PRUNE)); // anchor failed/superseded/failed_held on their failure time so Phase 4 can still see eligible 'failed' records
       if (changed0 || ms0.held.length !== before) store.saveModeration(ms0);
     } catch {}
   }
@@ -892,6 +895,7 @@ class Orchestrator {
 
       cycle++;
       this._claimed = new Set(); // fresh per-cycle claim ledger (released claims free a post for another account)
+      this._jobbedThisCycle = new Set(); // accounts that already ran a browser job this cycle (poster takeover / Phase-4 re-post / Phase-3 rescue) — so no account does 2+ jobs/cycle (anti-spam)
       // Unique modes deal each post once across accounts. When every active account is unique
       // and no un-dealt posts remain, the campaign is complete — stop and reset for the next run.
       // Only FINITE modes (unique/sequence) can "complete"; daily-rotation and post-centric are ongoing
@@ -1126,6 +1130,7 @@ class Orchestrator {
         if (takeovers.length) {
           const tnames = new Set(takeovers.map((a) => a.name));
           this._reserve = (this._reserve || []).filter((a) => !tnames.has(a.name)); // don't also use them for Phase-3 rescue
+          tnames.forEach((n) => this._jobbedThisCycle.add(n)); // promoted reserves did a posting job this cycle → no 2nd job (Phase 3/4)
           this._progress.accountsTotal += takeovers.length; this.emit('automation-progress', { ...this._progress });
           this.log(`🔁 Reserve takeover: ${takeovers.length} healthy reserve account(s) delivering posts a dropped account left undealt — ${takeovers.map((a) => a.alias || a.name).join(', ')}`);
           for (const a of takeovers) queue.push(a);
@@ -1176,6 +1181,77 @@ class Orchestrator {
         finally { this._approving = false; }
       }
 
+      // ── PHASE 4: HELD-POST RE-POST RESCUE (opt-in, settings.repostEnabled) ─────────────────────────
+      // A post FB held in "Spam potentiel" that the moderator could NOT approve (status flipped to 'failed'
+      // by _pruneModeration after the 30-min window) is RE-POSTED by a healthy RESERVE account so the content
+      // reaches the group 100%. runRepost FIRST checks the public feed — if FB auto-released the original it
+      // does NOT re-post (no duplicate) and we re-home the link-comment instead. Capped at ONE replacement per
+      // (post,group); a replacement that's also held → failed_held + reported. Holds the _approving guard so
+      // its moderation-state writes can't race the concurrent moderator loop. No-op when repostEnabled is off.
+      if (settings.repostEnabled && !this._shouldStop() && !this._approving) {
+        this._approving = true;
+        try {
+          const graceMs = (Number.isFinite(settings.repostGraceSec) ? settings.repostGraceSec : 180) * 1000;
+          const candidates = (store.loadModeration().held || []).filter((h) => h && h.status === 'failed' && !(h.repostAttempts > 0) && (Date.now() - (h.heldFailedAt || h.heldAt || 0)) > graceMs);
+          if (candidates.length) {
+            const { runRepost } = require('./repost');
+            const inGroup = (a, gid) => (data.groups || []).some((g) => (g.groupId || g.id) === gid && (a.assignedGroups || []).some((x) => x === g.id || x === g.groupId));
+            const cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
+            for (const rec of candidates) {
+              if (this._shouldStop()) break;
+              const grpObj = (data.groups || []).find((g) => (g.groupId || g.id) === rec.gid);
+              const post = (data.posts || []).find((p) => p.id === rec.postId);
+              if (!grpObj || !post) { this.log(`♻️ held re-post: skip "${rec.groupName || rec.gid}" — ${!post ? 'post no longer in the library' : 'group not found'}.`); continue; }
+              const nowR = Date.now();
+              // RESERVES ONLY (never an active poster), and never an account that already ran a job this cycle
+              // (takeover / a prior Phase-4 re-post) — so no account opens a 2nd browser on its profile/cycle.
+              const reserve = (this._reserve || [])
+                .filter((a) => a.enabled !== false && !a.isModerator && a.status === 'logged_in' && (Number(a.rateLimitedUntil) || 0) <= nowR
+                  && a.name !== rec.posterAccount && !this._jobbedThisCycle.has(a.name) && inGroup(a, rec.gid)
+                  && (cap <= 0 || store.dailyUsed(((data.accounts || []).find((x) => x.name === a.name) || a).daily) < cap))
+                .sort((x, y) => (((this._heldCount || {})[x.name]) || 0) - (((this._heldCount || {})[y.name]) || 0))[0]; // prefer the least-held reserve
+              if (!reserve) { this.log(`♻️ held re-post: no idle healthy in-group reserve for "${rec.groupName || rec.gid}" — left undeliverable (raise Reserve Accounts / assign+warm an account in that group).`); continue; }
+              // Re-read under the guard; if it changed (moderator approved it, or another pass took it), skip. Claim it as superseded BEFORE launching.
+              const ms2 = store.loadModeration();
+              const live = (ms2.held || []).find((x) => x.postId === rec.postId && x.gid === rec.gid);
+              if (!live || live.status !== 'failed') continue;
+              live.status = 'superseded'; live.repostedBy = reserve.name; live.repostAt = Date.now();
+              store.saveModeration(ms2);
+              this._jobbedThisCycle.add(reserve.name); // it's now doing a re-post job this cycle
+              this._reserve = (this._reserve || []).filter((a) => a.name !== reserve.name); // don't reuse this account for Phase-3 rescue this cycle
+              this.log(`♻️ [${reserve.name}] re-posting held content to "${rec.groupName || rec.gid}" (original by ${rec.posterAccount} stayed in Spam potentiel)…`);
+              const result = await runRepost({
+                account: reserve, post, gid: rec.gid, groupName: rec.groupName, captionSnip: rec.captionSnip, group: grpObj,
+                settings, useProxies: !!data.useProxies, proxies: data.proxies || [],
+                log: (m) => this.log(m), shouldStop: () => this._shouldStop(),
+                isLoginOpen: this.isLoginOpen, registerAborter: (ab) => this._registerAborter(ab),
+                onResult: (rc) => { try { store.appendReport(rc); } catch {} },
+                isOnline: () => isOnline(), waitIfPaused: () => this._waitWhilePaused(), isPaused: () => this._paused,
+              }).catch((e) => { this.log(`♻️ re-post error: ${e.message}`); return { posted: 0, heldRecords: [], commentQueue: [] }; });
+              if (result && result.alreadyLive) {
+                // FB auto-released the original → re-home the link-comment onto the now-live post (no duplicate).
+                try {
+                  const cs = store.loadComments();
+                  const dup = (cs.pending || []).some((c) => c.gid === rec.gid && ((rec.captionSnip && c.captionSnip === rec.captionSnip) || (rec.postId && c.postId === rec.postId)) && c.status !== 'failed'); // pending/done/rehomed all count as already-covered
+                  if (!dup && (rec.comment || rec.commentImg)) { cs.pending.push({ gid: rec.gid, postId: rec.postId || null, posterAccount: rec.posterAccount || null, fbDisplayName: rec.fbDisplayName || null, groupName: rec.groupName || null, captionSnip: rec.captionSnip || null, postCaption: rec.postCaption || null, comment: rec.comment || '', commentImg: rec.commentImg || null, postPermalink: null, status: 'pending', queuedAt: Date.now(), attempts: 0, source: 'repost_alreadylive' }); store.saveComments(cs); }
+                  this.log(`♻️ "${rec.groupName || rec.gid}" was already live (FB released it) — link-comment queued for rescue; no duplicate post.`);
+                } catch {}
+              } else if (result && (result.posted || 0) >= 1) {
+                this.log(`✅ [${reserve.name}] re-posted the held content LIVE to "${rec.groupName || rec.gid}" — delivered (100%).`);
+                try { const cq = (result.commentQueue || []); if (cq.length) { const cs = store.loadComments(); for (const c of cq) cs.pending.push({ ...c, status: 'pending', queuedAt: Date.now(), attempts: 0 }); store.saveComments(cs); } } catch {}
+              } else {
+                // Replacement also held (or failed) → cap at 1, mark failed_held, surface in the completion report.
+                const ms3 = store.loadModeration();
+                const r3 = (ms3.held || []).find((x) => x.postId === rec.postId && x.gid === rec.gid);
+                if (r3) { r3.status = 'failed_held'; r3.repostAttempts = 1; r3.note = 'replacement re-post was also held / failed — no further attempts (group-level spam gate)'; store.saveModeration(ms3); }
+                this.log(`⚠️ [${reserve.name}] replacement re-post to "${rec.groupName || rec.gid}" did NOT go live → reported undeliverable (2 accounts held = group-level spam gate). Warm/replace accounts for this group.`);
+              }
+            }
+          }
+        } catch (e) { this.log(`⚠️ held re-post phase error: ${e.message}`); }
+        finally { this._approving = false; }
+      }
+
       // ── PHASE 3: COMMENT RESCUE ───────────────────────────────────────────────────────────────────
       // Place orphaned link-comments — posts that went LIVE but couldn't get their comment from their own
       // account (a comment rate-limit, or a transient feed miss) — using a HEALTHY account that is a
@@ -1191,7 +1267,8 @@ class Orchestrator {
             const reserveNames = new Set((this._reserve || []).map((a) => a.name));
             const eligibleFor = (c) => (data.accounts || []).filter((a) =>
               a.enabled !== false && !a.isModerator && a.status === 'logged_in' &&
-              (Number(a.rateLimitedUntil) || 0) <= now && a.name !== c.posterAccount && inGroup(a, c.gid))
+              (Number(a.rateLimitedUntil) || 0) <= now && a.name !== c.posterAccount && inGroup(a, c.gid) &&
+              !(this._jobbedThisCycle && this._jobbedThisCycle.has(a.name))) // not an account that already ran a takeover/re-post job this cycle
               .sort((a, b) => (reserveNames.has(b.name) ? 1 : 0) - (reserveNames.has(a.name) ? 1 : 0)); // reserve first
             const PER_RESCUER = 5; // cap per rescuer per cycle so it doesn't burst-comment links and get itself blocked
             const byAccount = new Map(); const unassigned = [];
@@ -1463,10 +1540,12 @@ class Orchestrator {
     const campaignAgents = (active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan');
     const campaignRemaining = campaignAgents.length ? this._campaignRemaining() : 0;
     undealt += campaignRemaining;
-    let pending = 0, held = 0;
+    let pending = 0, held = 0, failedHeld = 0;
     try { pending = (store.loadComments().pending || []).filter((c) => c.status === 'pending' && (c.attempts || 0) < 3).length; } catch {}
-    try { held = (store.loadModeration().held || []).filter((h) => h.status === 'held').length; } catch {}
-    return { undealt, pending, held, total: undealt + pending + held, hasFinite: finite.length > 0 || campaignAgents.length > 0 };
+    try { const hh = (store.loadModeration().held || []); held = hh.filter((h) => h.status === 'held').length; failedHeld = hh.filter((h) => h.status === 'failed_held').length; } catch {}
+    // failedHeld = undeliverable even after a replacement re-post (capped) — informational, NOT counted in
+    // total (it must not block completion; it's surfaced in the report instead).
+    return { undealt, pending, held, failedHeld, total: undealt + pending + held, hasFinite: finite.length > 0 || campaignAgents.length > 0 };
   }
 
   // Final report when a completion-mode run ends: what got delivered, what's left (if undeliverable), and
@@ -1485,6 +1564,8 @@ class Orchestrator {
     this.log(`📊 Delivered this run: ${posted} published, ${pending} pending-approval, ${errors} error(s).`);
     if (bad.length) this.log(`🔧 Accounts to REPLACE/check (went bad this run): ${bad.map((a) => `${a.alias || a.name}${(Number(a.rateLimitedUntil) || 0) > now ? ' (rate-limited)' : (this._runFlags && this._runFlags[a.name] ? ` (${this._runFlags[a.name]})` : '')}`).join(', ')}`);
     else this.log('✅ No accounts went bad this run.');
+    // Posts that stayed held even after a replacement re-post (group-level spam gate) — the only undelivered gap.
+    try { const fh = (store.loadModeration().held || []).filter((h) => h.status === 'failed_held'); if (fh.length) this.log(`🚧 ${fh.length} (post,group) pair(s) UNDELIVERABLE — held even after a replacement re-post: ${fh.map((h) => h.groupName || h.gid).join(', ')}. Warm/replace accounts for those groups, or post different content there.`); } catch {}
   }
 
   // ── CAMPAIGN PLAN (campaign-plan mode) ───────────────────────────────────────────────────────────

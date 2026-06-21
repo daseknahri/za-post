@@ -87,6 +87,14 @@ test('clampSettings: scheduleMode + dailyPostTime are validated (daily-schedule 
   assert.equal(store.clampSettings({ dailyPostTime: 'garbage' }).dailyPostTime, '09:00', 'invalid → default');
 });
 
+test('clampSettings: held-repost rescue settings (repostEnabled bool, repostGraceSec clamp)', () => {
+  assert.equal(store.clampSettings({ repostEnabled: 1 }).repostEnabled, true);
+  assert.equal(store.clampSettings({ repostEnabled: 0 }).repostEnabled, false);
+  assert.equal(store.clampSettings({ repostGraceSec: 300 }).repostGraceSec, 300);
+  assert.equal(store.clampSettings({ repostGraceSec: -5 }).repostGraceSec, 0, 'floored at 0');
+  assert.equal(store.clampSettings({ repostGraceSec: 999999 }).repostGraceSec, 86400, 'capped at 1 day');
+});
+
 test('moderation: state round-trips, fail-closed defaults, fbDisplayName trimmed (MOD-1)', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zpost-mod-'));
   store.init(tmp);
