@@ -1049,7 +1049,10 @@ class Orchestrator {
           if (res.dealtIds.length) {
             this._perAccountRotation = this._perAccountRotation || {};
             this._perAccountRotation[account.name] = { lastPostId: res.dealtIds[0], lastPostedDate: this._localDayKey() };
-            try { const _r = store.loadRotation(); _r.perAccountRotation = this._perAccountRotation; if (!store.saveRotation(_r)) throw new Error('saveRotation returned false'); }
+            // Write the FULL current in-memory rotation state (not a load-then-patch) so a concurrent
+            // _persistDealt from a unique-mode account in the same pool can't clobber dealt/perAccountRotation
+            // — every writer writes the complete, authoritative in-memory truth.
+            try { if (!store.saveRotation({ dealt: [...this._dealt], roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation, campaignPlan: this._campaignPlan || null })) throw new Error('saveRotation returned false'); }
             catch (e) { this.log(`⚠️ [${account.name}] could not persist its rotation pointer (${e.message}) — it may re-post today's post tomorrow. Free disk space / fix data-folder permissions.`); }
           }
           cyclePostedIds.push(...[]); cycleDealtIds.push(...res.dealtIds); if (res.flag) cycleFlags.push(res.flag);

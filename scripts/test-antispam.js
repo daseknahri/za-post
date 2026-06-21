@@ -41,12 +41,14 @@ const ok = (name, cond, extra) => { if (cond) { passed++; console.log('PASS ' + 
 
   // ---- C) link variation + jitter bounds ----------------------------------
   const worker = require('../automation/worker');
+  // varyLinks now uses utm_content (a param sites/CMS ignore so the article resolves identically) instead
+  // of s=/ref= ('?s=' is WordPress's SEARCH query — recipe blogs are WordPress — so it must NOT be reused).
   const linked = worker.varyLinks('see http://example.com and https://shop.io/p?id=9 now', 'acctX|grp7');
-  const tags = (linked.match(/[?&]s=/g) || []).length;
-  ok('varyLinks tags BOTH urls (s= param, NOT colliding ref=)', tags === 2 && !/ref=/.test(linked), linked);
+  const tags = (linked.match(/[?&]utm_content=/g) || []).length;
+  ok('varyLinks tags BOTH urls with utm_content', tags === 2, linked);
   ok('varyLinks keeps the original domains', linked.includes('http://example.com') && linked.includes('https://shop.io/p?id=9'));
-  ok('varyLinks uses ? for param-less url and & for one with a query', /example\.com\?s=/.test(linked) && /id=9&s=/.test(linked));
-  ok('varyLinks REPLACES an existing ref=/s= instead of doubling', (() => { const r = worker.varyLinks('http://x.io/a?ref=old', 'z'); return /\?s=[a-z0-9]+$/.test(r) && !/ref=/.test(r) && (r.match(/s=/g) || []).length === 1; })());
+  ok('varyLinks uses ? for param-less url and & for one with a query', /example\.com\?utm_content=/.test(linked) && /id=9&utm_content=/.test(linked));
+  ok('varyLinks REPLACES an existing utm_content instead of doubling', (() => { const r = worker.varyLinks('http://x.io/a?utm_content=old', 'z'); return /utm_content=[a-z0-9]+$/.test(r) && (r.match(/utm_content=/g) || []).length === 1; })());
   ok('varyLinks leaves link-free text alone', worker.varyLinks('no links here', 's') === 'no links here');
   let jmin = Infinity, jmax = -Infinity, jneg = false;
   for (let i = 0; i < 2000; i++) { const v = worker.jitter(1000, 0.3); jmin = Math.min(jmin, v); jmax = Math.max(jmax, v); if (v < 0) jneg = true; }
@@ -80,8 +82,10 @@ const ok = (name, cond, extra) => { if (cond) { passed++; console.log('PASS ' + 
       { name: 'okacct', enabled: true, assignedGroups: ['g1'], postingOrder: 'post-centric' },
     ],
     settings: {
-      parallelAccounts: 1, accountDelay: 0, waitInterval: 0, groupDelay: 0, maxCycles: 3,
-      staggerAccounts: false, dailyCap: 2, varyImages: false, varyContent: true,
+      // Use the RANGE keys the loop actually reads (the legacy singular keys are inert) with explicit 0 so
+      // the cycles run back-to-back and the run completes within the test window.
+      parallelAccounts: 1, maxCycles: 3, staggerAccounts: false, dailyCap: 2, varyImages: false, varyContent: true,
+      waitIntervalMin: 0, waitIntervalMax: 0, accountDelayMin: 0, accountDelayMax: 0, groupDelayMin: 0, groupDelayMax: 0,
     },
     proxies: [], useProxies: false,
   });
