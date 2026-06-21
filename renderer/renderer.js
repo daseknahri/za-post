@@ -1311,7 +1311,8 @@ function renderModeratorPanel() {
     return `<div style="display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.06);">
       <span style="min-width:120px; font-size:13px; color:#e5e7eb; font-weight:600;">🛡️ ${escapeHtml(a.alias || a.name)}</span>
       <span style="font-size:12px;">${badge}</span>
-      <a href="#" onclick="loginAccount('${escapeHtml(a.name)}');return false;" style="color:#818cf8; font-size:12px;">log in / re-login</a>
+      <a href="#" onclick="loginAccount('${escapeHtml(a.name)}');return false;" style="color:#818cf8; font-size:12px;">🔐 log in</a>
+      <a href="#" onclick="openImportCookiesModal('${escapeHtml(a.name)}');return false;" style="color:#818cf8; font-size:12px;">🍪 cookies</a>
       <input type="text" value="${escapeHtml(a.fbDisplayName || '')}" placeholder="FB display name (to skip its own posts)" onchange="updateFbDisplayName('${escapeHtml(a.name)}', this.value)" style="flex:1; min-width:140px; padding:6px 8px; background:#1f2937; border:1px solid #374151; border-radius:6px; color:#e5e7eb; font-size:12px;">
       <button onclick="toggleModerator('${escapeHtml(a.name)}', false)" title="Remove as moderator" style="background:none; border:none; color:#f87171; cursor:pointer; font-size:14px;">✕</button>
     </div>`;
@@ -1354,8 +1355,7 @@ async function submitAddModerator() {
   const a = (appData.accounts || []).find((x) => x.name === accountName);
   if (a) { a.isModerator = true; await saveData(); }
   try { renderModeratorPanel(); renderAccounts(); } catch {}
-  showNotification(`🛡️ ${accountName} added as moderator — opening the login window…`, 'success');
-  loginAccount(accountName);
+  showNotification(`🛡️ ${accountName} added as moderator — authenticate it with “🔐 log in” or “🍪 cookies” in its row.`, 'success');
 }
 
 // Edit account name and alias
