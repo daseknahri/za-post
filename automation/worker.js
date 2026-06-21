@@ -1821,7 +1821,7 @@ async function runAccount(o) {
         // fallback. Tolerate "See more" truncation. Poll up to ~12s so a slow render isn't read as "gone".
         let find = null;
         let expectedPostId = null; // OUR post's stable id — the trust anchor for commenting (CT-4)
-        const findDeadline = Date.now() + 22000;
+        const findDeadline = Date.now() + 16000;
         let _renderScrolls = 0;
         do {
           find = await evalTimed(page, (s) => {
@@ -1874,11 +1874,15 @@ async function runAccount(o) {
               if (rh) { find.href = rh; const m = rh.match(/\/(?:posts|permalink)\/(\d+)/); if (m) find.postId = m[1]; }
             }
           }
-          if (find && find.matched && (find.href || find.postId)) break;
+          // A caption match = our post is LIVE in the public feed — that's the confirmation. We do NOT
+          // keep looping for a numeric post-id: FB's current [aria-posinset] DOM rarely exposes one, and
+          // the comment targets our post by caption regardless. (One hover attempt above tries for the
+          // permalink; if it doesn't render, id stays null and the comment uses the caption-matched box.)
+          if (find && find.matched) break;
           // Right after a reload FB renders the top posts as EMPTY [aria-posinset] shells until the page
-          // scrolls (lazy content) — which is why the verify saw empty posts and couldn't confirm LIVE.
-          // Nudge the feed a few times so our post's caption + permalink render, then re-scan.
-          if (_renderScrolls < 5) { try { await page.evaluate((y) => window.scrollBy(0, y), 450 + _renderScrolls * 150); } catch {} _renderScrolls++; }
+          // scrolls (lazy content) — that's why the post can be invisible to the scan. Nudge the feed a
+          // couple of times so our post's caption renders, then re-scan.
+          if (_renderScrolls < 3) { try { await page.evaluate((y) => window.scrollBy(0, y), 500 + _renderScrolls * 200); } catch {} _renderScrolls++; }
           await sleep(1500);
         } while (Date.now() < findDeadline);
 
