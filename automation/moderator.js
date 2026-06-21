@@ -102,42 +102,48 @@ async function runModerator(o) {
       }
       if (!onQueue) { log(`🛡️ [moderator] [${gname}] our held post was NOT found on any known queue URL${fallbackUrl ? ` (last queue-looking: ${fallbackUrl})` : ''} — skipping (tell me the Spam-potentiel page URL from your browser if this persists)`); out.errors++; continue; }
 
-      // Scan held cards. Decide the (author AND caption AND approve-button) match. ONLY a card that passes
-      // the FULL gate is tagged with a unique data-zp-mod="<idx>" so the click pass can re-select that EXACT
-      // card; non-matching cards are never tagged and can never be clicked. capSnipMatched lets us map the
-      // card back to its specific held record (by snippet value — robust even if capSnips was filtered).
+      // CAPTION-ANCHORED scan. The Spam-potentiel queue DOM is obfuscated (cards are <a role="link"> +
+      // nested divs with hashed classes, NOT [aria-posinset]/article, and the approve button is not a
+      // descendant of the posinset shells). So we anchor on OUR caption text: find the tightest element
+      // containing a held caption, then climb ancestors to the smallest one that ALSO contains an approve
+      // button — that ancestor is the card. We tag ONLY that card (data-zp-mod) so the click pass re-selects
+      // it exactly. nearbyBtns reports the button labels we saw (so the approve-label regex can be tuned).
       const scan = await evalTimed(page, (arg) => {
-        const { ours, snips } = arg;
+        const { snips } = arg;
         const nm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-        const APPROVE = /\b(approve|approuver|publ|allow|autoriser|accepter|accept)\b|appro/; // multi-locale approve labels
-        const cards = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 25);
-        const results = []; let tag = 0;
-        for (const c of cards) {
-          const txt = (c.innerText || '').replace(/\s+/g, ' ').trim();
-          if (!txt) continue;
-          const aEl = c.querySelector('a[href*="/user/"], a[href*="/people/"], a[href*="profile.php"], h3 a, h4 a, strong a, span strong');
-          let author = aEl ? aEl.textContent : (txt.split('·')[0] || '');
-          author = nm(author).slice(0, 50);
-          const body = nm(txt);
-          const authorOurs = !!author && ours.includes(author); // strict normalized equality, never substring
-          let capSnipMatched = null;
-          for (const s of snips) { if (s && (body.includes(s) || (s.length >= 28 && body.startsWith(s.slice(0, 28))))) { capSnipMatched = s; break; } } // full-snip contains, or a long (≥28ch) prefix — avoids boilerplate-prefix collisions
-          const capMatch = !!capSnipMatched;
-          const hasApprove = Array.from(c.querySelectorAll('[role="button"], button')).some((b) => APPROVE.test(nm(b.getAttribute('aria-label') || b.textContent)));
-          let zpTag = null;
-          // CAPTION-PRIMARY gate: our 40-char held caption is a unique signal and we only ever act in the
-          // admin's OWN spam queue, so match on caption + an approve button. Author is captured for the log
-          // but NOT required (the poster display-name capture is unreliable). A card is tagged (clickable)
-          // only when caption matches a held snippet AND it has an approve button.
-          if (capMatch && hasApprove) { zpTag = String(tag++); c.setAttribute('data-zp-mod', zpTag); }
-          results.push({ author, authorOurs, capMatch, capSnipMatched, hasApprove, zpTag, snippet: txt.slice(0, 70) });
+        const APPROVE = /\b(approve|approuver|publ|allow|autoriser|accepter|accept|admettre)\b|appro|autoris/; // multi-locale approve labels
+        const isApprove = (b) => APPROVE.test(nm((b.getAttribute && b.getAttribute('aria-label')) || b.textContent || ''));
+        const results = []; let tag = 0; const nearbyBtns = [];
+        const els = Array.from(document.querySelectorAll('div, span, a, li'));
+        for (const snip of snips) {
+          if (!snip || snip.length < 8) continue;
+          // tightest element whose text contains the caption (textContent = cheap, no layout)
+          let textEl = null, best = Infinity;
+          for (const e of els) { const t = nm(e.textContent || ''); if (t && (t.includes(snip) || (snip.length >= 28 && t.includes(snip.slice(0, 28)))) && t.length < best) { textEl = e; best = t.length; } }
+          if (!textEl) continue;
+          // climb to the smallest ancestor that contains an approve button → that's the card
+          let card = null, n = textEl;
+          for (let i = 0; i < 12 && n && n.tagName; i++) {
+            const btns = Array.from(n.querySelectorAll('[role="button"], button, [role="menuitem"], a[role="link"]'));
+            if (btns.length && nearbyBtns.length < 16) btns.slice(0, 16).forEach((b) => { const l = nm((b.getAttribute && b.getAttribute('aria-label')) || b.textContent || ''); if (l && l.length <= 28) nearbyBtns.push(l); });
+            if (btns.some(isApprove)) { card = n; break; }
+            n = n.parentElement;
+          }
+          const snippet = (textEl.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 70);
+          if (card && !card.getAttribute('data-zp-mod')) {
+            const zpTag = String(tag++); card.setAttribute('data-zp-mod', zpTag);
+            const aEl = card.querySelector('a[href*="/user/"], a[href*="/groups/"], h3 a, h4 a, strong');
+            results.push({ author: nm(aEl ? aEl.textContent : '').slice(0, 50), authorOurs: false, capMatch: true, capSnipMatched: snip, hasApprove: true, zpTag, snippet });
+          } else {
+            results.push({ author: '', authorOurs: false, capMatch: true, capSnipMatched: snip, hasApprove: false, zpTag: null, snippet });
+          }
         }
-        return { count: cards.length, results };
-      }, { ours: ourNames, snips: capSnips }, 12000).catch(() => null);
+        return { count: results.length, results, nearbyBtns: [...new Set(nearbyBtns)].slice(0, 16) };
+      }, { snips: capSnips }, 14000).catch(() => null);
 
       if (!scan) { log(`🛡️ [moderator] [${gname}] scan failed (selector/timeout) — dumping nothing; refine selectors`); out.errors++; continue; }
       out.scanned += scan.count;
-      log(`🛡️ [moderator] [${gname}] scanned ${scan.count} card(s)`);
+      log(`🛡️ [moderator] [${gname}] matched ${scan.count} of our caption(s) in the queue; buttons seen near posts: [${(scan.nearbyBtns || []).join(' | ') || 'none'}]`);
       let matchedThisGroup = 0;
       const handledSnips = new Set(); // snippets already acted on this group — never approve/queue one held post twice
       for (let i = 0; i < scan.results.length; i++) {
