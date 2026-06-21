@@ -1332,6 +1332,22 @@ async function runAccount(o) {
     const _pages = await browser.pages();
     for (let i = 1; i < _pages.length; i++) { try { await _pages[i].close(); } catch {} }
     const page = _pages[0] || (await browser.newPage());
+    // ── beforeunload guard ────────────────────────────────────────────────────────────────────────
+    // Facebook attaches a `beforeunload` handler to the post composer while a post is still uploading /
+    // has "unsaved changes". When we then reload the group to verify, or navigate to comment, Chrome
+    // pops its NATIVE "Quitter le site Web ?" dialog and BLOCKS the navigation. Puppeteer never answers
+    // it on its own, so in a VISIBLE browser the run hangs until a human clicks "Quitter". Auto-accept
+    // beforeunload (= "Quitter" → navigation proceeds) and dismiss any other stray native dialog, on the
+    // main page AND on any popup/tab FB opens. THIS is the recurring "I had to click Quitter" hang.
+    const attachDialogGuard = (pg) => {
+      try {
+        pg.on('dialog', async (d) => {
+          try { if (d.type() === 'beforeunload') await d.accept(); else await d.dismiss(); } catch {}
+        });
+      } catch {}
+    };
+    attachDialogGuard(page);
+    try { browser.on('targetcreated', async (t) => { try { if (t.type() === 'page') { const np = await t.page(); if (np) attachDialogGuard(np); } } catch {} }); } catch {}
     // Make Facebook treat the page as FOCUSED + VISIBLE even when the window is off-screen, and
     // force the window off-screen. Each CDP step has its OWN try/catch + log so a failure in one
     // (e.g. a CDP attach race) can't silently skip the others — the force-off-screen MUST run when
