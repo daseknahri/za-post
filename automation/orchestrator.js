@@ -194,6 +194,7 @@ class Orchestrator {
       'post-centric-unique': 'Post-Centric-Unique',
       'random-unique': 'Random-Unique',
       'daily-rotation': 'Daily Rotation (1 new post/day per agent)',
+      'campaign-plan': 'Campaign Plan (each group-set gets the whole library, split across its agents, 1/day)',
     };
     return MAP[order] || order;
   }
@@ -303,6 +304,21 @@ class Orchestrator {
       let pick = list[nextIdx];
       if (list.length > 1 && pick && pick.id === rec.lastPostId) pick = list[(nextIdx + 1) % list.length]; // anti-repeat
       return pick ? [pick] : [];
+    }
+
+    // CAMPAIGN PLAN (per-cluster split): this agent walks ITS pre-assigned slice of the library (computed by
+    // _computeCampaignPlan so its group-set collectively covers the whole library), 1 post/LOCAL-day, in
+    // order, until its slice is done. The slice + daily pacing are tracked exactly like daily-rotation
+    // (perAccountRotation pointer). Returns [] once the agent finished its slice OR already posted today.
+    if (order === 'campaign-plan') {
+      const plan = this._campaignPlan;
+      const listIds = (plan && plan.agentLists && plan.agentLists[account.name]) || [];
+      if (!listIds.length) return [];
+      if (((this._perAccountRotation || {})[account.name] || {}).lastPostedDate === this._localDayKey()) return []; // 1/day
+      const n = this._campaignNextIdx(account.name);
+      if (n.idx >= n.len) return []; // this agent finished its slice (batch done for it)
+      const post = data.posts.find((p) => p.id === listIds[n.idx]);
+      return post ? [post] : [];
     }
 
     if (!unique) {
@@ -717,7 +733,7 @@ class Orchestrator {
   _persistDealt(cycleDealtIds) {
     if (!cycleDealtIds || !cycleDealtIds.length) return true;
     const merged = [...new Set([...this._dealt, ...cycleDealtIds])];
-    if (store.saveRotation({ dealt: merged, roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {} })) {
+    if (store.saveRotation({ dealt: merged, roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null })) {
       this._dealt = new Set(merged);
       return true;
     }
@@ -737,7 +753,8 @@ class Orchestrator {
     this._roundOffset = _st.roundOffset || 0; // rotates account↔post mapping across Loop-campaign recycles
     this._staggerRotation = _st.staggerRotation || 0; // E-N3: rotates account START order each cycle (fairness)
     this._lastDailyRunDate = _st.lastDailyRunDate || null; // 'daily' schedule: local day-key of the last run (same-day-restart dedupe)
-    this._perAccountRotation = (_st.perAccountRotation && typeof _st.perAccountRotation === 'object') ? _st.perAccountRotation : {}; // daily-rotation: per-agent { lastPostId, lastPostedDate }
+    this._perAccountRotation = (_st.perAccountRotation && typeof _st.perAccountRotation === 'object') ? _st.perAccountRotation : {}; // daily-rotation + campaign-plan: per-agent { lastPostId, lastPostedDate }
+    this._campaignPlan = (_st.campaignPlan && typeof _st.campaignPlan === 'object') ? _st.campaignPlan : null; // campaign-plan: { batchId, agentLists{}, clusters[] }
     this._retryCount = {}; // E-N4: per-account consecutive rate-limit retries → stagger decay (in-memory)
     try { this._proxyHealth.load(this._proxyHealthFile()); } catch {} // E-X3: restore proxy health (prunes >1h)
     let cycle = 0;
@@ -813,6 +830,30 @@ class Orchestrator {
       }
       this._active = active;
       this._reserve = reserve;
+      // CAMPAIGN PLAN: (re)compute the per-cluster day-by-day split when there are campaign-plan agents and
+      // either no plan yet OR the library/agent-set changed (batchId mismatch). Recompute preserves each
+      // agent's delivered pointer (perAccountRotation) — only future slots change — so edits don't re-post.
+      {
+        const planAgents = active.filter((a) => (a.postingOrder || '') === 'campaign-plan');
+        if (planAgents.length) {
+          const planPosts = (this._data.posts || []).filter((p) => matchesFilter(p, (planAgents[0].postFilter) || 'all'));
+          const fresh = this._computeCampaignPlan(planPosts, planAgents, this._roundOffset || 0);
+          if (!this._campaignPlan || this._campaignPlan.batchId !== fresh.batchId) {
+            // A CHANGED plan (content/roster edited) → reset the per-agent slice pointers so distribution
+            // restarts cleanly with the new content. An UNCHANGED restart keeps the same batchId → no
+            // recompute → pointers preserved → it resumes mid-campaign. (Edit content between rounds, or
+            // Stop→edit→Start, to avoid re-posting mid-round.)
+            const wasExisting = !!this._campaignPlan;
+            this._campaignPlan = fresh;
+            if (wasExisting) for (const a of planAgents) delete (this._perAccountRotation || (this._perAccountRotation = {}))[a.name];
+            try { const _r = store.loadRotation(); _r.campaignPlan = this._campaignPlan; _r.perAccountRotation = this._perAccountRotation || {}; store.saveRotation(_r); } catch {}
+            const totalDays = Math.max(0, ...fresh.clusters.map((c) => c.days));
+            this.log(`🗓️ Campaign Plan: ${planPosts.length} post(s) split across ${planAgents.length} agent(s) in ${fresh.clusters.length} group-set(s) → ~${totalDays} day(s); each group-set receives the whole library.`);
+          }
+        } else if (this._campaignPlan) {
+          this._campaignPlan = null; // no campaign-plan agents this cycle
+        }
+      }
       // Shared-IP warning (once per run): many accounts from ONE IP is a top coordinated-spam signal.
       if (!this._proxyWarned && active.length > 1) {
         this._proxyWarned = true;
@@ -851,11 +892,11 @@ class Orchestrator {
           this.log('🔁 All posts distributed — looping (recycling, rotating content across accounts)...');
           this._dealt.clear();
           this._roundOffset = (this._roundOffset || 0) + 1;
-          try { store.saveRotation({ dealt: [], roundOffset: this._roundOffset, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {} }); } catch {} // keep the daily + per-agent markers so a same-day restart can't double-run
+          try { store.saveRotation({ dealt: [], roundOffset: this._roundOffset, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null }); } catch {} // keep the daily + per-agent + campaign markers so a same-day restart can't double-run
           // fall through: this cycle now re-deals the full library
         } else {
           this.log('✅ All posts have been distributed — campaign complete.');
-          this._dealt.clear(); try { store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {} }); } catch {}
+          this._dealt.clear(); try { store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null }); } catch {}
           break;
         }
       }
@@ -868,10 +909,22 @@ class Orchestrator {
       // Determine whether any account uses a unique/sequence mode (drives header style).
       const anyUnique = active.some((a) => { const o = a.postingOrder || 'post-centric'; return o.includes('unique') || o === 'sequence'; });
       const anyDaily = active.some((a) => (a.postingOrder || '') === 'daily-rotation');
+      const anyPlan = active.some((a) => (a.postingOrder || '') === 'campaign-plan');
       // Use first active account's mode as the representative label (mixed-mode is rare).
       const cycleOrder = (active[0] && active[0].postingOrder) || 'post-centric';
       const cycleModeLabel = this._modeLabel(cycleOrder);
-      if (anyDaily) {
+      if (anyPlan && this._campaignPlan) {
+        // Campaign Plan: show each group-set's batch length + today's per-agent assignment (truthful).
+        this.log(`🗓️ Campaign Plan — each group-set receives the whole library, split across its agents (1/agent/day):`);
+        for (const c of (this._campaignPlan.clusters || [])) this.log(`   • group-set [${c.groupKey || '(no groups)'}]: ${c.agents.length} agent(s) deliver ${c.totalPosts} post(s) over ${c.days} day(s)`);
+        const tParts = active.filter((a) => (a.postingOrder || '') === 'campaign-plan').map((a) => {
+          const ap = this._postsForAccount(a, cycle, false);
+          if (!ap.length) { const n = this._campaignNextIdx(a.name); return `[${a.name}] → ${n.idx >= n.len ? '✓ slice complete' : 'already posted today'}`; }
+          const idx = this._data.posts.findIndex((p) => p.id === ap[0].id);
+          return `[${a.name}] → Post #${idx + 1}`;
+        });
+        for (let pi = 0; pi < tParts.length; pi += 3) this.log('   ' + tParts.slice(pi, pi + 3).join('   '));
+      } else if (anyDaily) {
         // Daily Rotation: print each agent's next post (truthful — the same selection the run will use).
         this.log(`📅 ${cycleModeLabel}: ${active.length} agent(s) — each posts 1 new post/day to its groups`);
         const dParts = active.map((a) => {
@@ -988,14 +1041,16 @@ class Orchestrator {
         // single pick if it published OR pended). A failure leaves the pointer so it retries the SAME post
         // next day. Strip postedIds so rotation content is never auto-deleted (it recycles). Keep dealtIds
         // for the cycle's progress/stall bookkeeping but do NOT let it pollute the shared dealt-set.
-        if ((account.postingOrder || '') === 'daily-rotation') {
+        if ((account.postingOrder || '') === 'daily-rotation' || (account.postingOrder || '') === 'campaign-plan') {
+          // Both modes track per-agent progress by a daily pointer (perAccountRotation) and own their own
+          // persistence (the shared _persistDealt is skipped below). Advance ONLY on a successful post
+          // (dealtIds = the single pick) so a failure retries the SAME slot next day. Strip postedIds so the
+          // content is never auto-deleted. Keep dealtIds for cycle progress/stall bookkeeping only.
           if (res.dealtIds.length) {
             this._perAccountRotation = this._perAccountRotation || {};
             this._perAccountRotation[account.name] = { lastPostId: res.dealtIds[0], lastPostedDate: this._localDayKey() };
-            // This is the ONLY persist path for a pure daily-rotation fleet (_persistDealt is skipped), so a
-            // silent failure here would make the agent re-post the same content tomorrow — warn loudly.
             try { const _r = store.loadRotation(); _r.perAccountRotation = this._perAccountRotation; if (!store.saveRotation(_r)) throw new Error('saveRotation returned false'); }
-            catch (e) { this.log(`⚠️ [${account.name}] could not persist its daily-rotation pointer (${e.message}) — it may re-post today's post tomorrow. Free disk space / fix data-folder permissions.`); }
+            catch (e) { this.log(`⚠️ [${account.name}] could not persist its rotation pointer (${e.message}) — it may re-post today's post tomorrow. Free disk space / fix data-folder permissions.`); }
           }
           cyclePostedIds.push(...[]); cycleDealtIds.push(...res.dealtIds); if (res.flag) cycleFlags.push(res.flag);
         } else {
@@ -1005,7 +1060,7 @@ class Orchestrator {
         // already-published post. _persistDealt halts the run (sets _stop) on a write failure. SKIP for
         // daily-rotation: it owns its per-agent pointer (persisted above) and must NOT grow the shared
         // dealt-set (which is for finite unique/sequence distribution only).
-        if ((account.postingOrder || '') !== 'daily-rotation' && res.dealtIds.length && !this._persistDealt(res.dealtIds)) { stopPool = true; return; }
+        if ((account.postingOrder || '') !== 'daily-rotation' && (account.postingOrder || '') !== 'campaign-plan' && res.dealtIds.length && !this._persistDealt(res.dealtIds)) { stopPool = true; return; }
         if (res.offline) { sawOffline = true; stopPool = true; } // connection lost mid-flight → drain + hold
       };
 
@@ -1190,16 +1245,30 @@ class Orchestrator {
 
       if (this._shouldStop() || this._finish) break;
 
+      // CAMPAIGN PLAN big-cycle: every group-set has received the WHOLE library (all agents finished their
+      // slices). If Loop Campaign is ON, start a fresh round (rotate who-posts-what; pace from the next day).
+      // If OFF, the completion engine just below drains any last comments/held, then reports + stops.
+      if (this._campaignPlan && settings.loopCampaign && this._campaignAllFinished()) {
+        this._roundOffset = (this._roundOffset || 0) + 1;
+        const planAgents = (this._active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan');
+        for (const a of planAgents) (this._perAccountRotation || (this._perAccountRotation = {}))[a.name] = { lastPostId: null, lastPostedDate: this._localDayKey() }; // reset slice; pace round 2 to next day
+        const planPosts = (this._data.posts || []).filter((p) => matchesFilter(p, (planAgents[0] && planAgents[0].postFilter) || 'all'));
+        this._campaignPlan = this._computeCampaignPlan(planPosts, planAgents, this._roundOffset);
+        try { const _r = store.loadRotation(); _r.campaignPlan = this._campaignPlan; _r.perAccountRotation = this._perAccountRotation; _r.roundOffset = this._roundOffset; store.saveRotation(_r); } catch {}
+        this.log('🔁 Campaign Plan: every group-set received the full library — new round started (reshuffled who posts what); resumes next day.');
+      }
+
       // ── COMPLETION ENGINE ────────────────────────────────────────────────────────────────────────
-      // Finite campaign + completionMode: keep self-healing (reserve takeover, retries, comment rescue,
-      // moderator approval all already ran this cycle) until EVERYTHING is delivered, then auto-stop + report.
-      // Outstanding = posts not yet published + comments queued + posts held. Two phases:
+      // Engages for completionMode OR a finishing campaign-plan (Loop OFF). Keep self-healing (reserve
+      // takeover, retries, comment rescue, moderator approval all ran this cycle) until EVERYTHING is
+      // delivered, then auto-stop + report. Two phases:
       //  • POSTING (undealt>0): fall through to the NORMAL guards below so a dead fleet is caught fast by the
       //    stall-breaker (with its named cause); we only suppress the premature "all dealt → stop" (guarded above).
       //  • DRAINING (undealt===0): posts are all out, only comments/held remain — loop FAST (≤3min) to place
       //    them. Stuck items self-resolve (comment retry ×3, held→failed after 30min); backstop stops + reports
       //    if NOTHING drains for ~12 cycles.
-      if (settings.completionMode) {
+      const _campaignFinishing = !!(this._campaignPlan && !settings.loopCampaign && (this._active || []).some((a) => (a.postingOrder || '') === 'campaign-plan'));
+      if (settings.completionMode || _campaignFinishing) {
         const out = this._outstandingWork(active); // computed ONCE per cycle
         if (out.hasFinite) {
           if (out.total === 0) { this._emitCompletionReport('completed'); break; }
@@ -1256,7 +1325,8 @@ class Orchestrator {
       if (cycleDealtIds.length === 0 && settings.scheduleMode !== 'daily' && (this._active || []).length > 0) {
         const _today = this._localDayKey();
         const _allRotatedToday = (this._active || []).every((a) => {
-          if ((a.postingOrder || '') !== 'daily-rotation') return false;
+          const o = a.postingOrder || '';
+          if (o !== 'daily-rotation' && o !== 'campaign-plan') return false;
           const rec = (this._perAccountRotation || {})[a.name] || {};
           return rec.lastPostedDate === _today;
         });
@@ -1373,10 +1443,14 @@ class Orchestrator {
       for (const a of finite) for (const p of (data.posts || []).filter((p) => matchesFilter(p, a.postFilter || 'all'))) if (!this._dealt.has(p.id)) seen.add(p.id);
       undealt = seen.size;
     }
+    // Campaign-plan posts not yet delivered (tracked by per-agent pointers, not the shared dealt-set).
+    const campaignAgents = (active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan');
+    const campaignRemaining = campaignAgents.length ? this._campaignRemaining() : 0;
+    undealt += campaignRemaining;
     let pending = 0, held = 0;
     try { pending = (store.loadComments().pending || []).filter((c) => c.status === 'pending' && (c.attempts || 0) < 3).length; } catch {}
     try { held = (store.loadModeration().held || []).filter((h) => h.status === 'held').length; } catch {}
-    return { undealt, pending, held, total: undealt + pending + held, hasFinite: finite.length > 0 };
+    return { undealt, pending, held, total: undealt + pending + held, hasFinite: finite.length > 0 || campaignAgents.length > 0 };
   }
 
   // Final report when a completion-mode run ends: what got delivered, what's left (if undeliverable), and
@@ -1395,6 +1469,59 @@ class Orchestrator {
     this.log(`📊 Delivered this run: ${posted} published, ${pending} pending-approval, ${errors} error(s).`);
     if (bad.length) this.log(`🔧 Accounts to REPLACE/check (went bad this run): ${bad.map((a) => `${a.alias || a.name}${(Number(a.rateLimitedUntil) || 0) > now ? ' (rate-limited)' : (this._runFlags && this._runFlags[a.name] ? ` (${this._runFlags[a.name]})` : '')}`).join(', ')}`);
     else this.log('✅ No accounts went bad this run.');
+  }
+
+  // ── CAMPAIGN PLAN (campaign-plan mode) ───────────────────────────────────────────────────────────
+  // Cluster agents by their SHARED group-set, then WITHIN each cluster partition the WHOLE post library
+  // across the cluster's agents (round-robin) — so every group-set receives the entire campaign, split
+  // across its team of agents, 1 post/agent/day. Returns per-agent ordered lists (each agent walks its
+  // own list via the daily pointer) plus a cluster preview. Pure + deterministic (agent order preserved).
+  _computeCampaignPlan(posts, agents, roundOffset = 0) {
+    const sig = (a) => (a.assignedGroups || []).slice().sort().join('|');
+    const clusters = new Map(); // group signature -> [agents] (insertion order = deterministic)
+    for (const a of agents) { const k = sig(a); if (!clusters.has(k)) clusters.set(k, []); clusters.get(k).push(a); }
+    const agentLists = {};
+    const preview = [];
+    for (const [k, cAgents] of clusters) {
+      const K = cAgents.length;
+      // roundOffset rotates WHICH agent in the cluster starts the partition, so a new big-cycle reshuffles.
+      cAgents.forEach((a, j) => {
+        const slot = (j + roundOffset) % K;
+        agentLists[a.name] = posts.filter((_, idx) => idx % K === slot).map((p) => p.id);
+      });
+      const maxLen = Math.max(0, ...cAgents.map((a) => agentLists[a.name].length));
+      const days = [];
+      for (let d = 0; d < maxLen; d++) days.push(cAgents.map((a) => ({ agentName: a.name, postId: agentLists[a.name][d] || null })).filter((s) => s.postId));
+      preview.push({ groupKey: k, agents: cAgents.map((a) => a.name), totalPosts: posts.length, days: days.length, grid: days });
+    }
+    const fp = posts.map((p) => p.id).join(',') + '::' + agents.map((a) => a.name + ':' + sig(a)).join(',');
+    let h = 5381; for (let i = 0; i < fp.length; i++) h = ((h * 33) ^ fp.charCodeAt(i)) >>> 0; // djb2 change-detection hash
+    return { batchId: String(h), planStartDate: this._localDayKey(), roundOffset, agentLists, clusters: preview };
+  }
+
+  // The next index into an agent's campaign list (after its last-delivered post), skipping deleted posts.
+  _campaignNextIdx(name) {
+    const plan = this._campaignPlan; if (!plan || !plan.agentLists) return { idx: 0, len: 0 };
+    const list = plan.agentLists[name] || [];
+    const rec = (this._perAccountRotation || {})[name] || {};
+    let idx = rec.lastPostId ? list.indexOf(rec.lastPostId) + 1 : 0;
+    if (idx < 1) idx = 0;
+    while (idx < list.length && !(this._data.posts || []).some((p) => p.id === list[idx])) idx++; // skip deleted
+    return { idx, len: list.length };
+  }
+
+  // Every active campaign-plan agent has reached the end of its list → the whole library has been
+  // delivered to every group-set (the batch is complete).
+  _campaignAllFinished() {
+    const agents = (this._active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan');
+    if (!agents.length) return false;
+    return agents.every((a) => { const n = this._campaignNextIdx(a.name); return n.idx >= n.len; });
+  }
+
+  // Posts still to deliver across all active campaign-plan agents (for completionMode / outstanding work).
+  _campaignRemaining() {
+    let r = 0; for (const a of (this._active || []).filter((x) => (x.postingOrder || '') === 'campaign-plan')) { const n = this._campaignNextIdx(a.name); r += Math.max(0, n.len - n.idx); }
+    return r;
   }
 }
 

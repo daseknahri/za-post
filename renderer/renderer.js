@@ -1130,6 +1130,7 @@ function renderAccounts() {
             <option value="random-unique" ${account.postingOrder === 'random-unique' ? 'selected' : ''}>🔀🔒 Random (No Repeat Across Accounts)</option>
             <option value="sequence" ${account.postingOrder === 'sequence' ? 'selected' : ''}>📋 Progressive (Sequential)</option>
             <option value="daily-rotation" ${account.postingOrder === 'daily-rotation' ? 'selected' : ''}>📅 Daily Rotation — 1 new post/day, this agent advances on its own</option>
+            <option value="campaign-plan" ${account.postingOrder === 'campaign-plan' ? 'selected' : ''}>🗓️ Campaign Plan — agents sharing groups split the whole library, 1/agent/day</option>
           </select>
         </div>
 
@@ -1260,7 +1261,8 @@ async function updatePostingOrder(accountName, orderValue) {
     'random': 'Random (Shuffle)',
     'random-unique': 'Random (No Repeat Across Accounts)',
     'sequence': 'Progressive (Sequential)',
-    'daily-rotation': 'Daily Rotation (1 new post/day per agent)'
+    'daily-rotation': 'Daily Rotation (1 new post/day per agent)',
+    'campaign-plan': 'Campaign Plan (each group-set gets the whole library, split across its agents)'
   };
   showNotification(`Posting method set to: ${orderLabels[orderValue]}`, 'success');
 }
