@@ -1591,7 +1591,8 @@ function openAddAccountModal() {
 }
 
 async function saveAccount() {
-  if (appData.accounts.length >= appLimits.maxAccounts) {
+  // Moderators are free — only posting accounts count against the seat limit.
+  if (appData.accounts.filter(a => !a.isModerator).length >= appLimits.maxAccounts) {
     showNotification(`License Limit Reached! Max Accounts: ${appLimits.maxAccounts}`, 'error');
     return;
   }

@@ -559,10 +559,12 @@ ipcMain.handle('create-account', (_e, accountName, alias, opts) => {
   const data = getData();
   if (!accountName) return fail('Account name required');
   if (data.accounts.some((a) => a.name === accountName)) return fail('Account already exists');
-  const over = overLimit('accounts', data.accounts.length); if (over) return over; // M1-05 backend enforcement
   // A moderator is born flagged + disabled-as-poster so it can NEVER be selected into the posting pool,
   // even in the brief window before the renderer would set the flag (no race; no one-frame-as-poster).
   const isMod = !!(opts && opts.isModerator);
+  // Licensing: moderators are FREE — only posting accounts count against the per-seat limit. So skip the
+  // check for moderators, and for posters count posters only (a designated moderator must not eat a seat).
+  if (!isMod) { const over = overLimit('accounts', data.accounts.filter((a) => !a.isModerator).length); if (over) return over; }
   data.accounts.push({
     name: accountName, alias: alias || '', status: 'not_logged_in', lastMessage: '',
     assignedGroups: [], postFilter: 'all', postingOrder: 'post-centric-unique',
