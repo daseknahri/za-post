@@ -418,9 +418,10 @@ class Orchestrator {
           // lost. A pending post (admin may reject) also stays (never enters postedIds).
           if (r && (r.posted || 0) > 0) { progressed = true; if (post.id) { if (r.fullyPosted) postedIds.push(post.id); dealtIds.push(post.id); } }
           else if (r && (r.pendingApproval || 0) > 0) { progressed = true; if (post.id) dealtIds.push(post.id); }
-          // MOD: persist held posts (deduped) so the moderator phase can approve them. Gated on the
-          // opt-in flag — when off, this is a no-op and behavior is identical to before.
-          if (data.settings.moderationEnabled && r && r.heldRecords && r.heldRecords.length) {
+          // Persist held posts (deduped) so a consumer can act on them: the MODERATOR approves, the Phase-4
+          // RE-POST replaces, and the COMPLETION engine counts them (so it can't prematurely report success
+          // while a post is held). Gated on those opt-ins — when all are off this is a no-op (behavior as before).
+          if ((data.settings.moderationEnabled || data.settings.repostEnabled || data.settings.completionMode) && r && r.heldRecords && r.heldRecords.length) {
             try {
               const ms = store.loadModeration();
               for (const h of r.heldRecords) {
@@ -746,6 +747,12 @@ class Orchestrator {
   // Returns false — and halts the run — if the write fails: a post that was published but whose
   // dealt-state couldn't be saved would be re-dealt and RE-POSTED after a crash/restart, so we
   // stop loudly rather than let duplicate-post risk compound batch after batch.
+  // Write the FULL current in-memory rotation state (every field) — used by the mid-cycle saves so a
+  // load-then-patch can never drop a sibling field (dealt / staggerRotation / lastDailyRunDate / etc.).
+  _saveRotationState() {
+    try { return store.saveRotation({ dealt: [...(this._dealt || [])], roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null }); } catch { return false; }
+  }
+
   _persistDealt(cycleDealtIds) {
     if (!cycleDealtIds || !cycleDealtIds.length) return true;
     const merged = [...new Set([...this._dealt, ...cycleDealtIds])];
@@ -764,6 +771,7 @@ class Orchestrator {
     this._dealt = new Set(Array.isArray(_st.dealt) ? _st.dealt : []); // post-ids already dealt (unique modes)
     this._zeroProgressCycles = 0; // consecutive cycles that dealt nothing -> stall breaker
     this._lastOutstanding = null; this._noDrain = 0; // completion engine: detect when drain stops progressing -> undeliverable
+    this._drainingCompletion = false; // true while the completion engine is fast-draining queues — bypasses the daily-schedule 24h gate
     this._proxyWarned = false;    // one-time per-run "proxies off / shared IP" warning
     this._auditWarned = false;    // one-time per-run "audit-log write failed" warning
     this._roundOffset = _st.roundOffset || 0; // rotates account↔post mapping across Loop-campaign recycles
@@ -785,7 +793,7 @@ class Orchestrator {
       // per account into its groups; next day the next post" model — pair with sequence mode + Loop). Wait
       // until the fire time; if today's run already happened, wait until tomorrow. Survives a same-day
       // restart via the persisted lastDailyRunDate. continuous mode is unchanged (no gate).
-      if (settings.scheduleMode === 'daily') {
+      if (settings.scheduleMode === 'daily' && !this._drainingCompletion) { // skip the 24h gate while fast-draining the completion queues
         const waitMs = this._msUntilDailyFire(settings.dailyPostTime, this._lastDailyRunDate);
         if (waitMs > 0) {
           this.log(`📅 Daily mode — next run at ${settings.dailyPostTime} (in ~${Math.round(waitMs / 360000) / 10}h).`);
@@ -862,7 +870,7 @@ class Orchestrator {
             const wasExisting = !!this._campaignPlan;
             this._campaignPlan = fresh;
             if (wasExisting) for (const a of planAgents) delete (this._perAccountRotation || (this._perAccountRotation = {}))[a.name];
-            try { const _r = store.loadRotation(); _r.campaignPlan = this._campaignPlan; _r.perAccountRotation = this._perAccountRotation || {}; store.saveRotation(_r); } catch {}
+            this._saveRotationState();
             const totalDays = Math.max(0, ...fresh.clusters.map((c) => c.days));
             this.log(`🗓️ Campaign Plan: ${planPosts.length} post(s) split across ${planAgents.length} agent(s) in ${fresh.clusters.length} group-set(s) → ~${totalDays} day(s); each group-set receives the whole library.`);
           }
@@ -903,7 +911,10 @@ class Orchestrator {
       const finiteActive = active.filter((a) => { const o = a.postingOrder || 'post-centric'; return o.includes('unique') || o === 'sequence'; });
       // In completion mode we do NOT stop/recycle at "all posts dealt" — we keep cycling to DRAIN the
       // comment-rescue + moderator-approval queues; the completion check at the cycle's end decides the stop.
-      if (!settings.completionMode && finiteActive.length && finiteActive.reduce((s, a) => s + this._postsForAccount(a, cycle).length, 0) === 0) {
+      // Also require campaign-plan agents (excluded from finiteActive) to have finished their slices, so a
+      // mixed unique+campaign fleet doesn't stop/recycle (and reset campaign pointers) mid-campaign.
+      const campaignDone = !this._campaignPlan || this._campaignAllFinished();
+      if (!settings.completionMode && finiteActive.length && campaignDone && finiteActive.reduce((s, a) => s + this._postsForAccount(a, cycle).length, 0) === 0) {
         if (settings.loopCampaign) {
           // Loop campaign: re-distribute the whole library, rotating content across accounts.
           this.log('🔁 All posts distributed — looping (recycling, rotating content across accounts)...');
@@ -1107,7 +1118,7 @@ class Orchestrator {
       // and stagger all apply unchanged). Reused reserves are removed from this._reserve so Phase-3 rescue
       // can't double-use them. Continuous/non-unique modes have no dealt-set, so this is a no-op there.
       const _dropFlags = new Set(['rate_limited', 'needs_login', 'needs_verification', 'account_disabled', 'likely_blocked', 'proxy_invalid']);
-      const _uniqueMode = active.some((a) => { const o = a.postingOrder || 'post-centric'; return o.includes('unique') || o === 'sequence'; });
+      const _uniqueMode = active.some((a) => { const o = a.postingOrder || 'post-centric'; return o.includes('unique') || o === 'sequence' || o === 'daily-rotation' || o === 'campaign-plan'; });
       if (!sawOffline && !stopPool && !this._shouldStop() && !this._finish && _uniqueMode && cycleFlags.some((f) => _dropFlags.has(f)) && (this._reserve || []).length) {
         const nowT = Date.now();
         const capT = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
@@ -1143,6 +1154,9 @@ class Orchestrator {
           await Promise.allSettled([...inFlight]);
         } else {
           this._active = active; // no takeover → restore the unmodified active set
+          // A campaign-plan agent's slice is pinned to that agent (a reserve isn't in agentLists), so takeover
+          // can't fill it — surface the gap so the operator adds reserves to the plan / warms accounts.
+          if (active.some((a) => (a.postingOrder || '') === 'campaign-plan')) this.log('⚠️ A campaign-plan agent dropped this cycle and no reserve can deliver its pinned slice — that cluster\'s group(s) miss today\'s post (it resumes when the agent recovers, or add more agents to that group-set).');
         }
       }
 
@@ -1211,14 +1225,19 @@ class Orchestrator {
                   && (cap <= 0 || store.dailyUsed(((data.accounts || []).find((x) => x.name === a.name) || a).daily) < cap))
                 .sort((x, y) => (((this._heldCount || {})[x.name]) || 0) - (((this._heldCount || {})[y.name]) || 0))[0]; // prefer the least-held reserve
               if (!reserve) { this.log(`♻️ held re-post: no idle healthy in-group reserve for "${rec.groupName || rec.gid}" — left undeliverable (raise Reserve Accounts / assign+warm an account in that group).`); continue; }
-              // Re-read under the guard; if it changed (moderator approved it, or another pass took it), skip. Claim it as superseded BEFORE launching.
+              // Re-read under the guard; if it changed (moderator approved it, or another pass took it), skip. Claim it as
+              // superseded BEFORE launching. Disambiguate by captionSnip so a null-postId record can't match the wrong row.
+              const recMatch = (x) => x.postId === rec.postId && x.gid === rec.gid && (!rec.captionSnip || !x.captionSnip || x.captionSnip === rec.captionSnip);
               const ms2 = store.loadModeration();
-              const live = (ms2.held || []).find((x) => x.postId === rec.postId && x.gid === rec.gid);
+              const live = (ms2.held || []).find(recMatch);
               if (!live || live.status !== 'failed') continue;
               live.status = 'superseded'; live.repostedBy = reserve.name; live.repostAt = Date.now();
-              store.saveModeration(ms2);
+              if (!store.saveModeration(ms2)) { this.log(`⚠️ couldn't claim the held record for "${rec.groupName || rec.gid}" (disk full/locked?) — skipping this cycle to avoid double-dispatch.`); continue; }
               this._jobbedThisCycle.add(reserve.name); // it's now doing a re-post job this cycle
               this._reserve = (this._reserve || []).filter((a) => a.name !== reserve.name); // don't reuse this account for Phase-3 rescue this cycle
+              // On a resolved re-post, advance the record OFF 'superseded' to terminal 'approved' so the Phase-1 dedup
+              // (which blocks held/superseded/failed_held) doesn't permanently block a FUTURE re-hold of the same post.
+              const markResolved = () => { try { const msR = store.loadModeration(); const rR = (msR.held || []).find(recMatch); if (rR && rR.status === 'superseded') { rR.status = 'approved'; rR.approvedAt = Date.now(); store.saveModeration(msR); } } catch {} };
               this.log(`♻️ [${reserve.name}] re-posting held content to "${rec.groupName || rec.gid}" (original by ${rec.posterAccount} stayed in Spam potentiel)…`);
               const result = await runRepost({
                 account: reserve, post, gid: rec.gid, groupName: rec.groupName, captionSnip: rec.captionSnip, group: grpObj,
@@ -1236,16 +1255,20 @@ class Orchestrator {
                   if (!dup && (rec.comment || rec.commentImg)) { cs.pending.push({ gid: rec.gid, postId: rec.postId || null, posterAccount: rec.posterAccount || null, fbDisplayName: rec.fbDisplayName || null, groupName: rec.groupName || null, captionSnip: rec.captionSnip || null, postCaption: rec.postCaption || null, comment: rec.comment || '', commentImg: rec.commentImg || null, postPermalink: null, status: 'pending', queuedAt: Date.now(), attempts: 0, source: 'repost_alreadylive' }); store.saveComments(cs); }
                   this.log(`♻️ "${rec.groupName || rec.gid}" was already live (FB released it) — link-comment queued for rescue; no duplicate post.`);
                 } catch {}
+                markResolved();
               } else if (result && (result.posted || 0) >= 1) {
                 this.log(`✅ [${reserve.name}] re-posted the held content LIVE to "${rec.groupName || rec.gid}" — delivered (100%).`);
                 try { const cq = (result.commentQueue || []); if (cq.length) { const cs = store.loadComments(); for (const c of cq) cs.pending.push({ ...c, status: 'pending', queuedAt: Date.now(), attempts: 0 }); store.saveComments(cs); } } catch {}
+                markResolved();
               } else {
                 // Replacement also held (or failed) → cap at 1, mark failed_held, surface in the completion report.
                 const ms3 = store.loadModeration();
-                const r3 = (ms3.held || []).find((x) => x.postId === rec.postId && x.gid === rec.gid);
+                const r3 = (ms3.held || []).find(recMatch);
                 if (r3) { r3.status = 'failed_held'; r3.repostAttempts = 1; r3.note = 'replacement re-post was also held / failed — no further attempts (group-level spam gate)'; store.saveModeration(ms3); }
                 this.log(`⚠️ [${reserve.name}] replacement re-post to "${rec.groupName || rec.gid}" did NOT go live → reported undeliverable (2 accounts held = group-level spam gate). Warm/replace accounts for this group.`);
               }
+              // Space consecutive re-posts so a batch of held records doesn't fan out as a coordinated burst.
+              if (!this._shouldStop()) await this._interruptibleSleep(30000 + Math.floor(Math.random() * 60000));
             }
           }
         } catch (e) { this.log(`⚠️ held re-post phase error: ${e.message}`); }
@@ -1310,14 +1333,14 @@ class Orchestrator {
               this.log(`💬 Comment rescue: ${pending.length - unassigned.length} orphaned comment(s) across ${byAccount.size} healthy account(s)…`);
               for (const { account, tasks } of byAccount.values()) {
                 if (this._shouldStop()) break;
-                await runRescue({ account, tasks, settings, hidden, log: (m) => this.log(m), shouldStop: () => this._shouldStop(), onResult: markResult });
+                await runRescue({ account, tasks, settings, hidden, log: (m) => this.log(m), shouldStop: () => this._shouldStop(), isPaused: () => this._paused, waitIfPaused: () => this._waitWhilePaused(), onResult: markResult });
               }
             }
-            // Prune resolved records (done/failed/rehomed) so the queue keeps ONLY retryable 'pending'.
-            // OUTSIDE the byAccount block → done/failed records are reaped even on cycles where no rescuer
-            // was assigned (else pending-comments.json grows unbounded across days).
-            try { const d3 = store.loadComments(); d3.pending = (d3.pending || []).filter((c) => c.status === 'pending'); store.saveComments(d3); } catch {}
           }
+          // Prune resolved records (done/failed/rehomed) so the queue keeps ONLY retryable 'pending'. OUTSIDE
+          // `if (pending.length)` → resolved records are reaped even on cycles with zero pending (else
+          // pending-comments.json grows unbounded once everything resolves). Only writes when it changed.
+          try { const d3 = store.loadComments(); const b = (d3.pending || []).length; d3.pending = (d3.pending || []).filter((c) => c.status === 'pending'); if (d3.pending.length !== b) store.saveComments(d3); } catch {}
         } catch (e) { this.log(`⚠️ comment-rescue phase error: ${e.message}`); }
       }
 
@@ -1347,7 +1370,7 @@ class Orchestrator {
         for (const a of planAgents) (this._perAccountRotation || (this._perAccountRotation = {}))[a.name] = { lastPostId: null, lastPostedDate: this._localDayKey() }; // reset slice; pace round 2 to next day
         const planPosts = (this._data.posts || []).filter((p) => matchesFilter(p, (planAgents[0] && planAgents[0].postFilter) || 'all'));
         this._campaignPlan = this._computeCampaignPlan(planPosts, planAgents, this._roundOffset);
-        try { const _r = store.loadRotation(); _r.campaignPlan = this._campaignPlan; _r.perAccountRotation = this._perAccountRotation; _r.roundOffset = this._roundOffset; store.saveRotation(_r); } catch {}
+        this._saveRotationState();
         this.log('🔁 Campaign Plan: every group-set received the full library — new round started (reshuffled who posts what); resumes next day.');
       }
 
@@ -1368,12 +1391,14 @@ class Orchestrator {
           if (out.undealt === 0 && (out.pending || out.held)) {
             if (this._lastOutstanding != null && out.total >= this._lastOutstanding) this._noDrain = (this._noDrain || 0) + 1; else this._noDrain = 0;
             this._lastOutstanding = out.total;
-            if (this._noDrain >= 12) { this._emitCompletionReport('undeliverable', out); break; }
+            if (this._noDrain >= 12) { this._drainingCompletion = false; this._emitCompletionReport('undeliverable', out); break; }
+            this._drainingCompletion = true; // bypass the daily 24h gate so the drain cycles every ≤3min, not once/day
             this.log(`⏳ Completion mode: all posts published — placing ${out.pending} comment(s) + approving ${out.held} held post(s)…`);
             await this._waitWithCountdown(Math.min(rangeMs(settings, 'waitIntervalMin', 'waitIntervalMax', 90, 180, 60000, 1), 180000), 'Completing campaign');
             if (this._shouldStop() || this._finish) break;
             continue; // drain phase governs the loop — skip the stall-breaker (which would misread 0 posts as a stall)
           }
+          this._drainingCompletion = false; // still posting (undealt>0) → normal daily cadence applies
           this._noDrain = 0; this._lastOutstanding = out.total; // still posting → reset drain tracker, use normal guards/wait below
         }
       }
@@ -1464,8 +1489,9 @@ class Orchestrator {
       if (settings.scheduleMode === 'daily') {
         // Mark today's run done + persist (survives a same-day restart) so the top-of-loop daily gate now
         // waits until TOMORROW's fire time. The continuous inter-cycle wait below is skipped in daily mode.
+        this._drainingCompletion = false; // a normal daily cycle finished → resume the 24h gate
         this._lastDailyRunDate = this._localDayKey();
-        try { const _r = store.loadRotation(); _r.lastDailyRunDate = this._lastDailyRunDate; store.saveRotation(_r); } catch {}
+        this._saveRotationState();
         this.log(`📅 Daily run complete — next run tomorrow at ${settings.dailyPostTime}.`);
         continue; // the top-of-loop daily gate performs the ~24h wait until the next fire
       }
@@ -1490,11 +1516,11 @@ class Orchestrator {
     let end = Date.now() + ms;
     let lastLog = 0;
     const fmt = (sec) => { const m = Math.floor(sec / 60), s = sec % 60; return (m > 0 ? m + 'm ' : '') + s + 's'; };
-    while (Date.now() < end && !this._shouldStop()) {
+    while (Date.now() < end && !this._shouldStop() && !this._finish) { // Finish wakes a long daily-schedule wait
       if (this._paused) {
         const pausedAt = Date.now();
         await this._waitWhilePaused();
-        end += Date.now() - pausedAt;
+        end += Math.max(0, Date.now() - pausedAt); // clamp: a backward clock step must not shrink the wait
         if (this._shouldStop()) break;
         continue;
       }

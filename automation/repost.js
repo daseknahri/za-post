@@ -13,7 +13,7 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 const store = require('../lib/store');
 const { chromiumPath } = require('../lib/chromium');
-const { runAccount } = require('./worker');
+const { runAccount, killChromiumForProfile } = require('./worker');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -36,9 +36,14 @@ async function isContentLive(account, gid, captionSnip, settings, log, shouldSto
     const pages = await browser.pages();
     const page = pages[0] || (await browser.newPage());
     page.on('dialog', async (d) => { try { if (d.type() === 'beforeunload') await d.accept(); else await d.dismiss(); } catch {} });
-    await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+    // Stop-aware navigation: a CDP hang must not hold the caller for the full 90s after Stop.
+    await Promise.race([
+      page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }),
+      new Promise((_, rej) => { const iv = setInterval(() => { if (shouldStop()) { clearInterval(iv); rej(new Error('stopped')); } }, 500); }),
+    ]).catch(() => {});
+    if (shouldStop()) return false;
     await page.waitForSelector('[aria-posinset], div[role="article"]', { timeout: 20000 }).catch(() => {});
-    for (let s = 0; s < 3 && !shouldStop(); s++) { await page.evaluate(() => window.scrollBy(0, 700)).catch(() => {}); await sleep(1200); } // nudge lazy render
+    for (let s = 0; s < 3 && !shouldStop(); s++) { await page.evaluate(() => window.scrollBy(0, 700)).catch(() => {}); await sleep(800 + Math.floor(Math.random() * 800)); } // nudge lazy render (jittered, not metronomic)
     const found = await page.evaluate((sn) => {
       const n = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
       return Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 10).some((a) => n(a.textContent).includes(sn));
@@ -69,13 +74,18 @@ async function runRepost(o) {
   try {
     const profDir = store.profileDir(account.name);
     for (let i = 0; i < 20; i++) {
+      if (shouldStop()) return { posted: 0, heldRecords: [] };
       let locked = false;
       try { locked = fs.readdirSync(profDir).some((f) => /^Singleton/i.test(f)); } catch { locked = false; }
       if (!locked) break;
       await sleep(500);
     }
   } catch {}
+  if (shouldStop()) return { posted: 0, heldRecords: [] };
   await sleep(800);
+  // Clear any STALE lock from a previously-crashed browser on this profile (runAccount does this internally,
+  // but the presence-check browser above could have left one if it was killed) so the re-post launch can't fail silently.
+  try { const c = await killChromiumForProfile(store.profileDir(account.name), log); if (c) await sleep(800); } catch {}
   log(`♻️ ${where} not public — re-posting the content via this reserve account (1 group only).`);
   // runAccount launches its OWN browser on this profile (presence-check browser is closed) and posts the
   // post to ONLY this group (groups:[group] ∩ assignedGroups = this group; eligibility guaranteed membership).

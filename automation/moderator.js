@@ -16,6 +16,7 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 const store = require('../lib/store');
 const { chromiumPath } = require('../lib/chromium');
+const { killChromiumForProfile } = require('./worker');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Jitter a base delay ±pct so a trusted admin account doesn't browse the spam queue on a metronomic cadence.
@@ -44,6 +45,7 @@ async function runModerator(o) {
     // is shown ON-screen too, so they can SEE which account is approving + watch the Spam-potentiel pass.
     const hideMod = ((o.settings && o.settings.hideBrowser) !== false);
     if (!hideMod) log(`🛡️ [moderator:${name}] running VISIBLE (hide-browser is off) — watch this window approve the held posts.`);
+    try { const c = await killChromiumForProfile(store.profileDir(name), log); if (c) await sleep(800); } catch {} // clear a stale lock from a crashed prior session
     browser = await puppeteer.launch({
       headless: false,
       executablePath: chromiumPath(),

@@ -2360,7 +2360,7 @@ function normalizeCookie(c) {
 }
 
 module.exports = {
-  runAccount, parseProxy, normalizeCookie, addFirstComment,
+  runAccount, parseProxy, normalizeCookie, addFirstComment, killChromiumForProfile,
   // exported for diagnostics — use the EXACT worker logic
   clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish,
   // exported for tests (no runtime effect)

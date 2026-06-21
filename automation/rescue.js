@@ -13,7 +13,7 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 const store = require('../lib/store');
 const { chromiumPath } = require('../lib/chromium');
-const { addFirstComment } = require('./worker');
+const { addFirstComment, killChromiumForProfile } = require('./worker');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (a, b) => a + Math.floor(Math.random() * Math.max(0, b - a + 1));
@@ -24,12 +24,16 @@ const rand = (a, b) => a + Math.floor(Math.random() * Math.max(0, b - a + 1));
 async function runRescue(o) {
   const { account, tasks, settings = {}, log } = o;
   const shouldStop = o.shouldStop || (() => false);
+  const isPaused = o.isPaused || (() => false);
+  const waitIfPaused = o.waitIfPaused || (async () => {});
   const hidden = o.hidden !== false; // default hidden, mirrors the worker
   const name = account.name;
   const out = { placed: 0, failed: 0, blocked: false, needsLogin: false };
-  let browser = null;
+  const PER_TASK_MS = 300000; // per-task hang ceiling (normal nav timeouts are ~90s, so 300s is safe)
+  let browser = null, sessionWatchdog = null;
   try {
     log(`💬 [rescue:${name}] placing ${tasks.length} orphaned link-comment(s) on live posts…`);
+    try { const c = await killChromiumForProfile(store.profileDir(name), log); if (c) await sleep(800); } catch {} // clear a stale lock from a crashed prior session
     browser = await puppeteer.launch({
       headless: false,
       executablePath: chromiumPath(),
@@ -53,6 +57,9 @@ async function runRescue(o) {
     }).catch(() => true);
     if (!loggedIn) { log(`⚠️ [rescue:${name}] not logged in — skipping (its queued comments stay pending)`); out.needsLogin = true; return out; }
 
+    // Session watchdog: a fully-hung session can't occupy the sequential loop indefinitely — force-close past the budget.
+    sessionWatchdog = setTimeout(() => { try { log(`💬 [rescue:${name}] session exceeded its time budget — closing the browser`); if (browser) browser.close().catch(() => {}); } catch {} }, tasks.length * PER_TASK_MS + 60000);
+
     for (let i = 0; i < tasks.length; i++) {
       if (shouldStop()) break;
       const t = tasks[i];
@@ -62,9 +69,12 @@ async function runRescue(o) {
         // Pass the original POSTER's display name as the expected author — the rescue account is different,
         // but the post was authored by the poster, so the author-gate confirms we comment on the right post
         // (and addFirstComment ignores a non-FB local postId). Fail-closed: it skips if it can't confirm.
-        const res = await addFirstComment(page, t.gid, post, t.commentImg || null,
-          (m) => log(`💬 [rescue:${name}] [${label}] ${m}`),
-          t.postPermalink || null, settings, t.postId || null, t.fbDisplayName || '');
+        const res = await Promise.race([
+          addFirstComment(page, t.gid, post, t.commentImg || null,
+            (m) => log(`💬 [rescue:${name}] [${label}] ${m}`),
+            t.postPermalink || null, settings, t.postId || null, t.fbDisplayName || ''),
+          new Promise((r) => setTimeout(() => r('timeout'), PER_TASK_MS)), // per-task hang ceiling → treated as failure
+        ]);
         if (res === 'posted' || res === 'unconfirmed' || res === 'not_visible') {
           out.placed++; o.onResult && o.onResult(t, 'done');
           log(`💬 [rescue:${name}] ✅ link-comment placed on a "${label}" post (${res})`);
@@ -84,13 +94,13 @@ async function runRescue(o) {
         const hi = Number.isFinite(settings.commentDelayMax) ? settings.commentDelayMax : 180;
         const ms = rand(Math.min(lo, hi), Math.max(lo, hi)) * 1000;
         let waited = 0;
-        while (waited < ms && !shouldStop() && !out.blocked) { const chunk = Math.min(1000, ms - waited); await sleep(chunk); waited += chunk; }
+        while (waited < ms && !shouldStop() && !out.blocked) { if (isPaused()) { await waitIfPaused(); continue; } const chunk = Math.min(1000, ms - waited); await sleep(chunk); waited += chunk; }
       }
     }
     log(`💬 [rescue:${name}] done — placed=${out.placed} failed=${out.failed}${out.blocked ? ' (stopped: rate-limited)' : ''}`);
     return out;
   } catch (e) { log(`❌ [rescue:${name}] ${e.message}`); return out; }
-  finally { try { if (browser) await Promise.race([browser.close().catch(() => {}), sleep(8000)]); } catch {} }
+  finally { try { if (sessionWatchdog) clearTimeout(sessionWatchdog); } catch {} try { if (browser) await Promise.race([browser.close().catch(() => {}), sleep(8000)]); } catch {} }
 }
 
 module.exports = { runRescue };

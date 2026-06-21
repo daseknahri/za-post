@@ -736,6 +736,13 @@
                 <small class="block mt-2 text-xs text-gray-500">When a post stays stuck in FB "Spam potentiel" and the moderator can't approve it, a healthy reserve account (member of that group) re-posts the content so it goes live — guaranteeing delivery. It first checks the feed so it never duplicates a post FB already released, and caps at one replacement per post/group (then reports it as undeliverable). Keep your accounts warmed + on dedicated proxies so this stays a rare fallback.</small>
               </div>
 
+              <div class="ml-7 mt-2">
+                <label class="block text-xs font-semibold text-gray-400 mb-1" for="setting-repost-grace-sec">Re-post grace period (seconds)</label>
+                <input type="number" id="setting-repost-grace-sec" min="0" max="86400" step="30" value="180"
+                       class="w-32 bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200 focus:outline-none focus:border-accent">
+                <small class="block mt-1 text-xs text-gray-500">How long to wait after a post is marked un-approvable before a reserve account re-posts it (0 – 86400 s). Default 180 s.</small>
+              </div>
+
               <div>
                 <label class="checkbox-label flex items-center gap-3 cursor-pointer">
                   <input type="checkbox" id="setting-vary-content" class="w-5 h-5 rounded-md accent-accent" checked>
