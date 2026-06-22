@@ -266,14 +266,14 @@ function deletePostByIndex(index) {
 
 function showLicenseWindow() {
   if (licenseWindow) { licenseWindow.focus(); return; }
-  licenseWindow = new BrowserWindow({ width: 440, height: 400, resizable: false, title: 'License', icon: path.join(__dirname, 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png'), webPreferences: { nodeIntegration: true, contextIsolation: false } });
+  licenseWindow = new BrowserWindow({ width: 440, height: 400, resizable: false, title: 'License', icon: path.join(__dirname, 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png'), webPreferences: { preload: path.join(__dirname, 'license-preload.js'), contextIsolation: true, nodeIntegration: false } });
   licenseWindow.removeMenu();
   licenseWindow.loadFile(path.join(__dirname, 'license-window.html'));
   licenseWindow.on('closed', () => { licenseWindow = null; });
 }
 function showRevokedWindow() {
   if (revokedWindow) { revokedWindow.focus(); return; }
-  revokedWindow = new BrowserWindow({ width: 440, height: 400, resizable: false, title: 'License', webPreferences: { nodeIntegration: true, contextIsolation: false } });
+  revokedWindow = new BrowserWindow({ width: 440, height: 400, resizable: false, title: 'License', webPreferences: { preload: path.join(__dirname, 'license-preload.js'), contextIsolation: true, nodeIntegration: false } });
   revokedWindow.removeMenu();
   revokedWindow.loadFile(path.join(__dirname, 'revoked.html'));
   revokedWindow.on('closed', () => { revokedWindow = null; });

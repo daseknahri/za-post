@@ -89,14 +89,14 @@
     </div>
 
     <script>
-        const { shell, ipcRenderer } = require('electron');
+        const api = window.licenseAPI; // license-preload.js (contextIsolation-safe)
 
         document.getElementById('contactBtn').addEventListener('click', () => {
-            shell.openExternal('https://wa.me/message/RQAP2VWXTUEPG1');
+            api.openExternal('https://wa.me/message/RQAP2VWXTUEPG1');
         });
 
         document.getElementById('enterKeyBtn').addEventListener('click', () => {
-            ipcRenderer.send('retry-license');
+            api.retry();
         });
     </script>
 </body>
