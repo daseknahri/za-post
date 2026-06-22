@@ -1212,9 +1212,18 @@ async function focusEditable(page) {
     const pt = await page.evaluate(() => {
       const dlg = document.querySelector('div[role="dialog"]') || document;
       const cands = Array.from(dlg.querySelectorAll('[contenteditable="true"], [role="textbox"]'));
+      const vis = (e) => { const r = e.getBoundingClientRect(); return r.width > 120 && r.height > 20; };
+      // Prefer the editable we ALREADY chose (it may have lost its placeholder/aria-label once it got text,
+      // so re-matching by placeholder would drift to a DIFFERENT box and read it as "empty").
+      const prior = dlg.querySelector('[data-zp-editor="1"]');
       const labeled = cands.find((e) => /create (a )?public post|what'?s on your mind|write something|start a discussion|^post$/i.test((e.getAttribute('aria-label') || '') + ' ' + (e.getAttribute('aria-placeholder') || '')));
-      const el = labeled || cands.find((e) => { const r = e.getBoundingClientRect(); return r.width > 120 && r.height > 20; }) || cands[0];
-      if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + Math.min(r.height / 2, 20) }; }
+      const el = (prior && vis(prior)) ? prior : (labeled || cands.find(vis) || cands[0]);
+      if (el) {
+        // Mark the EXACT element we focus/paste into so verification reads the SAME element later.
+        try { dlg.querySelectorAll('[data-zp-editor]').forEach((e) => { if (e !== el) e.removeAttribute('data-zp-editor'); }); } catch {}
+        el.setAttribute('data-zp-editor', '1');
+        el.scrollIntoView({ block: 'center' }); el.focus(); const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + Math.min(r.height / 2, 20) };
+      }
       return null;
     }).catch(() => null);
     if (pt) { await page.mouse.click(pt.x, pt.y, { delay: 40 }).catch(() => {}); await sleep(400); return true; }
@@ -1222,17 +1231,43 @@ async function focusEditable(page) {
   return false;
 }
 
-// Normalized length of the MAIN composer editor's text (0 = empty). Used to decide whether a paste
-// landed and to confirm the editor is empty before typing — so a re-type can never DOUBLE the text.
+// Normalized length of the MAIN composer editor's text (0 = empty). Reads the SAME element we focused/pasted
+// into (marked data-zp-editor) via textContent — which is LAYOUT-INDEPENDENT, so it returns the real text even
+// in an off-screen window (innerText would be '' there). Used to decide whether a paste landed and to confirm
+// the editor is empty before typing — so a re-type can never DOUBLE the text.
 async function editableLen(page) {
   return page.evaluate(() => {
     const dlg = document.querySelector('div[role="dialog"]') || document;
-    const cands = Array.from(dlg.querySelectorAll('[contenteditable="true"], [role="textbox"]'));
-    const labeled = cands.find((e) => /create (a )?public post|what'?s on your mind|write something|start a discussion|^post$/i.test((e.getAttribute('aria-label') || '') + ' ' + (e.getAttribute('aria-placeholder') || '')));
-    const el = labeled || cands.find((e) => { const r = e.getBoundingClientRect(); return r.width > 120 && r.height > 20; }) || cands[0];
+    const el = dlg.querySelector('[data-zp-editor="1"]')
+      || Array.from(dlg.querySelectorAll('[contenteditable="true"], [role="textbox"]')).find((e) => { const r = e.getBoundingClientRect(); return r.width > 120 && r.height > 20; });
     if (!el) return 0;
-    return String(el.innerText || el.textContent || '').replace(/\s+/g, '').length;
+    // Strip zero-width chars (FB can leave one in an "empty" editor) so the empty check + length stay honest.
+    return String(el.textContent || el.innerText || '').replace(/[​-‍﻿]/g, '').replace(/\s+/g, '').length;
   }).catch(() => 0);
+}
+
+// VERIFY THE CAPTION LANDED after a paste (the operator's "add a step to verify"): poll the EXACT marked
+// editor's textContent until it contains the caption (or, fallback, has substantial text), so a slow paste
+// isn't read too early and a successful paste is NEVER cleared+retyped. Returns { landed, len }.
+async function verifyCaptionLanded(page, caption, ms = 6000) {
+  const want = String(caption || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, '').toLowerCase();
+  const probe = want.slice(0, 24); // a prefix match is enough; pastes can normalize punctuation/emoji slightly
+  const need = Math.min(probe.length || 1, 12); // "substantial text present" fallback when the prefix can't match
+  const deadline = Date.now() + ms;
+  let len = 0;
+  while (Date.now() < deadline) {
+    const got = await page.evaluate(() => {
+      const dlg = document.querySelector('div[role="dialog"]') || document;
+      const el = dlg.querySelector('[data-zp-editor="1"]')
+        || Array.from(dlg.querySelectorAll('[contenteditable="true"], [role="textbox"]')).find((e) => { const r = e.getBoundingClientRect(); return r.width > 120 && r.height > 20; });
+      return el ? String(el.textContent || el.innerText || '') : '';
+    }).catch(() => '');
+    const norm = got.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, '').toLowerCase();
+    len = norm.length;
+    if ((probe && norm.includes(probe)) || len >= need) return { landed: true, len };
+    await sleep(400);
+  }
+  return { landed: false, len };
 }
 
 // Robustly EMPTY the focused composer editor and CONFIRM it's empty before any typing — so typing can
@@ -1248,62 +1283,6 @@ async function clearEditable(page, attempts = 4) {
     if ((await editableLen(page)) === 0) return true;
   }
   return (await editableLen(page)) === 0;
-}
-
-function normalizeForCompare(text) {
-  return String(text || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/\s+/g, '')
-    .toLowerCase();
-}
-
-async function composerCaptionState(page, caption) {
-  const expected = normalizeForCompare(caption).slice(0, 20);
-  return page.evaluate((expectedPrefix) => {
-    const normalize = (text) => String(text || '')
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/\s+/g, '')
-      .toLowerCase();
-    const dialog = document.querySelector('div[role="dialog"]') || document;
-    const nodes = Array.from(dialog.querySelectorAll('[contenteditable="true"], [role="textbox"]'));
-    const candidates = nodes.map((node, index) => {
-      const raw = [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('aria-placeholder'),
-      ].filter(Boolean).join('\n');
-      const text = raw.replace(/\s+/g, ' ').trim();
-      return {
-        index,
-        len: normalize(text).length,
-        matched: !!expectedPrefix && normalize(text).includes(expectedPrefix),
-        sample: text.slice(0, 120),
-      };
-    });
-    const dialogText = (dialog.innerText || dialog.textContent || '').replace(/\s+/g, ' ').trim();
-    candidates.push({
-      index: -1,
-      len: normalize(dialogText).length,
-      matched: !!expectedPrefix && normalize(dialogText).includes(expectedPrefix),
-      sample: dialogText.slice(0, 120),
-    });
-    candidates.sort((a, b) => Number(b.matched) - Number(a.matched) || b.len - a.len);
-    return candidates[0] || { index: null, len: 0, matched: false, sample: '' };
-  }, expected).catch(() => ({ index: null, len: 0, matched: false, sample: '' }));
-}
-
-async function waitForCaptionState(page, caption, timeout = 5000) {
-  const end = Date.now() + timeout;
-  let last = { index: null, len: 0, matched: false, sample: '' };
-  while (Date.now() < end) {
-    last = await composerCaptionState(page, caption);
-    if (last.matched) return last;
-    await sleep(350);
-  }
-  return last;
 }
 
 // Attempt a real email+password login using the account's EXISTING page (profile is locked,
@@ -1905,18 +1884,6 @@ async function runAccount(o) {
         }
         step('Composer opened; preparing post');
 
-        // Read the composer editable text length, with a settle delay for robustness.
-        const captionLen = (extraDelay = 0) => sleep(extraDelay).then(() =>
-          composerCaptionState(page, post.caption).then((state) => state.len || 0)
-        );
-        // Verify caption was entered: accept if the editable has meaningful length (> 0)
-        // and contains at least the first ~15 non-space chars of the caption (handles emoji,
-        // newline, and auto-formatting differences that break exact-match checks).
-        const captionOk = async () => {
-          const state = await sleep(500).then(() => composerCaptionState(page, post.caption));
-          return !!state.matched || (!post.caption.trim() && state.len > 0);
-        };
-
         // Perturb the image per (account, group) so the SAME picture doesn't upload with an
         // IDENTICAL perceptual hash to every group — FB dedups images across groups, a strong
         // spam signal. Visually identical; best-effort (falls back to the original if jimp is off).
@@ -1976,43 +1943,34 @@ async function runAccount(o) {
         // reliable. Verify it landed; if not, fall back to typing so the post still goes out.
         if (post.caption) {
           step('Entering caption');
-          await focusEditable(page);
-          let captionState = { matched: false, len: 0, sample: '' };
+          await focusEditable(page); // focuses + MARKS the exact editor (data-zp-editor) so we verify the SAME box
+          let pasted = false;
           try {
             await page.evaluate((t) => navigator.clipboard.writeText(t), post.caption);
             await page.keyboard.down('Control'); await page.keyboard.press('v'); await page.keyboard.up('Control');
-            captionState = await waitForCaptionState(page, post.caption, 5000);
-          } catch (e) {
-            step('Clipboard paste unavailable; typing caption');
-          }
-          if (captionState.matched) {
-            step(`Caption pasted and verified (${captionState.len} chars)`);
-          } else if ((await editableLen(page)) > 0) {
-            // Text IS in the EDITOR (editableLen reads ONLY the composer editable — NOT captionState.len,
-            // which folds in dialog chrome/placeholder and is always >0). The paste landed but our matcher
-            // can't read it (FB hides editor text) — typing now would DOUBLE the caption. Accept it; publish
-            // confirmation verifies. A genuinely-empty editor (failed paste) falls through to type below.
-            step(`Caption present in composer but not directly readable — accepting the paste (NOT retyping, avoids doubling)`);
+            pasted = true;
+          } catch (e) { step('Clipboard paste unavailable — will type the caption instead'); }
+          // VERIFY THE CAPTION LANDED — the single source of truth (polls the EXACT marked editor's textContent,
+          // which is readable even in an off-screen window). Pasting is how a real person posts (grab the source,
+          // paste it), so when it lands we ACCEPT it and do NOT clear+retype — that was the double-work you saw.
+          let landed = pasted ? await verifyCaptionLanded(page, post.caption, 6000) : { landed: false, len: 0 };
+          if (landed.landed) {
+            step(`Caption pasted and verified (${landed.len} chars) ✅`);
           } else {
-            // Editor is genuinely EMPTY → the paste did not land. Clear-and-verify-empty, then type ONCE.
-            step('Caption paste did not land (editor empty); typing caption');
-            await clearEditable(page); // confirms empty first → typing can't double
+            // The paste genuinely did NOT land (clipboard blocked / it didn't take). clearEditable confirms the
+            // editor is EMPTY first, so typing can never DOUBLE an existing caption. Type once, verify again.
+            step(pasted ? 'Caption paste did not land — typing it instead' : 'Typing caption');
+            await clearEditable(page);
             await humanType(page, post.caption, settings);
-            captionState = await waitForCaptionState(page, post.caption, 2500);
-            // Retype only if STILL empty (nothing landed). If text is present but unmatched, accept it.
-            if (!captionState.matched && (captionState.len || 0) === 0 && (await editableLen(page)) === 0) {
-              step('Caption did not land — clearing and retyping once');
+            landed = await verifyCaptionLanded(page, post.caption, 3000);
+            if (!landed.landed && (await editableLen(page)) === 0) {
+              step('Caption still empty — clearing and retyping once');
               await clearEditable(page);
               await humanType(page, post.caption, settings);
-              captionState = await waitForCaptionState(page, post.caption, 2500);
+              landed = await verifyCaptionLanded(page, post.caption, 3000);
             }
-          }
-          if (captionState.matched || await captionOk()) {
-            const finalState = captionState.matched ? captionState : await composerCaptionState(page, post.caption);
-            step(`Caption verified in composer (${finalState.len} chars)`);
-          } else {
-            const finalState = await composerCaptionState(page, post.caption);
-            step(`Caption typed; Facebook editor text not directly readable (${finalState.len} chars detected). Publish confirmation will verify the post`);
+            step(landed.landed ? `Caption typed and verified (${landed.len} chars) ✅`
+              : `Caption entered but the editor text isn't directly readable (${landed.len} chars) — publish confirmation will verify`);
           }
         }
 
