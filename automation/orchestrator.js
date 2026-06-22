@@ -1215,8 +1215,8 @@ class Orchestrator {
       // ── PHASE 2: MODERATOR APPROVAL (opt-in, behind settings.moderationEnabled) ──────────────────
       // FB holds poster accounts' posts in the group "Spam potentiel" / pending queue (not the public
       // feed), so the first comment can't attach. A designated MODERATOR account (admin of the groups)
-      // approves OUR held posts so they go live. DRY-RUN for now: it scans the queues and LOGS what it
-      // would approve (no clicks) so we refine the queue DOM live, then enable the click. No-op when off.
+      // approves OUR held posts so they go live (caption + author matched; never a stranger's post). It
+      // approves LIVE by default; settings.moderationDryRun = true makes it scan + log only (test mode). Off → no-op.
       this._pruneModeration(); // hygiene runs EVERY cycle, even when moderation is OFF (no frozen residue)
       if (settings.moderationEnabled && !this._shouldStop() && !this._approving) {
         this._approving = true;

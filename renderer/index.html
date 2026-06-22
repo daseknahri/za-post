@@ -644,7 +644,11 @@
               <input type="checkbox" id="setting-moderation-enabled" class="w-5 h-5 rounded-md accent-accent">
               <span class="text-sm font-semibold text-gray-200">🛡️ Enable moderator approval (your own groups)</span>
             </label>
-            <small class="block mt-2 text-xs text-gray-500 ml-8">For groups you ADMIN: a designated moderator account (toggle it on an account) approves posts Facebook holds in "Spam potentiel"/pending, so the post goes live and its comment can land. Currently a safe DRY-RUN — it scans the queue and logs what it would approve (no clicks) so we confirm it targets only your posts; clicking is enabled after that.</small>
+            <small class="block mt-2 text-xs text-gray-500 ml-8">For groups you ADMIN: a designated moderator account (toggle it on an account) <b class="text-cyber-green">approves</b> posts Facebook holds in "Spam potentiel"/pending, so the post goes live and its comment can land. It approves only posts that match YOUR captions (and, when set, your accounts' FB display names — never a stranger's post). Tip: turn on Test mode below first to see what it would approve before it clicks.</small>
+            <label class="checkbox-label flex items-center gap-3 cursor-pointer mt-3 ml-8">
+              <input type="checkbox" id="setting-moderation-dry-run" class="w-4 h-4 rounded-md accent-accent">
+              <span class="text-xs font-medium text-gray-300">🧪 Test mode (dry-run) — scan + log what it WOULD approve, without clicking</span>
+            </label>
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
@@ -1205,6 +1209,17 @@
           <textarea id="edit-post-comment" rows="3" placeholder="Edit your comment (leave empty for no comment)..."
             class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all resize-y"></textarea>
           <small class="block mt-1 text-xs text-gray-500">Leave empty to remove the comment.</small>
+        </div>
+        <div class="form-group">
+          <label for="edit-post-image-url" class="block text-sm font-semibold text-gray-300 mb-2">Post image URL</label>
+          <input type="text" id="edit-post-image-url" placeholder="https://… (leave empty for no/keep-uploaded image)"
+            class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 transition-all">
+          <small class="block mt-1 text-xs text-gray-500">A remote image URL downloaded at post time. (Uploaded local images can't be changed here — delete + re-add the post for that.)</small>
+        </div>
+        <div class="form-group">
+          <label for="edit-post-comment-image-url" class="block text-sm font-semibold text-gray-300 mb-2">Comment image URL</label>
+          <input type="text" id="edit-post-comment-image-url" placeholder="https://… (optional)"
+            class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 transition-all">
         </div>
       </div>
       <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">

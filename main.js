@@ -363,7 +363,10 @@ app.whenReady().then(async () => {
     onStop: () => { orchestrator.stop(); setRunActive(false); },
     addPost: (fields) => addPostFromRemote(fields),
     deletePost: (index) => deletePostByIndex(index),
-    setInterval: (minutes) => store.update((d) => { d.settings.waitInterval = clampSettings({ waitInterval: minutes }).waitInterval; }).then(() => send('data-updated')).catch(() => {}),
+    // Set the inter-cycle interval. The engine reads the waitIntervalMin/Max RANGE (the single waitInterval key
+    // was removed), so a fixed interval = min=max=minutes. Returns the promise so the caller can await the write.
+    setInterval: (minutes) => store.update((d) => { const m = clampSettings({ waitIntervalMin: minutes, waitIntervalMax: minutes }); d.settings.waitIntervalMin = m.waitIntervalMin; d.settings.waitIntervalMax = m.waitIntervalMax; }).then(() => send('data-updated')),
+    toggleAccount: (name, enabled) => store.update((d) => { const a = (d.accounts || []).find((x) => x.name === name); if (a) a.enabled = enabled === undefined ? a.enabled === false : !!enabled; }).then(() => send('data-updated')),
     loginAccount: (name) => openLoginBrowser(name),
     closeLogin: (name) => closeLoginBrowser(name),
     getTunnelUrl: () => tunnelUrl || '',
@@ -538,6 +541,10 @@ ipcMain.handle('edit-post', async (_e, postId, updates) => {
       if (!p) return false;
       if (updates.caption !== undefined) p.caption = updates.caption;
       if (updates.comment !== undefined) p.comment = updates.comment;
+      // Remote image URLs are simple strings downloaded at post time — editable here (uploaded local images
+      // aren't, to avoid re-encoding; delete + re-add for those).
+      if (updates.imageUrl !== undefined) p.imageUrl = updates.imageUrl;
+      if (updates.commentImageUrl !== undefined) p.commentImageUrl = updates.commentImageUrl;
       return true;
     });
     if (!found) return fail('Post not found');

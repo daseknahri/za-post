@@ -838,6 +838,8 @@ function openEditPostModal(postId) {
   editingPostId = postId;
   document.getElementById('edit-post-caption').value = post.caption || '';
   document.getElementById('edit-post-comment').value = post.comment || '';
+  { const el = document.getElementById('edit-post-image-url'); if (el) el.value = post.imageUrl || ''; }
+  { const el = document.getElementById('edit-post-comment-image-url'); if (el) el.value = post.commentImageUrl || ''; }
   openModal('modal-edit-post');
 }
 
@@ -846,13 +848,15 @@ async function saveEditPost() {
 
   const caption = document.getElementById('edit-post-caption').value.trim();
   const comment = document.getElementById('edit-post-comment').value.trim();
+  const imageUrl = ((document.getElementById('edit-post-image-url') || {}).value || '').trim();
+  const commentImageUrl = ((document.getElementById('edit-post-comment-image-url') || {}).value || '').trim();
 
   if (!caption) {
     showNotification('Caption cannot be empty', 'error');
     return;
   }
 
-  const result = await window.electronAPI.editPost(editingPostId, { caption, comment });
+  const result = await window.electronAPI.editPost(editingPostId, { caption, comment, imageUrl, commentImageUrl });
 
   if (result.success) {
     showNotification('Post updated!', 'success');
@@ -902,6 +906,7 @@ function renderGroups() {
       </div>
       <div class="group-actions">
         ${modSelect(group)}
+        <button class="icon-btn" onclick="renameGroup('${group.id}')" title="Rename">✏️</button>
         <button class="icon-btn" onclick="deleteGroup('${group.id}')" title="Delete">🗑️</button>
       </div>
     </div>
@@ -912,6 +917,22 @@ function openAddGroupModal() {
   document.getElementById('group-id').value = '';
   document.getElementById('group-name').value = '';
   openModal('modal-add-group');
+}
+
+// Rename a group's display name (the groupId is fixed). Race-safe: fetch fresh → set → save.
+async function renameGroup(groupId) {
+  const cur = (appData.groups || []).find((x) => x.id === groupId);
+  if (!cur) return;
+  const name = prompt('Group name:', cur.name || '');
+  if (name == null) return; // cancelled
+  const fresh = await window.electronAPI.getData();
+  const g = (fresh.groups || []).find((x) => x.id === groupId);
+  if (!g) return;
+  g.name = name.trim() || g.name;
+  const res = await window.electronAPI.saveData(fresh);
+  if (res && res.success === false) { showNotification('Failed to save: ' + (res.error || 'unknown error'), 'error'); return; }
+  appData = fresh; renderGroups();
+  showNotification('Group renamed', 'success');
 }
 
 async function saveGroup() {
@@ -2261,6 +2282,7 @@ function loadSettings() {
   document.getElementById('setting-max-cycles').value = appData.settings.maxCycles !== undefined ? appData.settings.maxCycles : 0;
   document.getElementById('setting-enable-tunnel').checked = appData.settings.enableTunnel || false;
   { const el = document.getElementById('setting-moderation-enabled'); if (el) el.checked = appData.settings.moderationEnabled === true; }
+  { const el = document.getElementById('setting-moderation-dry-run'); if (el) el.checked = appData.settings.moderationDryRun === true; }
   { const el = document.getElementById('setting-reserve-accounts'); if (el) el.value = (appData.settings.reserveAccounts != null ? appData.settings.reserveAccounts : 0); }
   document.getElementById('setting-loop-campaign').checked = appData.settings.loopCampaign || false;
   document.getElementById('setting-resume-on-startup').checked = appData.settings.resumeOnStartup === true;
@@ -2432,6 +2454,7 @@ async function saveSettings() {
     maxCycles: intOr('setting-max-cycles', 0),
     enableTunnel: document.getElementById('setting-enable-tunnel').checked,
     moderationEnabled: (document.getElementById('setting-moderation-enabled') || {}).checked || false,
+    moderationDryRun: (document.getElementById('setting-moderation-dry-run') || {}).checked || false,
     reserveAccounts: Math.max(0, Math.round(Number((document.getElementById('setting-reserve-accounts') || {}).value) || 0)),
     loopCampaign: document.getElementById('setting-loop-campaign').checked,
     resumeOnStartup: document.getElementById('setting-resume-on-startup').checked,

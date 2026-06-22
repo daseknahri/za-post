@@ -99,11 +99,11 @@ function startServer(port, injected) {
     res.json({ posts });
   });
 
-  app.post('/api/posts/add', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'commentImage', maxCount: 1 }]), (req, res) => {
+  app.post('/api/posts/add', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'commentImage', maxCount: 1 }]), async (req, res) => {
     try {
       const caption = (req.body.caption || '').trim();
       if (!caption) return res.json({ success: false, error: 'Caption is required' });
-      hooks.addPost({
+      await hooks.addPost({
         caption,
         comment: req.body.comment || '',
         imageUrl: req.body.imageUrl || '',
@@ -115,20 +115,20 @@ function startServer(port, injected) {
     } catch (e) { res.json({ success: false, error: e.message }); }
   });
 
-  app.delete('/api/posts/:index', (req, res) => {
-    try { hooks.deletePost(parseInt(req.params.index, 10)); res.json({ success: true }); }
+  app.delete('/api/posts/:index', async (req, res) => {
+    try { await hooks.deletePost(parseInt(req.params.index, 10)); res.json({ success: true }); }
     catch (e) { res.json({ success: false, error: e.message }); }
   });
 
   // ---- logs / interval (parity with original server) -------------------
   app.get('/api/automation/logs', (_req, res) => res.json({ logs: logs.slice(-150).map(shapeLog) }));
   app.get('/api/tunnel-url', (_req, res) => res.json({ url: hooks.getTunnelUrl() || '' }));
-  app.post('/api/automation/interval', (req, res) => {
+  app.post('/api/automation/interval', async (req, res) => {
     const minutes = parseInt(req.body.minutes ?? req.body.interval, 10);
     if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
       return res.json({ success: false, error: 'Invalid interval. Must be between 1 and 1440 minutes.' });
     }
-    try { hooks.setInterval(minutes); res.json({ success: true, message: `Interval updated to ${minutes} minutes. Restart automation for changes to take effect.` }); }
+    try { await hooks.setInterval(minutes); res.json({ success: true, message: `Interval updated to ${minutes} minutes. Restart automation for changes to take effect.` }); }
     catch (e) { res.json({ success: false, error: e.message }); }
   });
 
@@ -153,6 +153,14 @@ function startServer(port, injected) {
   app.post('/api/accounts/:name/close-login', (req, res) => {
     try { hooks.closeLogin(req.params.name); res.json({ success: true, message: `Login window closed for ${req.params.name}` }); }
     catch (e) { res.json({ success: false, error: e.message }); }
+  });
+  // Enable/disable an account remotely (parity with the desktop On/Off toggle). Body { enabled?:bool } — omit to flip.
+  app.post('/api/accounts/:name/toggle', async (req, res) => {
+    try {
+      if (typeof hooks.toggleAccount !== 'function') return res.json({ success: false, error: 'toggle not supported' });
+      await hooks.toggleAccount(req.params.name, req.body && req.body.enabled);
+      res.json({ success: true });
+    } catch (e) { res.json({ success: false, error: e.message }); }
   });
 
   // Bind localhost-only by default (no LAN exposure). The Cloudflare tunnel still
