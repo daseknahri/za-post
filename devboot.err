@@ -1,5 +1,5 @@
-[19108:0622/033732.631:INFO:CONSOLE(64)] "cdn.tailwindcss.com should not be used in production. To use Tailwind CSS in production, install it as a PostCSS plugin or use the Tailwind CLI: https://tailwindcss.com/docs/installation", source: https://cdn.tailwindcss.com/ (64)
-[19108:0622/033733.006:INFO:CONSOLE(2)] "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security
+[14488:0622/143522.791:INFO:CONSOLE(64)] "cdn.tailwindcss.com should not be used in production. To use Tailwind CSS in production, install it as a PostCSS plugin or use the Tailwind CLI: https://tailwindcss.com/docs/installation", source: https://cdn.tailwindcss.com/ (64)
+[14488:0622/143523.115:INFO:CONSOLE(2)] "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security
   Policy set or a policy with "unsafe-eval" enabled. This exposes users of
   this app to unnecessary security risks.
 
@@ -7,9 +7,3 @@ For more information and help, consult
 https://electronjs.org/docs/tutorial/security.
 This warning will not show up
 once the app is packaged.", source: node:electron/js2c/sandbox_bundle (2)
-[19108:0622/050551.276:WARNING:dns_config_service_win.cc(605)] Failed to read DnsConfig.
-[19108:0622/104852.541:WARNING:dns_config_service_win.cc(605)] Failed to read DnsConfig.
-[19108:0622/104854.375:WARNING:dns_config_service_win.cc(605)] Failed to read DnsConfig.
-[19108:0622/104854.680:WARNING:dns_config_service_win.cc(605)] Failed to read DnsConfig.
-[19108:0622/104854.699:WARNING:dns_config_service_win.cc(605)] Failed to read DnsConfig.
-[19108:0622/104854.717:WARNING:dns_config_service_win.cc(605)] Failed to read DnsConfig.

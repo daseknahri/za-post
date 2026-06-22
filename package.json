@@ -64,6 +64,18 @@
       {
         "from": "chrome-bin",
         "to": "chrome"
+      },
+      {
+        "from": "scripts/rdp-keepalive.ps1",
+        "to": "rdp-setup/rdp-keepalive.ps1"
+      },
+      {
+        "from": "scripts/rdp-keepalive-setup.ps1",
+        "to": "rdp-setup/rdp-keepalive-setup.ps1"
+      },
+      {
+        "from": "SETUP-RDP.md",
+        "to": "rdp-setup/SETUP-RDP.md"
       }
     ],
     "asarUnpack": [

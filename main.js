@@ -933,6 +933,34 @@ ipcMain.handle('stop-automation', () => {
   setRunActive(false); // explicit Stop clears the flag — no auto-resume on next launch
   return ok();
 });
+// RDP/unattended: report whether the keepalive scheduled task is installed and whether the app is being
+// viewed over Remote Desktop right now — so the renderer can remind the operator to run the one-time setup
+// (a fresh laptop would otherwise silently miss it → a run stalls the first time they disconnect).
+function _runQuick(cmd, args) {
+  return new Promise((resolve) => {
+    try { execFile(cmd, args, { timeout: 5000, windowsHide: true }, (err, stdout) => resolve({ code: err ? (err.code != null ? err.code : 1) : 0, out: String(stdout || '') })); }
+    catch { resolve({ code: 1, out: '' }); }
+  });
+}
+function _rdpSetupDir() { return app.isPackaged ? path.join(process.resourcesPath, 'rdp-setup') : path.join(__dirname, 'scripts'); }
+ipcMain.handle('rdp-status', async () => {
+  if (process.platform !== 'win32') return { supported: false, keepaliveInstalled: true, remoteSession: false };
+  let keepaliveInstalled = false, remoteSession = false;
+  try { const r = await _runQuick('schtasks', ['/Query', '/TN', 'ZaPost RDP Keepalive']); keepaliveInstalled = r.code === 0; } catch {}
+  try { const q = await _runQuick('qwinsta', []); remoteSession = /rdp-tcp#\d/i.test(q.out); } catch {}
+  if (!remoteSession) remoteSession = /^rdp-/i.test(process.env.SESSIONNAME || ''); // fallback for an app launched within an RDP session
+  return { supported: true, keepaliveInstalled, remoteSession };
+});
+// Open the folder with the one-time keepalive setup script (selected), so the operator can run it as admin.
+ipcMain.handle('open-rdp-setup', async () => {
+  try {
+    const dir = _rdpSetupDir();
+    const setup = path.join(dir, 'rdp-keepalive-setup.ps1');
+    if (fs.existsSync(setup)) shell.showItemInFolder(setup);
+    else await shell.openPath(dir);
+    return ok();
+  } catch (e) { return fail(e); }
+});
 // F4: clear the dealt-state/rotation so the next Start re-deals every post from #1 (guarded to stopped).
 ipcMain.handle('reset-rotation', () => {
   try { return orchestrator.resetRotation(); } catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }

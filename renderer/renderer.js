@@ -29,6 +29,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   initializeEventListeners();
   updateDashboard();
   checkAutomationStatus();
+  checkRdpKeepalive(); // one-time: if viewing over RDP and the disconnect-keepalive isn't set up, remind
 
   // Remote Access Logic
   const urlDisplay = document.getElementById('remote-url-display');
@@ -1192,6 +1193,34 @@ async function toggleAccountStandby(accountName) {
     ? `🟡 ${accountName} is now Standby (backup) — it won't post normally; it steps in only when its groups need it`
     : `${accountName} is now a Primary poster again`, 'success');
   renderAccounts();
+}
+
+// RDP keepalive reminder: if the app is being viewed over Remote Desktop AND the one-time disconnect-keepalive
+// task isn't installed, show a dismissible corner banner. Only nags actual RDP users (never a console-only
+// machine), only until it's set up or dismissed — so a fresh laptop can't silently miss the step that keeps
+// runs alive after you disconnect.
+async function checkRdpKeepalive() {
+  try {
+    if (localStorage.getItem('rdpKeepaliveDismissed') === '1') return;
+    const s = await window.electronAPI.invoke('rdp-status');
+    if (!s || !s.supported || s.keepaliveInstalled || !s.remoteSession) return;
+    if (document.getElementById('rdp-keepalive-banner')) return;
+    const el = document.createElement('div');
+    el.id = 'rdp-keepalive-banner';
+    el.style.cssText = 'position:fixed;bottom:16px;right:16px;max-width:430px;z-index:99999;background:#1f2937;border:1px solid #f59e0b;border-radius:12px;padding:14px 16px;box-shadow:0 10px 30px rgba(0,0,0,0.45);font-size:13px;color:#e5e7eb;';
+    el.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;font-weight:700;color:#fbbf24;margin-bottom:6px;">⚠️ Remote Desktop detected</div>
+      <div style="color:#cbd5e1;line-height:1.45;margin-bottom:10px;">The disconnect-keepalive isn't set up on this laptop. When you disconnect RDP, posting can stall (the hidden browsers stop drawing). Run the one-time setup as admin so runs survive a disconnect.</div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button id="rdp-dismiss" style="background:#374151;color:#e5e7eb;border:none;border-radius:8px;padding:7px 12px;font-size:12px;font-weight:600;cursor:pointer;">Dismiss</button>
+        <button id="rdp-setup" style="background:#f59e0b;color:#1f2937;border:none;border-radius:8px;padding:7px 12px;font-size:12px;font-weight:700;cursor:pointer;">Open setup folder</button>
+      </div>`;
+    document.body.appendChild(el);
+    document.getElementById('rdp-dismiss').addEventListener('click', () => { try { localStorage.setItem('rdpKeepaliveDismissed', '1'); } catch {} el.remove(); });
+    document.getElementById('rdp-setup').addEventListener('click', async () => {
+      try { await window.electronAPI.invoke('open-rdp-setup'); showNotification('Right-click rdp-keepalive-setup.ps1 → Run with PowerShell (as admin). See SETUP-RDP.md.', 'info'); } catch {}
+    });
+  } catch {}
 }
 
 // Toggle group dropdown visibility
