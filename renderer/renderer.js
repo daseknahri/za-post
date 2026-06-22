@@ -641,10 +641,10 @@ function renderPosts() {
   container.innerHTML = appData.posts.map(post => {
     // Support both old single imagePath and new imagePaths array
     const allPaths = post.imagePaths || (post.imagePath ? [post.imagePath] : []);
-    const _rawFirst = allPaths[0] || '';
+    const _rawFirst = allPaths[0] || post.imageUrl || ''; // fall back to a remote image URL so URL-only posts don't show "Text Only"
     const firstImage = _rawFirst ? (/^https?:/i.test(_rawFirst) ? _rawFirst : 'file:///' + _rawFirst.replace(/\\/g, '/')) : '';
-    const imageCount = allPaths.length;
-    const hasImages = imageCount > 0;
+    const imageCount = allPaths.length || (post.imageUrl ? 1 : 0);
+    const hasImages = !!firstImage;
     const countBadge = imageCount > 1 ? `<span style="position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.7);color:#fff;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;">📷 ${imageCount}</span>` : '';
     
     // Build image section or text-only placeholder
@@ -658,7 +658,7 @@ function renderPosts() {
           <span style="color:#94a3b8;font-size:13px;margin-left:10px;font-weight:500;">Text Only</span>
         </div>`;
 
-    const commentImageBadge = post.commentImagePath ? '<span class="post-badge">🖼️ Comment Image</span>' : '';
+    const commentImageBadge = (post.commentImagePath || post.commentImageUrl) ? '<span class="post-badge">🖼️ Comment Image</span>' : '';
 
     return `
     <div class="post-card">
