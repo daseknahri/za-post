@@ -537,10 +537,10 @@
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label for="setting-posts-per-group" class="block text-sm font-semibold text-gray-300 mb-2">Posts Per Group</label>
+            <label for="setting-posts-per-group" class="block text-sm font-semibold text-gray-300 mb-2">Max posts per cycle</label>
             <input type="number" id="setting-posts-per-group" min="0" max="50" value="1"
               class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-            <small class="block mt-2 text-xs text-gray-500">Number of posts to make in each group per cycle (0 = no limit). Unique modes always post 1.</small>
+            <small class="block mt-2 text-xs text-gray-500">How many distinct posts an account publishes each cycle (each post goes to ALL its groups). 0 = no limit. <b>Applies only to the "Post to All Groups" and "Random" methods</b> — Unique, Sequential, Daily Rotation and Campaign Plan always post 1.</small>
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
@@ -598,7 +598,7 @@
             <label for="setting-max-cycles" class="block text-sm font-semibold text-gray-300 mb-2">Max Cycles (0 = unlimited)</label>
             <input type="number" id="setting-max-cycles" min="0" value="0"
               class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-            <small class="block mt-2 text-xs text-gray-500">Number of full posting cycles to run; 0 means run indefinitely</small>
+            <small class="block mt-2 text-xs text-gray-500">Number of full posting cycles to run; 0 = run indefinitely. Daily Rotation runs ~1 cycle/day. Leave at 0 with Completion Mode — it's ignored while a finite campaign is still delivering (so it can't cut a run short).</small>
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
@@ -661,9 +661,9 @@
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
             <label class="checkbox-label flex items-center gap-3 cursor-pointer">
               <input type="checkbox" id="setting-loop-campaign" class="w-5 h-5 rounded-md accent-accent">
-              <span class="text-sm font-semibold text-gray-300">🔁 Loop Campaign (unique modes)</span>
+              <span class="text-sm font-semibold text-gray-300">🔁 Loop Campaign (Unique / Sequential / Campaign Plan)</span>
             </label>
-            <small class="block mt-2 text-xs text-gray-500 ml-8">For unique posting modes: OFF = the campaign completes after each post is sent once. ON = it recycles continuously, re-distributing the library and rotating which account posts which content over time (like the original). Use without Auto-delete.</small>
+            <small class="block mt-2 text-xs text-gray-500 ml-8">For the FINITE methods (Unique, Sequential, Campaign Plan): OFF = the campaign completes after the library is delivered once, then stops. ON = it recycles continuously — re-distributing the library and rotating which account posts which content (Campaign Plan reshuffles a fresh round). <b>No effect on Post-to-all / Random / Daily Rotation</b> (those already run continuously). Use without Auto-delete.</small>
           </div>
 
           <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
@@ -715,7 +715,7 @@
                   <option value="continuous">Continuous — cycle repeatedly (every wait-interval)</option>
                   <option value="daily">Daily — one run per day at a set time</option>
                 </select>
-                <small class="block mt-2 text-xs text-gray-500">Daily mode runs ONE cycle per day: each account posts its next post into its own groups, then waits until tomorrow. Pair with Sequence posting order + Loop Campaign so each day advances to the next post.</small>
+                <small class="block mt-2 text-xs text-gray-500">Daily mode runs ONE cycle/day at the time below; Continuous cycles every wait-interval. <b>Daily Rotation and Campaign Plan self-pace to 1 post/day either way</b> — Daily mode just pins the time. For Sequential/Unique, pair Daily + Loop Campaign so each day advances to the next post. Post-to-all / Random publish their whole batch each cycle.</small>
               </div>
 
               <div>
@@ -730,7 +730,7 @@
                   <input type="checkbox" id="setting-completion-mode" class="w-4 h-4 accent-accent">
                   <span class="text-sm font-semibold text-gray-300">Run to completion, then stop + report</span>
                 </label>
-                <small class="block mt-2 text-xs text-gray-500">For a one-time push (Unique/Sequence modes): keep self-healing — swap in reserve accounts for ones that go bad, retry, rescue comments, approve held posts — until EVERY post is published and every comment placed, then auto-stop and report what was delivered and which accounts to replace. Ignored for Daily-Rotation (it runs ongoing).</small>
+                <small class="block mt-2 text-xs text-gray-500">For a one-time push (Unique / Sequential / Campaign Plan): keep self-healing — swap in reserve accounts for ones that go bad, retry, rescue comments, approve held posts — until EVERY post is published and every comment placed, then auto-stop and report what was delivered and which accounts to replace. <b>Ignored for Post-to-all / Random / Daily Rotation</b> (they run continuously). Campaign Plan stops on its own once its batch is delivered even with this OFF.</small>
               </div>
 
               <div>

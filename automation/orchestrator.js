@@ -11,6 +11,17 @@
 //   post-centric-unique  -> account posts ONE post, offset by account index so accounts
 //                           post DIFFERENT content in the same cycle (rotates each cycle)
 //   random-unique        -> like post-centric-unique but the per-account pick is shuffled
+//   daily-rotation       -> account posts ONE post PER LOCAL DAY, advancing its OWN persisted pointer
+//                           (independent of other agents + the shared dealt-set); self-paces to 1/day
+//   campaign-plan        -> agents sharing the SAME groups split the whole library (per-cluster), each
+//                           walking its pre-assigned slice 1 post/local-day until the finite batch is done
+//
+// Which SETTINGS apply to which method:
+//   postsPerGroup   -> ONLY post-centric/random (caps distinct posts per cycle); others always post 1.
+//   loopCampaign    -> ONLY the finite methods (unique/sequence recycle; campaign-plan reshuffles a round).
+//   completionMode  -> ONLY the finite methods (drain to 100% then stop+report); no-op for ongoing modes.
+//   scheduleMode    -> daily-rotation/campaign-plan self-pace to 1/day regardless; daily gate adds a once/day
+//                      cap for the others. maxCycles caps cycles but is ignored while completion is draining.
 
 const path = require('path');
 const store = require('../lib/store');
@@ -111,11 +122,19 @@ class Orchestrator {
   // re-post across restart). Does NOT delete posts.
   resetRotation() {
     if (this.isRunning()) return { ok: false, error: 'Stop the automation before resetting the rotation.' };
+    // FULL reset (the button says "start fresh"): clear ALL rotation state in memory AND on disk — the shared
+    // unique/sequence dealt-set + round offset, the per-agent daily-rotation/campaign-plan pointers, the
+    // campaign plan, and the daily-run marker. A partial write (dealt only) used to silently WIPE the per-agent
+    // + campaign state from disk while memory kept it → an inconsistent restart. Now everything restarts at #1.
     this._dealt = new Set();
     this._roundOffset = 0;
-    const wrote = store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: this._staggerRotation || 0 });
+    this._staggerRotation = 0;
+    this._perAccountRotation = {};
+    this._campaignPlan = null;
+    this._lastDailyRunDate = null;
+    const wrote = store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: 0, lastDailyRunDate: null, perAccountRotation: {}, campaignPlan: null });
     if (!wrote) return { ok: false, error: 'Could not write rotation state (disk full / permissions).' };
-    this.log('🔄 Campaign rotation reset — the next Start re-deals all posts from #1.');
+    this.log('🔄 Campaign rotation reset — all modes restart from #1 on the next Start (shared deal + per-agent daily/campaign pointers cleared).');
     return { ok: true };
   }
   stop() {
@@ -775,6 +794,8 @@ class Orchestrator {
     this._proxyWarned = false;    // one-time per-run "proxies off / shared IP" warning
     this._auditWarned = false;    // one-time per-run "audit-log write failed" warning
     this._completionWarned = false; // one-time per-run completion-mode advisory (else suppressed forever after a Stop/Start)
+    this._loopNoopWarned = false;   // one-time per-run "Loop Campaign has no finite fleet" advisory
+    this._finiteDoneLogged = false; // one-time per-run "finite content done, ongoing accounts keep running" log
     this._roundOffset = _st.roundOffset || 0; // rotates account↔post mapping across Loop-campaign recycles
     this._staggerRotation = _st.staggerRotation || 0; // E-N3: rotates account START order each cycle (fairness)
     this._lastDailyRunDate = _st.lastDailyRunDate || null; // 'daily' schedule: local day-key of the last run (same-day-restart dedupe)
@@ -944,6 +965,12 @@ class Orchestrator {
         if (settings.loopCampaign) this.log('ℹ️ Completion mode is ON but so is Loop Campaign — a looping campaign never "completes", so completion mode won\'t auto-stop. Turn Loop Campaign OFF for a finite campaign that reports + stops.');
         else if (!finiteActive.length && !hasCampaign) this.log('ℹ️ Completion mode is ON but no account uses a FINITE method (Unique / Sequential / Campaign Plan) — it has no effect on post-centric / daily-rotation fleets (they run continuously).');
       }
+      // One-time advisory: Loop Campaign also only applies to a finite fleet.
+      if (settings.loopCampaign && !this._loopNoopWarned) {
+        this._loopNoopWarned = true;
+        const hasCampaign2 = active.some((a) => (a.postingOrder || '') === 'campaign-plan');
+        if (!finiteActive.length && !hasCampaign2) this.log('ℹ️ Loop Campaign is ON but no account uses a finite method (Unique / Sequential / Campaign Plan) — it has no effect on post-centric / random / daily-rotation (they already run continuously).');
+      }
       if (!settings.completionMode && finiteActive.length && campaignDone && finiteActive.reduce((s, a) => s + this._postsForAccount(a, cycle).length, 0) === 0) {
         if (settings.loopCampaign) {
           // Loop campaign: re-distribute the whole library, rotating content across accounts.
@@ -953,9 +980,19 @@ class Orchestrator {
           try { store.saveRotation({ dealt: [], roundOffset: this._roundOffset, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null }); } catch {} // keep the daily + per-agent + campaign markers so a same-day restart can't double-run
           // fall through: this cycle now re-deals the full library
         } else {
-          this.log('✅ All posts have been distributed — campaign complete.');
-          this._dealt.clear(); try { store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null }); } catch {}
-          break;
+          // Finite content is fully distributed. Only STOP THE WHOLE RUN when there are no ONGOING-mode accounts
+          // (post-centric / random / daily-rotation) still working — otherwise stopping would kill them too. In a
+          // mixed fleet the finite accounts simply idle now (their _postsForAccount returns []) while the ongoing
+          // ones keep posting.
+          const ongoingActive = active.filter((a) => { const o = a.postingOrder || 'post-centric'; return !o.includes('unique') && o !== 'sequence' && o !== 'campaign-plan'; });
+          if (!ongoingActive.length) {
+            this.log('✅ All posts have been distributed — campaign complete.');
+            this._dealt.clear(); try { store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null }); } catch {}
+            break;
+          } else if (!this._finiteDoneLogged) {
+            this._finiteDoneLogged = true;
+            this.log(`✅ Finite content fully distributed — the ${ongoingActive.length} ongoing account(s) (Post-to-all / Random / Daily-rotation) keep running.`);
+          }
         }
       }
       this._progress.cycle = cycle;
@@ -1506,12 +1543,14 @@ class Orchestrator {
       // schedule mode the top-of-loop gate already does the waiting, so this is skipped there.)
       if (cycleDealtIds.length === 0 && settings.scheduleMode !== 'daily' && (this._active || []).length > 0) {
         const _today = this._localDayKey();
-        const _allRotatedToday = (this._active || []).every((a) => {
-          const o = a.postingOrder || '';
-          if (o !== 'daily-rotation' && o !== 'campaign-plan') return false;
-          const rec = (this._perAccountRotation || {})[a.name] || {};
-          return rec.lastPostedDate === _today;
-        });
+        // Fire when every DAILY-ROTATION / CAMPAIGN-PLAN agent has posted today. We filter to THOSE agents
+        // first (the old code used .every() over ALL active accounts, so any non-DR account — e.g. a finished
+        // unique agent still in the active set — made it return false, so the hold never fired in a mixed
+        // fleet and the stall-breaker wrongly STOPPED the run, killing the daily-rotation agents). The
+        // cycleDealtIds===0 guard above already means nothing else produced this cycle, so holding to the next
+        // day is safe — everyone retries tomorrow.
+        const drAgents = (this._active || []).filter((a) => { const o = a.postingOrder || ''; return o === 'daily-rotation' || o === 'campaign-plan'; });
+        const _allRotatedToday = drAgents.length > 0 && drAgents.every((a) => ((this._perAccountRotation || {})[a.name] || {}).lastPostedDate === _today);
         if (_allRotatedToday) {
           const d = new Date();
           const nextLocalMidnight = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 30).getTime();
@@ -1547,7 +1586,11 @@ class Orchestrator {
         this.log(`🛑 3 cycles in a row posted nothing — stopping so the app doesn't spin unattended. Likely cause: ${cause}.`);
         break;
       }
-      if ((settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {
+      // maxCycles is a hard cycle cap — but DON'T let it cut a "deliver everything then stop" campaign short:
+      // Completion mode and a finishing (Loop-OFF) campaign-plan have their OWN stop condition (100% delivered),
+      // so maxCycles is ignored while those are draining (it would otherwise abort mid-distribution).
+      const _completionDriven = settings.completionMode || (this._campaignPlan && !settings.loopCampaign && (this._active || []).some((a) => (a.postingOrder || '') === 'campaign-plan'));
+      if (!_completionDriven && (settings.maxCycles || 0) > 0 && cycle >= settings.maxCycles) {
         this.log(`🏁 Reached maxCycles (${settings.maxCycles}) — finishing.`); break;
       }
       if (settings.scheduleMode === 'daily') {
