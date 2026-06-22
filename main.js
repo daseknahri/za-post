@@ -1082,6 +1082,7 @@ function setLicenseState(r, enforced) {
     enforced: !!enforced,
     tier: (r && r.tier) || (enforced ? 'standard' : 'owner'),
     limits: license.limitsOf(r),
+    expiry: (r && (r.expires || r.expiry)) || null, // carry the validated expiry so the UI can show "Valid Until"
   };
 }
 // Returns a fail() result if creating `add` more of `kind` ('accounts'|'groups') would exceed the
@@ -1100,7 +1101,7 @@ function overLimit(kind, currentCount, add = 1) {
 ipcMain.handle('get-license-info', () => {
   const L = _licenseState;
   const toN = (v) => (Number.isFinite(v) ? v : 9999);
-  return { valid: L.valid, enforced: L.enforced, tier: L.tier, lifetime: !L.enforced, maxAccounts: toN(L.limits.maxAccounts), maxGroups: toN(L.limits.maxGroups) };
+  return { valid: L.valid, enforced: L.enforced, tier: L.tier, lifetime: !L.enforced && !L.expiry, expiry: L.expiry || null, maxAccounts: toN(L.limits.maxAccounts), maxGroups: toN(L.limits.maxGroups) };
 });
 ipcMain.handle('get-remote-url', () => tunnelUrl || '');
 ipcMain.handle('open-logs-folder', () => {

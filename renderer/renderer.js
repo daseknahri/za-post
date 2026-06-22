@@ -513,11 +513,14 @@ function initializeEventListeners() {
     });
   }
 
+  // Closing the login modal must also CANCEL the login (close its browser + reset state), not just hide it.
+  const dismissModal = (id) => { if (id === 'modal-login-instructions') { try { cancelLogin(); return; } catch {} } closeModal(id); };
+
   // Modal close buttons
   document.querySelectorAll('.modal-close, [data-dismiss="modal"]').forEach(btn => {
     btn.addEventListener('click', (e) => {
       const modal = e.target.closest('.modal');
-      if (modal) closeModal(modal.id);
+      if (modal) dismissModal(modal.id);
     });
   });
 
@@ -525,7 +528,7 @@ function initializeEventListeners() {
   document.querySelectorAll('.modal').forEach(modal => {
     modal.addEventListener('click', (e) => {
       if (e.target === modal) {
-        closeModal(modal.id);
+        dismissModal(modal.id);
       }
     });
   });
@@ -1160,6 +1163,9 @@ function renderAccounts() {
           <button class="btn-primary" onclick="loginAccount('${account.name}')">
             🔐 Login
           </button>
+          <button class="btn-secondary" onclick="checkAccountStatusCard('${account.name}')" title="Check this account's Facebook login status now" style="padding: 8px 12px; font-size: 13px;">
+            🔄 Check
+          </button>
           <button class="btn-secondary" onclick="openImportCookiesModal('${account.name}')" title="Import Cookies" style="padding: 8px 12px; font-size: 13px;">
             🍪 Cookies
           </button>
@@ -1185,14 +1191,23 @@ async function toggleAccountEnabled(accountName) {
 // when a working account there drops, a post stays held, or a comment needs placing. Persists via saveData
 // (the account's `standby` field rides along; the orchestrator reads it to keep it out of the posting pool).
 async function toggleAccountStandby(accountName) {
-  const a = (appData.accounts || []).find((x) => x.name === accountName);
+  const a = await patchAccount(accountName, (acc) => { acc.standby = !acc.standby; });
   if (!a) return;
-  a.standby = !a.standby;
-  await saveData();
   showNotification(a.standby
     ? `🟡 ${accountName} is now Standby (backup) — it won't post normally; it steps in only when its groups need it`
     : `${accountName} is now a Primary poster again`, 'success');
   renderAccounts();
+}
+
+// Standalone account-card "Check" — probe this account's Facebook login status without opening the login modal.
+async function checkAccountStatusCard(name) {
+  showNotification(`Checking ${name}…`, 'info');
+  try {
+    const result = await window.electronAPI.checkAccountStatus(name);
+    await loadData();
+    if (result && result.status === 'logged_in') showNotification(`✅ ${name}: logged in`, 'success');
+    else showNotification(`⚠️ ${name}: ${(result && result.message) || 'not logged in'}`, 'error');
+  } catch (e) { showNotification(`Check failed for ${name}: ${(e && e.message) || e}`, 'error'); }
 }
 
 // RDP keepalive reminder: if the app is being viewed over Remote Desktop AND the one-time disconnect-keepalive
@@ -1319,17 +1334,25 @@ async function submitBatchGroupAssign() {
   showNotification(`✅ Assigned ${groupIds.length} group${groupIds.length === 1 ? '' : 's'} to ${n} agent${n === 1 ? '' : 's'} — in Campaign Plan they now form one team that splits the library across those groups.`, 'success');
 }
 
+// Race-safe single-account field update: fetch FRESH backend data, mutate ONE account, save the whole fresh
+// object — so a per-field change can't clobber a concurrent backend write (e.g. the running orchestrator
+// updating an account's status). Returns the mutated account, or null if not found / save failed.
+async function patchAccount(accountName, mutate) {
+  const fresh = await window.electronAPI.getData();
+  if (!fresh || !Array.isArray(fresh.accounts)) return null;
+  const a = fresh.accounts.find((x) => x.name === accountName);
+  if (!a) return null;
+  mutate(a);
+  const res = await window.electronAPI.saveData(fresh);
+  if (res && res.success === false) { showNotification('Failed to save: ' + (res.error || 'unknown error'), 'error'); return null; }
+  appData = fresh;
+  return a;
+}
+
 // Update post filter for an account
 async function updatePostFilter(accountName, filterValue) {
-  const account = appData.accounts.find(a => a.name === accountName);
+  const account = await patchAccount(accountName, (a) => { a.postFilter = filterValue; });
   if (!account) return;
-
-  account.postFilter = filterValue;
-
-  // Save to backend
-  await saveData();
-
-  // Show confirmation
   const filterLabels = {
     'all': 'All Posts',
     'with-comments': 'Only with Comments',
@@ -1340,15 +1363,8 @@ async function updatePostFilter(accountName, filterValue) {
 
 // Update posting order for an account
 async function updatePostingOrder(accountName, orderValue) {
-  const account = appData.accounts.find(a => a.name === accountName);
+  const account = await patchAccount(accountName, (a) => { a.postingOrder = orderValue; });
   if (!account) return;
-
-  account.postingOrder = orderValue;
-
-  // Save to backend
-  await saveData();
-
-  // Show confirmation
   const orderLabels = {
     'post-centric': 'Post to All Groups',
     'post-centric-unique': 'One Post Per Account (Unique, All Groups)',
@@ -1363,10 +1379,8 @@ async function updatePostingOrder(accountName, orderValue) {
 
 // Update per-account proxy
 async function updateAccountProxy(accountName, proxyValue) {
-  const account = appData.accounts.find(a => a.name === accountName);
+  const account = await patchAccount(accountName, (a) => { a.proxy = (proxyValue || '').trim(); });
   if (!account) return;
-  account.proxy = (proxyValue || '').trim();
-  await saveData();
   showNotification(account.proxy ? `Proxy set for ${accountName}` : `Proxy cleared for ${accountName}`, 'success');
 }
 
@@ -1374,38 +1388,39 @@ async function updateAccountProxy(accountName, proxyValue) {
 // a moderator never posts. Each group is routed to its moderator via group.moderatedBy (or, with one
 // moderator, automatically).
 async function toggleModerator(name, makeMod) {
-  const a = (appData.accounts || []).find((x) => x.name === name);
-  if (!a) return;
-  const becomingMod = (makeMod === undefined) ? !a.isModerator : !!makeMod;
+  const a0 = (appData.accounts || []).find((x) => x.name === name);
+  if (!a0) return;
+  const becomingMod = (makeMod === undefined) ? !a0.isModerator : !!makeMod;
   // Demotion guard: a moderator carries a trusted admin session and was never meant to post. If we just
   // cleared the flag it would resurrect as an ENABLED poster. Confirm + disable it so it can't post
   // unattended from the admin account; the operator re-enables it on the Accounts tab if they really want.
-  if (!becomingMod && a.isModerator) {
-    if (!confirm(`Remove "${a.name}" as moderator?\n\nIt becomes a normal account and will be DISABLED (so it can't post from your admin session). Re-enable it on the Accounts tab if you want it to post.`)) {
+  if (!becomingMod && a0.isModerator) {
+    if (!confirm(`Remove "${name}" as moderator?\n\nIt becomes a normal account and will be DISABLED (so it can't post from your admin session). Re-enable it on the Accounts tab if you want it to post.`)) {
       try { renderModeratorPanel(); } catch {}
       return;
     }
-    a.enabled = false;
   }
-  a.isModerator = becomingMod;
-  await saveData();
-  showNotification(a.isModerator ? `🛡️ ${a.name} is now a group moderator (it won't post)` : `${a.name} removed as moderator (disabled — re-enable on Accounts to post)`, 'success');
+  const a = await patchAccount(name, (acc) => { const wasMod = acc.isModerator; acc.isModerator = becomingMod; if (!becomingMod && wasMod) acc.enabled = false; });
+  if (!a) return;
+  showNotification(a.isModerator ? `🛡️ ${name} is now a group moderator (it won't post)` : `${name} removed as moderator (disabled — re-enable on Accounts to post)`, 'success');
   try { renderModeratorPanel(); renderGroups(); renderAccounts(); } catch {}
 }
 // MOD: assign which moderator account covers a group's held posts ('' = auto / the only moderator).
 async function updateGroupModerator(groupId, accountName) {
-  const g = (appData.groups || []).find((x) => (x.id === groupId) || (x.groupId === groupId));
+  const fresh = await window.electronAPI.getData();
+  if (!fresh || !Array.isArray(fresh.groups)) return;
+  const g = fresh.groups.find((x) => (x.id === groupId) || (x.groupId === groupId));
   if (!g) return;
   g.moderatedBy = (accountName || '').trim() || undefined;
-  await saveData();
+  const res = await window.electronAPI.saveData(fresh);
+  if (res && res.success === false) { showNotification('Failed to save: ' + (res.error || 'unknown error'), 'error'); return; }
+  appData = fresh;
   showNotification(g.moderatedBy ? `Moderator for "${g.name || groupId}" set to ${g.moderatedBy}` : `Moderator for "${g.name || groupId}" set to auto`, 'success');
 }
 // MOD: the FB display name used to recognise this account's posts in the moderation queue.
 async function updateFbDisplayName(name, value) {
-  const a = (appData.accounts || []).find((x) => x.name === name);
+  const a = await patchAccount(name, (acc) => { acc.fbDisplayName = (value || '').trim(); });
   if (!a) return;
-  a.fbDisplayName = (value || '').trim();
-  await saveData();
   showNotification(`FB display name ${a.fbDisplayName ? 'set' : 'cleared'} for ${name}`, 'success');
 }
 // MOD: the dedicated moderator section in the Groups view — designate the admin account, log it in,
@@ -1515,16 +1530,18 @@ async function saveAccountCredentials() {
   if (!editingAccountName) return;
   const emailVal = document.getElementById('edit-account-email').value.trim();
   const passVal = document.getElementById('edit-account-password').value;
-  // If password field is blank, preserve the existing stored password (pass empty string
-  // signals "clear it"; blank input means "don't change" — we read existing from appData).
+  // Blank password field = "leave unchanged" → pass null so the backend KEEPS the existing encrypted password.
+  // (The old code passed account.password — already ENCRYPTED — which the backend then re-encrypted, corrupting
+  // the saved password on every email/alias edit. The backend now ignores null and keeps the existing value.)
   const account = appData.accounts.find(a => a.name === editingAccountName);
-  const finalPass = passVal !== '' ? passVal : (account ? (account.password || '') : '');
+  const finalPass = passVal !== '' ? passVal : null;
   const result = await window.electronAPI.setAccountCredentials(editingAccountName, emailVal, finalPass);
   if (result && result.success) {
-    // Update local cache so badge reflects new state without a full reload
-    if (account) { account.email = emailVal; account.password = finalPass; }
+    // Update local cache so the badge reflects the new state without a full reload (mark "set", never cache plaintext).
+    if (account) { account.email = emailVal; if (finalPass != null) account.password = finalPass ? 'set' : ''; }
+    const hasPass = (finalPass != null) ? !!finalPass : !!(account && account.password);
     const badge = document.getElementById('edit-account-cred-badge');
-    if (badge) badge.style.display = finalPass ? 'block' : 'none';
+    if (badge) badge.style.display = hasPass ? 'block' : 'none';
     document.getElementById('edit-account-password').value = '';
     showNotification('Auto-login credentials saved!', 'success');
   } else {
@@ -1614,10 +1631,9 @@ async function submitCookieImport() {
     if (!Array.isArray(cookiesArray)) {
       throw new Error('Not an array');
     }
-    // Basic validation
-    if (!cookiesArray.every(c => c.name && c.value)) {
-      throw new Error('Some cookies are missing name or value');
-    }
+    // No per-cookie pre-validation here: a single empty-value entry in an otherwise-good export must NOT
+    // block the whole import. The backend (import-cookies) filters junk entries and warns if c_user/xs are
+    // missing — that's the right place to validate.
   } catch (e) {
     statusEl.textContent = '❌ Invalid JSON format: ' + e.message;
     statusEl.style.display = 'block';

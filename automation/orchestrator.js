@@ -935,6 +935,14 @@ class Orchestrator {
       // Also require campaign-plan agents (excluded from finiteActive) to have finished their slices, so a
       // mixed unique+campaign fleet doesn't stop/recycle (and reset campaign pointers) mid-campaign.
       const campaignDone = !this._campaignPlan || this._campaignAllFinished();
+      // One-time advisory: completionMode only does something for a FINITE campaign. Tell the operator when it
+      // can't take effect — Loop Campaign on (never ends), or an all-ongoing fleet (post-centric/daily-rotation).
+      if (settings.completionMode && !this._completionWarned) {
+        this._completionWarned = true;
+        const hasCampaign = active.some((a) => (a.postingOrder || '') === 'campaign-plan');
+        if (settings.loopCampaign) this.log('ℹ️ Completion mode is ON but so is Loop Campaign — a looping campaign never "completes", so completion mode won\'t auto-stop. Turn Loop Campaign OFF for a finite campaign that reports + stops.');
+        else if (!finiteActive.length && !hasCampaign) this.log('ℹ️ Completion mode is ON but no account uses a FINITE method (Unique / Sequential / Campaign Plan) — it has no effect on post-centric / daily-rotation fleets (they run continuously).');
+      }
       if (!settings.completionMode && finiteActive.length && campaignDone && finiteActive.reduce((s, a) => s + this._postsForAccount(a, cycle).length, 0) === 0) {
         if (settings.loopCampaign) {
           // Loop campaign: re-distribute the whole library, rotating content across accounts.

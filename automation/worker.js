@@ -1441,13 +1441,13 @@ async function runAccount(o) {
   // through proxy-chain (a local anonymized HTTP proxy) when credentials are present.
   let proxyAuth = null, anonLocal = null, watchdog = null;
   const tempImages = []; // downloaded remote images to clean up at the end
-  if (useProxies) {
-    // Per-account STABLE proxy: prefer the account's OWN assigned proxy; else pick from the shared
-    // pool by a stable hash of the account name, so an account keeps the SAME exit IP every run.
-    // (FB trusts a consistent per-account IP and links accounts that share/hop IPs — the old code
-    // picked a RANDOM pool entry each launch, making every account look like it changed IP each run.)
+  {
+    // Per-account STABLE proxy: an account's OWN assigned proxy is ALWAYS honored — even when the global
+    // proxy toggle is OFF — because the operator set it deliberately. The global `useProxies` only enables the
+    // shared POOL fallback for accounts without their own proxy. (FB trusts a consistent per-account IP and
+    // links accounts that share/hop IPs, so the pool pick is a stable hash of the account name.)
     let proxyStr = (account.proxy && String(account.proxy).trim()) || '';
-    if (!proxyStr && proxies && proxies.length) {
+    if (!proxyStr && useProxies && proxies && proxies.length) {
       let h = 0; for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
       proxyStr = proxies[h % proxies.length];
     }
@@ -1467,7 +1467,7 @@ async function runAccount(o) {
         report('', '', 'error', 'invalid proxy — account skipped', '');
         return { posted: 0, errors: 1, pendingApproval: 0, noRetry: true, flag: 'proxy_invalid', postedIds: [] };
       }
-    } else {
+    } else if (useProxies) {
       log(`⚠️ [${name}] proxies are ON but this account has NO proxy assigned (pool empty) — it will post from your real IP. Assign a proxy in the Accounts tab.`);
     }
   }
