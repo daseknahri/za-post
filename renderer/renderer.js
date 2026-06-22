@@ -621,6 +621,9 @@ function renderHealth() {
 }
 
 // Posts Management
+let postSearch = '';
+function setPostSearch(v) { postSearch = v || ''; renderPosts(); const el = document.getElementById('post-search'); if (el) { try { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } catch {} } }
+
 function renderPosts() {
   const container = document.getElementById('posts-container');
 
@@ -638,7 +641,10 @@ function renderPosts() {
     return;
   }
 
-  container.innerHTML = appData.posts.map(post => {
+  const q = (postSearch || '').toLowerCase();
+  const fposts = q ? appData.posts.filter((p) => ((p.caption || '') + ' ' + (p.comment || '')).toLowerCase().includes(q)) : appData.posts;
+  const postToolbar = `<div style="margin-bottom:12px;display:flex;align-items:center;gap:8px;"><input id="post-search" value="${escapeHtml(postSearch)}" oninput="setPostSearch(this.value)" placeholder="🔍 Search posts by caption or comment…" style="flex:1;min-width:170px;padding:7px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;font-size:13px;outline:none;">${q ? `<span style="font-size:11px;color:#64748b;white-space:nowrap;">showing ${fposts.length}/${appData.posts.length}</span>` : ''}</div>`;
+  container.innerHTML = postToolbar + (fposts.length ? fposts.map(post => {
     // Support both old single imagePath and new imagePaths array
     const allPaths = post.imagePaths || (post.imagePath ? [post.imagePath] : []);
     const _rawFirst = allPaths[0] || post.imageUrl || ''; // fall back to a remote image URL so URL-only posts don't show "Text Only"
@@ -675,7 +681,7 @@ function renderPosts() {
         </div>
       </div>
     </div>
-  `}).join('');
+  `}).join('') : `<div class="empty-state" style="padding:24px;"><div class="icon">🔍</div><h3>No posts match</h3><p>Clear the search to see all posts.</p></div>`);
 }
 
 // Show/hide comment image section based on: comment enabled

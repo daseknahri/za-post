@@ -678,17 +678,6 @@ async function waitForPublish(page, dialogCountBefore, timeout = 45000, shouldSt
   return 'timeout';
 }
 
-// Detect the "pending admin approval" state moderated groups show after posting. Phrase list is
-// FB.pending (multi-locale, single source of truth — also unit-tested).
-async function checkPendingApproval(page) {
-  try {
-    return await page.evaluate((pats) => {
-      const t = (document.body.innerText || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-      return pats.some((p) => t.includes(p));
-    }, FB.pending);
-  } catch { return false; }
-}
-
 // POST-SPECIFIC pending signal: a genuinely moderated group shows a "will be reviewed / pending
 // approval" notice for OUR just-submitted post in a TOAST / ALERT / open DIALOG — NEVER inside a feed
 // article. We scan ONLY those notice surfaces (excluding [role="article"]) so this can't false-match
