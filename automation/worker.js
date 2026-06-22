@@ -1543,7 +1543,12 @@ async function runAccount(o) {
       catch (e) { log(`⚠️ [${name}] focus emulation failed (${e.message}) — publish may be slower`); }
     }
     try {
-      await page.evaluateOnNewDocument(() => {
+      // Per-account screen offset (deterministic from the name hash) so many accounts hitting the SAME groups
+      // don't all report the IDENTICAL screenX/Y — a correlatable cross-account fingerprint. Stable per account
+      // across runs (so it doesn't itself look anomalous), distinct between accounts.
+      let _nh = 0; for (let _i = 0; _i < name.length; _i++) _nh = (_nh * 31 + name.charCodeAt(_i)) >>> 0;
+      const _sx = 60 + (_nh % 900), _sy = 30 + (_nh % 500);
+      await page.evaluateOnNewDocument((sx, sy) => {
         Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
         Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
         document.hasFocus = () => true;
@@ -1553,11 +1558,11 @@ async function runAccount(o) {
         // Define on Window.prototype (where real browsers expose these) so a probe of
         // Object.getOwnPropertyDescriptor(window,'screenX') sees no own-property override.
         const proto = Object.getPrototypeOf(window) || window;
-        for (const pv of [['screenX', 80], ['screenY', 40], ['screenLeft', 80], ['screenTop', 40]]) {
+        for (const pv of [['screenX', sx], ['screenY', sy], ['screenLeft', sx], ['screenTop', sy]]) {
           try { Object.defineProperty(proto, pv[0], { configurable: true, get: () => pv[1] }); }
           catch { try { Object.defineProperty(window, pv[0], { configurable: true, get: () => pv[1] }); } catch {} }
         }
-      });
+      }, _sx, _sy);
     } catch {}
     // Allow clipboard access so captions can be PASTED (fast + reliable, like the original agent).
     try { await browser.defaultBrowserContext().overridePermissions('https://www.facebook.com', ['clipboard-read', 'clipboard-write']); } catch {}
@@ -1779,6 +1784,10 @@ async function runAccount(o) {
       return { posted: 0, errors: 1, pendingApproval: 0, noRetry: true, flag: null, postedIds: [], dealtIds: [], fullyPosted: false, offline: false };
     }
 
+    // Per-RUN salt for image variation: stable within this run (retries of a group reuse the same temp file,
+    // no churn) but fresh each daily cycle — so a recurring campaign doesn't re-post the identical image hash
+    // to the same group every day (a cross-cycle dedup signal).
+    const runSalt = Date.now().toString(36);
     const groupRetries = {}; // E-P1: per-group transient-retry counter (max 1 retry, pre-publish only)
     for (let i = 0; i < targetGroups.length; i++) {
       let publishClicked = false; // E-P1: once true, NEVER retry this group (would risk a double-post)
@@ -1893,11 +1902,11 @@ async function runAccount(o) {
         if (settings.varyImages !== false && imageVary.available() && resolvedImages.length) {
           const vi = [];
           for (const im of resolvedImages) {
-            const v = await imageVary.varyImage(im, `${name}|${gid}|${im}`);
+            const v = await imageVary.varyImage(im, `${name}|${gid}|${im}|${runSalt}`);
             if (v) { vi.push(v); tempImages.push(v); } else vi.push(im);
           }
           groupImages = vi;
-          if (groupCommentImg) { const cv = await imageVary.varyImage(groupCommentImg, `${name}|${gid}|c|${groupCommentImg}`); if (cv) { groupCommentImg = cv; tempImages.push(cv); } }
+          if (groupCommentImg) { const cv = await imageVary.varyImage(groupCommentImg, `${name}|${gid}|c|${groupCommentImg}|${runSalt}`); if (cv) { groupCommentImg = cv; tempImages.push(cv); } }
           step('Image varied (unique hash for this group)');
         }
 

@@ -54,7 +54,9 @@ function startServer(port, injected) {
   const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB cap
 
   const app = express();
-  app.use(cors());
+  // The dashboard is SAME-ORIGIN on the tunnel URL — no legitimate cross-origin need. Disabling CORS removes
+  // the browser's same-origin barrier exploit if a token-bearing URL ever leaks to another origin.
+  app.use(cors({ origin: false }));
   app.use(express.json({ limit: '15mb' }));
   app.use(express.urlencoded({ extended: true }));
   app.use((_req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });

@@ -39,7 +39,9 @@ function adminAuth(req, res, next) {
   const token = process.env.ADMIN_TOKEN;
   if (!token) return res.status(403).json({ error: 'admin disabled — set ADMIN_TOKEN' });
   const hdr = req.get('authorization') || '';
-  const provided = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : (req.query.admin || '');
+  // Header-only (Bearer) — the ?admin= query fallback was removed: query strings leak into Nginx/Cloudflare
+  // access logs, exposing ADMIN_TOKEN. Send `Authorization: Bearer <token>`.
+  const provided = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : '';
   if (provided !== token) return res.status(403).json({ error: 'forbidden' });
   next();
 }

@@ -442,16 +442,18 @@ class Orchestrator {
           // while a post is held). Gated on those opt-ins — when all are off this is a no-op (behavior as before).
           if ((data.settings.moderationEnabled || data.settings.repostEnabled || data.settings.completionMode) && r && r.heldRecords && r.heldRecords.length) {
             try {
-              const ms = store.loadModeration();
-              for (const h of r.heldRecords) {
-                // Skip if an ACTIVE or already-HANDLED record exists for this (post,group) — held (awaiting),
-                // superseded (a re-post was dispatched), or failed_held (re-post also held, capped). This stops
-                // a replacement's own hold (or a re-hold of the same post) from spawning a phantom fresh 'held'.
-                if (!ms.held.some((x) => x.postId === h.postId && x.gid === h.gid && (x.status === 'held' || x.status === 'superseded' || x.status === 'failed_held'))) {
-                  ms.held.push({ ...h, status: 'held', permalink: null, heldAt: Date.now(), approvedAt: null, commentedAt: null });
+              // Serialized so two parallel accounts can't lost-update the held list (clobbering each other's appends).
+              const { ok: _msOk } = await store.updateModeration((ms) => {
+                for (const h of r.heldRecords) {
+                  // Skip if an ACTIVE or already-HANDLED record exists for this (post,group) — held (awaiting),
+                  // superseded (a re-post was dispatched), or failed_held (re-post also held, capped). This stops
+                  // a replacement's own hold (or a re-hold of the same post) from spawning a phantom fresh 'held'.
+                  if (!ms.held.some((x) => x.postId === h.postId && x.gid === h.gid && (x.status === 'held' || x.status === 'superseded' || x.status === 'failed_held'))) {
+                    ms.held.push({ ...h, status: 'held', permalink: null, heldAt: Date.now(), approvedAt: null, commentedAt: null });
+                  }
                 }
-              }
-              if (store.saveModeration(ms)) {
+              });
+              if (_msOk) {
                 this.log(`📥 [${account.name}] ${r.heldRecords.length} post(s) held in "Spam potentiel" — moderator will try to approve (fallback; the comment lands once they're public)`);
                 // A hold is a TRUST signal, not the routine path: FB's Spam-potentiel is account-signal-driven
                 // (admin role does NOT bypass it), so the durable fix is account trust, not the scrape. Track
@@ -483,14 +485,17 @@ class Orchestrator {
           // the rescue phase — a post is never left without its link.
           if (r && r.commentQueue && r.commentQueue.length) {
             try {
-              const cs = store.loadComments();
-              let added = 0;
-              for (const c of r.commentQueue) {
-                if (!cs.pending.some((x) => x.gid === c.gid && (x.postId && c.postId ? x.postId === c.postId : x.captionSnip === c.captionSnip) && x.status !== 'done')) {
-                  cs.pending.push({ ...c, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null }); added++;
+              // Serialized so parallel accounts can't lost-update the pending-comments list.
+              const { ok: _csOk, result: added } = await store.updateComments((cs) => {
+                let n = 0;
+                for (const c of r.commentQueue) {
+                  if (!cs.pending.some((x) => x.gid === c.gid && (x.postId && c.postId ? x.postId === c.postId : x.captionSnip === c.captionSnip) && x.status !== 'done')) {
+                    cs.pending.push({ ...c, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null }); n++;
+                  }
                 }
-              }
-              if (added && store.saveComments(cs)) this.log(`📌 [${account.name}] ${added} post(s) live but uncommented — queued for comment-rescue by a healthy account`);
+                return n;
+              });
+              if (added && _csOk) this.log(`📌 [${account.name}] ${added} post(s) live but uncommented — queued for comment-rescue by a healthy account`);
               else if (added) this.log(`🛑 [${account.name}] could NOT persist ${added} orphaned-comment record(s) (disk full/locked?) — those posts risk staying without their link. Check disk/permissions.`);
             } catch (e) { this.log(`🛑 [${account.name}] could not persist comment-rescue queue: ${e.message} — orphaned comment(s) at risk`); }
           }
