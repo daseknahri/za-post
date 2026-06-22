@@ -857,9 +857,11 @@
         }
 
         async function loadPosts() {
-            const res = await fetch('/api/posts');
-            const data = await res.json();
-            renderPosts(data.posts);
+            try {
+                const res = await fetch('/api/posts');
+                const data = await res.json();
+                renderPosts(data.posts);
+            } catch (e) { console.error('loadPosts failed', e); } // polled every 2s — never throw an unhandled rejection
         }
 
         async function addPost() {
@@ -1131,8 +1133,7 @@
         }
 
         setInterval(pollAll, 2000);
-        pollAll();
-        loadPosts();
+        pollAll(); // pollAll() already calls loadPosts() — no separate loadPosts() needed here
         loadTunnelUrl();
 
     </script>

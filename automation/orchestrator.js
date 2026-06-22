@@ -774,6 +774,7 @@ class Orchestrator {
     this._drainingCompletion = false; // true while the completion engine is fast-draining queues — bypasses the daily-schedule 24h gate
     this._proxyWarned = false;    // one-time per-run "proxies off / shared IP" warning
     this._auditWarned = false;    // one-time per-run "audit-log write failed" warning
+    this._completionWarned = false; // one-time per-run completion-mode advisory (else suppressed forever after a Stop/Start)
     this._roundOffset = _st.roundOffset || 0; // rotates account↔post mapping across Loop-campaign recycles
     this._staggerRotation = _st.staggerRotation || 0; // E-N3: rotates account START order each cycle (fairness)
     this._lastDailyRunDate = _st.lastDailyRunDate || null; // 'daily' schedule: local day-key of the last run (same-day-restart dedupe)

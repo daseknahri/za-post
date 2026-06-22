@@ -161,7 +161,7 @@ async function runModerator(o) {
         // diagnostics: distinct labels of the approve-looking buttons we considered
         const nearbyBtns = [...new Set(approveBtns.map((b) => nm((b.getAttribute && b.getAttribute('aria-label')) || b.textContent || '')).filter(Boolean))].slice(0, 12);
         return { count: results.length, results, approveBtnCount: approveBtns.length, nearbyBtns };
-      }, { snips: capSnips }, 14000).catch(() => null);
+      }, { snips: capSnips, ourNames }, 14000).catch(() => null);
 
       if (!scan) { log(`🛡️ [moderator] [${gname}] scan failed (selector/timeout) — dumping nothing; refine selectors`); out.errors++; continue; }
       out.scanned += scan.count;
