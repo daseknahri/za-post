@@ -651,12 +651,19 @@ async function waitForPublish(page, dialogCountBefore, timeout = 45000, shouldSt
     const dialogCount = await evalTimed(page, () => document.querySelectorAll('div[role="dialog"]').length, null, 8000).catch(() => -1);
     if (dialogCount >= 0 && dialogCountBefore > 0 && dialogCount < dialogCountBefore) return 'published';
     const sig = await evalTimed(page, () => {
-      const t = (document.body.innerText || '').toLowerCase();
-      if (/pending|in review|will be reviewed|shared once approved|post is pending|posted to the group/.test(t)) return 'submitted';
-      // Explicit Facebook failure — return early instead of polling the full window, and never
-      // count it as published (so the post is retried, not lost).
-      if (/couldn.t post|can.t share|something went wrong|unable to post|failed to post|couldn.t share/.test(t)) return 'error';
-      const hasEnabledPost = Array.from(document.querySelectorAll('div[role="dialog"] [role="button"]'))
+      // Scope success/error/pending detection to NOTICE surfaces (alert/status/dialog), NEVER feed articles:
+      // a moderated group's feed is full of old "pending"/"posted to the group" text that would otherwise
+      // FALSE-POSITIVE 'submitted' on the very first poll (before our post even transmitted) → a lost post.
+      const nt = Array.from(document.querySelectorAll('[role="alert"], [role="status"], div[role="dialog"]'))
+        .filter((n) => !n.closest('[role="article"]')).map((n) => n.innerText || '').join(' \n ').toLowerCase();
+      if (/pending|in review|will be reviewed|shared once approved|post is pending|posted to the group/.test(nt)) return 'submitted';
+      // Explicit Facebook failure — never count it as published (so the post is retried, not lost).
+      if (/couldn.t post|can.t share|something went wrong|unable to post|failed to post|couldn.t share/.test(nt)) return 'error';
+      // While the composer DIALOG is still open, a DISABLED Post button = still SUBMITTING (loading spinner),
+      // NOT published — keep polling. The dialog CLOSING (the count drop checked above) is the authoritative
+      // 'published' signal. Only treat a vanished button as 'gone' when there's NO dialog (inline composer).
+      if (document.querySelector('div[role="dialog"]')) return 'open';
+      const hasEnabledPost = Array.from(document.querySelectorAll('[role="button"]'))
         .some((b) => (b.getAttribute('aria-label') || b.textContent || '').trim().toLowerCase() === 'post' && b.getAttribute('aria-disabled') !== 'true');
       return hasEnabledPost ? 'open' : 'gone';
     }, null, 8000).catch(() => 'timeout');
@@ -1889,6 +1896,13 @@ async function runAccount(o) {
         }
         await sleep(1500);
         await dismissPopups(page);
+        // Drift guard: if a popup-dismiss click followed a link, or FB redirected to the home feed / login,
+        // we must NOT compose+publish here (it would post to the wrong place / the user's own feed). We check
+        // we're still in the /groups/ section (tolerant of vanity-vs-numeric group URLs), not the exact id.
+        if (!/\/groups\//.test(String(page.url()))) {
+          step(`Page drifted off the group (now ${String(page.url()).slice(0, 80)}) — skipping to avoid posting to the wrong place`);
+          errors++; report(groupName, gid, 'error', 'page drifted off the group before posting', ''); continue;
+        }
         step('Composer opened; preparing post');
 
         // Read the composer editable text length, with a settle delay for robustness.
@@ -2031,9 +2045,11 @@ async function runAccount(o) {
           if (postBtnInfo.found) step(`Post button found (label="${postBtnInfo.label}")`);
           else step(`⚠️ Post button NOT found (${postBtnInfo.dialogs} dialog(s)) — possible selector drift. Buttons seen: ${(postBtnInfo.seen || []).join(' | ') || '(none)'}. If this recurs, run scripts/inspect-fb.js.`);
         }
-        publishClicked = true; // E-P1: from here on this group must NOT be retried (would double-post)
         const clicked = await clickPostButton(page);
         if (!clicked) { step('Post button not found; skipping group'); errors++; report(groupName, gid, 'error', 'post button not found', ''); continue; }
+        // E-P1: set ONLY after the click actually fired (clickPostButton returns true post-mouse-click). If it
+        // had thrown BEFORE clicking (e.g. mouse-move on a dead page), no click went out → a retry is safe.
+        publishClicked = true; // from here this group must NOT be retried (would double-post)
         step('Post button clicked');
         let publishResult = await waitForPublish(page, dialogCountBefore, 45000, shouldStop);
         if (publishResult === 'stopped') { step('Stop requested during publish wait — halting'); break; }
@@ -2042,7 +2058,14 @@ async function runAccount(o) {
           // window and trip the wait. Do a READ-ONLY feed rescan (NEVER re-click Post — that would
           // double-post): if OUR caption is already in the feed, the post landed → treat as published.
           const _landSnip = (post.caption || '').replace(/\s+/g, ' ').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().slice(0, 40);
-          if (_landSnip.length >= 12) {
+          // (a) Cheap, caption-independent: did the composer dialog CLOSE just after the wait expired? That's
+          // a published signal that works for SHORT/no-caption posts too (the caption rescan below can't help
+          // them) — without it a slow-publish short-caption post is a FALSE failure → re-posted next cycle = a DOUBLE-POST.
+          {
+            const dcNow = await evalTimed(page, () => document.querySelectorAll('div[role="dialog"]').length, null, 5000).catch(() => -1);
+            if (dcNow >= 0 && dialogCountBefore > 0 && dcNow < dialogCountBefore) { step('Publish wait timed out but the composer dialog CLOSED — treating as published (slow publish).'); publishResult = 'published'; }
+          }
+          if (publishResult === 'timeout' && _landSnip.length >= 12) {
             step('Publish wait timed out — rescanning the feed (read-only) to see if it landed anyway…');
             await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
             await page.waitForSelector('[aria-posinset], div[role="article"]', { timeout: 20000 }).catch(() => {});
