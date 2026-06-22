@@ -113,12 +113,20 @@ async function moveMouseTo(page, x, y) {
   } catch {}
 }
 
+// "Fast path": instant typing + skipped human-reading dwells. True when humanization is OFF, or the operator
+// chose a FAST or TURBO ("super experienced user") speed preset. The anti-spam GAPS (group/comment/cycle
+// delays) still apply from their ranges — only the cosmetic dwells/typing speed collapse here.
+function isFastMode(settings) {
+  settings = settings || {};
+  return settings.humanizeMaster === false || settings.speedMode === 'fast' || settings.speedMode === 'turbo';
+}
+
 // Land on a group and behave like a human reading before composing: a little mouse drift and a
 // few wheel scrolls with pauses, total ~5-13s. Reduces the "instant composer open" bot pattern.
 async function humanDwell(page, shouldStop = () => false, settings = {}) {
   try {
-    // humanizeMaster off / fast speed → skip the human-reading dwell entirely (deterministic + fast).
-    if (settings.humanizeMaster === false || settings.speedMode === 'fast') return;
+    // humanizeMaster off / fast / turbo → skip the human-reading dwell entirely (deterministic + fast).
+    if (isFastMode(settings)) return;
     // T5: total browse time is a random draw from the configurable pageScrollDwell range (0/0 = skip).
     const dwellMs = rangeMs(settings, 'pageScrollDwellSecMin', 'pageScrollDwellSecMax', 3, 15, 0);
     if (dwellMs <= 0) return;
@@ -702,7 +710,7 @@ async function humanType(page, text, settings = {}) {
   // FAST mode: when humanization is off (humanizeMaster===false) OR the operator set a very fast cadence
   // (speedMode==='fast'), type near-instantly with no inter-chunk pause — so a deliberately-fast setting
   // applies on the typed-caption fallback too (not just the paste path). Otherwise model a real typist.
-  const fast = settings.humanizeMaster === false || settings.speedMode === 'fast';
+  const fast = isFastMode(settings);
   const perKey = fast ? 0 : 35 + Math.floor(Math.random() * 70); // ~35-105ms/key ≈ 50 WPM; 0 = machine-fast
   const chunks = String(text).match(/.{1,12}/gs) || [];
   for (const c of chunks) {
@@ -1057,7 +1065,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
     // H1 / commentDwell: a human reads the post before commenting — a randomized, configurable pause
     // with an occasional micro-scroll. Pre-focus and pre-keystroke (the focus step below re-centers the
     // box, correcting any scroll drift), so this never moves the box off-screen or touches the text.
-    if (!(settings.humanizeMaster === false || settings.speedMode === 'fast')) { // fast/humanize-off → no reading dwell
+    if (!isFastMode(settings)) { // fast/turbo/humanize-off → no reading dwell
       await sleep(rangeMs(settings, 'commentDwellSecMin', 'commentDwellSecMax', 1, 4, 0));
       if (Math.random() < 0.4) { try { await page.mouse.wheel({ deltaY: 50 + Math.random() * 90 }); await sleep(humanDelay(500, settings, 'pause')); await page.mouse.wheel({ deltaY: -(50 + Math.random() * 90) }); } catch {} }
     }
@@ -1971,7 +1979,7 @@ async function runAccount(o) {
         // Publish — then CONFIRM it actually published (dialog closed / Post button gone).
         // Variable human "re-read before posting" pause (2-8s), not a fixed 1.5s on every post.
         // humanizeMaster off / fast speed → skip the dwell (deterministic). Pause/disable honored mid-dwell.
-        const _ppDwell = (settings.humanizeMaster === false || settings.speedMode === 'fast') ? 0 : rangeMs(settings, 'prePublishDwellSecMin', 'prePublishDwellSecMax', 3, 8, 2);
+        const _ppDwell = isFastMode(settings) ? 0 : rangeMs(settings, 'prePublishDwellSecMin', 'prePublishDwellSecMax', 3, 8, 2);
         await sleepInterruptible(_ppDwell, softStop, 500, isPaused, pauseHold); // T1: randomized "re-read before posting"
         step('Waiting for Post button to enable');
         const dialogCountBefore = await withTimeout(page.evaluate(() => document.querySelectorAll('div[role="dialog"]').length), 8000, 1).catch(() => 1);
@@ -2206,7 +2214,7 @@ async function runAccount(o) {
             if (cAttempt > 1) {
               // ~25% of the min comment delay, floored at 2.5s normally but only 0.3s when the operator
               // chose fast (humanize off or speedMode fast) — so fast settings apply to retries too.
-              const _fast = settings.humanizeMaster === false || settings.speedMode === 'fast';
+              const _fast = isFastMode(settings);
               const gap = Math.max(_fast ? 300 : 2500, Math.round(Math.min(lo, hi) * 1000 * 0.25));
               step(`Comment: retry ${cAttempt}/3 (waiting ${Math.round(gap / 1000)}s — keeping the human cadence)`);
               await sleepInterruptible(gap, softStop, 500, isPaused, pauseHold);
@@ -2364,6 +2372,6 @@ module.exports = {
   // exported for diagnostics — use the EXACT worker logic
   clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish,
   // exported for tests (no runtime effect)
-  jitter, rand, rangeMs, humanDelay, varyLinks, retryAsync, downloadImage, isSafeImageUrl, proxyFormatHint, classifyGroupError,
+  jitter, rand, rangeMs, humanDelay, isFastMode, varyLinks, retryAsync, downloadImage, isSafeImageUrl, proxyFormatHint, classifyGroupError,
   FB, isRateLimitText, isCheckpointText, isPendingText, isPostButtonLabel, isCommentBoxLabel,
 };

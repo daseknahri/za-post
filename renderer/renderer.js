@@ -2282,6 +2282,9 @@ function injectSettingsHelp() {
 // the verified defaults; Slow = safest (most human, lowest spam risk); Fast = quickest STILL-SAFE
 // pacing (group delay never goes below the engine's 120s floor). The operator can fine-tune after.
 const SPEED_PRESETS = {
+  // TURBO = power-user / "super experienced user": instant typing + skipped reading dwells (speedMode triggers
+  // the fast path in the worker) + the smallest still-nonzero gaps (a real fast human, not a 0ms bot).
+  turbo:  { waitIntervalMin: 10,  waitIntervalMax: 20,  accountDelayMin: 0, accountDelayMax: 1, groupDelayMin: 20,  groupDelayMax: 45,  commentDelayMin: 8,   commentDelayMax: 20,  pageScrollDwellSecMin: 0, pageScrollDwellSecMax: 0,  prePublishDwellSecMin: 0, prePublishDwellSecMax: 1, commentDwellSecMin: 0, commentDwellSecMax: 1, composerOpenInitialDelayMs: 800 },
   fast:   { waitIntervalMin: 45,  waitIntervalMax: 90,  accountDelayMin: 1, accountDelayMax: 2, groupDelayMin: 120, groupDelayMax: 180, commentDelayMin: 45,  commentDelayMax: 90,  pageScrollDwellSecMin: 2, pageScrollDwellSecMax: 6,  prePublishDwellSecMin: 1, prePublishDwellSecMax: 4,  commentDwellSecMin: 1, commentDwellSecMax: 3, composerOpenInitialDelayMs: 1000 },
   normal: { waitIntervalMin: 90,  waitIntervalMax: 180, accountDelayMin: 1, accountDelayMax: 4, groupDelayMin: 120, groupDelayMax: 300, commentDelayMin: 60,  commentDelayMax: 180, pageScrollDwellSecMin: 3, pageScrollDwellSecMax: 15, prePublishDwellSecMin: 3, prePublishDwellSecMax: 8,  commentDwellSecMin: 1, commentDwellSecMax: 4, composerOpenInitialDelayMs: 1500 },
   slow:   { waitIntervalMin: 180, waitIntervalMax: 360, accountDelayMin: 3, accountDelayMax: 8, groupDelayMin: 300, groupDelayMax: 600, commentDelayMin: 120, commentDelayMax: 300, pageScrollDwellSecMin: 8, pageScrollDwellSecMax: 25, prePublishDwellSecMin: 5, prePublishDwellSecMax: 12, commentDwellSecMin: 3, commentDwellSecMax: 8, composerOpenInitialDelayMs: 2500 },

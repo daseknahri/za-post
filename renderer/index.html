@@ -497,8 +497,9 @@
           <!-- One-click pacing preset: fills every timing range below at once so the operator doesn't tune each number. -->
           <div class="form-group bg-gradient-to-br from-accent/10 to-dark-700/40 backdrop-blur-sm border border-accent/25 rounded-2xl p-5">
             <label class="block text-sm font-semibold text-gray-200 mb-1">Posting speed</label>
-            <small class="block mb-3 text-xs text-gray-400">One click sets all the timing ranges below. <b class="text-cyber-green">Slow</b> = safest (most human, lowest spam risk) · <b class="text-cyber-blue">Normal</b> = balanced · <b class="text-cyber-amber">Fast</b> = quickest still-safe pacing. You can still fine-tune any value afterward.</small>
-            <div class="grid grid-cols-3 gap-3">
+            <small class="block mb-3 text-xs text-gray-400">One click sets all the timing ranges below. <b class="text-cyber-green">Slow</b> = safest (most human) · <b class="text-cyber-blue">Normal</b> = balanced · <b class="text-cyber-amber">Fast</b> = quickest still-safe · <b class="text-red-400">Turbo</b> = power-user, extremely fast (instant typing, minimal gaps — higher spam risk; use with warmed accounts + proxies). You can still fine-tune any value afterward.</small>
+            <div class="grid grid-cols-2 gap-3">
+              <button type="button" data-speed="turbo" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">⚡⚡ Turbo (power user)</button>
               <button type="button" data-speed="fast" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">⚡ Fast</button>
               <button type="button" data-speed="normal" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">⚖️ Normal</button>
               <button type="button" data-speed="slow" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">🐢 Slow</button>

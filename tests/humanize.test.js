@@ -70,10 +70,33 @@ test('migration: a legacy single timing key derives the min/max range on load', 
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-test('clampSettings: speedMode is coerced to a valid preset name', () => {
+test('clampSettings: speedMode is coerced to a valid preset name (incl. turbo)', () => {
   assert.equal(store.clampSettings({ speedMode: 'slow' }).speedMode, 'slow');
   assert.equal(store.clampSettings({ speedMode: 'fast' }).speedMode, 'fast');
+  assert.equal(store.clampSettings({ speedMode: 'turbo' }).speedMode, 'turbo', 'turbo (super-experienced-user preset) is valid');
   assert.equal(store.clampSettings({ speedMode: 'bogus' }).speedMode, 'normal', 'invalid → normal');
+});
+
+test('isFastMode: turbo + fast + humanize-off take the instant path; normal/slow do not', () => {
+  assert.equal(w.isFastMode({ speedMode: 'turbo' }), true, 'turbo → instant typing + skipped dwells');
+  assert.equal(w.isFastMode({ speedMode: 'fast' }), true);
+  assert.equal(w.isFastMode({ humanizeMaster: false }), true);
+  assert.equal(w.isFastMode({ speedMode: 'normal' }), false);
+  assert.equal(w.isFastMode({ speedMode: 'slow' }), false);
+  assert.equal(w.isFastMode({}), false, 'default is not fast');
+});
+
+test('rangeMs: a TURBO-style small explicit range actually applies to the real gap (numbers take effect)', () => {
+  // The turbo preset sets groupDelayMin:20, groupDelayMax:45 — the loop must draw within that exact window
+  // (sec→ms), not fall back to the 120s safety default. This is the "speed numbers apply to the work" guarantee.
+  for (let i = 0; i < 500; i++) {
+    const ms = w.rangeMs({ groupDelayMin: 20, groupDelayMax: 45 }, 'groupDelayMin', 'groupDelayMax', 120, 300, 120);
+    assert.ok(ms >= 20000 && ms <= 45000, `turbo group gap out of range: ${ms}`);
+  }
+  // And the randomized cadence is genuinely spread across the window (not a fixed value).
+  const draws = new Set();
+  for (let i = 0; i < 200; i++) draws.add(w.rangeMs({ commentDelayMin: 8, commentDelayMax: 20 }, 'commentDelayMin', 'commentDelayMax', 60, 180, 1));
+  assert.ok(draws.size > 5, 'comment-delay draws are randomized across the range, not constant');
 });
 
 test('clampSettings: scheduleMode + dailyPostTime are validated (daily-schedule feature)', () => {
