@@ -2010,7 +2010,14 @@ async function runAccount(o) {
         publishClicked = true; // from here this group must NOT be retried (would double-post)
         step('Post button clicked');
         let publishResult = await waitForPublish(page, dialogCountBefore, 45000, shouldStop);
-        if (publishResult === 'stopped') { step('Stop requested during publish wait — halting'); break; }
+        if (publishResult === 'stopped') {
+          // Stop hit DURING the publish wait — the Post button was ALREADY clicked (publishClicked), so the
+          // post most likely went out. COUNT it so the orchestrator marks it dealt; a bare break would leave
+          // it un-dealt → re-posted on the next Start = a visible DUPLICATE. (Missing one post on a manual
+          // Stop is far better than duplicating one.)
+          if (publishClicked) { posted++; report(groupName, gid, 'posted', 'stopped mid-publish — counted to avoid a duplicate next run', ''); }
+          step('Stop requested during publish wait — halting'); break;
+        }
         if (publishResult === 'timeout') {
           // E-P5/E-P11: a genuine publish can take 35-40s on a slow connection or a hidden/occluded
           // window and trip the wait. Do a READ-ONLY feed rescan (NEVER re-click Post — that would
@@ -2217,7 +2224,11 @@ async function runAccount(o) {
           // (it re-navigates each time) can NEVER duplicate an already-sent comment. C2: keep a per-
           // attempt human gap so retries don't collapse into an instant burst.
           let cres = 'failed';
-          for (let cAttempt = 1; cAttempt <= 3 && (cres === 'failed' || cres === 'notfound') && !shouldStop() && !aborted && browser && browser.isConnected(); cAttempt++) {
+          // Retry ONLY on 'failed' (a transient pre-Enter miss — re-navigating can recover it). 'notfound'
+          // means the post is HELD in Spam-potentiel (not public) → retrying can't make it public, and a late
+          // flicker to 'failed' would misroute a held post to the comment-rescue queue (which can't reach a
+          // non-public post). So a 'notfound' breaks immediately and is routed to MODERATOR approval below.
+          for (let cAttempt = 1; cAttempt <= 3 && cres === 'failed' && !shouldStop() && !aborted && browser && browser.isConnected(); cAttempt++) {
             if (cAttempt > 1) {
               // ~25% of the min comment delay, floored at 2.5s normally but only 0.3s when the operator
               // chose fast (humanize off or speedMode fast) — so fast settings apply to retries too.

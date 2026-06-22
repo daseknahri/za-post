@@ -902,7 +902,7 @@ class Orchestrator {
       // Shared-IP warning (once per run): many accounts from ONE IP is a top coordinated-spam signal.
       if (!this._proxyWarned && active.length > 1) {
         this._proxyWarned = true;
-        if (!settings.useProxies) {
+        if (!data.useProxies) { // useProxies is a TOP-LEVEL data field, not a setting (settings.useProxies was always undefined → this warned even when proxies were ON)
           this.log(`⚠️ Proxies are OFF and ${active.length} accounts are active — they will all post from the SAME IP. Facebook links accounts that share an IP and can flag them together. Strongly consider assigning a proxy per account (Accounts tab), or run fewer accounts at once.`);
         } else {
           const poolN = ((this._data && this._data.proxies) || []).length;
@@ -1306,6 +1306,8 @@ class Orchestrator {
                 const rF = (msF.held || []).find(recMatch);
                 if (rF && rF.status === 'superseded') { rF.status = 'failed'; rF.repostedBy = null; store.saveModeration(msF); }
                 const why = (result && result.flag) ? result.flag : 'transient failure';
+                // Surface a logged-out reserve so the operator can re-login it (its status was otherwise stale).
+                if (result && (result.flag === 'needs_login' || result.flag === 'needs_verification')) await this._markLoggedOut(reserve.name, result.flag === 'needs_verification' ? '🔐 Needs verification — re-posting skipped' : '⚠️ Logged out — re-posting skipped; re-login required');
                 this.log(`↩️ [${reserve.name}] could NOT re-post "${rec.groupName || rec.gid}" (${why}) — left for retry next cycle (re-login/replace the reserve). Cap not consumed.`);
               }
               // Space consecutive re-posts so a batch of held records doesn't fan out as a coordinated burst.
@@ -1384,7 +1386,9 @@ class Orchestrator {
               this.log(`💬 Comment rescue: ${pending.length - unassigned.length} orphaned comment(s) across ${byAccount.size} healthy account(s)…`);
               for (const { account, tasks } of byAccount.values()) {
                 if (this._shouldStop()) break;
-                await runRescue({ account, tasks, settings, hidden, log: (m) => this.log(m), shouldStop: () => this._shouldStop(), isPaused: () => this._paused, waitIfPaused: () => this._waitWhilePaused(), onResult: markResult });
+                const rres = await runRescue({ account, tasks, settings, hidden, log: (m) => this.log(m), shouldStop: () => this._shouldStop(), isPaused: () => this._paused, waitIfPaused: () => this._waitWhilePaused(), onResult: markResult });
+                // A logged-out rescuer leaves its comments pending; mark it so the operator re-logs it in.
+                if (rres && rres.needsLogin) await this._markLoggedOut(account.name, '⚠️ Logged out — comment rescue skipped; re-login required');
               }
             }
           }
@@ -1598,6 +1602,15 @@ class Orchestrator {
     const fireToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hh, mm, 0, 0);
     if (lastRunDateKey === this._localDayKey(now)) { const t = new Date(fireToday.getTime()); t.setDate(t.getDate() + 1); return t.getTime() - now.getTime(); }
     return Math.max(0, fireToday.getTime() - now.getTime());
+  }
+
+  // Mark a reserve/rescue account logged-out on disk + refresh the UI, so a backup that turned out to be
+  // logged out during its job surfaces in the Accounts tab (was previously left showing a stale status).
+  async _markLoggedOut(name, msg) {
+    try {
+      await store.update((d) => { const a = (d.accounts || []).find((x) => x.name === name); if (a) { a.status = 'not_logged_in'; a.lastMessage = msg || '⚠️ Logged out — re-login required'; } });
+      this.emit('data-updated');
+    } catch {}
   }
 
   // Completion engine: how much of a FINITE campaign is still outstanding — posts not yet published

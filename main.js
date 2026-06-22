@@ -431,10 +431,20 @@ app.on('window-all-closed', () => {
 // IPC: DATA
 // =======================================================================
 ipcMain.handle('get-data', () => getData());
-ipcMain.handle('save-data', (_e, data) => {
+ipcMain.handle('save-data', async (_e, data) => {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return fail('Invalid data');
   if (!Array.isArray(data.posts) || !Array.isArray(data.groups) || !Array.isArray(data.accounts)) return fail('Invalid data');
-  store.save(data); return ok();
+  try {
+    // Route through update() (the serialized write-chain) so a renderer save can't lost-update against a
+    // concurrent orchestrator write, and through normalize() so every save coerces accounts/settings the
+    // same way load() does (e.g. account.standby/isModerator booleans, settings defaults).
+    await store.update((d) => {
+      const n = store.normalize(data);
+      d.posts = n.posts; d.groups = n.groups; d.accounts = n.accounts;
+      d.settings = n.settings; d.proxies = n.proxies; d.useProxies = n.useProxies;
+    });
+    return ok();
+  } catch (e) { return fail(e); }
 });
 
 // =======================================================================
@@ -492,27 +502,23 @@ ipcMain.handle('add-posts-bulk', async (_e, posts) => {
   } catch (e) { return fail(e); }
 });
 
-ipcMain.handle('add-groups-bulk', (_e, items) => {
+ipcMain.handle('add-groups-bulk', async (_e, items) => {
   try {
     if (!Array.isArray(items)) return fail('Expected an array of group URLs/IDs');
-    const data = getData();
-    const existingIds = new Set(data.groups.map((g) => g.groupId));
     let added = 0, skipped = 0, limited = 0;
     const now = Date.now();
-    for (let i = 0; i < items.length; i++) {
-      const groupId = extractGroupId(String(items[i] || ''));
-      if (!groupId || existingIds.has(groupId)) { skipped++; continue; }
-      // M1-05: stop adding once the license group limit is reached (count the rest as "limited").
-      if (overLimit('groups', data.groups.length)) { limited++; continue; }
-      existingIds.add(groupId);
-      data.groups.push({
-        id: `group-${now}-${i}`,
-        groupId,
-        name: `Group ${data.groups.length + 1}`,
-      });
-      added++;
-    }
-    store.save(data);
+    await store.update((data) => {
+      const existingIds = new Set(data.groups.map((g) => g.groupId));
+      for (let i = 0; i < items.length; i++) {
+        const groupId = extractGroupId(String(items[i] || ''));
+        if (!groupId || existingIds.has(groupId)) { skipped++; continue; }
+        // M1-05: stop adding once the license group limit is reached (count the rest as "limited").
+        if (overLimit('groups', data.groups.length)) { limited++; continue; }
+        existingIds.add(groupId);
+        data.groups.push({ id: `group-${now}-${i}`, groupId, name: `Group ${data.groups.length + 1}` });
+        added++;
+      }
+    });
     send('data-updated');
     return ok({ added, skipped, limited, message: limited ? `${limited} group(s) not added — your ${_licenseState.tier} plan limit of ${_licenseState.limits.maxGroups} groups was reached.` : undefined });
   } catch (e) { return fail(e); }
@@ -542,23 +548,31 @@ ipcMain.handle('edit-post', async (_e, postId, updates) => {
 // =======================================================================
 // IPC: GROUPS
 // =======================================================================
-ipcMain.handle('add-group', (_e, group) => {
-  const data = getData();
-  const groupId = extractGroupId(group.groupId);
-  if (!groupId) return fail('Invalid group ID / URL');
-  const over = overLimit('groups', data.groups.length); if (over) return over; // M1-05 backend enforcement
-  data.groups.push({ id: 'group-' + Date.now(), groupId, name: group.name || `Group ${data.groups.length + 1}` });
-  store.save(data); send('data-updated'); return ok();
+ipcMain.handle('add-group', async (_e, group) => {
+  try {
+    const groupId = extractGroupId(group.groupId);
+    if (!groupId) return fail('Invalid group ID / URL');
+    const res = await store.update((data) => {
+      const over = overLimit('groups', data.groups.length); if (over) return over; // M1-05 backend enforcement
+      data.groups.push({ id: 'group-' + Date.now(), groupId, name: group.name || `Group ${data.groups.length + 1}` });
+      return null;
+    });
+    if (res) return res; // over-limit fail object
+    send('data-updated'); return ok();
+  } catch (e) { return fail(e); }
 });
 
-ipcMain.handle('delete-group', (_e, groupId) => {
-  const data = getData();
-  data.groups = data.groups.filter((g) => g.id !== groupId && g.groupId !== groupId);
-  // Prune the deleted group from every account's assignedGroups so the worker never
-  // wastes a cycle on a group that no longer exists.
-  const valid = new Set(data.groups.map((g) => g.id));
-  for (const a of data.accounts) a.assignedGroups = (a.assignedGroups || []).filter((id) => valid.has(id));
-  store.save(data); send('data-updated'); return ok();
+ipcMain.handle('delete-group', async (_e, groupId) => {
+  try {
+    await store.update((data) => {
+      data.groups = data.groups.filter((g) => g.id !== groupId && g.groupId !== groupId);
+      // Prune the deleted group from every account's assignedGroups so the worker never
+      // wastes a cycle on a group that no longer exists.
+      const valid = new Set(data.groups.map((g) => g.id));
+      for (const a of data.accounts) a.assignedGroups = (a.assignedGroups || []).filter((id) => valid.has(id));
+    });
+    send('data-updated'); return ok();
+  } catch (e) { return fail(e); }
 });
 
 function extractGroupId(input) {
@@ -571,55 +585,71 @@ function extractGroupId(input) {
 // =======================================================================
 // IPC: ACCOUNTS
 // =======================================================================
-ipcMain.handle('create-account', (_e, accountName, alias, opts) => {
-  const data = getData();
-  if (!accountName) return fail('Account name required');
-  if (data.accounts.some((a) => a.name === accountName)) return fail('Account already exists');
-  // A moderator is born flagged + disabled-as-poster so it can NEVER be selected into the posting pool,
-  // even in the brief window before the renderer would set the flag (no race; no one-frame-as-poster).
-  const isMod = !!(opts && opts.isModerator);
-  // Licensing: moderators are FREE — only posting accounts count against the per-seat limit. So skip the
-  // check for moderators, and for posters count posters only (a designated moderator must not eat a seat).
-  if (!isMod) { const over = overLimit('accounts', data.accounts.filter((a) => !a.isModerator).length); if (over) return over; }
-  data.accounts.push({
-    name: accountName, alias: alias || '', status: 'not_logged_in', lastMessage: '',
-    assignedGroups: [], postFilter: 'all', postingOrder: 'post-centric-unique',
-    enabled: !isMod, isModerator: isMod,
-  });
-  store.profileDir(accountName); // create profile dir
-  store.save(data); send('data-updated'); return ok();
+ipcMain.handle('create-account', async (_e, accountName, alias, opts) => {
+  try {
+    if (!accountName) return fail('Account name required');
+    // A moderator is born flagged + disabled-as-poster so it can NEVER be selected into the posting pool,
+    // even in the brief window before the renderer would set the flag (no race; no one-frame-as-poster).
+    const isMod = !!(opts && opts.isModerator);
+    const res = await store.update((data) => {
+      if (data.accounts.some((a) => a.name === accountName)) return fail('Account already exists');
+      // Licensing: moderators are FREE — only posting accounts count against the per-seat limit. So skip the
+      // check for moderators, and for posters count posters only (a designated moderator must not eat a seat).
+      if (!isMod) { const over = overLimit('accounts', data.accounts.filter((a) => !a.isModerator).length); if (over) return over; }
+      data.accounts.push({
+        name: accountName, alias: alias || '', status: 'not_logged_in', lastMessage: '',
+        assignedGroups: [], postFilter: 'all', postingOrder: 'post-centric-unique',
+        enabled: !isMod, isModerator: isMod,
+      });
+      return null;
+    });
+    if (res) return res; // 'already exists' / over-limit fail object
+    store.profileDir(accountName); // create profile dir
+    send('data-updated'); return ok();
+  } catch (e) { return fail(e); }
 });
 
 // Enable/disable an account for automation (disabled accounts are skipped by the orchestrator).
-ipcMain.handle('toggle-account', (_e, accountName, enabled) => {
-  const data = getData();
-  const a = data.accounts.find((x) => x.name === accountName);
-  if (!a) return fail('Account not found');
-  a.enabled = enabled === undefined ? a.enabled === false : !!enabled;
-  store.save(data); send('data-updated'); return ok({ enabled: a.enabled });
+ipcMain.handle('toggle-account', async (_e, accountName, enabled) => {
+  try {
+    const res = await store.update((data) => {
+      const a = data.accounts.find((x) => x.name === accountName);
+      if (!a) return { _notfound: true };
+      a.enabled = enabled === undefined ? a.enabled === false : !!enabled;
+      return { enabled: a.enabled };
+    });
+    if (res && res._notfound) return fail('Account not found');
+    send('data-updated'); return ok(res);
+  } catch (e) { return fail(e); }
 });
 
-ipcMain.handle('delete-account', (_e, accountName) => {
-  if (orchestrator && orchestrator.isRunning()) return fail('Stop automation before deleting an account');
-  if (loginBrowsers.has(accountName)) return fail('Close the login browser for this account first');
-  const data = getData();
-  data.accounts = data.accounts.filter((a) => a.name !== accountName);
-  store.save(data);
-  try { fs.rmSync(store.accountDir(accountName), { recursive: true, force: true }); } catch {}
-  send('data-updated'); return ok();
+ipcMain.handle('delete-account', async (_e, accountName) => {
+  try {
+    if (orchestrator && orchestrator.isRunning()) return fail('Stop automation before deleting an account');
+    if (loginBrowsers.has(accountName)) return fail('Close the login browser for this account first');
+    await store.update((data) => { data.accounts = data.accounts.filter((a) => a.name !== accountName); });
+    try { fs.rmSync(store.accountDir(accountName), { recursive: true, force: true }); } catch {}
+    send('data-updated'); return ok();
+  } catch (e) { return fail(e); }
 });
 
-ipcMain.handle('set-account-credentials', (_e, accountName, email, password) => {
-  const data = getData();
-  const a = data.accounts.find((x) => x.name === accountName);
-  if (!a) return fail('Account not found');
-  // M3-01: encrypt credentials at rest (Electron safeStorage / DPAPI). Falls back to plaintext only
-  // where OS encryption is unavailable (dev). decrypt() in the worker is transparent.
-  a.email = secret.encrypt(email || '');
-  a.password = secret.encrypt(password || '');
-  store.save(data);
-  send('data-updated');
-  return ok();
+ipcMain.handle('set-account-credentials', async (_e, accountName, email, password) => {
+  try {
+    const res = await store.update((data) => {
+      const a = data.accounts.find((x) => x.name === accountName);
+      if (!a) return { _notfound: true };
+      // M3-01: encrypt credentials at rest (Electron safeStorage / DPAPI). Falls back to plaintext only
+      // where OS encryption is unavailable (dev). decrypt() in the worker is transparent.
+      a.email = secret.encrypt(email || '');
+      // KEEP the existing password when the form left it blank (null/undefined) — re-encrypting '' on every
+      // email/alias edit would silently WIPE a saved password. Only overwrite when a value is actually given.
+      if (password != null) a.password = secret.encrypt(password);
+      return {};
+    });
+    if (res && res._notfound) return fail('Account not found');
+    send('data-updated');
+    return ok();
+  } catch (e) { return fail(e); }
 });
 
 // Decrypted email + whether a password is set, for the edit-account form (local renderer only —
@@ -630,19 +660,24 @@ ipcMain.handle('get-account-credentials', (_e, accountName) => {
   return ok({ email: secret.decrypt(a.email || ''), hasPassword: !!a.password });
 });
 
-ipcMain.handle('rename-account', (_e, oldName, newName) => {
-  if (orchestrator && orchestrator.isRunning()) return fail('Stop automation before renaming an account');
-  if (loginBrowsers.has(oldName)) return fail('Close the login browser for this account first');
-  const data = getData();
-  const a = data.accounts.find((x) => x.name === oldName);
-  if (!a) return fail('Account not found');
-  if (data.accounts.some((x) => x.name === newName)) return fail('Name already in use');
+ipcMain.handle('rename-account', async (_e, oldName, newName) => {
   try {
-    const from = store.accountDir(oldName), to = path.join(store.paths.ACCOUNTS_DIR, store.sanitizeName(newName));
-    if (fs.existsSync(from) && !fs.existsSync(to)) fs.renameSync(from, to);
+    if (orchestrator && orchestrator.isRunning()) return fail('Stop automation before renaming an account');
+    if (loginBrowsers.has(oldName)) return fail('Close the login browser for this account first');
+    const res = await store.update((data) => {
+      const a = data.accounts.find((x) => x.name === oldName);
+      if (!a) return { err: 'Account not found' };
+      if (data.accounts.some((x) => x.name === newName)) return { err: 'Name already in use' };
+      try {
+        const from = store.accountDir(oldName), to = path.join(store.paths.ACCOUNTS_DIR, store.sanitizeName(newName));
+        if (fs.existsSync(from) && !fs.existsSync(to)) fs.renameSync(from, to);
+      } catch (e) { return { err: (e && e.message) || 'rename failed' }; }
+      a.name = newName;
+      return {};
+    });
+    if (res && res.err) return fail(res.err);
+    send('data-updated'); return ok();
   } catch (e) { return fail(e); }
-  a.name = newName;
-  store.save(data); send('data-updated'); return ok();
 });
 
 ipcMain.handle('import-cookies', async (_e, accountName, cookies) => {
@@ -1020,11 +1055,13 @@ ipcMain.handle('get-proxies', () => {
   const data = getData();
   return ok({ useProxies: !!data.useProxies, proxies: data.proxies || [] });
 });
-ipcMain.handle('save-proxies', (_e, proxies) => {
-  const data = getData(); data.proxies = Array.isArray(proxies) ? proxies : []; store.save(data); return ok();
+ipcMain.handle('save-proxies', async (_e, proxies) => {
+  try { await store.update((d) => { d.proxies = Array.isArray(proxies) ? proxies : []; }); return ok(); }
+  catch (e) { return fail(e); }
 });
-ipcMain.handle('toggle-proxies', (_e, enabled) => {
-  const data = getData(); data.useProxies = !!enabled; store.save(data); return ok();
+ipcMain.handle('toggle-proxies', async (_e, enabled) => {
+  try { await store.update((d) => { d.useProxies = !!enabled; }); return ok(); }
+  catch (e) { return fail(e); }
 });
 
 ipcMain.handle('select-image', async () => {

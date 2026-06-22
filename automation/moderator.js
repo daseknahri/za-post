@@ -80,6 +80,9 @@ async function runModerator(o) {
       // short snippet). A short snippet would substring-match a STRANGER's pending post and wrong-approve
       // it, so anything under 12 chars is dropped: we never approve on a weak/ambiguous caption key.
       const capSnips = heldByGid[gid].map((h) => norm(h.captionSnip)).filter((s) => s && s.length >= 12);
+      // Our account display names for this group's held posts → a VETO so we never approve a STRANGER's held
+      // post that merely shares our caption. Empty (no fbDisplayName set) → can't veto → caption-only (as before).
+      const ourNames = [...new Set((heldByGid[gid] || []).map((h) => norm(h.fbDisplayName)).filter((s) => s && s.length >= 2))];
       const gname = groupName(gid);
       if (!capSnips.length) { log(`🛡️ [moderator] [${gname}] ${heldByGid[gid].length} held record(s) but no caption snippet ≥12 chars — skipping (cannot match safely; would risk approving the wrong post)`); out.errors++; continue; }
       // The held "Spam potentiel" post lives in the group's SPAM queue, NOT pending_posts — and it could be
@@ -119,7 +122,7 @@ async function runModerator(o) {
       // approve button, climb to the row that ALSO contains one of our held captions — that's our post —
       // and tag THAT button (data-zp-mod) to click. Refuser/decline/delete is explicitly excluded.
       const scan = await evalTimed(page, (arg) => {
-        const { snips } = arg;
+        const { snips, ourNames } = arg;
         const nm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
         const APPROVE = /\b(publier|publish|approve|approuver|allow|autoriser|accepter|accept|admettre|confirmer)\b|approuv|approv/; // includes "publier"
         const DECLINE = /refus|decline|reject|delete|supprim|remove|spam|signaler|masquer|hide/; // never click these
@@ -138,8 +141,22 @@ async function runModerator(o) {
             n = n.parentElement;
           }
           if (!matched) continue;
+          // Best-effort poster-name read from the matched row → a VETO for a confident STRANGER (fail-open).
+          // Names are short links/headings; the caption preview is long → length-filtered out. If we can't
+          // read a name (obfuscated DOM) OR no ourNames configured, authorOurs stays true (caption-only).
+          let author = '', authorOurs = true;
+          try {
+            const cand = Array.from(n.querySelectorAll('a[role="link"], strong, h2, h3, h4'))
+              .map((e) => nm(e.textContent || ''))
+              .filter((s) => s && s.length >= 2 && s.length <= 50 && !APPROVE.test(s) && !DECLINE.test(s) && !snips.some((sn) => sn && s.includes(sn.slice(0, 20))));
+            if (ourNames && ourNames.length) {
+              const hit = cand.find((c) => ourNames.some((on) => c.includes(on) || on.includes(c)));
+              if (hit) { author = hit; authorOurs = true; }
+              else if (cand.length) { author = cand[0]; authorOurs = false; } // a readable, non-matching name → veto
+            } else if (cand.length) { author = cand[0]; }
+          } catch {}
           const zpTag = String(tag++); btn.setAttribute('data-zp-mod', zpTag);
-          results.push({ author: '', authorOurs: false, capMatch: true, capSnipMatched: matched, hasApprove: true, zpTag, snippet: rowText.slice(0, 70) });
+          results.push({ author, authorOurs, capMatch: true, capSnipMatched: matched, hasApprove: true, zpTag, snippet: rowText.slice(0, 70) });
         }
         // diagnostics: distinct labels of the approve-looking buttons we considered
         const nearbyBtns = [...new Set(approveBtns.map((b) => nm((b.getAttribute && b.getAttribute('aria-label')) || b.textContent || '')).filter(Boolean))].slice(0, 12);
@@ -154,7 +171,14 @@ async function runModerator(o) {
       for (let i = 0; i < scan.results.length; i++) {
         if (shouldStop()) break;
         const r = scan.results[i];
-        const fullMatch = r.capMatch && r.hasApprove && r.zpTag != null; // caption-primary (author is a hint, not required)
+        // VETO: caption matched + an approve button, but we confidently read an author that is NOT one of our
+        // accounts → it's a stranger's held post → never approve it (you're the admin; don't approve spam).
+        // Fail-open: when the author is unreadable or no fbDisplayName is set, authorOurs is true (caption-only).
+        if (r.capMatch && r.hasApprove && r.zpTag != null && !r.authorOurs) {
+          log(`🛡️ [moderator] [${gname}] card ${i + 1}: caption matched but author "${r.author}" is NOT one of our accounts — NOT approving (avoids approving a stranger's post). If wrong, set this account's FB display name on the Accounts tab.`);
+          continue;
+        }
+        const fullMatch = r.capMatch && r.hasApprove && r.zpTag != null && r.authorOurs; // caption + (author-ours OR author-unknown)
         if (fullMatch && handledSnips.has(r.capSnipMatched)) {
           log(`🛡️ [moderator] [${gname}] card ${i + 1}: duplicate of an already-handled held post — skipping (no double-approve)`);
           continue;
