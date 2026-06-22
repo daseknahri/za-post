@@ -832,6 +832,10 @@ class Orchestrator {
           if (this._shouldStop() || this._finish) break;
           continue; // re-enter: now it's fire time → falls through and runs one cycle
         }
+        // Mark today's run as STARTED (not only at the end) + persist NOW — so if the app crashes mid-cycle and
+        // resume-on-startup re-fires, the daily gate sees "ran today" and waits for tomorrow instead of
+        // RE-RUNNING the whole cycle (which at dailyCap=0 would re-post to every group = duplicates).
+        if (this._lastDailyRunDate !== this._localDayKey()) { this._lastDailyRunDate = this._localDayKey(); try { this._saveRotationState(); } catch {} }
       }
       // RESERVE POOL: never run the whole fleet. Hold back `reserveAccounts` healthy accounts — they stay
       // available to RESCUE orphaned link-comments (a post whose own account got blocked before commenting)

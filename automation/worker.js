@@ -268,7 +268,11 @@ async function downloadImage(url, log) {
   if (!r.ok) { const st = r.error && r.error.response && r.error.response.status; note(`request failed after retries${st ? ` (HTTP ${st})` : ''}: ${r.error && r.error.message}`); return null; }
   // Reject non-image responses (an HTML error page / unexpected content type isn't an image).
   const ct = String((r.result.headers && (r.result.headers['content-type'] || r.result.headers['Content-Type'])) || '').toLowerCase();
-  if (ct && !ct.startsWith('image/')) { note(`response is not an image (content-type: ${ct})`); return null; }
+  const looksImg = /\.(jpe?g|png|gif|webp)(\?|#|$)/i.test(String(url));
+  // Reject a present-but-non-image content-type, OR a MISSING content-type when the URL doesn't even look like
+  // an image (likely an HTML error/redirect page) — but allow a header-less response from an image-URL (some
+  // hosts omit Content-Type), letting FB's own byte-sniff validate it.
+  if ((ct && !ct.startsWith('image/')) || (!ct && !looksImg)) { note(`response is not an image (content-type: ${ct || 'none'})`); return null; }
   try {
     const ext = (String(url).match(/\.(jpg|jpeg|png|gif|webp)/i) || [, 'jpg'])[1];
     const file = path.join(os.tmpdir(), `za-img-${Date.now()}-${Math.floor(Math.random() * 1e6)}.${ext}`);
@@ -1766,6 +1770,14 @@ async function runAccount(o) {
       report('', '', 'error', 'post image could not be resolved', '');
       return { posted: 0, errors: 1, pendingApproval: 0, noRetry: true, flag: null, postedIds: [], dealtIds: [], fullyPosted: false, offline: false };
     }
+    // Degenerate post: NO caption AND NO image — there's nothing to publish. Bail ONCE with a clear account-
+    // level error instead of opening the composer N times and reporting a misleading "Post button not found"
+    // per group.
+    if (!resolvedImages.length && !((basePost.caption || '').trim())) {
+      log(`❌ [${name}] this post has no caption AND no image — nothing to publish; skipping.`);
+      report('', '', 'error', 'empty post — no caption and no image', '');
+      return { posted: 0, errors: 1, pendingApproval: 0, noRetry: true, flag: null, postedIds: [], dealtIds: [], fullyPosted: false, offline: false };
+    }
 
     const groupRetries = {}; // E-P1: per-group transient-retry counter (max 1 retry, pre-publish only)
     for (let i = 0; i < targetGroups.length; i++) {
@@ -1796,7 +1808,9 @@ async function runAccount(o) {
       // is the #1 fix for "identical content to many groups" — FB's strongest content-spam signal.
       let captionText = basePost.caption || '', commentText = basePost.comment || '';
       if (settings.varyContent !== false) { captionText = spintax.expand(captionText); commentText = spintax.expand(commentText); }
-      if (settings.randomizeLinks !== false) commentText = varyLinks(commentText, `${name}|${gid}`);
+      // Vary links in BOTH the caption and the comment (distinct seeds) — a link in the CAPTION was previously
+      // posted byte-identical to every group/account, the exact cross-post dedup signal varyLinks defeats.
+      if (settings.randomizeLinks !== false) { captionText = varyLinks(captionText, `${name}|${gid}|cap`); commentText = varyLinks(commentText, `${name}|${gid}`); }
       const post = { ...basePost, caption: captionText, comment: commentText };
       let groupImages = resolvedImages, groupCommentImg = commentImg; // per-group (optionally perturbed) images
       try {
@@ -1916,15 +1930,22 @@ async function runAccount(o) {
           // only, so an image-less post would pass as "published". Wait for the composer preview to
           // render (mirrors the comment path); if it doesn't, throw transient so the group re-attempts
           // (publishClicked is still false here → double-post-safe) rather than publishing caption-only.
+          // Verify ALL N images attached, not just one — the old check matched a single blob/Remove element,
+          // so a dropped image[1..N-1] in a MULTI-image post would publish a deficient post with no warning.
+          const _imgN = groupImages.length;
           const imgPreviewed = await page.waitForFunction(
-            () => !!document.querySelector('div[role="dialog"] img[src^="blob:"], [role="dialog"] img[src^="blob:"], div[role="dialog"] [aria-label*="Remove" i]'),
-            { timeout: 15000 }
+            (n) => {
+              const blobs = document.querySelectorAll('div[role="dialog"] img[src^="blob:"], [role="dialog"] img[src^="blob:"]').length;
+              const removes = document.querySelectorAll('div[role="dialog"] [aria-label*="Remove" i], [role="dialog"] [aria-label*="Remove" i]').length;
+              return blobs >= n || removes >= n;
+            },
+            { timeout: 20000 }, _imgN
           ).then(() => true).catch(() => false);
           if (!imgPreviewed) {
-            step('Image preview did not render — FB may have rejected the upload; re-attempting the group to avoid an image-less post');
-            throw new Error('transient: image attach not confirmed (no preview)');
+            step(`Image preview shows fewer than the ${_imgN} uploaded image(s) — FB may have dropped one; re-attempting the group to avoid a deficient/image-less post`);
+            throw new Error('transient: image attach not confirmed (preview count < N)');
           }
-          step('Image attached (preview rendered)');
+          step(`Image attached (${_imgN} preview${_imgN > 1 ? 's' : ''} rendered)`);
           await sleepInterruptible(1500, shouldStop);
         }
 
@@ -2200,9 +2221,11 @@ async function runAccount(o) {
           // CRITICAL anti-spam: do NOT comment seconds after the post — post-then-instant-link is a
           // textbook spam pattern. Wait a randomized human gap first. The permalink was already
           // captured above, so OUR post is still found reliably even after the wait.
+          // Use rangeMs (same as the inter-group gap + rescue.js): a random value in [min,max] with a 30s
+          // floor on the defaults. Then jitter ±12% so even a min===max config isn't a metronomic post→link gap.
           const lo = Number.isFinite(settings.commentDelayMin) ? settings.commentDelayMin : 60;
           const hi = Number.isFinite(settings.commentDelayMax) ? settings.commentDelayMax : 180;
-          const cd = Math.round((Math.min(lo, hi) + Math.random() * Math.abs(hi - lo)) * 1000);
+          const cd = jitter(rangeMs(settings, 'commentDelayMin', 'commentDelayMax', 60, 180, 30), 0.12);
           if (cd > 0 && !softStop()) { step(`Comment: waiting ${Math.round(cd / 1000)}s before commenting (avoids the instant post→link spam pattern)`); await sleepInterruptible(cd, softStop, 1000, isPaused, pauseHold); }
           // PAUSE/DISABLE BOUNDARY: the post is already published (safe), the comment is a SEPARATE action.
           // If paused now, HOLD here (watchdog-safe) so Pause stops BEFORE the comment fires even when the
@@ -2333,8 +2356,8 @@ async function runAccount(o) {
       if (cks && stillAuthed && !authBroke) store.writeCookies(name, cks);
       else if (cks && !stillAuthed) log(`🔒 [${name}] session not valid at run end — keeping the existing saved cookies (not overwriting with a logged-out jar)`);
     } catch {}
-    fs.writeFileSync(require('path').join(store.accountDir(name), 'last-run-success.txt'),
-      `${errors === 0 ? 'SUCCESS' : 'PARTIAL'}\nPosts: ${posted}\nPending: ${pendingApproval}\nTime: ${new Date().toISOString()}\n`);
+    try { fs.writeFileSync(require('path').join(store.accountDir(name), 'last-run-success.txt'),
+      `${errors === 0 ? 'SUCCESS' : 'PARTIAL'}\nPosts: ${posted}\nPending: ${pendingApproval}\nTime: ${new Date().toISOString()}\n`); } catch {} // purely diagnostic — a disk-full here must NOT throw into the outer catch (false fatal + blocks auto-delete + warm-up bump)
     // Bump the warm-up run counter for any completed run (not only posted>0) so a new account that
     // keeps failing to post still ages out of warm-up instead of repeating the warm-up browse forever.
     try { fs.writeFileSync(runCountFile, String(priorRuns + 1)); } catch {}
@@ -2345,7 +2368,10 @@ async function runAccount(o) {
     unregisterAborter();
     if (watchdog) clearTimeout(watchdog);
     if (browser) await closeBrowserOnce();
-    if (anonLocal && proxyChain) { try { await proxyChain.closeAnonymizedProxy(anonLocal, true); } catch {} }
+    // Bound the proxy-chain close: its socket drain (the `true` flag) can hang forever on a Windows CLOSE_WAIT
+    // socket after an abrupt browser kill — which would never let runAccount return and would wedge the whole
+    // pool (the orchestrator awaits each slot). Race it against an 8s cap.
+    if (anonLocal && proxyChain) { try { await Promise.race([proxyChain.closeAnonymizedProxy(anonLocal, true).catch(() => {}), sleep(8000)]); } catch {} }
     for (const t of tempImages) { try { fs.unlinkSync(t); } catch {} }
   }
   // fullyPosted = the post landed in EVERY targeted group, none pending, no errors — only then is it

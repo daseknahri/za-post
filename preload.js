@@ -1,9 +1,30 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+// ALLOWLIST for the generic invoke() bridge. Without it, ANY renderer-side JS (incl. injected/XSS) could call
+// SENSITIVE main handlers — e.g. get-account-credentials (decrypts FB passwords) or batch-account-action
+// (bulk-delete accounts + wipe profiles). Only these explicitly-known channels are reachable.
+const ALLOWED_CHANNELS = new Set([
+  'get-data', 'save-data',
+  'add-post', 'delete-post', 'edit-post', 'add-posts-bulk', 'add-groups-bulk',
+  'add-group', 'delete-group',
+  'create-account', 'login-account', 'check-account-status', 'delete-account', 'import-cookies',
+  'close-login-browser', 'toggle-account', 'set-account-credentials', 'get-account-credentials',
+  'rename-account', 'batch-account-action',
+  'start-automation', 'stop-automation', 'pause-automation', 'resume-automation', 'finish-automation',
+  'get-automation-status', 'reset-rotation', 'approve-held-now',
+  'select-image', 'save-settings',
+  'get-proxies', 'save-proxies', 'toggle-proxies',
+  'get-remote-url', 'get-license-info', 'get-server-url', 'update-server-url',
+  'open-logs-folder', 'rdp-status', 'open-rdp-setup',
+]);
+
 // Expose protected methods to renderer process
 contextBridge.exposeInMainWorld('electronAPI', {
-  // Data operations
-  invoke: (channel, ...args) => ipcRenderer.invoke(channel, ...args),
+  // Data operations — the generic invoke is GATED to ALLOWED_CHANNELS (no arbitrary-channel passthrough).
+  invoke: (channel, ...args) => {
+    if (!ALLOWED_CHANNELS.has(channel)) return Promise.reject(new Error('IPC channel not allowed: ' + channel));
+    return ipcRenderer.invoke(channel, ...args);
+  },
   getData: () => ipcRenderer.invoke('get-data'),
   saveData: (data) => ipcRenderer.invoke('save-data', data),
 

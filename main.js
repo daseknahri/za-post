@@ -461,6 +461,14 @@ ipcMain.handle('save-data', async (_e, data) => {
     // same way load() does (e.g. account.standby/isModerator booleans, settings defaults).
     await store.update((d) => {
       const n = store.normalize(data);
+      // CRITICAL: the renderer's snapshot of the RUNTIME account fields is STALE. Take those from the live
+      // disk copy (`d`) instead of overwriting them — otherwise a settings/standby/proxy edit would reset a
+      // live rate-limit COOLDOWN or the daily POST COUNT, which actively deepens Facebook bans. Renderer-owned
+      // STRUCTURAL fields (alias, assignedGroups, postFilter, postingOrder, enabled, standby, proxy,
+      // isModerator, fbDisplayName, email, password) are kept from the renderer; runtime fields below are not.
+      const RUNTIME = ['status', 'lastMessage', 'daily', 'rateLimitedUntil', 'rlStrikes', 'fbUserId', 'fbName', 'lastChecked'];
+      const live = new Map((d.accounts || []).map((a) => [a.name, a]));
+      for (const a of n.accounts) { const cur = live.get(a.name); if (cur) for (const k of RUNTIME) { if (cur[k] === undefined) delete a[k]; else a[k] = cur[k]; } }
       d.posts = n.posts; d.groups = n.groups; d.accounts = n.accounts;
       d.settings = n.settings; d.proxies = n.proxies; d.useProxies = n.useProxies;
     });
@@ -993,7 +1001,7 @@ async function openLoginBrowser(accountName) {
         if (captured.id && captured.pass) {
           try {
             const d = getData(); const acc = d.accounts.find((a) => a.name === accountName);
-            if (acc) { acc.email = secret.encrypt(captured.id); acc.password = secret.encrypt(captured.pass); store.save(d); send('data-updated'); emit('automation-log', `🔑 [${accountName}] login credentials saved (encrypted) for auto-login`); }
+            if (acc) { acc.email = secret.encrypt(captured.id); acc.password = secret.encrypt(captured.pass); store.save(d); send('data-updated'); emit('automation-log', `🔑 [${accountName}] login credentials saved ${secret.available() ? '(encrypted)' : '(⚠️ OS encryption unavailable — stored as PLAINTEXT in data.json)'} for auto-login`); }
           } catch {}
         }
         emit('automation-log', `✅ [${accountName}] logged in as ${res.fbName || '(unknown)'} (c_user=${res.fbUserId || '?'})`);
