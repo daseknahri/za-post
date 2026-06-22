@@ -1065,15 +1065,22 @@ function renderAccounts() {
     const enabledPill = isEnabled
       ? `<button onclick="toggleAccountEnabled('${account.name}')" title="Click to disable this account" style="background:#22c55e;color:#fff;border:none;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;line-height:1.4;">On</button>`
       : `<button onclick="toggleAccountEnabled('${account.name}')" title="Click to enable this account" style="background:#6b7280;color:#fff;border:none;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;line-height:1.4;">Off</button>`;
+    // STANDBY (backup): an extra account for these groups that posts ONLY when needed (a working account drops,
+    // a post stays held, or a comment needs placing). Off = a normal Primary poster.
+    const isStandby = account.standby === true;
+    const standbyPill = isStandby
+      ? `<button onclick="toggleAccountStandby('${account.name}')" title="Standby (backup): idle until a working account in its groups drops, a post stays held, or a comment needs placing. Click to make it a normal Primary poster." style="background:#f59e0b;color:#1f2937;border:none;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:700;cursor:pointer;line-height:1.4;">🟡 Standby</button>`
+      : `<button onclick="toggleAccountStandby('${account.name}')" title="Primary poster. Click to make it a Standby (backup) account that only works when its groups need it." style="background:#1e293b;color:#94a3b8;border:1px solid #374151;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;line-height:1.4;">Primary</button>`;
 
     return `
       <div class="account-card" data-account-name="${escapeHtml(account.name)}" style="${isEnabled ? '' : 'opacity:0.5;'}">
         <div class="account-header">
           <div class="account-avatar">${displayName.charAt(0).toUpperCase()}</div>
           <div class="account-info">
-            <h3 style="display:flex;align-items:center;gap:8px;">${escapeHtml(displayName)} ${enabledPill}</h3>
+            <h3 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">${escapeHtml(displayName)} ${enabledPill} ${standbyPill}</h3>
             ${subName ? `<div style="color: #9ca3af; font-size: 12px; margin-top: 2px;">${escapeHtml(subName)}</div>` : ''}
             ${!isEnabled ? `<div style="color:#f59e0b;font-size:11px;font-weight:600;margin-top:2px;">Disabled — will be skipped by automation</div>` : ''}
+            ${isEnabled && isStandby ? `<div style="color:#f59e0b;font-size:11px;font-weight:600;margin-top:2px;">🟡 Standby (backup) — idle until a working account in its groups needs help</div>` : ''}
             <div class="account-status">
               <span class="status-dot ${statusClass}" style="${account.status === 'error' ? 'background-color: #dc2626;' : account.status === 'checking' ? 'background-color: #f59e0b;' : account.status === 'logging_in' ? 'background-color: #3b82f6;' : account.status === 'rate_limited' ? 'background-color: #f59e0b;' : ''}"></span>
               <span>${statusText}</span>
@@ -1171,6 +1178,20 @@ function renderAccounts() {
 async function toggleAccountEnabled(accountName) {
   await window.electronAPI.toggleAccount(accountName);
   await loadData();
+}
+
+// Toggle Standby (backup) — a Standby account never posts in normal cycles; it only steps in for ITS groups
+// when a working account there drops, a post stays held, or a comment needs placing. Persists via saveData
+// (the account's `standby` field rides along; the orchestrator reads it to keep it out of the posting pool).
+async function toggleAccountStandby(accountName) {
+  const a = (appData.accounts || []).find((x) => x.name === accountName);
+  if (!a) return;
+  a.standby = !a.standby;
+  await saveData();
+  showNotification(a.standby
+    ? `🟡 ${accountName} is now Standby (backup) — it won't post normally; it steps in only when its groups need it`
+    : `${accountName} is now a Primary poster again`, 'success');
+  renderAccounts();
 }
 
 // Toggle group dropdown visibility
@@ -1901,10 +1922,14 @@ async function startAutomation() {
   // Moderators approve held posts; they never post — exclude them from every posting preflight check
   // (otherwise a correctly-configured moderator with no groups trips these warnings on every Start).
   const posters = appData.accounts.filter(a => !a.isModerator);
-  const eligible = posters.filter(a => a.enabled !== false && a.status === 'logged_in' && (a.assignedGroups || []).length > 0);
+  // A Standby (backup) account doesn't post on its own — Start needs at least one PRIMARY (non-standby) poster.
+  const eligible = posters.filter(a => a.enabled !== false && !a.standby && a.status === 'logged_in' && (a.assignedGroups || []).length > 0);
   if (eligible.length === 0) {
-    showNotification('No account can post yet — each needs to be enabled, logged in, and assigned at least 1 group. Fix accounts, then Start.', 'error');
-    addLog('🛑 Start blocked: no eligible account (need enabled + logged-in + ≥1 assigned group).\n');
+    const standbyReady = posters.some(a => a.enabled !== false && a.standby && a.status === 'logged_in' && (a.assignedGroups || []).length > 0);
+    showNotification(standbyReady
+      ? 'Only Standby (backup) accounts are ready — they don\'t post on their own. Make at least one a Primary (toggle Standby off), then Start.'
+      : 'No account can post yet — each needs to be enabled, logged in, and assigned at least 1 group. Fix accounts, then Start.', 'error');
+    addLog('🛑 Start blocked: no eligible PRIMARY account (need enabled + not-standby + logged-in + ≥1 assigned group).\n');
     return;
   }
 

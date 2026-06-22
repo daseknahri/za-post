@@ -4,7 +4,7 @@
 // via lib/store, runs automation via automation/orchestrator + worker, exposes a
 // remote dashboard via server.js, and uses a permissive LOCAL license (no server).
 
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, powerSaveBlocker } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
@@ -137,6 +137,7 @@ const REMOTE_TOKEN = require('crypto').randomBytes(16).toString('hex');
 let RUN_STATE_FILE = null;
 
 /** Persist active=true/false atomically so a hard kill leaves the flag intact. */
+let _psbId = null;
 function setRunActive(active) {
   // Durable write (temp → fsync → rename) so a hard kill can't leave a torn run-state file
   // that would silently suppress crash-resume.
@@ -146,6 +147,13 @@ function setRunActive(active) {
     try { fs.writeSync(fd, JSON.stringify({ active: !!active, ts: Date.now() })); fs.fsyncSync(fd); }
     finally { fs.closeSync(fd); }
     fs.renameSync(tmp, RUN_STATE_FILE);
+  } catch {}
+  // RDP/unattended: while a run is active, block system + display sleep. The hidden off-screen Chromium
+  // windows stop painting if the display sleeps, so this keeps automation reliable on a laptop left running
+  // (and 'prevent-display-sleep' also prevents system suspend). Released the moment the run stops.
+  try {
+    if (active) { if (_psbId == null || !powerSaveBlocker.isStarted(_psbId)) { _psbId = powerSaveBlocker.start('prevent-display-sleep'); appendLogFile && appendLogFile('powerSaveBlocker ON (display/system sleep blocked while running)'); } }
+    else if (_psbId != null) { try { if (powerSaveBlocker.isStarted(_psbId)) powerSaveBlocker.stop(_psbId); } catch {} _psbId = null; }
   } catch {}
 }
 /** Returns true if the previous session left active=true (interrupted / shutdown). */

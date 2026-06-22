@@ -336,7 +336,7 @@ class Orchestrator {
     let remaining = filtered.filter((p) => !this._dealt.has(p.id) && !(claimedSet && claimedSet.has(p.id)));
     if (!remaining.length) return [];
     if (order.includes('random')) remaining = seededShuffle(remaining, (cycle + 1) * 7919); // randomized deal order (consistent within the cycle)
-    const activeList = this._active || data.accounts.filter((a) => a.enabled !== false && !a.isModerator);
+    const activeList = this._active || data.accounts.filter((a) => a.enabled !== false && !a.isModerator && a.standby !== true);
     const i = activeList.findIndex((a) => a.name === account.name);
     if (i < 0) return [];
     // roundOffset rotates which account gets which post across Loop-campaign recycles.
@@ -787,8 +787,17 @@ class Orchestrator {
       const data = this._data; // the moderator/rescue phases below reference `data` — bind it (was a latent ReferenceError swallowed by their try/catch, silently disabling rescue + the end-of-cycle approval sweep)
       const { posts, accounts, settings } = this._data;
       if (!posts.length) { this.log('⚠️ No posts configured — stopping.'); break; }
-      const allPosters = accounts.filter((a) => a.enabled !== false && !a.isModerator); // MOD: the moderator only approves, never posts
-      if (!allPosters.length) { this.log('⚠️ No enabled accounts — stopping.'); break; }
+      const enabledNonMod = accounts.filter((a) => a.enabled !== false && !a.isModerator); // MOD: the moderator only approves, never posts
+      // STANDBY (backup) accounts NEVER post in normal cycles — they're held as on-demand reserves for THEIR
+      // groups (added to this._reserve below). So the posting fleet is the enabled, non-moderator, non-standby set.
+      const standbyAccounts = enabledNonMod.filter((a) => a.standby === true);
+      const allPosters = enabledNonMod.filter((a) => a.standby !== true);
+      if (!allPosters.length) {
+        this.log(standbyAccounts.length
+          ? '⚠️ Every enabled account is set to Standby — there is no primary to post. Turn Standby OFF on at least one account (Standby accounts only step in when a primary in their groups needs help).'
+          : '⚠️ No enabled accounts — stopping.');
+        break;
+      }
       // DAILY SCHEDULE: run exactly ONE cycle/day at the local dailyPostTime (the operator's "1 post/day
       // per account into its groups; next day the next post" model — pair with sequence mode + Loop). Wait
       // until the fire time; if today's run already happened, wait until tomorrow. Survives a same-day
@@ -844,7 +853,10 @@ class Orchestrator {
         }
         reserve = allPosters.filter((a) => reserveSet.has(a.name));
         active = allPosters.filter((a) => !reserveSet.has(a.name));
-        const uncovered = activeGroups.filter((g) => !reserve.some((a) => isMember(a, g) && healthy(a)));
+        // Coverage counts BOTH the held-back actives AND the Standby (backup) accounts (added to reserve
+        // below) — a group whose only backup is a Standby account is NOT uncovered.
+        const coverPool = reserve.concat(standbyAccounts);
+        const uncovered = activeGroups.filter((g) => !coverPool.some((a) => isMember(a, g) && healthy(a)));
         const rkey = reserve.map((a) => a.name).sort().join(',');
         if (rkey !== this._lastReserveKey) {
           this._lastReserveKey = rkey;
@@ -853,7 +865,16 @@ class Orchestrator {
         }
       }
       this._active = active;
-      this._reserve = reserve;
+      // Standby (backup) accounts are ALWAYS reserve (regardless of the reserveAccounts number) — available for
+      // their groups' takeover / held re-post / comment-rescue, but never the normal posting pool.
+      this._reserve = reserve.concat(standbyAccounts);
+      if (standbyAccounts.length) {
+        const skey = standbyAccounts.map((a) => a.name).sort().join(',');
+        if (skey !== this._lastStandbyKey) {
+          this._lastStandbyKey = skey;
+          this.log(`🟡 Standby (backup) accounts ready: ${standbyAccounts.map((a) => a.alias || a.name).join(', ')} — they post ONLY when a working account in their groups drops, a post stays held, or a comment needs placing.`);
+        }
+      }
       // CAMPAIGN PLAN: (re)compute the per-cluster day-by-day split when there are campaign-plan agents and
       // either no plan yet OR the library/agent-set changed (batchId mismatch). Recompute preserves each
       // agent's delivered pointer (perAccountRotation) — only future slots change — so edits don't re-post.
