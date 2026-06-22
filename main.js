@@ -391,6 +391,22 @@ app.whenReady().then(async () => {
     if (r.valid) createWindow();
     else if (r.revoked) showRevokedWindow();
     else showLicenseWindow();
+    // Periodic re-validation — ONLY when enforcement is on (no-op in owner/dev mode). Re-checks every ~6h so a
+    // server-side revoke or an expiry takes effect WITHOUT a restart: refresh the tier limits, and if the
+    // license has gone invalid, stop any running automation and surface the re-validation window.
+    const REVAL_MS = 6 * 60 * 60 * 1000;
+    setInterval(async () => {
+      try {
+        const rr = await license.checkCached(app.getPath('userData'), licenseServerUrl());
+        setLicenseState(rr, true);
+        try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('license-updated'); } catch {}
+        if (!rr.valid) {
+          try { if (orchestrator.isRunning()) { orchestrator.stop(); setRunActive(false); } } catch {}
+          emit('automation-log', '🔒 License is no longer valid — automation stopped. Re-validate to continue.');
+          try { if (rr.revoked) showRevokedWindow(); else showLicenseWindow(); } catch {}
+        }
+      } catch {}
+    }, REVAL_MS);
   }
 
   // ---- Auto-resume after shutdown / crash ------------------------------------
@@ -613,6 +629,42 @@ ipcMain.handle('create-account', async (_e, accountName, alias, opts) => {
     if (res) return res; // 'already exists' / over-limit fail object
     store.profileDir(accountName); // create profile dir
     send('data-updated'); return ok();
+  } catch (e) { return fail(e); }
+});
+
+// Apply ONE action to MANY accounts atomically (single store.update). action: enable|disable|standby|primary|
+// postingOrder|postFilter|proxy|delete. Moderators are never touched. Used by the Accounts-tab bulk-action bar.
+ipcMain.handle('batch-account-action', async (_e, payload) => {
+  try {
+    const { names, action, value } = payload || {};
+    if (!Array.isArray(names) || !names.length || !action) return fail('No accounts or action given');
+    if (action === 'delete') {
+      if (orchestrator && orchestrator.isRunning()) return fail('Stop automation before deleting accounts');
+      for (const n of names) if (loginBrowsers.has(n)) return fail(`Close the login browser for "${n}" first`);
+    }
+    const set = new Set(names);
+    let count = 0;
+    await store.update((data) => {
+      if (action === 'delete') {
+        data.accounts = (data.accounts || []).filter((a) => { if (set.has(a.name) && !a.isModerator) { count++; return false; } return true; });
+        return;
+      }
+      for (const a of data.accounts || []) {
+        if (!set.has(a.name) || a.isModerator) continue;
+        if (action === 'enable') a.enabled = true;
+        else if (action === 'disable') a.enabled = false;
+        else if (action === 'standby') a.standby = true;
+        else if (action === 'primary') a.standby = false;
+        else if (action === 'postingOrder') a.postingOrder = String(value || 'post-centric');
+        else if (action === 'postFilter') a.postFilter = String(value || 'all');
+        else if (action === 'proxy') a.proxy = String(value || '').trim();
+        else continue;
+        count++;
+      }
+    });
+    if (action === 'delete') { for (const n of names) { try { fs.rmSync(store.accountDir(n), { recursive: true, force: true }); } catch {} } }
+    send('data-updated');
+    return ok({ count });
   } catch (e) { return fail(e); }
 });
 

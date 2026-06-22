@@ -987,6 +987,79 @@ async function deleteGroup(groupId) {
 }
 
 // Accounts Management
+// ---- Account multi-select + bulk actions + search/filter (batch account management) -----------------
+let accountSelectMode = false;
+const selectedAccounts = new Set();
+let accountFilter = '';
+let accountStatusFilter = 'all';
+
+function setAccountFilter(v) { accountFilter = v || ''; renderAccounts(); const el = document.getElementById('acct-search'); if (el) { try { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } catch {} } }
+function setAccountStatusFilter(v) { accountStatusFilter = v || 'all'; renderAccounts(); }
+function toggleSelectMode() { accountSelectMode = !accountSelectMode; if (!accountSelectMode) selectedAccounts.clear(); renderAccounts(); }
+function toggleAccountSelect(name) { if (selectedAccounts.has(name)) selectedAccounts.delete(name); else selectedAccounts.add(name); renderAccounts(); }
+function selectAllFiltered(names) { (names || []).forEach((n) => selectedAccounts.add(n)); renderAccounts(); }
+function clearAccountSelection() { selectedAccounts.clear(); renderAccounts(); }
+
+function accountsToolbarHtml(posters, filtered, filteredNames, s) {
+  const chip = (label, val, color) => `<button onclick="setAccountStatusFilter('${val}')" style="background:${accountStatusFilter === val ? color : '#1e293b'};color:${accountStatusFilter === val ? '#fff' : '#94a3b8'};border:1px solid ${color}44;border-radius:999px;padding:4px 11px;font-size:11px;font-weight:600;cursor:pointer;">${label}</button>`;
+  const btn = (label, onclick, bg, fg) => `<button onclick="${onclick}" style="background:${bg};color:${fg};border:none;border-radius:7px;padding:6px 10px;font-size:12px;font-weight:600;cursor:pointer;">${label}</button>`;
+  const orderOpts = ['post-centric:🎯 All groups', 'post-centric-unique:🎯🔒 Unique', 'random:🔀 Random', 'random-unique:🔀🔒 Random-unique', 'sequence:📋 Sequential', 'daily-rotation:📅 Daily rotation', 'campaign-plan:🗓️ Campaign plan'].map((o) => { const [v, l] = o.split(':'); return `<option value="${v}">${l}</option>`; }).join('');
+  const filterOpts = ['all:All posts', 'with-comments:With comments', 'without-comments:Without comments'].map((o) => { const [v, l] = o.split(':'); return `<option value="${v}">${l}</option>`; }).join('');
+  const selStyle = 'background:#0f172a;border:1px solid #334155;border-radius:7px;color:#cbd5e1;font-size:12px;padding:6px 8px;cursor:pointer;';
+  const bulkBar = accountSelectMode ? `
+    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;width:100%;background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.3);border-radius:10px;padding:8px 10px;margin-top:8px;">
+      <span style="font-size:12px;color:#c7d2fe;font-weight:700;">${selectedAccounts.size} selected</span>
+      ${btn(`Select all (${filteredNames.length})`, `selectAllFiltered(${escapeHtml(JSON.stringify(filteredNames)).replace(/"/g, '&quot;')})`, '#334155', '#e5e7eb')}
+      ${btn('None', 'clearAccountSelection()', '#334155', '#e5e7eb')}
+      <span style="flex:1;"></span>
+      ${btn('On', "bulkAccountAction('enable')", '#16a34a', '#fff')}
+      ${btn('Off', "bulkAccountAction('disable')", '#6b7280', '#fff')}
+      ${btn('🟡 Standby', "bulkAccountAction('standby')", '#d97706', '#fff')}
+      ${btn('Primary', "bulkAccountAction('primary')", '#334155', '#e5e7eb')}
+      <select onchange="if(this.value){bulkAccountAction('postingOrder',this.value);this.selectedIndex=0;}" style="${selStyle}"><option value="">Set mode ▾</option>${orderOpts}</select>
+      <select onchange="if(this.value){bulkAccountAction('postFilter',this.value);this.selectedIndex=0;}" style="${selStyle}"><option value="">Set filter ▾</option>${filterOpts}</select>
+      ${btn('🌐 Proxy', "bulkAccountAction('proxy')", '#334155', '#e5e7eb')}
+      ${btn('🔄 Check', "bulkAccountAction('check')", '#334155', '#e5e7eb')}
+      ${btn('🗑️ Delete', "bulkAccountAction('delete')", '#b91c1c', '#fff')}
+    </div>` : '';
+  return `<div style="margin-bottom:14px;">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <input id="acct-search" value="${escapeHtml(accountFilter)}" oninput="setAccountFilter(this.value)" placeholder="🔍 Search accounts by name or alias…" style="flex:1;min-width:170px;padding:7px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;font-size:13px;outline:none;">
+      <button onclick="toggleSelectMode()" style="background:${accountSelectMode ? '#6366f1' : '#1e293b'};color:${accountSelectMode ? '#fff' : '#cbd5e1'};border:1px solid #6366f155;border-radius:8px;padding:7px 12px;font-size:13px;font-weight:600;cursor:pointer;">${accountSelectMode ? '✓ Selecting' : '☑ Select'}</button>
+      <button onclick="openBatchGroupModal()" title="Assign the SAME groups to several agents at once — they become one Campaign Plan team that splits the library across those groups" style="background:rgba(59,130,246,0.15);color:#93c5fd;border:1px solid rgba(59,130,246,0.35);border-radius:8px;padding:7px 12px;font-size:13px;font-weight:600;cursor:pointer;">🧩 Batch groups</button>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px;">
+      ${chip(`All ${posters.length}`, 'all', '#475569')}
+      ${chip(`✅ ${s.logged}`, 'logged_in', '#22c55e')}
+      ${chip(`⚠️ ${s.needs} need login`, 'needs_login', '#f59e0b')}
+      ${chip(`🟡 ${s.standby} standby`, 'standby', '#f59e0b')}
+      ${chip(`⏸ ${s.disabled} off`, 'disabled', '#6b7280')}
+      ${(accountFilter || accountStatusFilter !== 'all') ? `<span style="font-size:11px;color:#64748b;margin-left:4px;">showing ${filtered.length}</span>` : ''}
+    </div>
+    ${bulkBar}
+  </div>`;
+}
+
+async function bulkAccountAction(action, value) {
+  const names = [...selectedAccounts];
+  if (!names.length) { showNotification('Select at least one account first.', 'info'); return; }
+  if (action === 'check') {
+    showNotification(`Checking ${names.length} account(s)…`, 'info');
+    for (const n of names) { try { await window.electronAPI.checkAccountStatus(n); } catch {} }
+    await loadData(); showNotification('Status check complete', 'success'); return;
+  }
+  if (action === 'proxy') {
+    const v = prompt(`Set proxy for ${names.length} selected account(s) (leave blank to CLEAR):`, '');
+    if (v == null) return; value = v.trim();
+  }
+  if (action === 'delete' && !confirm(`Delete ${names.length} selected account(s)?\n\nThis removes their Chromium profiles + cookies and cannot be undone.`)) return;
+  const res = await window.electronAPI.invoke('batch-account-action', { names, action, value });
+  if (res && res.success === false) { showNotification('Batch action failed: ' + (res.error || 'unknown error'), 'error'); return; }
+  if (action === 'delete') selectedAccounts.clear();
+  await loadData();
+  showNotification(`Applied to ${(res && res.count) || names.length} account(s)`, 'success');
+}
+
 function renderAccounts() {
   const container = document.getElementById('accounts-container');
 
@@ -1004,7 +1077,20 @@ function renderAccounts() {
     return;
   }
 
-  container.innerHTML = `<div style="margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;"><button onclick="openBatchGroupModal()" title="Assign the SAME groups to several agents at once — they become one Campaign Plan team that splits the library across those groups" style="background:rgba(59,130,246,0.15);color:#93c5fd;border:1px solid rgba(59,130,246,0.35);border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer;">🧩 Assign groups to a batch of agents</button><span style="font-size:11px;color:#6b7280;">Give a team of agents the same groups → in Campaign Plan they split the library across those groups.</span></div>` + appData.accounts.filter((a) => !a.isModerator).map(account => {
+  const posters = appData.accounts.filter((a) => !a.isModerator);
+  const s = { logged: 0, needs: 0, disabled: 0, standby: 0 };
+  for (const a of posters) { if (a.enabled === false) s.disabled++; if (a.standby) s.standby++; if (a.status === 'logged_in') s.logged++; else if (a.enabled !== false) s.needs++; }
+  const q = (accountFilter || '').toLowerCase();
+  const filtered = posters.filter((a) => {
+    if (q && !((a.name || '').toLowerCase().includes(q) || (a.alias || '').toLowerCase().includes(q))) return false;
+    if (accountStatusFilter === 'logged_in') return a.status === 'logged_in';
+    if (accountStatusFilter === 'needs_login') return a.status !== 'logged_in' && a.enabled !== false;
+    if (accountStatusFilter === 'disabled') return a.enabled === false;
+    if (accountStatusFilter === 'standby') return a.standby === true;
+    return true;
+  });
+  const filteredNames = filtered.map((a) => a.name);
+  const cardsHtml = filtered.length ? filtered.map(account => {
     const isEnabled = account.enabled !== false; // treat missing/undefined as true
 
     let statusClass = '';
@@ -1097,9 +1183,11 @@ function renderAccounts() {
       ? `<button onclick="toggleAccountStandby('${account.name}')" title="Standby (backup): idle until a working account in its groups drops, a post stays held, or a comment needs placing. Click to make it a normal Primary poster." style="background:#f59e0b;color:#1f2937;border:none;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:700;cursor:pointer;line-height:1.4;">🟡 Standby</button>`
       : `<button onclick="toggleAccountStandby('${account.name}')" title="Primary poster. Click to make it a Standby (backup) account that only works when its groups need it." style="background:#1e293b;color:#94a3b8;border:1px solid #374151;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;line-height:1.4;">Primary</button>`;
 
+    const isSelected = selectedAccounts.has(account.name);
     return `
-      <div class="account-card" data-account-name="${escapeHtml(account.name)}" style="${isEnabled ? '' : 'opacity:0.5;'}">
+      <div class="account-card" data-account-name="${escapeHtml(account.name)}" style="${isEnabled ? '' : 'opacity:0.5;'}${isSelected ? 'outline:2px solid #6366f1;outline-offset:1px;' : ''}">
         <div class="account-header">
+          ${accountSelectMode ? `<input type="checkbox" ${isSelected ? 'checked' : ''} onclick="toggleAccountSelect('${account.name}')" title="Select for bulk action" style="width:18px;height:18px;margin-right:8px;accent-color:#6366f1;cursor:pointer;flex:0 0 auto;align-self:flex-start;margin-top:4px;">` : ''}
           <div class="account-avatar">${displayName.charAt(0).toUpperCase()}</div>
           <div class="account-info">
             <h3 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">${escapeHtml(displayName)} ${enabledPill} ${standbyPill}</h3>
@@ -1199,7 +1287,8 @@ function renderAccounts() {
         </div>
       </div>
     `;
-  }).join('');
+  }).join('') : `<div class="empty-state" style="padding:28px;"><div class="icon">🔍</div><h3>No accounts match</h3><p>Adjust the search or status filter above.</p></div>`;
+  container.innerHTML = accountsToolbarHtml(posters, filtered, filteredNames, s) + cardsHtml;
 }
 
 // Toggle account enabled/disabled state
