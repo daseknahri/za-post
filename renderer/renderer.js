@@ -622,12 +622,13 @@ function renderHealth() {
 
 // Posts Management
 let postSearch = '';
-function setPostSearch(v) { postSearch = v || ''; renderPosts(); const el = document.getElementById('post-search'); if (el) { try { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } catch {} } }
+function setPostSearch(v, sel0, sel1) { postSearch = v || ''; renderPosts(); const el = document.getElementById('post-search'); if (el) { try { el.focus(); const p = (sel0 == null ? el.value.length : sel0); el.setSelectionRange(p, sel1 == null ? p : sel1); } catch {} } }
 
 function renderPosts() {
   const container = document.getElementById('posts-container');
 
   if (appData.posts.length === 0) {
+    postSearch = ''; // don't let a stale search hide the first post re-added after a clear-all
     container.innerHTML = `
       <div class="empty-state">
         <div class="icon">📝</div>
@@ -643,7 +644,7 @@ function renderPosts() {
 
   const q = (postSearch || '').toLowerCase();
   const fposts = q ? appData.posts.filter((p) => ((p.caption || '') + ' ' + (p.comment || '')).toLowerCase().includes(q)) : appData.posts;
-  const postToolbar = `<div style="margin-bottom:12px;display:flex;align-items:center;gap:8px;"><input id="post-search" value="${escapeHtml(postSearch)}" oninput="setPostSearch(this.value)" placeholder="🔍 Search posts by caption or comment…" style="flex:1;min-width:170px;padding:7px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;font-size:13px;outline:none;">${q ? `<span style="font-size:11px;color:#64748b;white-space:nowrap;">showing ${fposts.length}/${appData.posts.length}</span>` : ''}</div>`;
+  const postToolbar = `<div style="margin-bottom:12px;display:flex;align-items:center;gap:8px;"><input id="post-search" value="${escapeHtml(postSearch)}" oninput="setPostSearch(this.value, this.selectionStart, this.selectionEnd)" placeholder="🔍 Search posts by caption or comment…" style="flex:1;min-width:170px;padding:7px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;font-size:13px;outline:none;">${q ? `<span style="font-size:11px;color:#64748b;white-space:nowrap;">showing ${fposts.length}/${appData.posts.length}</span>` : ''}</div>`;
   container.innerHTML = postToolbar + (fposts.length ? fposts.map(post => {
     // Support both old single imagePath and new imagePaths array
     const allPaths = post.imagePaths || (post.imagePath ? [post.imagePath] : []);
@@ -999,7 +1000,7 @@ const selectedAccounts = new Set();
 let accountFilter = '';
 let accountStatusFilter = 'all';
 
-function setAccountFilter(v) { accountFilter = v || ''; renderAccounts(); const el = document.getElementById('acct-search'); if (el) { try { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } catch {} } }
+function setAccountFilter(v, sel0, sel1) { accountFilter = v || ''; renderAccounts(); const el = document.getElementById('acct-search'); if (el) { try { el.focus(); const p = (sel0 == null ? el.value.length : sel0); el.setSelectionRange(p, sel1 == null ? p : sel1); } catch {} } }
 function setAccountStatusFilter(v) { accountStatusFilter = v || 'all'; renderAccounts(); }
 function toggleSelectMode() { accountSelectMode = !accountSelectMode; if (!accountSelectMode) selectedAccounts.clear(); renderAccounts(); }
 function toggleAccountSelect(name) { if (selectedAccounts.has(name)) selectedAccounts.delete(name); else selectedAccounts.add(name); renderAccounts(); }
@@ -1015,7 +1016,7 @@ function accountsToolbarHtml(posters, filtered, filteredNames, s) {
   const bulkBar = accountSelectMode ? `
     <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;width:100%;background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.3);border-radius:10px;padding:8px 10px;margin-top:8px;">
       <span style="font-size:12px;color:#c7d2fe;font-weight:700;">${selectedAccounts.size} selected</span>
-      ${btn(`Select all (${filteredNames.length})`, `selectAllFiltered(${escapeHtml(JSON.stringify(filteredNames)).replace(/"/g, '&quot;')})`, '#334155', '#e5e7eb')}
+      ${btn(`Select all (${filteredNames.length})`, `selectAllFiltered(${escapeHtml(JSON.stringify(filteredNames))})`, '#334155', '#e5e7eb')}
       ${btn('None', 'clearAccountSelection()', '#334155', '#e5e7eb')}
       <span style="flex:1;"></span>
       ${btn('On', "bulkAccountAction('enable')", '#16a34a', '#fff')}
@@ -1030,7 +1031,7 @@ function accountsToolbarHtml(posters, filtered, filteredNames, s) {
     </div>` : '';
   return `<div style="margin-bottom:14px;">
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-      <input id="acct-search" value="${escapeHtml(accountFilter)}" oninput="setAccountFilter(this.value)" placeholder="🔍 Search accounts by name or alias…" style="flex:1;min-width:170px;padding:7px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;font-size:13px;outline:none;">
+      <input id="acct-search" value="${escapeHtml(accountFilter)}" oninput="setAccountFilter(this.value, this.selectionStart, this.selectionEnd)" placeholder="🔍 Search accounts by name or alias…" style="flex:1;min-width:170px;padding:7px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;font-size:13px;outline:none;">
       <button onclick="toggleSelectMode()" style="background:${accountSelectMode ? '#6366f1' : '#1e293b'};color:${accountSelectMode ? '#fff' : '#cbd5e1'};border:1px solid #6366f155;border-radius:8px;padding:7px 12px;font-size:13px;font-weight:600;cursor:pointer;">${accountSelectMode ? '✓ Selecting' : '☑ Select'}</button>
       <button onclick="openBatchGroupModal()" title="Assign the SAME groups to several agents at once — they become one Campaign Plan team that splits the library across those groups" style="background:rgba(59,130,246,0.15);color:#93c5fd;border:1px solid rgba(59,130,246,0.35);border-radius:8px;padding:7px 12px;font-size:13px;font-weight:600;cursor:pointer;">🧩 Batch groups</button>
     </div>
@@ -1070,6 +1071,7 @@ function renderAccounts() {
   const container = document.getElementById('accounts-container');
 
   if (appData.accounts.length === 0) {
+    accountFilter = ''; accountStatusFilter = 'all'; selectedAccounts.clear(); accountSelectMode = false; // reset stale filter/selection
     container.innerHTML = `
       <div class="empty-state">
         <div class="icon">🔐</div>
@@ -1193,7 +1195,7 @@ function renderAccounts() {
     return `
       <div class="account-card" data-account-name="${escapeHtml(account.name)}" style="${isEnabled ? '' : 'opacity:0.5;'}${isSelected ? 'outline:2px solid #6366f1;outline-offset:1px;' : ''}">
         <div class="account-header">
-          ${accountSelectMode ? `<input type="checkbox" ${isSelected ? 'checked' : ''} onclick="toggleAccountSelect('${account.name}')" title="Select for bulk action" style="width:18px;height:18px;margin-right:8px;accent-color:#6366f1;cursor:pointer;flex:0 0 auto;align-self:flex-start;margin-top:4px;">` : ''}
+          ${accountSelectMode ? `<input type="checkbox" ${isSelected ? 'checked' : ''} onclick="toggleAccountSelect(${escapeHtml(JSON.stringify(account.name))})" title="Select for bulk action" style="width:18px;height:18px;margin-right:8px;accent-color:#6366f1;cursor:pointer;flex:0 0 auto;align-self:flex-start;margin-top:4px;">` : ''}
           <div class="account-avatar">${displayName.charAt(0).toUpperCase()}</div>
           <div class="account-info">
             <h3 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">${escapeHtml(displayName)} ${enabledPill} ${standbyPill}</h3>

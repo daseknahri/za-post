@@ -395,18 +395,20 @@ app.whenReady().then(async () => {
     // server-side revoke or an expiry takes effect WITHOUT a restart: refresh the tier limits, and if the
     // license has gone invalid, stop any running automation and surface the re-validation window.
     const REVAL_MS = 6 * 60 * 60 * 1000;
-    setInterval(async () => {
+    const revalTimer = setInterval(async () => {
       try {
         const rr = await license.checkCached(app.getPath('userData'), licenseServerUrl());
         setLicenseState(rr, true);
         try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('license-updated'); } catch {}
         if (!rr.valid) {
-          try { if (orchestrator.isRunning()) { orchestrator.stop(); setRunActive(false); } } catch {}
-          emit('automation-log', '🔒 License is no longer valid — automation stopped. Re-validate to continue.');
+          let stopped = false;
+          try { if (orchestrator.isRunning()) { orchestrator.stop(); setRunActive(false); stopped = true; } } catch {}
+          emit('automation-log', stopped ? '🔒 License is no longer valid — automation stopped. Re-validate to continue.' : '🔒 License is no longer valid — re-validate to run.');
           try { if (rr.revoked) showRevokedWindow(); else showLicenseWindow(); } catch {}
         }
       } catch {}
     }, REVAL_MS);
+    app.on('before-quit', () => { try { clearInterval(revalTimer); } catch {} });
   }
 
   // ---- Auto-resume after shutdown / crash ------------------------------------
@@ -644,9 +646,10 @@ ipcMain.handle('batch-account-action', async (_e, payload) => {
     }
     const set = new Set(names);
     let count = 0;
+    const deleted = []; // ONLY the accounts actually removed (excludes moderators) — so we never wipe a moderator's profile dir
     await store.update((data) => {
       if (action === 'delete') {
-        data.accounts = (data.accounts || []).filter((a) => { if (set.has(a.name) && !a.isModerator) { count++; return false; } return true; });
+        data.accounts = (data.accounts || []).filter((a) => { if (set.has(a.name) && !a.isModerator) { count++; deleted.push(a.name); return false; } return true; });
         return;
       }
       for (const a of data.accounts || []) {
@@ -662,7 +665,7 @@ ipcMain.handle('batch-account-action', async (_e, payload) => {
         count++;
       }
     });
-    if (action === 'delete') { for (const n of names) { try { fs.rmSync(store.accountDir(n), { recursive: true, force: true }); } catch {} } }
+    if (action === 'delete') { for (const n of deleted) { try { fs.rmSync(store.accountDir(n), { recursive: true, force: true }); } catch {} } }
     send('data-updated');
     return ok({ count });
   } catch (e) { return fail(e); }
