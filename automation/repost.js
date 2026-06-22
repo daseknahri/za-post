@@ -21,9 +21,11 @@ const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').rep
 // Is `captionSnip` already LIVE in the group's public feed (FB auto-released the held original)?
 // Fail-SAFE: on any error/timeout returns false so a genuine hold still gets re-posted (a rare duplicate is
 // less bad than never delivering); but a short/non-distinctive caption returns false too (can't confirm).
+// Returns 'live' (original is public — don't re-post), 'absent' (not public — safe to re-post), or
+// 'session_expired' (the reserve is logged out — bail, leave the held post for retry).
 async function isContentLive(account, gid, captionSnip, settings, log, shouldStop) {
   const snip = norm(captionSnip).slice(0, 40);
-  if (snip.length < 12) return false; // too short to confirm presence safely
+  if (snip.length < 12) return 'absent'; // too short to confirm presence — allow the (cap-1-bounded) re-post
   const hidden = (settings.hideBrowser !== false);
   let browser = null;
   try {
@@ -41,15 +43,22 @@ async function isContentLive(account, gid, captionSnip, settings, log, shouldSto
       page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }),
       new Promise((_, rej) => { const iv = setInterval(() => { if (shouldStop()) { clearInterval(iv); rej(new Error('stopped')); } }, 500); }),
     ]).catch(() => {});
-    if (shouldStop()) return false;
+    if (shouldStop()) return 'absent';
+    // Session check FIRST: a logged-out reserve redirects to /login or shows the account picker — the feed
+    // (and any presence verdict) is then meaningless. Surface it so the caller leaves the post for retry.
+    const gate = await page.evaluate(() => {
+      const t = (document.body.innerText || '').slice(0, 600).toLowerCase();
+      return /log in to facebook|continue as|use another profile|create new account/.test(t) || /\/login|checkpoint/.test(location.href);
+    }).catch(() => false);
+    if (gate) return 'session_expired';
     await page.waitForSelector('[aria-posinset], div[role="article"]', { timeout: 20000 }).catch(() => {});
     for (let s = 0; s < 3 && !shouldStop(); s++) { await page.evaluate(() => window.scrollBy(0, 700)).catch(() => {}); await sleep(800 + Math.floor(Math.random() * 800)); } // nudge lazy render (jittered, not metronomic)
     const found = await page.evaluate((sn) => {
       const n = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
       return Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 10).some((a) => n(a.textContent).includes(sn));
     }, snip).catch(() => false);
-    return !!found;
-  } catch { return false; }
+    return found ? 'live' : 'absent';
+  } catch { return 'absent'; } // best-effort: an error shouldn't permanently block delivery (cap-1 bounds any dup)
   finally { try { if (browser) await browser.close(); } catch {} }
 }
 
@@ -63,7 +72,12 @@ async function runRepost(o) {
   const shouldStop = o.shouldStop || (() => false);
   const where = `[repost:${account.name}] [${groupName || gid}]`;
   log(`♻️ ${where} held post un-approvable — checking the public feed before re-posting (avoids duplicating an auto-released post)…`);
-  if (await isContentLive(account, gid, captionSnip, settings, log, shouldStop)) {
+  const presence = await isContentLive(account, gid, captionSnip, settings, log, shouldStop);
+  if (presence === 'session_expired') {
+    log(`♻️ ${where} this reserve is LOGGED OUT — not re-posting; leaving the held post for retry next cycle (re-login the account).`);
+    return { posted: 0, heldRecords: [], flag: 'needs_login' };
+  }
+  if (presence === 'live') {
     log(`♻️ ${where} original is ALREADY LIVE (FB released it) — NOT re-posting; its link-comment will be placed on the live post instead.`);
     return { alreadyLive: true };
   }

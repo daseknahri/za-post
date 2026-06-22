@@ -1157,6 +1157,7 @@ class Orchestrator {
           // A campaign-plan agent's slice is pinned to that agent (a reserve isn't in agentLists), so takeover
           // can't fill it — surface the gap so the operator adds reserves to the plan / warms accounts.
           if (active.some((a) => (a.postingOrder || '') === 'campaign-plan')) this.log('⚠️ A campaign-plan agent dropped this cycle and no reserve can deliver its pinned slice — that cluster\'s group(s) miss today\'s post (it resumes when the agent recovers, or add more agents to that group-set).');
+          if (active.some((a) => (a.postingOrder || '') === 'daily-rotation')) this.log('ℹ️ A daily-rotation agent dropped this cycle — it RETRIES the same post automatically next cycle/day (its pointer only advances on a successful post), so nothing is permanently skipped.');
         }
       }
 
@@ -1219,10 +1220,14 @@ class Orchestrator {
               const nowR = Date.now();
               // RESERVES ONLY (never an active poster), and never an account that already ran a job this cycle
               // (takeover / a prior Phase-4 re-post) — so no account opens a 2nd browser on its profile/cycle.
+              // Read LIVE disk state (enabled toggle + daily count + cool-down) — the cycle-start snapshot is
+              // stale (a takeover reserve just posted; the operator may have toggled an account off mid-run).
+              const liveAccts = store.load().accounts || [];
               const reserve = (this._reserve || [])
-                .filter((a) => a.enabled !== false && !a.isModerator && a.status === 'logged_in' && (Number(a.rateLimitedUntil) || 0) <= nowR
-                  && a.name !== rec.posterAccount && !this._jobbedThisCycle.has(a.name) && inGroup(a, rec.gid)
-                  && (cap <= 0 || store.dailyUsed(((data.accounts || []).find((x) => x.name === a.name) || a).daily) < cap))
+                .filter((a) => { const la = liveAccts.find((x) => x.name === a.name) || a;
+                  return la.enabled !== false && !a.isModerator && la.status === 'logged_in' && (Number(la.rateLimitedUntil) || 0) <= nowR
+                    && a.name !== rec.posterAccount && !this._jobbedThisCycle.has(a.name) && inGroup(a, rec.gid)
+                    && (cap <= 0 || store.dailyUsed(la.daily) < cap); })
                 .sort((x, y) => (((this._heldCount || {})[x.name]) || 0) - (((this._heldCount || {})[y.name]) || 0))[0]; // prefer the least-held reserve
               if (!reserve) { this.log(`♻️ held re-post: no idle healthy in-group reserve for "${rec.groupName || rec.gid}" — left undeliverable (raise Reserve Accounts / assign+warm an account in that group).`); continue; }
               // Re-read under the guard; if it changed (moderator approved it, or another pass took it), skip. Claim it as
@@ -1258,14 +1263,29 @@ class Orchestrator {
                 markResolved();
               } else if (result && (result.posted || 0) >= 1) {
                 this.log(`✅ [${reserve.name}] re-posted the held content LIVE to "${rec.groupName || rec.gid}" — delivered (100%).`);
+                // Count this delivery against the reserve's daily cap (it went through runRepost→runAccount,
+                // NOT the pool, so the pool's _recordAccountOutcome never ran) — keeps the cap accurate so
+                // it isn't re-picked past its limit next cycle.
+                try { await this._recordAccountOutcome(reserve.name, { posted: result.posted || 0, pendingApproval: result.pendingApproval || 0, errors: result.errors || 0, flag: null, postedIds: [], dealtIds: [] }, settings); } catch {}
                 try { const cq = (result.commentQueue || []); if (cq.length) { const cs = store.loadComments(); for (const c of cq) cs.pending.push({ ...c, status: 'pending', queuedAt: Date.now(), attempts: 0 }); store.saveComments(cs); } } catch {}
                 markResolved();
-              } else {
-                // Replacement also held (or failed) → cap at 1, mark failed_held, surface in the completion report.
+              } else if (result && (result.heldRecords || []).length > 0) {
+                // Replacement was ALSO HELD → a group-level spam gate (2 accounts held). Cap at 1, mark
+                // failed_held, surface in the completion report. (Discard the replacement's held record — not
+                // routed through the pool, so it isn't independently persisted.)
                 const ms3 = store.loadModeration();
                 const r3 = (ms3.held || []).find(recMatch);
-                if (r3) { r3.status = 'failed_held'; r3.repostAttempts = 1; r3.note = 'replacement re-post was also held / failed — no further attempts (group-level spam gate)'; store.saveModeration(ms3); }
-                this.log(`⚠️ [${reserve.name}] replacement re-post to "${rec.groupName || rec.gid}" did NOT go live → reported undeliverable (2 accounts held = group-level spam gate). Warm/replace accounts for this group.`);
+                if (r3) { r3.status = 'failed_held'; r3.repostAttempts = 1; r3.note = 'replacement re-post was also held — no further attempts (group-level spam gate)'; store.saveModeration(ms3); }
+                this.log(`⚠️ [${reserve.name}] replacement re-post to "${rec.groupName || rec.gid}" was ALSO held → reported undeliverable (2 accounts held = group-level spam gate). Warm/replace accounts for this group.`);
+              } else {
+                // Session/infra/transient failure (logged out, profile lock, crash, no composer) — NOT a
+                // confirmed spam gate. REVERT to 'failed' so the held post retries next cycle with a healthy
+                // reserve; do NOT consume the cap (repostAttempts stays 0).
+                const msF = store.loadModeration();
+                const rF = (msF.held || []).find(recMatch);
+                if (rF && rF.status === 'superseded') { rF.status = 'failed'; rF.repostedBy = null; store.saveModeration(msF); }
+                const why = (result && result.flag) ? result.flag : 'transient failure';
+                this.log(`↩️ [${reserve.name}] could NOT re-post "${rec.groupName || rec.gid}" (${why}) — left for retry next cycle (re-login/replace the reserve). Cap not consumed.`);
               }
               // Space consecutive re-posts so a batch of held records doesn't fan out as a coordinated burst.
               if (!this._shouldStop()) await this._interruptibleSleep(30000 + Math.floor(Math.random() * 60000));
@@ -1288,7 +1308,10 @@ class Orchestrator {
             const now = Date.now();
             const inGroup = (a, gid) => (data.groups || []).some((g) => (g.groupId || g.id) === gid && (a.assignedGroups || []).some((x) => x === g.id || x === g.groupId));
             const reserveNames = new Set((this._reserve || []).map((a) => a.name));
-            const eligibleFor = (c) => (data.accounts || []).filter((a) =>
+            // Read LIVE account state (enabled toggle / status / cool-down updated mid-cycle), not the
+            // cycle-start snapshot — so a reserve turned OFF or cooled-down since the cycle began isn't dispatched.
+            const liveAccts3 = (getData().accounts) || [];
+            const eligibleFor = (c) => liveAccts3.filter((a) =>
               a.enabled !== false && !a.isModerator && a.status === 'logged_in' &&
               (Number(a.rateLimitedUntil) || 0) <= now && a.name !== c.posterAccount && inGroup(a, c.gid) &&
               !(this._jobbedThisCycle && this._jobbedThisCycle.has(a.name))) // not an account that already ran a takeover/re-post job this cycle
@@ -1324,6 +1347,13 @@ class Orchestrator {
                           if (!dup) { ms.held.push({ postId: task.postId || null, gid: task.gid, posterAccount: task.posterAccount || null, fbDisplayName: '', captionSnip: task.captionSnip || '', postCaption: task.postCaption || null, groupName: task.groupName || null, comment: task.comment || '', commentImg: task.commentImg || null, postPermalink: task.postPermalink || null, status: 'held', heldAt: Date.now(), approvedAt: null, source: 'rescue_notfound' }); store.saveModeration(ms); this.log(`🔁 [${task.groupName || task.gid}] orphaned comment looks HELD — re-homed to moderator approval`); }
                         } catch {}
                       }
+                    }
+                    else if (outcome === 'skipped') {
+                      // The rescuer can NEVER safely identify the post (no permalink, caption too short, or an
+                      // ambiguous feed) — retrying won't help. Mark terminal + surface, instead of silently
+                      // burning 3 attempts then vanishing as 'failed' with no operator signal.
+                      rec.status = 'skipped'; rec.note = 'cannot identify the post safely (no permalink / short caption / ambiguous feed)';
+                      this.log(`⚠️ [${task.groupName || task.gid}] orphaned comment could NOT be placed safely (ambiguous post) — left for manual handling (will not retry).`);
                     }
                     else if (rec.attempts >= 3) { rec.status = 'failed'; }
                   }

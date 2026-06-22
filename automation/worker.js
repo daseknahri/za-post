@@ -1038,7 +1038,15 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           if (res.clicked) await sleep(2500);
           const scoped = await page.$('[data-zp-ctarget="1"] [contenteditable="true"], [data-zp-ctarget="1"] [role="textbox"]').catch(() => null);
           if (scoped) { boxes = [scoped]; step(`Comment: our post found in feed (id=${res.postId || '?'}, pos=${res.pos + 1}) — using its comment box`); }
-          else if (res.pos === 0) { const all = await withTimeout(commentBoxes(), 15000, []); if (all.length) { boxes = [all[0]]; step('Comment: our post is the TOP post — using the top comment box'); } else step('Comment: our post is top but no comment box rendered — not commenting'); }
+          else if (res.pos === 0) {
+            // Scoped box didn't render though our post was topmost. Re-scan to RE-CONFIRM (author+caption)
+            // and re-mark OUR post, then take ITS box — never a bare top box that may have re-rendered to a
+            // DIFFERENT post (wrong-post-safe). If it still doesn't render, skip (rescue/retry will catch it).
+            const res2 = await scanFeed();
+            const scoped2 = res2.clicked ? await page.$('[data-zp-ctarget="1"] [contenteditable="true"], [data-zp-ctarget="1"] [role="textbox"]').catch(() => null) : null;
+            if (scoped2) { boxes = [scoped2]; step('Comment: re-confirmed OUR post after a rescan — using its comment box'); }
+            else step('Comment: our post is top but its comment box did not render after a rescan — not commenting (avoids a wrong-post)');
+          }
           else step('Comment: found OUR post but its scoped comment box did not render — not commenting (avoids a wrong-post)');
         } else {
           // 'nomatch' = our post is genuinely NOT in the public feed. After publish confirmed, that means
@@ -1088,14 +1096,26 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           onAttempt: (a, n, e) => step(`Comment: image upload attempt ${a}/${n} failed (${e.message})${a < n ? ' — retrying' : ''}`),
         });
         if (cu.ok) {
-          // Wait for the image PREVIEW to actually render before submitting, so a slow CDN
-          // upload can't be dropped when Enter fires (a blind fixed delay was unreliable).
-          const previewed = await page.waitForFunction(() => !!document.querySelector('[role="article"] img[src^="blob:"], [role="dialog"] img[src^="blob:"]'), { timeout: 15000 }).then(() => true).catch(() => false);
+          // Wait for the image PREVIEW to render IN OUR comment box's container before submitting (a blind
+          // delay was unreliable). SCOPED to the box's own container — a document-wide blob-img check would
+          // false-match a pre-existing image in another feed post and submit before OUR image attached.
+          let previewed = false;
+          { const _pdl = Date.now() + 15000;
+            while (Date.now() < _pdl) {
+              const ok = await target.evaluate((el) => { const c = el.closest('[aria-posinset], [role="article"], [role="dialog"], form, [data-pagelet]') || document; return !!c.querySelector('img[src^="blob:"]'); }).catch(() => false);
+              if (ok) { previewed = true; break; }
+              await sleep(700);
+            } }
           step(previewed ? 'Comment: image attached (preview rendered)' : 'Comment: image uploaded (preview not detected — submitting anyway)');
           await sleep(1500);
         } else { step(`Comment: image upload failed after retries (${cu.error && cu.error.message}) — posting text only`); }
       }
       else step('Comment: image input not found — posting text only');
+      // RE-FOCUS: uploadFile dispatches to the file <input> (a sibling), stealing focus from the
+      // contenteditable — so the keystrokes + Enter below would type into nothing / the wrong element.
+      // Re-focus the actual comment box (the attached image stays attached).
+      await withTimeout(target.evaluate((el) => { el.scrollIntoView({ block: 'center' }); el.focus(); }), 5000, null);
+      await sleep(300);
     }
     // Type the comment. In a FB comment box ENTER SUBMITS, so insert newlines as Shift+Enter
     // and type the rest — otherwise a multi-line comment would submit at the first line.
@@ -1148,15 +1168,21 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
     const commentSnip = String(post.comment || '').replace(/\s+/g, ' ').trim().slice(0, 30);
     if (commentSnip.length >= 6) {
       const seen = await evalTimed(page, (s) => {
+        // SCOPE to OUR post (the data-zp-ctarget article we commented under) so the snippet can't
+        // false-match another post's body/comment in the top-3. Permalink page → no marker → its single
+        // article is ours, so the top-article fallback is still correct.
+        const tgt = document.querySelector('[data-zp-ctarget="1"]');
+        if (tgt) return (tgt.innerText || '').includes(s);
         const arts = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 3);
         return arts.some((a) => (a.innerText || '').includes(s));
       }, commentSnip, 6000).catch(() => null);
       if (seen === true) outcome = 'posted';
       else if (seen === false && confirmed) outcome = 'not_visible';
       // seen === null (timeout): keep the box-empty result (unconfirmed/not_visible)
-    } else if (confirmed) {
-      outcome = 'posted'; // image-only / very short comment: an emptied box is our best available signal
     }
+    // image-only / very short comment: box-empty is the BEST available signal but NOT a confirmed landing
+    // (FB also empties the box on a silent reject) — leave it 'unconfirmed' (still blocks rescue) rather
+    // than falsely claim 'posted ✅'.
     step(outcome === 'posted' ? 'Comment: posted and verified ✅ (visible under the post)'
        : outcome === 'not_visible' ? 'Comment: sent but NOT visible under the post — verify this group manually'
        : 'Comment: sent (delivery not auto-verified) — likely OK, spot-check if unsure');
