@@ -1,4 +1,4 @@
-const { ipcRenderer } = require('electron');
+const api = window.licenseAPI; // exposed by license-preload.js (contextIsolation-safe)
 
 const keyInput = document.getElementById('licenseKey');
 const verifyBtn = document.getElementById('verifyBtn');
@@ -21,11 +21,11 @@ verifyBtn.addEventListener('click', async () => {
     setLoading(true);
 
     // Send key to main process (don't wait for response)
-    ipcRenderer.send('validate-license-async', key);
+    api.validate(key);
 });
 
 // Listen for validation result (errors)
-ipcRenderer.on('license-validation-result', (event, result) => {
+api.onResult((result) => {
     console.log('🔴 Got validation result:', result);
     if (!result.valid) {
         showStatus(result.message || 'Invalid License', 'error');
@@ -56,7 +56,7 @@ const urlInput = document.getElementById('server-url-input');
 
 if (btnSettings) {
     btnSettings.addEventListener('click', async () => {
-        const currentUrl = await ipcRenderer.invoke('get-server-url');
+        const currentUrl = await api.getServerUrl();
         urlInput.value = currentUrl;
         settingsModal.style.display = 'block';
     });
@@ -69,7 +69,7 @@ if (btnSettings) {
         const newUrl = urlInput.value.trim();
         if (!newUrl) return;
 
-        const res = await ipcRenderer.invoke('update-server-url', newUrl);
+        const res = await api.updateServerUrl(newUrl);
         if (res.success) {
             settingsModal.style.display = 'none';
             showStatus('Server URL updated. Retrying...', 'success');

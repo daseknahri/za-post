@@ -19,11 +19,13 @@ let hooks = {
   onStart: () => {},
   onStop: () => {},
   addPost: () => {},                 // (postFields) => void   persists via main.js
+  addPostsBulk: async () => ({ added: 0, skipped: 0 }), // (posts[, {replace}]) => {added,skipped}  bulk JSON insert
   deletePost: () => {},              // (index) => void
   setInterval: () => {},             // (minutes) => void
   loginAccount: () => {},            // (name) => Promise
   closeLogin: () => {},              // (name) => void
   getTunnelUrl: () => '',            // () => string
+  getProxyHealth: () => ({ proxies: [], summary: { total: 0, healthy: 0, failing: 0, onCooldown: 0 } }), // E-X4
 };
 
 function shapeLog(l) {
@@ -42,37 +44,70 @@ function addLog(msg) {
   if (logs.length > 500) logs = logs.slice(-500);
 }
 
+// In-memory per-IP rate limiter (no external dep) — bounds token brute-forcing + flooding the browser-spawning
+// endpoints when the API is public via the tunnel. Keyed per (ip, limit) so different limiters don't share a bucket;
+// expired buckets are pruned so the map can't grow unbounded.
+const _rlBuckets = new Map();
+function rateLimit(max, windowMs) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = (req.ip || (req.socket && req.socket.remoteAddress) || '?') + '|' + max + '|' + windowMs;
+    let b = _rlBuckets.get(key);
+    if (!b || now > b.resetAt) { b = { count: 0, resetAt: now + windowMs }; _rlBuckets.set(key, b); }
+    if (++b.count > max) return res.status(429).json({ success: false, error: 'Too many requests — slow down.' });
+    if (_rlBuckets.size > 5000) { for (const [k, v] of _rlBuckets) if (now > v.resetAt) _rlBuckets.delete(k); }
+    next();
+  };
+}
+
+// Remote error responder: log the real error server-side, return only a GENERIC message to the (possibly remote,
+// tunnel-exposed) client so store/filesystem internals + userData paths never leak over the wire.
+function apiErr(res, e, code) {
+  try { addLog(`API error: ${(e && e.stack) || (e && e.message) || e}`); } catch {}
+  return res.status(code || 200).json({ success: false, error: 'Operation failed' });
+}
+
 function startServer(port, injected) {
   hooks = { ...hooks, ...injected };
   // Uploads must go to a WRITABLE dir. In a packaged app __dirname is inside the
   // read-only asar, so main.js injects userData/uploads. Falls back to public/uploads in dev.
   const UPLOAD_DIR = hooks.uploadDir || path.join(__dirname, 'public', 'uploads');
   const IMAGES_DIR = hooks.imagesDir || path.join(path.dirname(UPLOAD_DIR), 'storage', 'images');
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  fs.mkdirSync(IMAGES_DIR, { recursive: true });
+  // Wrapped: a non-writable uploads dir (EACCES/EPERM/ENOTDIR) must NOT throw synchronously out of startServer — that
+  // would reject the awaited call in main.js's whenReady chain and skip createWindow() (a headless zombie with no UI).
+  // Degrade instead: the API + app still start; only image uploads are unavailable.
+  try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); fs.mkdirSync(IMAGES_DIR, { recursive: true }); }
+  catch (e) { addLog(`Remote API: uploads dir not writable (${e.message}) — image uploads disabled, server still starting`); }
   const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB cap
 
   const app = express();
-  app.use(cors());
+  // The dashboard is SAME-ORIGIN on the tunnel URL — no legitimate cross-origin need. Disabling CORS removes
+  // the browser's same-origin barrier exploit if a token-bearing URL ever leaks to another origin.
+  app.use(cors({ origin: false }));
   app.use(express.json({ limit: '15mb' }));
   app.use(express.urlencoded({ extended: true }));
   app.use((_req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
   app.use(express.static(path.join(__dirname, 'public')));
-  app.use('/uploads', express.static(UPLOAD_DIR));
-  app.use('/images', express.static(IMAGES_DIR));
 
-  // When a token is configured (set by main.js whenever the public tunnel is enabled),
-  // require it on every /api route. The dashboard is reached as `<url>/?token=…`; its
-  // bootstrap forwards the token as the X-Access-Token header. Without this, anyone with
-  // the tunnel URL could control automation and read account data.
+  // When a token is configured (set by main.js whenever the public tunnel is enabled), require it on
+  // every /api route AND on the static image dirs (post/comment creative). The dashboard is reached as
+  // `<url>/?token=…`; its bootstrap forwards the token as the X-Access-Token header on /api calls and
+  // appends ?token=… to image <img> src. Without gating the image dirs, anyone with the tunnel base URL
+  // could scrape every client image; without gating /api they could control automation and read data.
   const API_TOKEN = hooks.apiToken || null;
-  if (API_TOKEN) {
-    app.use('/api', (req, res, next) => {
-      const tok = req.get('X-Access-Token') || req.query.token;
-      if (tok === API_TOKEN) return next();
-      return res.status(401).json({ success: false, error: 'Unauthorized — open the dashboard with ?token=… (see the app).' });
-    });
-  }
+  const tokenGate = (req, res, next) => {
+    if (!API_TOKEN) return next(); // local use (no tunnel) → no token required
+    const tok = req.get('X-Access-Token') || req.query.token;
+    // Constant-time compare: `===` short-circuits at the first differing byte → a remote token timing side-channel.
+    // The length guard is required (timingSafeEqual throws on unequal-length buffers; leaking only LENGTH is fine for a fixed-length token).
+    const _ta = Buffer.from(String(tok || '')), _tb = Buffer.from(String(API_TOKEN));
+    if (_ta.length === _tb.length && require('crypto').timingSafeEqual(_ta, _tb)) return next();
+    return res.status(401).json({ success: false, error: 'Unauthorized — open the dashboard with ?token=… (see the app).' });
+  };
+  app.use('/uploads', tokenGate, express.static(UPLOAD_DIR));
+  app.use('/images', tokenGate, express.static(IMAGES_DIR));
+  app.use('/api', rateLimit(120, 10000)); // per-IP throttle BEFORE tokenGate so failed-auth floods are counted too
+  if (API_TOKEN) app.use('/api', tokenGate);
 
   // ---- automation -----------------------------------------------------
   app.get('/api/automation/status', (_req, res) => {
@@ -80,10 +115,10 @@ function startServer(port, injected) {
     res.json({ isRunning: running, pid: running ? process.pid : null, logs: logs.slice(-80).map(shapeLog) });
   });
   app.post('/api/automation/start', async (_req, res) => {
-    try { const r = await hooks.onStart(); res.json(r && r.success === false ? r : { success: true }); } catch (e) { res.json({ success: false, error: e.message }); }
+    try { const r = await hooks.onStart(); res.json(r && r.success === false ? r : { success: true }); } catch (e) { apiErr(res, e); }
   });
   app.post('/api/automation/stop', (_req, res) => {
-    try { hooks.onStop(); res.json({ success: true }); } catch (e) { res.json({ success: false, error: e.message }); }
+    try { hooks.onStop(); res.json({ success: true }); } catch (e) { apiErr(res, e); }
   });
 
   // ---- posts ----------------------------------------------------------
@@ -97,11 +132,14 @@ function startServer(port, injected) {
     res.json({ posts });
   });
 
-  app.post('/api/posts/add', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'commentImage', maxCount: 1 }]), (req, res) => {
+  app.post('/api/posts/add', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'commentImage', maxCount: 1 }]), async (req, res) => {
+    // multer wrote the uploads to UPLOAD_DIR before this handler runs — on the empty-caption early-return (or a throw)
+    // hooks.addPost never persists them, so they'd leak forever. Clean them on the non-success paths.
+    const _cleanupUploads = () => { try { for (const k of ['image', 'commentImage']) { const f = req.files && req.files[k] && req.files[k][0]; if (f && f.path) { try { require('fs').unlinkSync(f.path); } catch {} } } } catch {} };
     try {
       const caption = (req.body.caption || '').trim();
-      if (!caption) return res.json({ success: false, error: 'Caption is required' });
-      hooks.addPost({
+      if (!caption) { _cleanupUploads(); return res.json({ success: false, error: 'Caption is required' }); }
+      await hooks.addPost({
         caption,
         comment: req.body.comment || '',
         imageUrl: req.body.imageUrl || '',
@@ -110,30 +148,47 @@ function startServer(port, injected) {
         commentImagePath: req.files && req.files.commentImage ? req.files.commentImage[0].path : null,
       });
       res.json({ success: true });
-    } catch (e) { res.json({ success: false, error: e.message }); }
+    } catch (e) { _cleanupUploads(); apiErr(res, e); }
   });
 
-  app.delete('/api/posts/:index', (req, res) => {
-    try { hooks.deletePost(parseInt(req.params.index, 10)); res.json({ success: true }); }
-    catch (e) { res.json({ success: false, error: e.message }); }
+  // BULK add posts from an external server in ONE request (one disk write) — the endpoint for API automation.
+  // JSON body: { "posts": [ { "caption": "...(required)", "comment": "...", "imageUrl": "...", "commentImageUrl": "..." }, ... ], "replace": false }
+  // A raw JSON array is also accepted. Blank captions are skipped. replace=true clears the library first
+  // (full refresh). Returns { success, added, skipped, replaced }. Token-gated like every /api route.
+  app.post('/api/posts/bulk', rateLimit(20, 60000), async (req, res) => {
+    try {
+      const posts = Array.isArray(req.body) ? req.body : (req.body && req.body.posts);
+      if (!Array.isArray(posts)) return res.status(400).json({ success: false, error: 'Body must be a JSON array of posts, or { "posts": [ … ] }.' });
+      if (posts.length > 1000) return res.status(400).json({ success: false, error: 'Too many posts in one request (max 1000).' });
+      const replace = !!(req.body && !Array.isArray(req.body) && req.body.replace);
+      const r = await hooks.addPostsBulk(posts, { replace });
+      res.json({ success: true, added: (r && r.added) || 0, skipped: (r && r.skipped) || 0, replaced: replace });
+    } catch (e) { apiErr(res, e, 500); }
+  });
+
+  app.delete('/api/posts/:index', async (req, res) => {
+    try { await hooks.deletePost(parseInt(req.params.index, 10)); res.json({ success: true }); }
+    catch (e) { apiErr(res, e); }
   });
 
   // ---- logs / interval (parity with original server) -------------------
   app.get('/api/automation/logs', (_req, res) => res.json({ logs: logs.slice(-150).map(shapeLog) }));
   app.get('/api/tunnel-url', (_req, res) => res.json({ url: hooks.getTunnelUrl() || '' }));
-  app.post('/api/automation/interval', (req, res) => {
-    const minutes = parseInt(req.body.minutes ?? req.body.interval, 10);
+  app.post('/api/automation/interval', async (req, res) => {
+    const _b = req.body || {}; // Express 5 leaves req.body undefined on an empty/non-JSON body — guard before deref (else a token-bearing empty POST 500s with a stack)
+    const minutes = parseInt(_b.minutes ?? _b.interval, 10);
     if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
       return res.json({ success: false, error: 'Invalid interval. Must be between 1 and 1440 minutes.' });
     }
-    try { hooks.setInterval(minutes); res.json({ success: true, message: `Interval updated to ${minutes} minutes. Restart automation for changes to take effect.` }); }
-    catch (e) { res.json({ success: false, error: e.message }); }
+    try { await hooks.setInterval(minutes); res.json({ success: true, message: `Interval updated to ${minutes} minutes. Restart automation for changes to take effect.` }); }
+    catch (e) { apiErr(res, e); }
   });
 
   // ---- accounts / groups (parity with original server) -----------------
   app.get('/api/accounts', (_req, res) => {
     // Never expose credentials/cookies over the network — map to display-safe fields only.
-    const accounts = (hooks.getData().accounts || []).map((a) => ({
+    // Moderators are not posting accounts — keep them out of the remote poster list (parity with the local UI).
+    const accounts = (hooks.getData().accounts || []).filter((a) => !a.isModerator).map((a) => ({
       name: a.name, alias: a.alias, status: a.status, lastMessage: a.lastMessage,
       enabled: a.enabled !== false, assignedGroups: a.assignedGroups || [],
       fbName: a.fbName, lastChecked: a.lastChecked,
@@ -141,13 +196,35 @@ function startServer(port, injected) {
     res.json({ accounts });
   });
   app.get('/api/groups', (_req, res) => res.json({ groups: hooks.getData().groups || [] }));
-  app.post('/api/accounts/:name/login', async (req, res) => {
-    try { await hooks.loginAccount(req.params.name); res.json({ success: true, message: `Login window opened for ${req.params.name}` }); }
-    catch (e) { res.json({ success: false, error: e.message }); }
+  // E-X4: proxy health snapshot (behind the same X-Access-Token as the other /api routes).
+  app.get('/api/proxies/health', (_req, res) => { try { res.json(hooks.getProxyHealth()); } catch (e) { apiErr(res, e, 500); } });
+  app.post('/api/accounts/:name/login', rateLimit(6, 60000), async (req, res) => {
+    // Propagate a blocked result (e.g. the license gate on an enforced+invalid build returns {success:false}) instead
+    // of always reporting "Login window opened" — mirrors the onStart handler above so the API response is truthful.
+    try { const r = await hooks.loginAccount(req.params.name); res.json(r && r.success === false ? r : { success: true, message: `Login window opened for ${req.params.name}` }); }
+    catch (e) { apiErr(res, e); }
   });
   app.post('/api/accounts/:name/close-login', (req, res) => {
     try { hooks.closeLogin(req.params.name); res.json({ success: true, message: `Login window closed for ${req.params.name}` }); }
-    catch (e) { res.json({ success: false, error: e.message }); }
+    catch (e) { apiErr(res, e); }
+  });
+  // Enable/disable an account remotely (parity with the desktop On/Off toggle). Body { enabled?:bool } — omit to flip.
+  app.post('/api/accounts/:name/toggle', async (req, res) => {
+    try {
+      if (typeof hooks.toggleAccount !== 'function') return res.json({ success: false, error: 'toggle not supported' });
+      await hooks.toggleAccount(req.params.name, req.body && req.body.enabled);
+      res.json({ success: true });
+    } catch (e) { apiErr(res, e); }
+  });
+
+  // Terminal error-handling middleware (AFTER all routes). Body-parser malformed-JSON SyntaxError and multer LIMIT_*
+  // errors are raised at the middleware layer BEFORE any route try/catch, so without this they fall to Express's
+  // finalhandler which returns err.stack (userData/asar paths) to the possibly-tunnel-exposed client. Route them
+  // through the SAME generic-message-only contract as apiErr — log the real error server-side, leak nothing over the wire.
+  app.use((err, _req, res, _next) => {
+    try { addLog(`API error (mw): ${(err && err.stack) || (err && err.message) || err}`); } catch {}
+    const code = (err && (err.status || err.statusCode)) || (err instanceof SyntaxError ? 400 : (err && err.code && String(err.code).startsWith('LIMIT_') ? 413 : 500));
+    if (!res.headersSent) res.status(code).json({ success: false, error: 'Operation failed' });
   });
 
   // Bind localhost-only by default (no LAN exposure). The Cloudflare tunnel still

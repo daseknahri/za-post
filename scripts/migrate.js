@@ -9,6 +9,8 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const secret = require('../lib/secret'); // cookies.json is byte-copied (encryption envelope preserved); secret only decrypts for the best-effort session count
 
 const VARIANT = (process.argv[2] || 'king').toLowerCase();
 const SRC_NAME = VARIANT === 'base' ? 'za-post-comment-tool' : 'za-post-comment-tool-king';
@@ -24,10 +26,9 @@ const DEST_DATA = path.join(DEST_ROOT, 'data.json');
 const DEST_ACCOUNTS = path.join(DEST_ROOT, 'accounts');
 const DEST_IMAGES = path.join(DEST_ROOT, 'storage', 'images');
 
-const DEFAULT_SETTINGS = {
-  parallelAccounts: 3, waitInterval: 60, accountDelay: 1, postsPerGroup: 15,
-  commentWithImage: false, autoDeletePosted: false, useProxies: false,
-};
+// M4-08: use the app's hardened defaults (lower-spam tempo) as the base so a migrated install
+// doesn't start at the old aggressive cadence; the SOURCE app's settings still override on top.
+const DEFAULT_SETTINGS = require('../lib/store').DEFAULT_SETTINGS;
 
 function log(...a) { console.log(...a); }
 function ensure(d) { fs.mkdirSync(d, { recursive: true }); return d; }
@@ -55,7 +56,8 @@ function main() {
   }));
 
   // ---- posts: copy image into DEST, map imagePath -> imagePaths[]
-  let imgCopied = 0, imgMissing = 0;
+  let imgCopied = 0, imgMissing = 0, imgCollision = 0;
+  const usedNames = new Map(); // destBasename -> the source path that claimed it (collision detection)
   const SRC_IMAGES = path.join(SRC_ROOT, 'storage', 'images');
   const posts = (src.posts || []).map((p, i) => {
     const imagePaths = [];
@@ -65,7 +67,20 @@ function main() {
       const candidates = [p.imagePath, path.join(SRC_IMAGES, base)];
       const found = candidates.find((c) => { try { return fs.existsSync(c); } catch { return false; } });
       if (found) {
-        const dest = path.join(DEST_IMAGES, base);
+        // M3-08: two posts can have same-basename images from DIFFERENT source dirs. Copying both to
+        // DEST_IMAGES/<base> would overwrite the first (last-wins) and silently mis-assign the image.
+        // Disambiguate the SECOND+ distinct source by appending a short hash of its full path.
+        let destBase = base;
+        const prior = usedNames.get(destBase);
+        if (prior && prior !== found) {
+          const h = crypto.createHash('sha1').update(found).digest('hex').slice(0, 8);
+          const ext = path.extname(base);
+          destBase = `${path.basename(base, ext)}-${h}${ext}`;
+          imgCollision++;
+          log(`  ⚠️ image name collision: "${base}" already taken — saving as "${destBase}" so it isn't overwritten`);
+        }
+        usedNames.set(destBase, found);
+        const dest = path.join(DEST_IMAGES, destBase);
         try { fs.copyFileSync(found, dest); imagePaths.push(dest); imgCopied++; }
         catch { imagePaths.push(found); }
       } else { imgMissing++; }
@@ -83,18 +98,23 @@ function main() {
 
   // ---- accounts: map + copy cookies.json from old per-account dir
   let cookieCopied = 0, cookieMissing = 0, withSession = 0;
+  const _sanitizeName = require('../lib/store').sanitizeName; // the app resolves each account's dir via sanitizeName — the DEST must use the same key or readCookies() returns [] and the migrated session is orphaned
+  const _seenDestKey = new Set();
   const accounts = (src.accounts || []).map((a) => {
     const name = a.name;
+    const key = _sanitizeName(name);
+    if (_seenDestKey.has(key)) console.warn(`⚠️ migrate: "${name}" sanitizes to the same dir "${key}" as another account — the app cannot distinguish them; rename one before running.`);
+    _seenDestKey.add(key);
     const srcCookies = path.join(SRC_ROOT, 'accounts', name, 'cookies.json');
-    const destDir = ensure(path.join(DEST_ACCOUNTS, name));
+    const destDir = ensure(path.join(DEST_ACCOUNTS, key));
     ensure(path.join(destDir, 'chrome-profile'));
     if (fs.existsSync(srcCookies)) {
       try {
         const raw = fs.readFileSync(srcCookies, 'utf8');
-        fs.writeFileSync(path.join(destDir, 'cookies.json'), raw);
+        fs.writeFileSync(path.join(destDir, 'cookies.json'), raw); // byte-copy preserves the enc:v1: envelope — the jar still decrypts on the SAME OS user/machine; a cross-machine migrate degrades to the usual re-login (migrated cookies are often stale regardless).
         cookieCopied++;
-        const ck = JSON.parse(raw);
-        if (Array.isArray(ck) && ck.some((c) => c.name === 'c_user') && ck.some((c) => c.name === 'xs')) withSession++;
+        // session count is BEST-EFFORT + must not mislabel a copied jar: an encrypted jar can only be parsed where it decrypts (this runs in plain node → encrypted jars are skipped from the count, NOT counted as "missing").
+        try { const txt = secret.isEncrypted(raw) ? secret.decrypt(raw) : raw; const ck = txt ? JSON.parse(txt) : []; if (Array.isArray(ck) && ck.some((c) => c.name === 'c_user') && ck.some((c) => c.name === 'xs')) withSession++; } catch {}
       } catch { cookieMissing++; }
     } else { cookieMissing++; }
     return {
@@ -122,7 +142,7 @@ function main() {
 
   log('\n=== MIGRATION COMPLETE ===');
   log(`Destination: ${DEST_DATA}`);
-  log(`  posts:    ${posts.length}  (images copied ${imgCopied}, missing ${imgMissing})`);
+  log(`  posts:    ${posts.length}  (images copied ${imgCopied}, missing ${imgMissing}, name-collisions resolved ${imgCollision})`);
   log(`  groups:   ${groups.length}`);
   log(`  accounts: ${accounts.length}  (cookies copied ${cookieCopied}, missing ${cookieMissing}, with c_user+xs session ${withSession})`);
   log(`  settings: ${JSON.stringify(out.settings)}`);

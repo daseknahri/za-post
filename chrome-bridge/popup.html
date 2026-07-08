@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<body style="font:13px system-ui,Segoe UI,sans-serif;width:250px;padding:12px;margin:0;color:#111">
+  <div style="font-weight:600;margin-bottom:8px">Za Post — Session Bridge</div>
+  <label style="display:block;font-size:12px;color:#555">Profile label (e.g. BB24)</label>
+  <input id="label" placeholder="optional — helps naming" autocomplete="off"
+         style="width:100%;box-sizing:border-box;padding:6px;margin:4px 0 8px;border:1px solid #ccc;border-radius:6px">
+  <details style="margin:0 0 8px">
+    <summary style="font-size:12px;color:#4f46e5;cursor:pointer">Add login (optional — re-login safety net)</summary>
+    <input id="email" placeholder="Facebook email/phone" autocomplete="off"
+           style="width:100%;box-sizing:border-box;padding:6px;margin:6px 0 4px;border:1px solid #ccc;border-radius:6px">
+    <input id="password" type="password" placeholder="Facebook password" autocomplete="off"
+           style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:6px">
+    <div style="font-size:11px;color:#888;margin-top:4px">Stored encrypted in the app; used only to auto re-login this account if its session ever expires.</div>
+  </details>
+  <button id="send" style="width:100%;padding:8px;background:#4f46e5;color:#fff;border:0;border-radius:6px;cursor:pointer">
+    Send this session to Za Post
+  </button>
+  <div id="status" style="margin-top:8px;font-size:12px;color:#555;min-height:16px"></div>
+  <script src="popup.js"></script>
+</body>

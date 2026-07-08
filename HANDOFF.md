@@ -1,10 +1,88 @@
 # Za Post Comment Tool - Session Handoff
 
-Last updated: 2026-06-20. Read this first when continuing in a new session.
+Last updated: 2026-07-08. Read this first when continuing in a new session.
 
 > **Full project reference: [`DOCS.md`](DOCS.md)** — architecture, run lifecycle, settings,
 > data layout, packaging internals, and dev scripts. This file is the live *status*; DOCS.md is
-> the *how it works*.
+> the *how it works*. **Engineering process: [`DEVELOPMENT.md`](DEVELOPMENT.md)** · **never-break rules:
+> [`INVARIANTS.md`](INVARIANTS.md)** · **decision log: [`docs/decisions/`](docs/decisions/).**
+
+## ⭐ STATUS 2026-07-08 — v1.0.27
+
+### ➡️ CONTINUE HERE (switching laptops / new session)
+
+- **Branch:** `enhancements` (this is the live work branch; ~94 commits ahead of `main`, pushed to `origin` =
+  `github.com/daseknahri/za-post.git`, PRIVATE). On the other laptop: `git clone` (or `git fetch`) then
+  `git checkout enhancements`. Keep committing here; don't merge to `main` yet.
+- **Dev/test setup:** repo at `C:\zpost\za-post`, Electron userData = `za-post-restored` (`npm start` uses it). Test
+  the DEV CLONE each cycle; smoke-test packaged builds with an isolated `--user-data-dir`. To test a code change:
+  restart the app (kill the Electron procs under `node_modules\electron`, relaunch `electron .`) and tail
+  `%APPDATA%/za-post-restored/logs/automation.log` (step lines: `[ts] [account] [group] NN message`).
+- **⚠️ OPERATOR ACTION NEEDED — set each account's display name.** The test account showed FB "logged in as
+  (unknown)". With the operator's IDENTICAL captions, when a group has several of our posts the feed-scan can only
+  pick the newest **if it knows the account name**; otherwise it REFUSES and routes the comment to rescue (safe, but
+  it doesn't land). Setting display names makes comments land on the newest post. (A tiny unique per-post caption
+  marker would make targeting bulletproof — operator's call.)
+- **VERIFY ON FACEBOOK after the next run:** re-check the two test groups (Grandma's Cooking, Grandma's Tips) to
+  confirm the v1.0.27 double-comment fix end-to-end (no post with 2 comments / 0 comments).
+- **Watch the next run's log** for whether the network capture still fires (`captured link confirmed OUR post`) or now
+  safely defers (`resolved to a DIFFERENT group` / `queued for rescue`). The v1.0.27 ambiguity-reject may make it fire
+  less often — that's SAFE (falls to the group-scoped feed-scan).
+- **Next speed win (NOT built):** pre-OPEN the composer during the pipeline pre-load. Composer render is 6–17s and is
+  Facebook/network-bound (measured; anti-throttling flags already present) — the biggest per-post chunk left. Pre-opening
+  it in the pre-loaded background tab would hide it. Complex (touches the pipeline + composer state) → build carefully +
+  adversarially verify. Otherwise the real throughput lever is **parallel accounts** (v1.0.17 caps at 3 concurrent on one
+  real IP = ~3×; the tests ran 1 account = 1×).
+- **Deferred hardening backlog:** IP-level circuit breaker (#3 real-IP cascade limiter), viewport-vs-monitor geometry
+  clamp, daily-scheduler durability trio (lost-day / N>1 crash recovery), webp image varying (needs sharp or in-browser
+  canvas — jimp can't read webp).
+
+### This session (v1.0.22 → v1.0.27), all committed + tested (242 unit + 27 anti-spam green)
+
+- **v1.0.22 — network post-link capture (opt-in `capturePostLinkFromNetwork`, default OFF).** Read OUR post's
+  permalink from Facebook's create-story GraphQL response instead of reloading+scrolling+hovering the feed. Two-phase
+  only. Wrong-post-safe (candidate id, re-verified before commenting). Watch log: "🔗 Captured the post's link…".
+- **v1.0.23 — comment-locate nudge-loop trim** (ramped the feed-render waits).
+- **v1.0.24 — FIX: `droppedImage is not defined` crash** at the end of EVERY clean run (a v1.0.16 scope bug that the
+  speedups exposed; it was discarding the run's heldRecords/commentQueue/deal-marking). Hoisted to function scope.
+- **v1.0.25 — comment confirms by CAPTION** (not the unreliable author) + polls for slow permalink renders — stopped
+  the false "author mismatch" fallback so public posts comment via the direct link.
+- **v1.0.26 — trimmed INSTANT inter-group / inter-comment pacing** (operator-requested; anti-spam velocity tradeoff,
+  kept jittered + ~0.5s floor). NON-instant tiers unchanged.
+- **v1.0.27 — FIX: DOUBLE-COMMENT** (operator found 2 comments on one post, 0 on the next). Root: identical caption +
+  same account across all groups/runs → only GROUP + RECENCY disambiguate. The network capture grabbed a wrong id
+  (cross-group late response via a non-gid field fallback; and same-group older post via first-match). Fixed at
+  capture: only OUR exact-gid post URL, and only when EXACTLY ONE distinct same-group id (else → group-scoped
+  feed-scan); + a group check at comment time. **INVARIANT: never trust caption/author alone to identify WHICH post is
+  ours — group-scope + recency.** See CHANGELOG 1.0.27 + memory `za-post-completion-audit`.
+
+Recent hardening (v1.0.7 → v1.0.22), all shipped:
+
+- **Owed-groups partial-delivery ledger** — when a run posts to only some of an account's groups (crash, rate-limit, pause), the undelivered groups are recorded and picked up next cycle instead of silently lost.
+- **Two-phase post-then-comment** — complete: the post is published first and confirmed, then the comment is attached in a second pass, so a comment failure no longer aborts or duplicates the post.
+- **Posting/compose hardening** — more resilient composer detection and retry; failed composes back out cleanly rather than leaving a half-typed dialog.
+- **Held-post recovery + login-cookie safety** — posts held in "Spam potentiel" are detected and recovered without duplicating; login/session cookies (incl. datr) are only persisted when actually logged in, so recovery and re-auth don't corrupt the profile.
+- **Persistent rotating tab pool (v1.0.13, ADR-0018)** — multi-tab posting reuses a small pool of open tabs (re-navigation) instead of opening/closing a fresh tab per group; more human, adversarially verified (no double-post/comment/leak), 242 tests green. Needs a live-FB run at `tabsPerBrowser=2`.
+- **Per-account membership check (v1.0.14)** — "🔎 Check membership" on each account card opens a hidden browser as that account and reports member/pending/not-member/logged-out per assigned group (read-only). A campaign started mid-check skips the account (new `isCheckOpen` guard) instead of killing its profile.
+- **App-wide gap hunt (v1.0.15)** — 8-subsystem adversarial hunt (find→refute→adjudicate) found 14 real gaps; **11 fixed** (comment-image handoff data-loss, held-record poster dedup, moderation re-open, server/renderer/store/migrate/lifecycle) — see CHANGELOG 1.0.15. Posting/recovery fixes cleared by a verify pass. 242 tests green.
+- **Gap hunt round 2 (v1.0.16)** — 6 more fixed on the peripheral surfaces: Chrome-import account-destruction guard, licensing wrong-lockout (hwid sentinel + memoize), Quick-Setup account-removal, settings proxy-geo clobber, multi-image drop→auto-delete gate, login-close serialized write. Two HIGH + the auto-delete gate cleared by a verify pass. 242 tests green.
+- **Real-IP posting hardening (v1.0.17, the MAIN method)** — focused audit of the no-proxy path (whole fleet on ONE residential IP): capped real-IP concurrency at 3 (was ~16, RAM-driven; tunable `realIpMaxConcurrent`), paced real-IP top-ups (no back-to-back into the shared line), and de-clustered the fleet fingerprint (per-account `hardwareConcurrency`; deviceMemory NOT spoofed — Sec-CH header coherence, see ADR-0001 refinement). Reviewed; the review caught a deviceMemory header mismatch (fixed). 242 tests green.
+- **Single-IP posting speedups (v1.0.18)** — with one IP, faster = more groups/hour PER ACCOUNT (not more concurrency). Multi-tab pipelining now DEFAULT (`tabsPerBrowser` 1→2, overlaps nav with posting, ~1.5–4 min/account/cycle); trimmed recoverable overhead (post-nav settle 3s→1.5s, verify ≥3-articles pre-wait 15s→5s, permalink comment wait 10s→4s). Audit-verified SAFE — no anti-spam gap, concurrency cap, or double-post trap touched (unsafe ideas rejected). Needs a dev-clone timing check (wall-time drops, delivered counts identical, no double-posts).
+
+Process is now formalized (not just code):
+- **DEVELOPMENT.md** — engineering workflow, version/release discipline.
+- **INVARIANTS.md** — the properties every change must preserve (ledger integrity, no double-post, profile/cookie safety).
+- **docs/decisions/** — ADRs for significant design choices, including the proposed persistent tab-pool (ADR-0018).
+
+Open items:
+1. **Persistent tab-pool** — BUILT in v1.0.13 ([ADR-0018](docs/decisions/ADR-0018-persistent-rotating-tab-pool.md), Accepted); needs a live-FB run at `tabsPerBrowser=2` to confirm behavior end-to-end.
+2. **License server** — bring live + issue real per-seat keys (enforcement marker exists; server does not).
+3. **Live-FB validations** — the tab pool, held-post recovery, two-phase comment, and owed-groups ledger still need confirmation against live Facebook at scale.
+4. **Keep committing per batch** — the v1.0.7→v1.0.12 backlog + engineering docs were checkpointed (commit `93bf9a1`); continue committing each batch.
+5. **DEFERRED from the v1.0.15 gap hunt** (a dedicated, separately-verified pass — they need coordinated persisted-state + resume changes; the no-over-post invariant is protected meanwhile): (a) moderation `markResult` notfound re-home — make the moderation write durable/ordered before the comment record is closed (a crash between the two write-chains can strand the link; moderation is off by default); (b) daily-schedule mode — an all-rate-limited fire-time cycle counts toward the day's quota, losing the day even after the fleet recovers; (c) daily N>1 sequence/unique — a mid-day crash drops the remaining cycles (persist + rehydrate the daily cycle counter).
+6. **DEFERRED from the v1.0.17 real-IP hardening** (dedicated pass; the v1.0.17 concurrency cap + fingerprint fix already attack the ROOT so the shared IP is far less likely to trip): (a) IP-level circuit breaker — after a cluster of same-cycle rate_limited drops, pause the shared IP fleet-wide instead of marching healthy reserves one-by-one into the same throttle (needs careful `coverDrop`/reserve-takeover surgery); (b) viewport-vs-monitor geometry — clamp/spoof so `innerWidth ≤ screen.width` coherently (needs standard-resolution modeling to avoid a NEW odd-resolution tell).
+
+---
 
 ## ⭐ STATUS 2026-06-20 — anti-spam hardening (full build-out)
 

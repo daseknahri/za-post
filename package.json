@@ -1,6 +1,6 @@
 {
   "name": "za-post-restored",
-  "version": "1.0.0",
+  "version": "1.0.27",
   "description": "Za Post Comment Tool - Facebook Automation (restored, clean source)",
   "main": "main.js",
   "author": "Abdelilah",
@@ -14,7 +14,9 @@
     "bundle:chromium": "node scripts/bundle-chromium.js",
     "pack": "node scripts/bundle-chromium.js && electron-builder --win nsis",
     "pack:portable": "node scripts/build-portable.js",
-    "compile": "node -e \"require('bytenode').compileFile('main.js','main.jsc')\""
+    "compile": "node -e \"require('bytenode').compileFile('main.js','main.jsc')\"",
+    "test": "node --test \"tests/**/*.test.js\"",
+    "test:antispam": "node scripts/test-antispam.js"
   },
   "dependencies": {
     "axios": "^1.13.2",
@@ -54,14 +56,29 @@
       "!.git/**",
       "!.gitignore",
       "!chrome-bin/**",
-      "!**/*.jsc",
       "!**/*.log",
-      "!**/.cache/**"
+      "!**/.cache/**",
+      "!**/*.md",
+      "!tests/**",
+      "!docs/**",
+      "!devboot.*"
     ],
     "extraResources": [
       {
         "from": "chrome-bin",
         "to": "chrome"
+      },
+      {
+        "from": "scripts/rdp-keepalive.ps1",
+        "to": "rdp-setup/rdp-keepalive.ps1"
+      },
+      {
+        "from": "scripts/rdp-keepalive-setup.ps1",
+        "to": "rdp-setup/rdp-keepalive-setup.ps1"
+      },
+      {
+        "from": "SETUP-RDP.md",
+        "to": "rdp-setup/SETUP-RDP.md"
       }
     ],
     "asarUnpack": [

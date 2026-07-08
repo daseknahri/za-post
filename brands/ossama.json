@@ -1,0 +1,12 @@
+{
+  "name": "ossama-post",
+  "appId": "com.ossamapost.app",
+  "productName": "Ossama Post",
+  "windowTitle": "Ossama Post",
+  "shortName": "Ossama Post",
+  "icon": "assets/icon-ossama.ico",
+  "remotePort": 3100,
+  "apiTokenEnv": "OSSAMA_API_TOKEN",
+  "autostartTask": "ossama-post-autostart",
+  "accentColor": "#14b8a6"
+}

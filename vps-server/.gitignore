@@ -1,0 +1,8 @@
+# Secrets + runtime state — these must NEVER be committed (they live on the server's /data volume + Coolify env)
+keys.json
+key-audit.log
+.env
+.env.*
+node_modules/
+*.log
+data/

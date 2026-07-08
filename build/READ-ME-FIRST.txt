@@ -20,6 +20,17 @@ HOW TO RUN
   Desktop automatically — use that to open the app from then on. (Keep this
   folder where it is; the shortcut points to the .exe inside it.)
 
+ACTIVATE YOUR LICENSE (first launch)
+  1. On the first run a "License" screen appears.
+  2. Enter the serial key your provider gave you (format: XXXX-XXXX-XXXX-XXXX)
+     and click "Activate". An internet connection is needed to activate.
+  3. The app unlocks and opens. You only do this once on this PC — the key
+     ties to THIS computer.
+  If activation fails ("could not reach license server"): check your internet
+  connection and try again. If it still fails, contact your provider (the
+  license server may be down, or the key may not be issued for this PC yet).
+  The app stays on the License screen until it activates.
+
 FIRST-TIME SETUP (inside the app)
   1. Accounts  -> Add an account -> click "Login".
      A browser window opens. Log into Facebook, then close that window.
@@ -30,6 +41,37 @@ FIRST-TIME SETUP (inside the app)
   4. Settings  -> set the timing (interval, delays, posts per group, etc.).
   5. Click "Start Automation".
 
+IMPORT FROM CHROME (best if your accounts are already logged in as Chrome profiles)
+  This brings each logged-in Chrome profile into the app WITH its device identity, so
+  Facebook keeps seeing the same account on the same device (no re-login, fewer checks).
+  1. Accounts -> "Import from Chrome" -> "Generate helper + open folder".
+  2. In Chrome open  chrome://extensions , turn on "Developer mode" (top right),
+     click "Load unpacked", and pick the folder from step 1. (Do this once.)
+  3. Open each of your profiles on facebook.com — the helper sends that account to the
+     app automatically (or click the helper's icon -> "Send"). Watch the count go up.
+     Tip: type each profile's label (e.g. BB24) in the helper popup to name the account.
+  Everything stays on this PC (the helper talks only to the app on localhost).
+
+BULK SETUP (many accounts at once — the fast way)
+  Instead of logging in one by one, import a whole list:
+  1. Accounts -> "Bulk Import". Paste ONE account per line, fields separated
+     by  |  (or a tab/comma):
+        name | alias | proxy | email | password
+     Only the name is required. Proxy format: host:port  or  host:port:user:pass
+  2. (Recommended) Cookies folder: click the cookies-folder button and pick a
+     folder that holds one  <name>.json  cookie export per account (from the
+     "Cookie-Editor" browser extension, exported while logged in). The file
+     name must match the account name. The app seeds each account's session
+     from its file — no browser opens during import.
+     IMPORTANT: export the FULL cookie set, INCLUDING the "datr" cookie. A
+     jar without "datr" still logs in but looks like a brand-new device to
+     Facebook, so those accounts hit far more security checkpoints. If the
+     app warns "N imported WITHOUT the datr cookie", re-export those accounts.
+  3. Assign groups in bulk: Groups tab -> import your groups, then Accounts
+     tab -> select accounts -> assign groups (each account posts to ITS groups).
+  4. Duplicate names (and names that collide once cleaned up) are skipped
+     safely — an existing account is never overwritten.
+
 GOOD TO KNOW
   - An internet connection is required (it posts to Facebook).
   - The browser it controls (Chromium) is bundled — nothing else to install.
@@ -38,7 +80,24 @@ GOOD TO KNOW
     visible so you can sign in.
   - Your accounts, groups, posts and login sessions are saved per Windows
     user under:  %APPDATA%\za-post-restored
-  - To move the tool to another PC, just copy this folder (logins won't
-    transfer — you'll log in again on the new PC).
+
+MOVING TO ANOTHER PC
+  Your license key is locked to one computer. To move to a new PC:
+   1. Ask your provider to reset your key (unbind it from the old machine).
+   2. Copy this folder to the new PC and run it.
+   3. Enter the same key on the new PC's License screen to re-activate.
+  (Facebook logins don't transfer — you'll sign in again on the new PC.)
+
+REMOTE API (optional — fill posts from another server)
+  - To push posts into the app over the internet from your own server,
+    double-click  "start.bat"  instead of the .exe. It enables the remote
+    link + a private access token, then opens the app (otherwise run the
+    .exe as usual for normal local use).
+  - The app then shows a web address (https://....trycloudflare.com). From
+    your server, POST your posts as JSON to:
+        <that address>/api/posts/bulk
+    with header   X-Access-Token: <the token inside start.bat>
+    Body: { "posts": [ {"caption":"...","comment":"...","imageUrl":"..."}, ... ] }
+  - Keep that token private — address + token = full control of the app.
 
 ============================================================

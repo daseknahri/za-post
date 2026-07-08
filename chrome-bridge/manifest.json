@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Za Post — Chrome Session Bridge",
+  "version": "1.0.0",
+  "description": "Sends the current Facebook profile's session (cookies incl. datr) to your local Za Post app so it can run the account with the same device identity. Localhost only — nothing leaves this PC.",
+  "permissions": ["cookies", "tabs", "storage", "alarms"],
+  "host_permissions": ["*://*.facebook.com/*", "http://127.0.0.1:__PORT__/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Send this Facebook session to Za Post" }
+}

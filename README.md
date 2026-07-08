@@ -1,10 +1,12 @@
 # Za Post Comment Tool — Restored (clean source)
 
-> **📖 Full, current reference: [`DOCS.md`](DOCS.md)** (architecture, run lifecycle, settings,
-> data layout, hidden/visible browser, packaging internals, robustness) · **Latest status:
-> [`HANDOFF.md`](HANDOFF.md)**. This README is the original reconstruction overview; DOCS.md
-> reflects the current hardened state. **To build the distributable:** `npm install` →
-> `npx puppeteer browsers install chrome` → `npm run pack:portable`.
+> **🧭 Running campaigns? Start with [`OPERATOR-GUIDE.md`](OPERATOR-GUIDE.md)** (day-to-day: accounts, groups,
+> posts, posting modes, Standby backups, speed, unattended/RDP). **Unattended on a laptop over RDP:**
+> [`SETUP-RDP.md`](SETUP-RDP.md). **Architecture / internals:** [`DOCS.md`](DOCS.md) · **Latest status:**
+> [`HANDOFF.md`](HANDOFF.md). **Contributing / engineering:** [`DEVELOPMENT.md`](DEVELOPMENT.md) (workflow &
+> release discipline) · [`INVARIANTS.md`](INVARIANTS.md) (the never-break rules) · [`docs/decisions/`](docs/decisions/)
+> (ADR decision log). **Build the installer:** `npm install` → `npm run pack` (NSIS) — or
+> `npm run pack:portable` for a portable zip.
 
 Facebook multi-account auto-poster (Electron + Puppeteer-extra/stealth). This is a
 **clean, fully-editable reconstruction** of the shipped "King" app, whose backend had

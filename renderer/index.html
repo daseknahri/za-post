@@ -5,7 +5,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Za Post Comment Tool King</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Tailwind is VENDORED locally (renderer/lib/tailwind.js) so the UI renders with NO internet — a CDN that's
+       blocked/down (locked-down client networks, unattended RDP/VPS) would otherwise leave the app unstyled. -->
+  <script src="lib/tailwind.js"></script>
+  <!-- Inter font is a progressive enhancement: if Google Fonts is blocked it falls back to the system sans-serif
+       (layout is unaffected — the fallback is set in tailwind.config below). -->
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap"
     rel="stylesheet">
   <script>
@@ -49,6 +53,133 @@
     }
   </script>
   <link rel="stylesheet" href="styles.css">
+  <style>
+    /* Settings help tooltips — a small "?" badge next to each setting; hover/focus to read what it
+       does and how to use it. Text lives in renderer.js (injectSettingsHelp). */
+    .help { position: relative; display: inline-flex; align-items: center; margin-left: 6px; vertical-align: middle; }
+    .help .help-q {
+      width: 16px; height: 16px; border-radius: 9999px; box-sizing: border-box;
+      background: rgba(255, 255, 255, 0.08); color: #cbd5e1; border: 1px solid rgba(255, 255, 255, 0.18);
+      font-size: 11px; font-weight: 700; line-height: 14px; text-align: center;
+      cursor: help; user-select: none; transition: all .12s ease; flex: 0 0 auto;
+    }
+    .help:hover .help-q, .help .help-q:focus-visible { background: #6366f1; color: #fff; border-color: #6366f1; outline: none; }
+    .help .help-tip {
+      position: absolute; top: calc(100% + 8px); left: 0; z-index: 1000;
+      width: 280px; max-width: 78vw;
+      background: #0b1020; color: #e2e8f0;
+      border: 1px solid rgba(99, 102, 241, 0.35); border-radius: 10px;
+      padding: 10px 12px; font-size: 12px; font-weight: 400; line-height: 1.55; text-align: left;
+      white-space: normal; box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+      opacity: 0; visibility: hidden; transform: translateY(-4px);
+      transition: opacity .12s ease, transform .12s ease; pointer-events: none;
+    }
+    .help .help-tip b { color: #a5b4fc; font-weight: 700; }
+    .help:hover .help-tip, .help:focus-within .help-tip { opacity: 1; visibility: visible; transform: translateY(0); }
+    /* Flip above when near the bottom of the panel (JS adds .help-up). */
+    .help.help-up .help-tip { top: auto; bottom: calc(100% + 8px); transform: translateY(4px); }
+    .help.help-up:hover .help-tip, .help.help-up:focus-within .help-tip { transform: translateY(0); }
+    /* Posting-speed preset buttons */
+    .speed-btn.active { background: #6366f1; color: #fff; border-color: #6366f1; box-shadow: 0 0 20px rgba(99, 102, 241, 0.28); }
+    .speed-btn.active:hover { border-color: #6366f1; }
+
+    /* ============================ Quick Setup Wizard ============================ */
+    @keyframes qsOverlayIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes qsModalIn { from { opacity: 0; transform: translateY(16px) scale(.965); } to { opacity: 1; transform: translateY(0) scale(1); } }
+    @keyframes qsBodyIn { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
+    @keyframes qsPop { 0% { transform: scale(.88); } 60% { transform: scale(1.05); } 100% { transform: scale(1); } }
+    @keyframes qsDotPulse { 0%,100% { box-shadow: 0 0 0 4px rgba(99,102,241,.18); } 50% { box-shadow: 0 0 0 7px rgba(99,102,241,.06); } }
+
+    #quick-setup-overlay { position: fixed; inset: 0; background: rgba(3,6,15,.72); backdrop-filter: blur(6px); display: flex; align-items: center; justify-content: center; z-index: 9999; animation: qsOverlayIn .18s ease; }
+    .qs-modal { background: linear-gradient(180deg,#121935 0%,#0b0f20 100%); border: 1px solid rgba(99,102,241,.28); border-radius: 18px; box-shadow: 0 28px 80px rgba(0,0,0,.62), inset 0 1px 0 rgba(255,255,255,.04), 0 0 70px rgba(99,102,241,.08); width: 720px; max-width: 95vw; max-height: 92vh; display: flex; flex-direction: column; overflow: hidden; animation: qsModalIn .28s cubic-bezier(.16,.84,.44,1); }
+    .qs-head { display: flex; align-items: center; justify-content: space-between; padding: 18px 22px 2px; }
+    .qs-title { font-weight: 800; color: #f1f5f9; font-size: 17px; letter-spacing: -.01em; display: flex; align-items: center; gap: 10px; }
+    .qs-spark { width: 30px; height: 30px; border-radius: 9px; background: linear-gradient(135deg,#6366f1,#a78bfa); display: flex; align-items: center; justify-content: center; font-size: 15px; box-shadow: 0 4px 14px rgba(99,102,241,.45); }
+    .qs-sub { font-size: 11px; color: #64748b; font-weight: 500; margin-top: 2px; }
+    .qs-x { background: none; border: none; color: #64748b; font-size: 22px; cursor: pointer; line-height: 1; width: 32px; height: 32px; border-radius: 9px; transition: all .14s ease; display: flex; align-items: center; justify-content: center; }
+    .qs-x:hover { background: rgba(248,113,113,.14); color: #f87171; }
+
+    .qs-steps { display: flex; align-items: center; padding: 16px 24px 14px; }
+    .qs-step { display: flex; align-items: center; gap: 8px; }
+    .qs-step-dot { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; transition: all .25s ease; flex-shrink: 0; border: 1.5px solid transparent; }
+    .qs-step.todo .qs-step-dot { background: #161d36; color: #64748b; border-color: #2a3354; }
+    .qs-step.current .qs-step-dot { background: #6366f1; color: #fff; animation: qsDotPulse 2.4s ease-in-out infinite; }
+    .qs-step.done .qs-step-dot { background: #16a34a; color: #fff; cursor: pointer; }
+    .qs-step.done .qs-step-dot:hover { background: #15803d; transform: scale(1.09); }
+    .qs-step-label { font-size: 12px; transition: color .2s ease; white-space: nowrap; }
+    .qs-step.current .qs-step-label { color: #e2e8f0; font-weight: 700; }
+    .qs-step.done .qs-step-label { color: #94a3b8; cursor: pointer; }
+    .qs-step.done .qs-step-label:hover { color: #cbd5e1; }
+    .qs-step.todo .qs-step-label { color: #64748b; }
+    .qs-step-line { flex: 1; height: 2px; margin: 0 9px; background: #2a3354; border-radius: 2px; min-width: 12px; transition: background .3s ease; }
+    .qs-step-line.filled { background: #16a34a; }
+
+    .qs-body { flex: 1; overflow: auto; min-height: 0; padding: 2px 24px 8px; }
+    .qs-body.qs-anim { animation: qsBodyIn .22s ease; }
+    .qs-body::-webkit-scrollbar { width: 10px; }
+    .qs-body::-webkit-scrollbar-thumb { background: rgba(99,102,241,.32); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+    .qs-body::-webkit-scrollbar-thumb:hover { background: rgba(99,102,241,.55); background-clip: padding-box; }
+    .qs-body::-webkit-scrollbar-track { background: transparent; }
+
+    .qs-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 14px 24px 18px; border-top: 1px solid rgba(255,255,255,.07); }
+    .qs-btn { border: none; border-radius: 10px; padding: 9px 18px; font-size: 13px; font-weight: 700; cursor: pointer; transition: all .15s ease; display: inline-flex; align-items: center; gap: 7px; }
+    .qs-btn:active { transform: translateY(1px); }
+    .qs-btn:focus-visible { outline: 2px solid #818cf8; outline-offset: 2px; }
+    .qs-btn-back { background: #1c2440; color: #cbd5e1; }
+    .qs-btn-back:hover { background: #283153; }
+    .qs-btn-next { background: #6366f1; color: #fff; box-shadow: 0 4px 14px rgba(99,102,241,.35); }
+    .qs-btn-next:hover { background: #5457e5; box-shadow: 0 7px 22px rgba(99,102,241,.5); transform: translateY(-1px); }
+    .qs-btn-apply { background: #13203a; color: #e5e7eb; border: 1px solid rgba(34,197,94,.35); }
+    .qs-btn-apply:hover { border-color: rgba(34,197,94,.75); background: #16284a; }
+    .qs-btn-start { background: linear-gradient(135deg,#16a34a,#15803d); color: #fff; box-shadow: 0 4px 16px rgba(22,163,74,.42); }
+    .qs-btn-start:hover { box-shadow: 0 7px 26px rgba(22,163,74,.6); transform: translateY(-1px); filter: brightness(1.08); }
+
+    .qs-card { border: 1.5px solid rgba(255,255,255,.1); background: rgba(15,23,42,.5); border-radius: 14px; padding: 15px 16px; margin-bottom: 11px; cursor: pointer; transition: all .18s ease; }
+    .qs-card:hover { border-color: rgba(129,140,248,.55); background: rgba(99,102,241,.07); transform: translateY(-1px); }
+    .qs-card.sel { border-color: #6366f1; background: rgba(99,102,241,.11); box-shadow: 0 0 0 1px #6366f1, 0 10px 26px rgba(99,102,241,.16); }
+    .qs-card-radio { width: 18px; height: 18px; border-radius: 50%; border: 2px solid #475569; flex-shrink: 0; transition: all .18s ease; position: relative; }
+    .qs-card.sel .qs-card-radio { border-color: #818cf8; background: #6366f1; }
+    .qs-card.sel .qs-card-radio::after { content: ''; position: absolute; inset: 3px; border-radius: 50%; background: #fff; }
+
+    .qs-chip { font-size: 11px; border-radius: 8px; padding: 5px 10px; margin: 3px; cursor: pointer; transition: all .14s ease; background: #0f172a; color: #94a3b8; border: 1px solid #334155; }
+    .qs-chip:hover { border-color: #6366f1; color: #c7d2fe; transform: translateY(-1px); }
+    .qs-chip.on { background: rgba(99,102,241,.18); color: #c7d2fe; border-color: #6366f1; animation: qsPop .2s ease; }
+    .qs-pill { font-size: 12px; border-radius: 9px; padding: 6px 13px; cursor: pointer; transition: all .14s ease; background: #0f172a; color: #94a3b8; border: 1px solid #334155; }
+    .qs-pill:hover { border-color: #6366f1; color: #c7d2fe; }
+    .qs-pill.on { background: rgba(99,102,241,.18); color: #c7d2fe; border: 1px solid #6366f1; font-weight: 700; }
+    .qs-rpill { font-size: 10px; font-weight: 700; border-radius: 999px; padding: 3px 10px; cursor: pointer; white-space: nowrap; transition: all .14s ease; }
+    .qs-rpill.actv { color: #34d399; background: rgba(16,185,129,.12); border: 1px solid rgba(16,185,129,.4); }
+    .qs-rpill.resv { color: #fbbf24; background: rgba(245,158,11,.12); border: 1px solid rgba(245,158,11,.4); }
+    .qs-rpill:hover { filter: brightness(1.28); transform: translateY(-1px); }
+    .qs-select, .qs-input { background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #e5e7eb; font-size: 13px; padding: 7px 10px; transition: all .14s ease; outline: none; }
+    .qs-select:hover, .qs-input:hover { border-color: #475569; }
+    .qs-select:focus, .qs-input:focus { border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,.2); }
+    .qs-select { cursor: pointer; }
+
+    .qs-table { width: 100%; border-collapse: collapse; }
+    .qs-table thead th { position: sticky; top: 0; background: rgba(9,13,28,.96); backdrop-filter: blur(4px); padding: 8px; font-size: 10px; color: #64748b; font-weight: 600; text-align: left; letter-spacing: .03em; }
+    .qs-table tbody tr { border-top: 1px solid rgba(255,255,255,.06); transition: background .12s ease; }
+    .qs-table tbody tr:hover { background: rgba(99,102,241,.06); }
+
+    /* Themed confirm modal (replaces native confirm() — on-theme, keyboard-friendly) */
+    .tc-overlay { position: fixed; inset: 0; background: rgba(3,6,15,.72); backdrop-filter: blur(6px); display: flex; align-items: center; justify-content: center; z-index: 10001; animation: qsOverlayIn .16s ease; }
+    .tc-modal { background: linear-gradient(180deg,#121935,#0b0f20); border: 1px solid rgba(99,102,241,.28); border-radius: 16px; box-shadow: 0 24px 70px rgba(0,0,0,.6); width: 460px; max-width: 92vw; padding: 20px 22px; animation: qsModalIn .24s cubic-bezier(.16,.84,.44,1); }
+    .tc-title { font-size: 16px; font-weight: 800; color: #f1f5f9; margin-bottom: 10px; }
+    .tc-msg { font-size: 13px; color: #cbd5e1; line-height: 1.6; margin-bottom: 18px; }
+    .tc-actions { display: flex; justify-content: flex-end; gap: 10px; }
+    .tc-btn { border: none; border-radius: 10px; padding: 9px 18px; font-size: 13px; font-weight: 700; cursor: pointer; transition: all .14s ease; }
+    .tc-btn:active { transform: translateY(1px); }
+    .tc-btn:focus-visible { outline: 2px solid #818cf8; outline-offset: 2px; }
+    .tc-cancel { background: #1c2440; color: #cbd5e1; }
+    .tc-cancel:hover { background: #283153; }
+    .tc-confirm { background: #6366f1; color: #fff; box-shadow: 0 4px 14px rgba(99,102,241,.35); }
+    .tc-confirm:hover { background: #5457e5; box-shadow: 0 6px 20px rgba(99,102,241,.5); }
+    .tc-danger { background: linear-gradient(135deg,#dc2626,#b91c1c); color: #fff; box-shadow: 0 4px 14px rgba(220,38,38,.4); }
+    .tc-danger:hover { filter: brightness(1.08); box-shadow: 0 6px 22px rgba(220,38,38,.55); }
+    .tc-btn:disabled { opacity: .4; cursor: not-allowed; box-shadow: none; filter: none; transform: none; }
+    .tc-input { width: 100%; box-sizing: border-box; margin-bottom: 16px; background: #0b1020; border: 1px solid #334155; border-radius: 9px; color: #e5e7eb; font-size: 13px; padding: 9px 12px; outline: none; transition: border-color .14s ease, box-shadow .14s ease; }
+    .tc-input:focus { border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,.2); }
+  </style>
 </head>
 
 <body class="bg-dark-900 text-gray-200 font-sans antialiased overflow-hidden h-screen">
@@ -67,11 +198,12 @@
             🚀
           </div>
           <div>
-            <h1 class="text-base font-bold text-white tracking-tight leading-tight">Za Post Comment</h1>
+            <h1 id="brand-name" class="text-base font-bold text-white tracking-tight leading-tight">Za Post Comment</h1>
             <p class="text-[10px] font-medium text-accent-light tracking-wider uppercase">v2.0 • Pro</p>
           </div>
         </div>
         <p id="license-expiry-display" class="text-[10px] text-cyber-blue mt-2 pl-12">Checking license...</p>
+        <p id="app-clock" class="text-[10px] text-slate-400 mt-1 pl-12 tabular-nums" title="The app's clock — it should match your laptop's. The daily schedule + auto-start fire on this time.">🕒 —</p>
       </div>
 
       <nav class="nav-menu flex-1 px-3 space-y-1 overflow-y-auto">
@@ -218,41 +350,8 @@
           <small class="block mt-2 text-gray-600 text-xs">Link changes every time the app restarts.</small>
         </div>
 
-        <!-- Live Run Card -->
-        <div class="grid grid-cols-2 gap-4 mb-6">
-          <div class="bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 hover:border-accent/20 transition-all duration-300">
-            <div class="flex items-center gap-2 mb-4">
-              <span class="text-lg">📡</span>
-              <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider">Live Run</h3>
-            </div>
-            <div class="grid grid-cols-2 gap-3">
-              <div class="bg-dark-900/60 rounded-xl p-3">
-                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Status</div>
-                <div id="dash-running" class="text-sm font-bold text-gray-400">Idle</div>
-              </div>
-              <div class="bg-dark-900/60 rounded-xl p-3">
-                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Cycle</div>
-                <div id="dash-cycle" class="text-sm font-bold text-white">—</div>
-              </div>
-              <div class="bg-dark-900/60 rounded-xl p-3">
-                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Posted</div>
-                <div id="dash-posted" class="text-sm font-bold text-cyber-green">0</div>
-              </div>
-              <div class="bg-dark-900/60 rounded-xl p-3">
-                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Errors</div>
-                <div id="dash-errors" class="text-sm font-bold text-red-400">0</div>
-              </div>
-              <div class="bg-dark-900/60 rounded-xl p-3">
-                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Pending</div>
-                <div id="dash-pending" class="text-sm font-bold text-cyber-amber">0</div>
-              </div>
-              <div class="bg-dark-900/60 rounded-xl p-3">
-                <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Accounts</div>
-                <div id="dash-accounts" class="text-sm font-bold text-cyber-blue">—</div>
-              </div>
-            </div>
-          </div>
-
+        <!-- Account Health (the Live Run stats now live inside the Campaign panel below, combined for tracking) -->
+        <div class="mb-6">
           <!-- Account Health Card -->
           <div class="bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 hover:border-accent/20 transition-all duration-300">
             <div class="flex items-center gap-2 mb-4">
@@ -283,9 +382,68 @@
           </div>
         </div>
 
+        <!-- Campaign Plan + Progress: the persistent day-by-day plan the engine drives to completion. -->
+        <div id="campaign-plan-panel" class="bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 mb-6 hover:border-accent/20 transition-all duration-300">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="text-lg">🗓️</span>
+            <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider">Campaign</h3>
+            <span id="plan-overall" class="text-[11px] text-gray-500 ml-auto"></span>
+          </div>
+          <!-- Live run strip (combined here for one-glance tracking) -->
+          <div class="grid grid-cols-6 gap-2 mb-4">
+            <div class="bg-dark-900/60 rounded-xl p-2.5">
+              <div class="text-[9px] text-gray-500 uppercase tracking-wider mb-0.5">Status</div>
+              <div id="dash-running" class="text-sm font-bold text-gray-400">Idle</div>
+            </div>
+            <div class="bg-dark-900/60 rounded-xl p-2.5">
+              <div class="text-[9px] text-gray-500 uppercase tracking-wider mb-0.5">Cycle</div>
+              <div id="dash-cycle" class="text-sm font-bold text-white">—</div>
+            </div>
+            <div class="bg-dark-900/60 rounded-xl p-2.5">
+              <div class="text-[9px] text-gray-500 uppercase tracking-wider mb-0.5">Posted</div>
+              <div id="dash-posted" class="text-sm font-bold text-cyber-green">0</div>
+            </div>
+            <div class="bg-dark-900/60 rounded-xl p-2.5">
+              <div class="text-[9px] text-gray-500 uppercase tracking-wider mb-0.5">Errors</div>
+              <div id="dash-errors" class="text-sm font-bold text-red-400">0</div>
+            </div>
+            <div class="bg-dark-900/60 rounded-xl p-2.5">
+              <div class="text-[9px] text-gray-500 uppercase tracking-wider mb-0.5">Pending</div>
+              <div id="dash-pending" class="text-sm font-bold text-cyber-amber">0</div>
+            </div>
+            <div class="bg-dark-900/60 rounded-xl p-2.5">
+              <div class="text-[9px] text-gray-500 uppercase tracking-wider mb-0.5">Accounts</div>
+              <div id="dash-accounts" class="text-sm font-bold text-cyber-blue">—</div>
+            </div>
+          </div>
+          <div id="plan-body">
+            <p class="text-xs text-gray-500 py-3">Loading plan…</p>
+          </div>
+        </div>
+
+        <!-- Live Operations: every active account's real-time state during a run (ALL of them, not just the few running in parallel). -->
+        <style>@keyframes lopulse{0%,100%{opacity:1}50%{opacity:.3}}</style>
+        <div id="live-ops-panel" class="bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 mb-6 hover:border-accent/20 transition-all duration-300">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="text-lg">⚡</span>
+            <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider">Live Operations</h3>
+            <span id="live-ops-summary" class="text-[11px] text-gray-500 ml-auto"></span>
+          </div>
+          <div id="live-ops-body" class="space-y-1.5 max-h-96 overflow-y-auto">
+            <p class="text-xs text-gray-500 py-2">Idle — start a run to see every account working live.</p>
+          </div>
+        </div>
+
         <div class="quick-actions">
           <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">Quick Actions</h3>
-          <div class="action-buttons grid grid-cols-4 gap-3">
+          <div class="action-buttons grid grid-cols-5 gap-3">
+            <button
+              class="action-btn group bg-gradient-to-r from-cyber-purple to-accent border-0 rounded-xl p-4 text-center shadow-glow hover:shadow-glow-lg hover:scale-[1.02] transition-all duration-300"
+              data-action="quick-setup"
+              title="Guided campaign setup: batches → active posters + reserves → daily time">
+              <span class="icon text-2xl block mb-2 group-hover:scale-110 transition-transform">⚡</span>
+              <span class="text-sm font-semibold text-white">Quick Setup</span>
+            </button>
             <button
               class="action-btn group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-xl p-4 text-center hover:border-accent/30 hover:shadow-glow transition-all duration-300"
               data-action="add-post">
@@ -324,6 +482,12 @@
           <div class="flex items-center gap-2">
             <button
               class="btn-secondary flex items-center gap-2 px-4 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-semibold hover:bg-dark-500 transition-all duration-300"
+              id="btn-start-over-posts"
+              title="Clear what each account has already posted so the next Start begins fresh from your current post list (#1). Use after you replace your posts.">
+              <span>🔄</span> Start over
+            </button>
+            <button
+              class="btn-secondary flex items-center gap-2 px-4 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-semibold hover:bg-dark-500 transition-all duration-300"
               id="btn-bulk-import-posts">
               <span>📦</span> Bulk Import
             </button>
@@ -359,6 +523,7 @@
             </button>
           </div>
         </div>
+        <div id="moderator-panel" class="mb-4"></div>
         <div class="groups-list space-y-3" id="groups-container">
           <!-- Groups will be dynamically added here -->
         </div>
@@ -371,11 +536,23 @@
             <h2 class="text-2xl font-bold text-white">Accounts Management</h2>
             <p class="text-sm text-gray-500 mt-1">Manage your Facebook accounts</p>
           </div>
-          <button
-            class="btn-primary flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all duration-300"
-            id="btn-add-account">
-            <span>➕</span> Add Account
-          </button>
+          <div class="flex items-center gap-3">
+            <button
+              class="btn-secondary flex items-center gap-2 px-5 py-2.5 bg-dark-600 rounded-xl text-gray-200 text-sm font-semibold hover:bg-dark-500 transition-all duration-300"
+              id="btn-chrome-import" title="Bring your logged-in Chrome profiles (with their device identity) into the app">
+              <span>🌐</span> Import from Chrome
+            </button>
+            <button
+              class="btn-secondary flex items-center gap-2 px-5 py-2.5 bg-dark-600 rounded-xl text-gray-200 text-sm font-semibold hover:bg-dark-500 transition-all duration-300"
+              id="btn-bulk-import-accounts">
+              <span>📦</span> Bulk Import
+            </button>
+            <button
+              class="btn-primary flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all duration-300"
+              id="btn-add-account">
+              <span>➕</span> Add Account
+            </button>
+          </div>
         </div>
         <div class="accounts-grid grid grid-cols-1 md:grid-cols-2 gap-4" id="accounts-container">
           <!-- Accounts will be dynamically added here -->
@@ -403,9 +580,19 @@
               <span>⏸</span> Pause
             </button>
             <button
+              class="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-sky-500 to-sky-600 rounded-xl text-white text-sm font-semibold hover:shadow-lg hover:shadow-sky-500/20 transition-all duration-300"
+              id="btn-finish-automation" style="display:none;" title="Stop gracefully: let the current batch finish, then end the run (no new work starts)">
+              <span>🏁</span> Finish after batch
+            </button>
+            <button
               class="btn-danger flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-red-500 to-red-600 rounded-xl text-white text-sm font-semibold hover:shadow-lg hover:shadow-red-500/20 transition-all duration-300 opacity-50 cursor-not-allowed"
-              id="btn-stop-automation" disabled>
+              id="btn-stop-automation" style="display:none;" disabled>
               <span>⏹️</span> Stop
+            </button>
+            <button
+              class="btn-secondary flex items-center gap-2 px-4 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-semibold hover:bg-dark-500 transition-all duration-300"
+              id="btn-reset-rotation" title="Start over: clear what each account has already posted so the next Start begins fresh from post #1. Same action as 'Start over' on the Posts tab. Does NOT delete posts. Disabled while running.">
+              <span>🔄</span> Start over
             </button>
           </div>
         </div>
@@ -419,11 +606,29 @@
               title="Open the logs folder in Explorer">
               📁 Open Logs Folder
             </button>
+            <button id="btn-log-group" onclick="toggleLogGrouping()"
+              class="flex items-center gap-1.5 px-3 py-1.5 bg-dark-600 rounded-lg text-gray-400 text-xs font-medium hover:bg-dark-500 hover:text-gray-200 transition-all duration-200 border border-white/5"
+              title="Group the log per agent (collapsible) vs the raw stream">
+              🧑 By agent
+            </button>
+          </div>
+          <div id="log-filter-bar" class="flex items-center gap-1.5 mb-2 flex-wrap">
+            <button data-lf="all" onclick="setLogFilter('all')" class="log-filter-btn active">All</button>
+            <button data-lf="success" onclick="setLogFilter('success')" class="log-filter-btn">✅ Posted</button>
+            <button data-lf="held" onclick="setLogFilter('held')" class="log-filter-btn">⚠️ Held</button>
+            <button data-lf="moderator" onclick="setLogFilter('moderator')" class="log-filter-btn">🛡️ Moderator</button>
+            <button data-lf="reserve" onclick="setLogFilter('reserve')" class="log-filter-btn">♻️ Reserve</button>
+            <button data-lf="error" onclick="setLogFilter('error')" class="log-filter-btn">❌ Errors</button>
           </div>
           <div
             class="logs-container bg-dark-900/80 backdrop-blur-sm border border-white/5 rounded-2xl p-4 h-[500px] overflow-y-auto font-mono text-xs"
             id="logs-container">
             <div class="log-entry text-gray-500">Waiting for automation to start...</div>
+          </div>
+          <div
+            class="logs-container bg-dark-900/80 backdrop-blur-sm border border-white/5 rounded-2xl p-4 h-[500px] overflow-y-auto font-mono text-xs"
+            id="logs-by-account" style="display:none;">
+            <div class="log-entry text-gray-500">Per-agent logs appear here once a run starts — each agent is a collapsible section with its action count and per-group tally.</div>
           </div>
         </div>
       </div>
@@ -442,181 +647,259 @@
           </button>
         </div>
 
-        <div class="settings-form max-w-xl space-y-5">
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label for="setting-parallel-accounts" class="block text-sm font-semibold text-gray-300 mb-2">Parallel
-              Accounts</label>
-            <input type="number" id="setting-parallel-accounts" min="1" max="10" value="3"
-              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-            <small class="block mt-2 text-xs text-gray-500">Number of accounts to run simultaneously (1-10)</small>
-          </div>
+        <style>
+          .set-sec{background:rgba(30,41,59,0.35);border:1px solid rgba(255,255,255,0.07);border-radius:16px;margin-bottom:14px;overflow:hidden;}
+          .set-sec>summary{cursor:pointer;padding:14px 18px;font-size:15px;font-weight:700;color:#e2e8f0;list-style:none;display:flex;align-items:center;gap:9px;user-select:none;}
+          .set-sec>summary::-webkit-details-marker{display:none;}
+          .set-sec>summary .set-chev{margin-left:auto;color:#64748b;transition:transform .2s;font-size:12px;}
+          .set-sec[open]>summary .set-chev{transform:rotate(90deg);}
+          .set-sec>summary:hover{background:rgba(255,255,255,0.03);}
+          .set-sec-desc{font-size:12px;color:#8a99ad;padding:0 18px 4px;margin-top:-6px;}
+          .set-sec-body{padding:14px 16px 16px;display:flex;flex-direction:column;gap:14px;}
+          .set-sub{background:rgba(15,23,42,0.5);border:1px dashed rgba(255,255,255,0.1);border-radius:14px;}
+          .set-sub>summary{cursor:pointer;padding:11px 15px;font-size:13px;font-weight:600;color:#cbd5e1;list-style:none;display:flex;align-items:center;gap:8px;user-select:none;}
+          .set-sub>summary::-webkit-details-marker{display:none;}
+          .set-sub>summary .set-chev{margin-left:auto;color:#64748b;transition:transform .2s;font-size:11px;}
+          .set-sub[open]>summary .set-chev{transform:rotate(90deg);}
+          .set-sub-body{padding:4px 14px 14px;display:flex;flex-direction:column;gap:12px;}
+        </style>
+        <div class="settings-form max-w-xl">
 
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label for="setting-wait-interval" class="block text-sm font-semibold text-gray-300 mb-2">Wait Interval
-              (minutes)</label>
-            <input type="number" id="setting-wait-interval" min="1" max="1440" value="60"
-              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-            <small class="block mt-2 text-xs text-gray-500">Minutes to wait between automation cycles</small>
-          </div>
-
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label for="setting-account-delay" class="block text-sm font-semibold text-gray-300 mb-2">Delay Between
-              Accounts (minutes)</label>
-            <input type="number" id="setting-account-delay" min="0" value="1"
-              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-            <small class="block mt-2 text-xs text-gray-500">Minutes to wait between switching accounts</small>
-          </div>
-
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label for="setting-posts-per-group" class="block text-sm font-semibold text-gray-300 mb-2">Posts Per Group</label>
-            <input type="number" id="setting-posts-per-group" min="0" max="50" value="1"
-              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-            <small class="block mt-2 text-xs text-gray-500">Number of posts to make in each group per cycle (0 = no limit). Unique modes always post 1.</small>
-          </div>
-
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label for="setting-group-delay" class="block text-sm font-semibold text-gray-300 mb-2">Delay Between Groups (seconds)</label>
-            <input type="number" id="setting-group-delay" min="0" value="60"
-              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-            <small class="block mt-2 text-xs text-gray-500">Seconds to wait between posting to each group</small>
-          </div>
-
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label for="setting-max-cycles" class="block text-sm font-semibold text-gray-300 mb-2">Max Cycles (0 = unlimited)</label>
-            <input type="number" id="setting-max-cycles" min="0" value="0"
-              class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-            <small class="block mt-2 text-xs text-gray-500">Number of full posting cycles to run; 0 means run indefinitely</small>
-          </div>
-
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" id="setting-comment-with-image" class="w-5 h-5 rounded-md accent-accent">
-              <span class="text-sm font-semibold text-gray-300">🖼️ Comment with Post Image</span>
-            </label>
-            <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, the same image from the post will also be
-              attached to the comment. Only applies to posts that have a comment.</small>
-          </div>
-
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" id="setting-auto-delete-posted" class="w-5 h-5 rounded-md accent-accent">
-              <span class="text-sm font-semibold text-gray-300">🗑️ Auto-Delete Posted Posts</span>
-            </label>
-            <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, posts will be automatically deleted from
-              the app after they have been successfully posted during automation.</small>
-          </div>
-
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" id="setting-hide-browser" class="w-5 h-5 rounded-md accent-accent">
-              <span class="text-sm font-semibold text-gray-300">🙈 Hide Browser During Automation</span>
-            </label>
-            <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled (default), the automation browser runs
-              off-screen and silent — invisible to you, but Facebook still treats it as active so posting works
-              (confirmed live). A Chrome icon stays in the taskbar (the window must keep rendering for Facebook to
-              accept the post). Turn OFF to run it on screen — it opens in the background and won't steal focus or sit
-              on top of your work.</small>
-          </div>
-
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" id="setting-enable-tunnel" class="w-5 h-5 rounded-md accent-accent">
-              <span class="text-sm font-semibold text-gray-300">🌐 Enable Remote Access / Dashboard Tunnel</span>
-            </label>
-            <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, a Cloudflare tunnel is started so you can monitor and control the app remotely from any device. Takes effect on next app restart.</small>
-          </div>
-
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" id="setting-loop-campaign" class="w-5 h-5 rounded-md accent-accent">
-              <span class="text-sm font-semibold text-gray-300">🔁 Loop Campaign (unique modes)</span>
-            </label>
-            <small class="block mt-2 text-xs text-gray-500 ml-8">For unique posting modes: OFF = the campaign completes after each post is sent once. ON = it recycles continuously, re-distributing the library and rotating which account posts which content over time (like the original). Use without Auto-delete.</small>
-          </div>
-
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" id="setting-resume-on-startup" class="w-5 h-5 rounded-md accent-accent">
-              <span class="text-sm font-semibold text-gray-300">🔁 Resume interrupted run on startup</span>
-            </label>
-            <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, if the app was closed mid-run (shutdown or crash), it will automatically resume the campaign on next launch. Enabled by default.</small>
-          </div>
-
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" id="setting-launch-on-startup" class="w-5 h-5 rounded-md accent-accent">
-              <span class="text-sm font-semibold text-gray-300">🚀 Launch app automatically when Windows starts</span>
-            </label>
-            <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, the app will be registered as a Windows login item and start automatically when you sign in. Disabled by default.</small>
-          </div>
-
-          <!-- Anti-spam sub-section -->
-          <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-            <h3 class="text-sm font-bold text-gray-200 mb-4" style="border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 10px;">🛡️ Anti-spam (Facebook safety)</h3>
-
-            <div class="space-y-4">
-              <div>
-                <label for="setting-comment-delay-min" class="block text-sm font-semibold text-gray-300 mb-2">First-comment delay min (seconds)</label>
-                <input type="number" id="setting-comment-delay-min" min="0" value="60"
-                  class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-                <small class="block mt-2 text-xs text-gray-500">Minimum seconds to wait before posting the first comment after a post</small>
+          <!-- ════ SECTION 1 — SPEED ════ -->
+          <details class="set-sec" open>
+            <summary>⚡ Speed <span class="set-chev">▸</span></summary>
+            <div class="set-sec-body">
+              <div class="form-group bg-gradient-to-br from-accent/10 to-dark-700/40 backdrop-blur-sm border border-accent/25 rounded-2xl p-5">
+                <label class="block text-sm font-semibold text-gray-200 mb-1">Posting speed (one click sets everything)</label>
+                <small class="block mb-3 text-xs text-gray-400">Fills all the timing below at once. <b class="text-cyber-green">Slow</b> = safest · <b class="text-cyber-blue">Normal</b> = balanced · <b class="text-cyber-amber">Fast</b> = quickest still-safe · <b class="text-red-400">Turbo</b> = power-user, extremely fast · <b class="text-red-500">Instant</b> = MAX speed: everything pasted, 0–7s between actions, post lands in seconds (highest ban risk — warmed accounts + proxies only). Quick Setup has the same selector.</small>
+                <div class="grid grid-cols-2 gap-3">
+                  <button type="button" data-speed="instant" class="speed-btn px-4 py-3 rounded-xl border border-red-500/40 bg-dark-900/60 text-sm font-semibold text-red-300 hover:border-red-500 transition-all">⚡ Instant (max speed · spam risk)</button>
+                  <button type="button" data-speed="turbo" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">🚀 Turbo (power user)</button>
+                  <button type="button" data-speed="fast" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">⚡ Fast</button>
+                  <button type="button" data-speed="normal" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">⚖️ Normal</button>
+                  <button type="button" data-speed="slow" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">🐢 Slow</button>
+                </div>
+                <div style="margin-top:14px;border-top:1px solid rgba(255,255,255,0.06);padding-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                  <label for="setting-default-pace" class="block text-xs font-semibold text-gray-400" style="white-space:nowrap;">Default account pace</label>
+                  <select id="setting-default-pace" class="px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
+                    <option value="safe">🐢 Safe — 2× slower, most human</option>
+                    <option value="normal">⚖️ Normal — global tempo (default)</option>
+                    <option value="fast">⚡ Fast — ½ gaps, instant typing</option>
+                    <option value="turbo">🚀 Turbo — ¼ gaps, power-user</option>
+                    <option value="instant">⚡ Instant — max speed (trusted accounts + proxies only)</option>
+                  </select>
+                  <small class="text-xs text-gray-500" style="flex:1;min-width:200px;">Fleet fallback for accounts with no individual pace (override per-account on the Accounts tab or in Quick Setup). <b class="text-red-400">Turbo/Instant here applies to your whole fleet</b> — pick it only if every account is warmed.</small>
+                </div>
               </div>
 
-              <div>
-                <label for="setting-comment-delay-max" class="block text-sm font-semibold text-gray-300 mb-2">First-comment delay max (seconds)</label>
-                <input type="number" id="setting-comment-delay-max" min="0" value="180"
-                  class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-                <small class="block mt-2 text-xs text-gray-500">Maximum seconds to wait before posting the first comment after a post</small>
-              </div>
+            </div>
+          </details>
 
-              <div>
-                <label for="setting-daily-cap" class="block text-sm font-semibold text-gray-300 mb-2">Daily post cap per account (0 = off)</label>
-                <input type="number" id="setting-daily-cap" min="0" value="0"
-                  class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-                <small class="block mt-2 text-xs text-gray-500">Maximum posts per account per day; 0 means no cap</small>
-              </div>
-
-              <div>
+          <!-- ════ SECTION 3 — CONTENT & VARIATION ════ -->
+          <details class="set-sec" open>
+            <summary>🖼️ Content &amp; variation <span class="set-chev">▸</span></summary>
+            <div class="set-sec-body">
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
                 <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-                  <input type="checkbox" id="setting-vary-content" class="w-5 h-5 rounded-md accent-accent" checked>
-                  <span class="text-sm font-semibold text-gray-300">Vary captions/comments with {a|b|c} spintax</span>
+                  <input type="checkbox" id="setting-comment-with-image" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">🖼️ Comment with Post Image</span>
                 </label>
-                <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, {option1|option2|option3} blocks in captions and comments are randomly resolved per post — helps avoid duplicate-content flags</small>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">Attach the post's image to its first comment too. Only applies to posts that have a comment.</small>
               </div>
-
-              <div>
-                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-                  <input type="checkbox" id="setting-vary-images" class="w-5 h-5 rounded-md accent-accent" checked>
-                  <span class="text-sm font-semibold text-gray-300">Vary image per group (unique hash)</span>
-                </label>
-                <small class="block mt-2 text-xs text-gray-500 ml-8">Applies an invisible per-group pixel tweak so each uploaded image has a unique hash, reducing duplicate-media detection</small>
-              </div>
-
-              <div>
-                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-                  <input type="checkbox" id="setting-randomize-links" class="w-5 h-5 rounded-md accent-accent" checked>
-                  <span class="text-sm font-semibold text-gray-300">Randomize links in first comment</span>
-                </label>
-                <small class="block mt-2 text-xs text-gray-500 ml-8">Adds a random tracking parameter to links in the first comment so each URL is unique and harder to flag as repetitive spam</small>
-              </div>
-
-              <div>
-                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-                  <input type="checkbox" id="setting-stagger-accounts" class="w-5 h-5 rounded-md accent-accent" checked>
-                  <span class="text-sm font-semibold text-gray-300">Stagger account start times</span>
-                </label>
-                <small class="block mt-2 text-xs text-gray-500 ml-8">Adds a random delay between accounts starting a new cycle so they don't all hit Facebook simultaneously</small>
-              </div>
-
-              <div>
-                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
-                  <input type="checkbox" id="setting-enable-warmup" class="w-5 h-5 rounded-md accent-accent">
-                  <span class="text-sm font-semibold text-gray-300">Warm up new accounts before posting</span>
-                </label>
-                <small class="block mt-2 text-xs text-gray-500 ml-8">When enabled, new accounts will browse and interact lightly before their first post to appear more human to Facebook</small>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 space-y-4">
+                <div>
+                  <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                    <input type="checkbox" id="setting-vary-content" class="w-5 h-5 rounded-md accent-accent" checked>
+                    <span class="text-sm font-semibold text-gray-300">Vary captions/comments with {a|b|c} spintax</span>
+                  </label>
+                  <small class="block mt-2 text-xs text-gray-500 ml-8">{option1|option2} blocks resolve randomly per post — avoids duplicate-content flags.</small>
+                </div>
+                <div>
+                  <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                    <input type="checkbox" id="setting-vary-images" class="w-5 h-5 rounded-md accent-accent" checked>
+                    <span class="text-sm font-semibold text-gray-300">Vary image per group (unique hash)</span>
+                  </label>
+                  <small class="block mt-2 text-xs text-gray-500 ml-8">Invisible per-group pixel tweak so each image has a unique hash — reduces duplicate-media detection.</small>
+                </div>
+                <div>
+                  <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                    <input type="checkbox" id="setting-randomize-links" class="w-5 h-5 rounded-md accent-accent" checked>
+                    <span class="text-sm font-semibold text-gray-300">Randomize links in first comment</span>
+                  </label>
+                  <small class="block mt-2 text-xs text-gray-500 ml-8">Adds a random tracking parameter so each URL is unique and harder to flag as repetitive spam.</small>
+                </div>
               </div>
             </div>
-          </div>
+          </details>
+
+          <!-- ════ SECTION 4 — ACCOUNTS & WARM-UP ════ -->
+          <details class="set-sec" open>
+            <summary>🌱 Accounts &amp; warm-up <span class="set-chev">▸</span></summary>
+            <div class="set-sec-body">
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-enable-warmup" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">🌱 Warm up new accounts before posting</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">New accounts browse and interact lightly before their first post to appear more human to Facebook.</small>
+                <div class="mt-3 ml-8">
+                  <label for="setting-warmup-runs" class="block text-xs font-semibold text-gray-400 mb-1">Warm-up runs</label>
+                  <input type="number" id="setting-warmup-runs" min="0" max="1000" value="5" class="w-32 px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                  <small class="block mt-1 text-xs text-gray-500">How many successful runs an account is treated as "new" and warmed (only used when warm-up is on).</small>
+                </div>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-daily-cap" class="block text-sm font-semibold text-gray-300 mb-2">Daily post cap per account (0 = off)</label>
+                <input type="number" id="setting-daily-cap" min="0" value="0" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">Max GROUP-posts per account per day (counts each group). 0 = no cap. For "1 post into all my groups daily" set this to the number of groups each account has (or leave 0 and use Daily mode).</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-cooldown-hours" class="block text-sm font-semibold text-gray-300 mb-2">Rate-limit cool-down (hours)</label>
+                <input type="number" id="setting-cooldown-hours" min="0" max="168" value="4" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">Base hours a rate-limited account rests before retrying; doubles each repeat strike (capped at 48h).</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-reserve-accounts" class="block text-sm font-semibold text-gray-300 mb-2">Reserve accounts held back (0 = standby-only)</label>
+                <input type="number" id="setting-reserve-accounts" min="0" max="100" value="0" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">Hold back this many healthy POSTERS each cycle as extra reserves (rotated). <b>0 = only your Standby accounts are reserves</b> (all posters post). Standby accounts are ALWAYS reserves regardless of this number.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-reserve-max-jobs" class="block text-sm font-semibold text-gray-300 mb-2">Max takeovers per reserve / cycle</label>
+                <input type="number" id="setting-reserve-max-jobs" min="1" max="5" value="1" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">How many drops ONE reserve may cover in a single cycle. <b>1 (default) = one job per account/cycle</b> (safest). Raise to 2–5 so a healthy reserve covers multiple dropped accounts when drops outnumber reserves.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label class="block text-sm font-semibold text-gray-300 mb-2">🌍 Proxy geo alignment (proxied accounts)</label>
+                <small class="block mb-3 text-xs text-gray-500">Make each <b>PROXIED</b> account's browser report its proxy's timezone + language instead of this computer's — a mismatch Facebook can use to link accounts. Applies to every proxied account that has no per-account override (Accounts tab). Leave blank for no override.</small>
+                <div style="display:flex;gap:12px;flex-wrap:wrap;">
+                  <div style="flex:1;min-width:200px;">
+                    <label for="setting-proxy-timezone" class="block text-xs font-semibold text-gray-400 mb-1">Proxy timezone (IANA)</label>
+                    <input type="text" id="setting-proxy-timezone" placeholder="e.g. America/New_York" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                  </div>
+                  <div style="flex:1;min-width:200px;">
+                    <label for="setting-proxy-locale" class="block text-xs font-semibold text-gray-400 mb-1">Proxy locale (BCP-47)</label>
+                    <input type="text" id="setting-proxy-locale" placeholder="e.g. en-US" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                  </div>
+                </div>
+                <button type="button" onclick="autoDetectProxyGeo(this)" class="mt-3 px-4 py-2 rounded-xl border border-accent/40 bg-accent/10 text-sm font-semibold text-accent hover:bg-accent/20 transition-all">🌍 Auto-detect from my proxies</button>
+                <small class="block mt-2 text-xs text-gray-500">Routes a lookup through each proxy to learn its region, then auto-fills each account's timezone/locale (and these fields if all proxies share one region). Proxies you add later are detected automatically.</small>
+              </div>
+            </div>
+          </details>
+
+          <!-- ════ SECTION 5 — AUTOMATION & SCHEDULE ════ -->
+          <details class="set-sec">
+            <summary>🕒 Automation &amp; schedule <span class="set-chev">▸</span></summary>
+            <div class="set-sec-body">
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-daily-post-time" class="block text-sm font-semibold text-gray-300 mb-2">Daily run time (local)</label>
+                <input type="time" id="setting-daily-post-time" value="09:00" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">Your accounts start their daily cycle(s) at this time.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-cycles-per-day" class="block text-sm font-semibold text-gray-300 mb-2">Cycles per run</label>
+                <input type="number" id="setting-cycles-per-day" min="1" max="8" value="1" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">How many cycles each run delivers, then it's done for the day (the next run auto-starts at the time above). Each cycle every account posts its NEXT post — so <b>5</b> = each account posts 5 of its posts this run, spaced by the gap below. Never the same post twice; posts stay spaced for safety.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-cycle-gap-min" class="block text-sm font-semibold text-gray-300 mb-2">Time between cycles (minutes)</label>
+                <input type="number" id="setting-cycle-gap-min" min="5" max="720" placeholder="auto (uses speed preset)" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">The gap between cycles within a run (jittered up to +30% so the cadence isn't a fixed spam tell). Lower = the run's cycles fire closer together; minimum 5 min. <b>Leave blank</b> to use your speed preset's timing. (Also sets the between-cycle gap in Continuous mode.)</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-tabs-per-browser" class="block text-sm font-semibold text-gray-300 mb-2">⚡ Parallel group tabs (speed)</label>
+                <input type="number" id="setting-tabs-per-browser" min="1" max="4" value="1" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500"><b>1</b> = classic (one group at a time). <b>2–4</b> = while a group is posting, the next group(s) <b>pre-load in background tabs</b> so each account finishes faster. Posting itself stays one-at-a-time and paced — this only overlaps the slow page-loading, so there's <b>no extra spam/velocity risk</b>. More tabs = faster but more RAM.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-post-then-comment" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">📝➡️💬 Post everything first, then comment (two-phase)</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">Each account posts the image+caption to <b>all</b> its groups first, then goes back and adds every post's comment. The time spent posting the other groups <b>becomes the wait before commenting</b> — so the per-post comment delay is absorbed for free, and <b>every post lands before any comment work</b>. Posts still fire one-at-a-time and paced; the comment can never double-post (the post is already counted). Combine with parallel tabs above. Held ("Spam potentiel") posts and any blocked comment route to a reserve/moderator exactly as normal.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-capture-link-from-network" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">🔗 Grab the post link from Facebook's response (faster, experimental)</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">Two-phase only. Instead of <b>reloading the group and scrolling to find the post</b> to read its link (slow, and Facebook often hides the link in the feed), read the link straight from Facebook's own <b>publish response</b> the moment the post is created — <b>no reload, no scroll</b>. Before commenting, the app still opens that link and <b>re-checks the post is yours</b> (caption + author), so a wrong link can never comment on the wrong post — it just falls back to the old feed search. Turn on and watch the log for "Captured the post's link from Facebook's publish response"; if you see it, it's working.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-auto-start-daily" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">🕒 Auto-launch + post daily (Windows task)</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">Registers a Windows scheduled task that launches the app and runs the daily post at the time above — even if the app is closed. Best for an unattended/RDP laptop.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-resume-on-startup" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">🔁 Resume interrupted run on startup</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">If the app was closed mid-run (shutdown or crash), resume the campaign on next launch. Recommended ON for an unattended laptop.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-launch-on-startup" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">🚀 Launch app automatically when Windows starts</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">Registers the app as a Windows login item so it starts when you sign in.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-hide-browser" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">🙈 Hide Browser During Automation</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">When ON (default), the automation browser runs off-screen — invisible to you, but Facebook still treats it as active. Turn OFF to watch it run on screen (it won't steal focus).</small>
+              </div>
+            </div>
+          </details>
+
+          <!-- ════ SECTION 6 — MODERATION & DELIVERY RESCUE ════ -->
+          <details class="set-sec">
+            <summary>🛡️ Moderation &amp; delivery rescue <span class="set-chev">▸</span></summary>
+            <div class="set-sec-body">
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-accent/20 rounded-2xl p-5">
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-moderation-enabled" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-200">🛡️ Enable moderator approval (your own groups)</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">For groups you ADMIN: a designated moderator account <b class="text-cyber-green">approves</b> posts FB holds in "Spam potentiel"/pending, so the post goes live and its comment can land. It approves only posts that match YOUR captions (and your accounts' FB display names) — never a stranger's. Turn on Test mode first to see what it would approve.</small>
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer mt-3 ml-8">
+                  <input type="checkbox" id="setting-moderation-dry-run" class="w-4 h-4 rounded-md accent-accent">
+                  <span class="text-xs font-medium text-gray-300">🧪 Test mode (dry-run) — scan + log what it WOULD approve, without clicking</span>
+                </label>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label class="flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-repost-enabled" class="w-4 h-4 accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">Re-post held posts via a reserve account</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-7">When a post stays stuck in "Spam potentiel" and the moderator can't approve it, a healthy reserve account (member of that group) re-posts the content so it goes live. Checks the feed first so it never duplicates, caps at one replacement per post.</small>
+                <div class="ml-7 mt-3">
+                  <label class="block text-xs font-semibold text-gray-400 mb-1" for="setting-repost-grace-sec">Re-post grace period (seconds)</label>
+                  <input type="number" id="setting-repost-grace-sec" min="0" max="86400" step="30" value="180" class="w-32 bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200 focus:outline-none focus:border-accent">
+                  <small class="block mt-1 text-xs text-gray-500">How long to wait after a post is marked un-approvable before a reserve re-posts it (0–86400 s). Default 180 s.</small>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <!-- ════ SECTION 7 — REMOTE ACCESS ════ -->
+          <details class="set-sec">
+            <summary>🌐 Remote access <span class="set-chev">▸</span></summary>
+            <div class="set-sec-body">
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-enable-tunnel" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">🌐 Enable Remote Access / Dashboard Tunnel</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">Starts a Cloudflare tunnel so you can monitor and control the app remotely from any device. Takes effect on next app restart.</small>
+              </div>
+            </div>
+          </details>
+
         </div>
       </div>
 
@@ -640,7 +923,7 @@
             class="form-group checkbox-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 mb-6">
             <label class="checkbox-label flex items-center gap-3 cursor-pointer">
               <input type="checkbox" id="proxies-enabled" class="w-5 h-5 rounded-md accent-accent">
-              <span class="text-base font-semibold text-gray-200">Enable SOCKS5 Proxy Rotation</span>
+              <span class="text-base font-semibold text-gray-200">Enable Proxy Pool (HTTP / SOCKS4 / SOCKS5)</span>
             </label>
             <p class="text-xs text-gray-500 mt-2 ml-8">When enabled, each account will be assigned a sticky SOCKS5 proxy
               from the list below.</p>
@@ -681,6 +964,17 @@
                 id="btn-add-proxy-row">
                 <span>➕</span> Add
               </button>
+            </div>
+          </div>
+
+          <!-- Bulk add: paste a whole proxy list (one per line) -->
+          <div class="bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 mb-6">
+            <label class="block mb-2 text-sm font-semibold text-gray-200">📋 Paste a proxy list (one per line)</label>
+            <textarea id="proxies-bulk" rows="4" placeholder="host:port:user:pass&#10;http://host:port:user:pass&#10;user:pass@host:port&#10;host:port"
+              class="w-full px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all" style="font-family:monospace;resize:vertical;"></textarea>
+            <div class="flex items-center gap-3 mt-3 flex-wrap">
+              <button id="btn-proxies-bulk-add" class="btn-success px-4 py-2 bg-gradient-to-r from-emerald-500 to-emerald-600 rounded-lg text-white text-sm font-semibold">➕ Add all to table</button>
+              <span class="text-xs text-gray-500">Accepts host:port, host:port:user:pass, user:pass@host:port, or full scheme://… — defaults to <b>http</b>. Then tick Enable + 💾 Save Proxies.</span>
             </div>
           </div>
 
@@ -740,6 +1034,13 @@
               <input type="text" id="image-url-input" placeholder="https://example.com/image.jpg"
                   class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
           </div>
+        </div>
+
+        <div class="form-group">
+          <label for="post-set" class="block text-sm font-semibold text-gray-300 mb-2">📦 Post set <span class="text-gray-500 font-normal">— which batch posts this (optional)</span></label>
+          <select id="post-set" class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 transition-all cursor-pointer">
+            <option value="">— default (all posts) —</option>
+          </select>
         </div>
 
         <div class="form-group">
@@ -870,6 +1171,31 @@
     </div>
   </div>
 
+  <!-- Modal for Adding a Group Moderator (admin) -->
+  <div id="modal-add-admin" class="modal">
+    <div class="modal-content bg-dark-700/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl max-w-md w-full">
+      <div class="modal-header flex justify-between items-center p-5 border-b border-white/5">
+        <h3 class="text-lg font-bold text-white">🛡️ Add group moderator (admin)</h3>
+        <button class="modal-close w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-500/20 transition-all" onclick="closeModal('modal-add-admin')">&times;</button>
+      </div>
+      <div class="modal-body p-5 space-y-4">
+        <div class="form-group">
+          <label for="admin-name" class="block text-sm font-semibold text-gray-300 mb-2">Moderator name *</label>
+          <input type="text" id="admin-name" placeholder="e.g., admin1"
+            class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+          <small class="block mt-2 text-xs text-gray-500">Letters, numbers and underscores only. This is an admin account that approves held posts — it never posts.</small>
+        </div>
+        <div class="info-box bg-accent/5 border border-accent/10 rounded-xl p-4">
+          <p class="text-xs text-gray-400">ℹ️ After you click Create, authenticate it from its row in the panel — <strong class="text-accent-light">🔐 log in</strong> (opens Chrome) or <strong class="text-accent-light">🍪 cookies</strong> (paste cookies). It won't appear in the Accounts tab.</p>
+        </div>
+      </div>
+      <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
+        <button class="btn-secondary px-5 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all" onclick="closeModal('modal-add-admin')">Cancel</button>
+        <button class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all" onclick="submitAddModerator()">Create moderator</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Modal for Login Instructions -->
   <div id="modal-login-instructions" class="modal">
     <div
@@ -956,8 +1282,12 @@
           <div id="edit-account-cred-badge" style="display:none;margin-bottom:8px;font-size:11px;color:#34d399;font-weight:600;">🔑 auto-login set</div>
           <input type="email" id="edit-account-email" placeholder="Facebook email"
             class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all mb-2">
-          <input type="password" id="edit-account-password" placeholder="Password (leave blank to keep existing)"
-            class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all mb-2">
+          <div style="position:relative;" class="mb-2">
+            <input type="text" id="edit-account-password" placeholder="Password (leave blank to keep existing)"
+              class="w-full px-4 py-3 pr-11 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+            <button type="button" id="edit-account-password-toggle" onclick="togglePasswordVisibility('edit-account-password', this)" title="Show/hide password"
+              style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:16px;line-height:1;padding:4px;">🙈</button>
+          </div>
           <button type="button" id="btn-save-account-creds"
             onclick="saveAccountCredentials()"
             class="px-4 py-2 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all border border-white/10">
@@ -989,6 +1319,12 @@
       </div>
       <div class="modal-body p-5 space-y-4">
         <div class="form-group">
+          <label for="edit-post-set" class="block text-sm font-semibold text-gray-300 mb-2">📦 Post set <span class="text-gray-500 font-normal">— which batch posts this (optional)</span></label>
+          <select id="edit-post-set" class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 transition-all cursor-pointer">
+            <option value="">— default (all posts) —</option>
+          </select>
+        </div>
+        <div class="form-group">
           <label for="edit-post-caption" class="block text-sm font-semibold text-gray-300 mb-2">Caption *</label>
           <textarea id="edit-post-caption" rows="5" placeholder="Edit your caption..."
             class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all resize-y"></textarea>
@@ -998,6 +1334,17 @@
           <textarea id="edit-post-comment" rows="3" placeholder="Edit your comment (leave empty for no comment)..."
             class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all resize-y"></textarea>
           <small class="block mt-1 text-xs text-gray-500">Leave empty to remove the comment.</small>
+        </div>
+        <div class="form-group">
+          <label for="edit-post-image-url" class="block text-sm font-semibold text-gray-300 mb-2">Post image URL</label>
+          <input type="text" id="edit-post-image-url" placeholder="https://… (leave empty for no/keep-uploaded image)"
+            class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 transition-all">
+          <small class="block mt-1 text-xs text-gray-500">A remote image URL downloaded at post time. (Uploaded local images can't be changed here — delete + re-add the post for that.)</small>
+        </div>
+        <div class="form-group">
+          <label for="edit-post-comment-image-url" class="block text-sm font-semibold text-gray-300 mb-2">Comment image URL</label>
+          <input type="text" id="edit-post-comment-image-url" placeholder="https://… (optional)"
+            class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 transition-all">
         </div>
       </div>
       <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
@@ -1110,6 +1457,93 @@ Example format:
       <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
         <button class="btn-secondary px-5 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all" data-dismiss="modal">Cancel</button>
         <button class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all" onclick="bulkImportGroups()">📦 Import Groups</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal-bulk-accounts" class="modal">
+    <div class="modal-content bg-dark-700/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl max-w-lg w-full">
+      <div class="modal-header flex justify-between items-center p-5 border-b border-white/5">
+        <h3 class="text-lg font-bold text-white">📦 Bulk Import Accounts</h3>
+        <button class="modal-close w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-500/20 transition-all">&times;</button>
+      </div>
+      <div class="modal-body p-5 space-y-4">
+        <div class="info-box bg-accent/5 border border-accent/10 rounded-xl p-4 text-xs text-gray-400">
+          <p class="font-semibold text-accent-light mb-1">One account per line — fields split by <span class="font-mono">|</span> (pipe), tab, or comma:</p>
+          <p class="text-gray-300 font-mono">name | alias | proxy | email | password</p>
+          <p class="mt-1 text-gray-500">Only <span class="text-gray-300">name</span> is required. Proxy: <span class="font-mono">host:port</span> or <span class="font-mono">host:port:user:pass</span>.</p>
+          <p class="mt-2 text-gray-500 italic">Duplicates + existing accounts are skipped. No browser opens — each account verifies on its first run.</p>
+        </div>
+        <div class="form-group">
+          <label for="bulk-accounts-input" class="block text-sm font-semibold text-gray-300 mb-2">Accounts *</label>
+          <textarea id="bulk-accounts-input" rows="10"
+            placeholder="acct001 | Anna | 1.2.3.4:8000:user:pass | anna@mail.com | secret123&#10;acct002&#10;acct003 | | 1.2.3.4:8001&#10;..."
+            class="w-full px-4 py-3 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all resize-y font-mono"
+            style="min-height: 160px;"></textarea>
+        </div>
+        <div class="form-group">
+          <label class="block text-sm font-semibold text-gray-300 mb-2">Cookies (optional)</label>
+          <div class="flex items-center gap-3">
+            <button type="button" id="btn-bulk-accounts-cookies" class="btn-secondary px-4 py-2 bg-dark-600 rounded-xl text-gray-200 text-sm font-medium hover:bg-dark-500 transition-all whitespace-nowrap">🍪 Choose folder…</button>
+            <span id="bulk-accounts-cookies-path" class="text-xs text-gray-500 truncate">No folder — accounts with a login auto-sign-in; the rest start logged out.</span>
+          </div>
+          <p class="text-xs text-gray-500 mt-2">Pick a folder of <span class="font-mono">&lt;name&gt;.json</span> cookie exports (Cookie-Editor format). Each is matched to its account by name and injected.</p>
+        </div>
+      </div>
+      <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
+        <button class="btn-secondary px-5 py-2.5 bg-dark-600 rounded-xl text-gray-300 text-sm font-medium hover:bg-dark-500 transition-all" data-dismiss="modal">Cancel</button>
+        <button class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all" onclick="bulkImportAccounts()">📦 Import Accounts</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Import from Chrome (companion-extension session bridge) -->
+  <div id="modal-chrome-import" class="modal">
+    <div class="modal-content bg-dark-700/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl max-w-xl w-full">
+      <div class="modal-header flex justify-between items-center p-5 border-b border-white/5">
+        <h3 class="text-lg font-bold text-white">🌐 Import from Chrome</h3>
+        <button class="modal-close w-8 h-8 rounded-lg bg-dark-600 flex items-center justify-center text-gray-400 hover:text-white hover:bg-red-500/20 transition-all">&times;</button>
+      </div>
+      <div class="modal-body p-5 space-y-4">
+        <div class="info-box bg-accent/5 border border-accent/10 rounded-xl p-4 text-xs text-gray-400">
+          Brings your already-logged-in Chrome profiles into the app <span class="text-gray-300">with their device identity (the <span class="font-mono">datr</span> cookie)</span>, so Facebook keeps seeing the same account on the same device — no re-login, no "new device" checkpoint. Modern Chrome encrypts sessions so this must go through a tiny helper extension (localhost only — nothing leaves this PC).
+        </div>
+        <ol class="space-y-3 text-sm text-gray-300">
+          <li class="flex gap-3"><span class="text-accent-light font-bold">1.</span>
+            <div>
+              <div class="font-semibold text-white mb-1">Generate &amp; open the helper</div>
+              <button id="btn-gen-chrome-ext" class="btn-secondary px-4 py-2 bg-dark-600 rounded-lg text-gray-200 text-sm font-medium hover:bg-dark-500 transition-all">⚙️ Generate helper + open folder</button>
+              <div id="chrome-ext-path" class="text-xs text-gray-500 mt-1 break-all"></div>
+            </div>
+          </li>
+          <li class="flex gap-3"><span class="text-accent-light font-bold">2.</span>
+            <div>
+              <div class="font-semibold text-white mb-1">Load it in Chrome (once)</div>
+              Open <span class="font-mono text-gray-200">chrome://extensions</span> → turn on <span class="text-gray-200">Developer mode</span> → <span class="text-gray-200">Load unpacked</span> → pick the folder from step 1. It applies to all your profiles.
+            </div>
+          </li>
+          <li class="flex gap-3"><span class="text-accent-light font-bold">3.</span>
+            <div>
+              <div class="font-semibold text-white mb-1">Open each profile on Facebook</div>
+              Open a profile on <span class="font-mono text-gray-200">facebook.com</span> — the helper auto-sends that account here (or click its toolbar icon and “Send”). Accounts appear below. Tip: in the helper popup set each profile’s label (e.g. BB24) to name it, and optionally its login for an auto re-login safety net.
+            </div>
+          </li>
+        </ol>
+        <div class="bg-dark-900/60 border border-white/10 rounded-xl px-4 py-3 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="text-sm text-gray-300">Imported from Chrome so far: <span id="chrome-import-count" class="font-bold text-accent-light">0</span><span id="chrome-profiles-note" class="text-gray-500"></span></span>
+            <button id="btn-refresh-chrome-import" class="btn-secondary px-3 py-1.5 bg-dark-600 rounded-lg text-gray-300 text-xs font-medium hover:bg-dark-500 transition-all">↻ Refresh</button>
+          </div>
+          <div id="chrome-health-summary" class="text-xs text-gray-400"></div>
+          <div class="text-[11px] text-gray-600">The helper keeps each open profile's session fresh and reports its health here. Leave a profile open on Facebook to refresh it; checkpointed/logged-out accounts are flagged so you can fix them in Chrome.</div>
+        </div>
+        <div class="bg-dark-900/60 border border-white/10 rounded-xl px-4 py-3 flex items-center justify-between gap-3">
+          <span class="text-xs text-gray-400">Assign each imported account to the target groups the helper confirmed it's a member of (adds — never removes).</span>
+          <button id="btn-assign-chrome-groups" class="btn-secondary px-3 py-1.5 bg-dark-600 rounded-lg text-gray-200 text-xs font-medium hover:bg-dark-500 transition-all whitespace-nowrap">🎯 Auto-assign groups</button>
+        </div>
+      </div>
+      <div class="modal-footer flex justify-end gap-3 p-5 border-t border-white/5">
+        <button class="btn-primary px-5 py-2.5 bg-gradient-to-r from-accent to-accent-dark rounded-xl text-white text-sm font-semibold hover:shadow-glow transition-all" data-dismiss="modal">Done</button>
       </div>
     </div>
   </div>

@@ -857,9 +857,11 @@
         }
 
         async function loadPosts() {
-            const res = await fetch('/api/posts');
-            const data = await res.json();
-            renderPosts(data.posts);
+            try {
+                const res = await fetch('/api/posts');
+                const data = await res.json();
+                renderPosts(data.posts);
+            } catch (e) { console.error('loadPosts failed', e); } // polled every 2s — never throw an unhandled rejection
         }
 
         async function addPost() {
@@ -988,7 +990,8 @@
                 var imageHtml;
                 if (post.imagePath) {
                     const filename = escapeHtml(post.imagePath.split(/[/\\]/).pop());
-                    const webPath = '/images/' + filename;
+                    const _tok = sessionStorage.getItem('apiToken');
+                    const webPath = '/images/' + filename + (_tok ? '?token=' + encodeURIComponent(_tok) : '');
                     imageHtml = '<div class="post-img-container"><img src="' + webPath + '" alt="Post Image" onerror="this.parentElement.innerHTML=\'<div style=\\\'display:flex;align-items:center;justify-content:center;height:100%;color:#64748b;font-size:1.5rem\\\'>📷</div>\'"></div>';
                 } else {
                     imageHtml = '<div class="post-img-container" style="display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#1e293b,#334155);"><span style="font-size:1.8rem;">📝</span></div>';
@@ -1126,11 +1129,11 @@
         function pollAll() {
             fetchStatus();
             loadAccounts();
+            loadPosts(); // keep the post queue live (it was loaded once at boot and never refreshed)
         }
 
         setInterval(pollAll, 2000);
-        pollAll();
-        loadPosts();
+        pollAll(); // pollAll() already calls loadPosts() — no separate loadPosts() needed here
         loadTunnelUrl();
 
     </script>
