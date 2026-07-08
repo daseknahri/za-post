@@ -2,6 +2,24 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.20] — 2026-07-08 — Fix the ~8s per-group image-vary stall (the "long pause after the composer opens")
+
+Reading the test log, the long pause right after the composer opens was **image variation**: jimp's hue rotation
+(a full pure-JS RGB→HSL→RGB conversion per pixel) cost ~6.5s per image on its own — the entire `varyImage` bottleneck.
+Profiled and replaced.
+
+### Fixed
+- **Image varying is ~8× faster (~8s → ~1s per group).** The per-group image perturbation used jimp's
+  `color([{apply:'hue'}])`, which cost ~6.5s alone (profiled: read 350ms · crop 80ms · brightness 31ms · **hue 6508ms**
+  · write 488ms). Replaced with a cheap per-channel color tint — one fast pixel pass (~50ms) that shifts the color
+  distribution + hash the same way. Anti-dedup is unchanged (**verified: two groups still get different images**); only
+  the slow implementation is gone. Also caps an oversized source at 1600px first (FB downscales uploads anyway).
+- **Honest "image varied" log.** It logged "Image varied" even when jimp couldn't read the format (notably **WEBP**,
+  which jimp can't decode — those upload identical to every group = an image-dedup risk). The log now says so and
+  recommends JPG/PNG. (Your active posts use JPG image URLs, which vary fine; this is a heads-up for WEBP uploads.)
+
+242 tests green. The anti-dedup protection is unchanged — the varied image still differs per group.
+
 ## [1.0.19] — 2026-07-08 — Trim redundant steps from the posting path (INSTANT optimality)
 
 A focused audit for genuinely UNNECESSARY/redundant steps (not just slow waits) found the posting path already lean —

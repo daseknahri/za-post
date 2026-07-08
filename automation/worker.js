@@ -2602,14 +2602,16 @@ async function runAccount(o) {
         // IDENTICAL perceptual hash to every group — FB dedups images across groups, a strong
         // spam signal. Visually identical; best-effort (falls back to the original if jimp is off).
         if (settings.varyImages !== false && imageVary.available() && resolvedImages.length) {
-          const vi = [];
+          const vi = []; let _anyVaried = false;
           for (const im of resolvedImages) {
             const v = await imageVary.varyImage(im, `${name}|${gid}|${im}|${runSalt}`);
-            if (v) { vi.push(v); tempImages.push(v); } else vi.push(im);
+            if (v) { vi.push(v); tempImages.push(v); _anyVaried = true; } else vi.push(im);
           }
           groupImages = vi;
-          if (groupCommentImg) { const cv = await imageVary.varyImage(groupCommentImg, `${name}|${gid}|c|${groupCommentImg}|${runSalt}`); if (cv) { groupCommentImg = cv; tempImages.push(cv); } }
-          step('Image varied (unique hash for this group)');
+          if (groupCommentImg) { const cv = await imageVary.varyImage(groupCommentImg, `${name}|${gid}|c|${groupCommentImg}|${runSalt}`); if (cv) { groupCommentImg = cv; tempImages.push(cv); _anyVaried = true; } }
+          // Truthful log: varyImage returns null for a format jimp can't read (notably WEBP) → the ORIGINAL uploads,
+          // identically to every group (image-dedup risk). Say so instead of a misleading "Image varied".
+          step(_anyVaried ? 'Image varied (unique hash for this group)' : '⚠️ Image NOT varied (jimp can\'t read this format, e.g. webp) — uploading the ORIGINAL, which is identical for every group (image-dedup risk). Use JPG/PNG for per-group variation.');
         }
 
         // CAPTION single-entry helper — declared at composer scope so BOTH the caption-first entry AND the post-image
