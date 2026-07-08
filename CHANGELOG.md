@@ -2,6 +2,38 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.15] — 2026-07-08 — App-wide gap hunt (11 fixes)
+
+A full-power adversarial gap hunt across eight subsystems (find → independent refute → adjudicate) surfaced 14 real
+gaps; **11 are fixed here.** The remaining 3 — a moderation-recovery write-ordering durability gap and two
+daily-schedule cycle-counter durability issues — are deferred to a dedicated, separately-verified pass because they
+need coordinated persisted-state + resume changes. No double-post / double-comment invariant was touched.
+
+### Fixed
+- **Comment images are no longer deleted before a reserve/moderator can use them.** With image variation on (the
+  default), a live-but-couldn't-comment post handed its comment image to the rescue/moderator queue, but the temp file
+  was unlinked at account end — so the later rescue failed (image-only comments lost; text+image comments lost their
+  image). The image is now kept until its consumer runs, with a startup sweep reclaiming any crash-orphaned temp.
+- **Two accounts holding the same post in the same group both get recovered.** A held-record dedup keyed only on
+  post+group dropped the second account's card; it now scopes by poster, so both are approved and both comments placed.
+- **Moderation: an approved post whose comment can't be placed is retried, not lost** (moderation is off by default). A
+  transient "not in feed" no longer strands the link behind a stale "approved" record — the post is re-opened for the
+  moderator (bounded to 3 re-opens, then surfaced as failed) instead of silently vanishing under a false "100% delivered".
+- **Remote API hardening:** `POST /api/automation/interval` no longer 500s (leaking a stack) on an empty body, and a
+  terminal error middleware routes malformed-JSON / upload-limit errors through the generic-message contract (no
+  stack/path leak to a tunnel-exposed client).
+- **Bulk account import validates names** (letters/numbers/underscore, like single-add) so a pasted name can't corrupt a
+  profile path or inject into a card's `id` — plus those `id` attributes are escaped as defense-in-depth.
+- **Proxy passwords containing `:` survive the Proxies-table edit round-trip** (were truncated on save).
+- **Rapid group/pace/filter toggles can't lost-update each other** — renderer account writes are serialized.
+- **Progress-ledger durability:** a corrupt ledger is quarantined instead of overwriting the good backup, and the
+  in-memory rollup commits only after a successful write (a failed write no longer diverges from disk).
+- **Migrated cookies land where the app reads them** (sanitized account key) so accounts with special-character names
+  keep their session.
+- **Reserve / moderator / re-post browsers hard-kill on a close-hang** so a stuck Chromium can't orphan on the profile.
+
+242 tests green. Fixes touching posting/recovery paths were cleared by an adversarial multi-agent verify.
+
 ## [1.0.14] — 2026-07-08 — Per-account group membership check
 
 A new operator tool: for any account, check whether it's actually a **member** of each of its assigned groups

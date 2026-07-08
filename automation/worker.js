@@ -11,6 +11,17 @@ let axios; try { axios = require('axios'); } catch {}
 let proxyChain; try { proxyChain = require('proxy-chain'); } catch {}
 
 const store = require('../lib/store');
+
+// One-time sweep of orphaned comment-image temps (zpv-*) in the OS temp dir. A temp handed off to the rescue/moderator
+// queue is intentionally kept past runAccount's cleanup so its consumer can upload it; if that consumer never runs
+// (crash/abort between persist and the rescue phase), the file would leak. Reclaim any older than 24h at module load.
+try {
+  const _tmp = os.tmpdir(), _cut = Date.now() - 24 * 3600 * 1000;
+  for (const f of fs.readdirSync(_tmp)) {
+    if (!/^(zpv-|za-img-)/.test(f)) continue; // zpv- = varied images; za-img- = downloaded (URL) images that were handed off un-varied
+    try { const p = path.join(_tmp, f); if (fs.statSync(p).mtimeMs < _cut) fs.unlinkSync(p); } catch {}
+  }
+} catch {}
 const { chromiumPath } = require('../lib/chromium');
 const spintax = require('../lib/spintax');
 const imageVary = require('../lib/imageVary');
@@ -3348,7 +3359,15 @@ async function runAccount(o) {
     // socket after an abrupt browser kill — which would never let runAccount return and would wedge the whole
     // pool (the orchestrator awaits each slot). Race it against an 8s cap.
     if (anonLocal && proxyChain) { try { await Promise.race([proxyChain.closeAnonymizedProxy(anonLocal, true).catch(() => {}), sleep(8000)]); } catch {} }
-    for (const t of tempImages) { try { fs.unlinkSync(t); } catch {} }
+    // Do NOT delete a comment image that was handed off to a persisted rescue/moderator queue — those are consumed
+    // LATER (after the orchestrator persists the queue + a later rescue/moderator phase), so unlinking them here (the
+    // old behaviour) makes their uploadFile ENOENT → image-only comments lost, text+image comments lose their image
+    // (fires under the default config, varyImages on). Derive the keep-set from the ACTUAL queued records so no push
+    // site can be missed; a startup sweep (below) reclaims any kept temp whose consumer never ran (crash/abort).
+    const _handedOff = new Set();
+    for (const q of commentQueue) if (q && q.commentImg) _handedOff.add(q.commentImg);
+    for (const h of heldRecords) if (h && h.commentImg) _handedOff.add(h.commentImg);
+    for (const t of tempImages) { if (_handedOff.has(t)) continue; try { fs.unlinkSync(t); } catch {} }
   }
   // fullyPosted = the post landed in EVERY targeted group, none pending, no errors — only then is it
   // safe to auto-delete from the library (a partial publish must be kept). See orchestrator deal gate.

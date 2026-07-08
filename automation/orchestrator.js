@@ -740,7 +740,11 @@ class Orchestrator {
                   // Skip if an ACTIVE or already-HANDLED record exists for this (post,group) — held (awaiting),
                   // superseded (a re-post was dispatched), or failed_held (re-post also held, capped). This stops
                   // a replacement's own hold (or a re-hold of the same post) from spawning a phantom fresh 'held'.
-                  if (!ms.held.some((x) => x.postId === h.postId && x.gid === h.gid && (x.status === 'held' || x.status === 'superseded' || x.status === 'failed_held'))) {
+                  // Scope by posterAccount too: postId is the LIBRARY id (not a unique FB id), so two DIFFERENT accounts
+                  // holding the SAME post in the SAME shared group are two genuinely distinct FB cards — without this the
+                  // second is deduped away and its card is never approved + its comment lost. (Same-account re-hold still
+                  // collapses.) Mirrors the poster-scoped handoff dedup. No double-post risk: two real cards, two accounts.
+                  if (!ms.held.some((x) => x.postId === h.postId && x.gid === h.gid && (x.posterAccount || '') === (h.posterAccount || '') && (x.status === 'held' || x.status === 'superseded' || x.status === 'failed_held'))) {
                     ms.held.push({ ...h, status: 'held', permalink: null, heldAt: Date.now(), approvedAt: null, commentedAt: null });
                   }
                 }
@@ -2201,16 +2205,41 @@ class Orchestrator {
                   else if (outcome === 'notfound') {
                     if (settings.moderationEnabled) {
                       // MODERATION ON: live-but-not-in-public-feed → actually HELD in Spam potentiel. RE-HOME it into the
-                      // moderator queue (so the moderator approves it → the comment is re-queued), and close this record.
-                      rec.status = 'rehomed'; rec.note = 're-homed to moderator approval (held in Spam potentiel)';
+                      // moderator queue (so the moderator approves it → the comment re-queues), then close THIS record.
                       if (task.captionSnip || task.postId) {
                         store.updateModeration((ms) => { // serialized moderation write
-                          // Veto re-insertion on ALL non-pruned statuses including the TERMINAL ones (failed_held =
-                          // capped undeliverable, superseded = a re-post is mid-flight) so a capped post isn't re-homed every cycle.
-                          const dup = (ms.held || []).some((x) => x.gid === task.gid && ((task.captionSnip && x.captionSnip) ? x.captionSnip === task.captionSnip : (!!x.postId && !!task.postId && x.postId === task.postId)) && (x.status === 'held' || x.status === 'approved' || x.status === 'failed_held' || x.status === 'superseded'));
+                          ms.held = ms.held || [];
+                          const match = (x) => x.gid === task.gid && ((task.captionSnip && x.captionSnip) ? x.captionSnip === task.captionSnip : (!!x.postId && !!task.postId && x.postId === task.postId));
+                          // RE-OPEN a stale 'approved' record (set when this comment was handed off) back to 'held' so the
+                          // moderator releases it AGAIN → the comment re-queues. Previously that 'approved' record VETOED the
+                          // re-home push while rec was already 'rehomed' → the link vanished with a false "100% delivered".
+                          const approved = ms.held.find((x) => match(x) && x.status === 'approved');
+                          if (approved) {
+                            approved.reopenCount = (approved.reopenCount || 0) + 1;
+                            if (approved.reopenCount > 3) {
+                              // BOUNDED: after 3 re-opens the post is permanently un-placeable (FB keeps re-holding it) — stop
+                              // re-approving it forever (the moderator only re-approves 'held'). Mark it terminally failed +
+                              // surface it, instead of an unbounded re-home → re-approve → re-queue → notfound loop.
+                              approved.status = 'failed'; approved.heldFailedAt = Date.now(); approved.note = 'approved but its comment could never be placed after 3 re-opens — live WITHOUT its comment';
+                              this.log(`❌ [${task.groupName || task.gid}] post repeatedly held after approval — giving up re-homing (live without its comment); place it manually.`);
+                            } else {
+                              approved.status = 'held'; approved.approvedAt = null; approved.note = 're-opened: approved but its comment could not be placed (still held in Spam potentiel)'; // keep the ORIGINAL heldAt so the 90-min STALE prune can still fire as a backstop
+                              this.log(`🔁 [${task.groupName || task.gid}] approved post's comment couldn't be placed — re-opened for the moderator to release again (${approved.reopenCount}/3)`);
+                            }
+                            return;
+                          }
+                          // Else push a fresh card, vetoed only by a genuinely LIVE owner (held = awaiting, superseded = a
+                          // re-post is mid-flight, failed_held = capped undeliverable) so a live/dead owner isn't duplicated.
+                          const dup = ms.held.some((x) => match(x) && (x.status === 'held' || x.status === 'failed_held' || x.status === 'superseded'));
                           if (!dup) { ms.held.push({ postId: task.postId || null, gid: task.gid, posterAccount: task.posterAccount || null, fbDisplayName: '', captionSnip: task.captionSnip || '', postCaption: task.postCaption || null, groupName: task.groupName || null, comment: task.comment || '', commentImg: task.commentImg || null, postPermalink: task.postPermalink || null, status: 'held', heldAt: Date.now(), approvedAt: null, source: 'rescue_notfound' }); this.log(`🔁 [${task.groupName || task.gid}] orphaned comment looks HELD — re-homed to moderator approval`); }
                         });
+                        rec.status = 'rehomed'; rec.note = 're-homed to moderator approval (held in Spam potentiel)';
+                      } else if (rec.attempts >= 3) {
+                        // No id/caption to re-home to a specific card → surface after 3 attempts instead of a silent 'rehomed' drop.
+                        rec.status = 'failed'; rec.note = 'post held in "Spam potentiel" but has no id/caption to re-home to the moderator — live WITHOUT its comment';
+                        this.log(`❌ [${task.groupName || task.gid}] link-comment could not be re-homed (no post id/caption) — live without its comment.`);
                       }
+                      // else (no identity, attempts < 3): leave rec 'pending' → retry next cycle.
                     } else if (rec.attempts >= 3) {
                       // MODERATION OFF (the owner's config): there is NO moderator to release a re-home, AND re-homing can
                       // be VETOED by a stale 'approved' held record left by an alreadyLive re-post → the link-comment would

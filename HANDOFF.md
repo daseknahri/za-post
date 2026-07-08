@@ -7,9 +7,9 @@ Last updated: 2026-07-08. Read this first when continuing in a new session.
 > the *how it works*. **Engineering process: [`DEVELOPMENT.md`](DEVELOPMENT.md)** · **never-break rules:
 > [`INVARIANTS.md`](INVARIANTS.md)** · **decision log: [`docs/decisions/`](docs/decisions/).**
 
-## ⭐ STATUS 2026-07-08 — v1.0.14
+## ⭐ STATUS 2026-07-08 — v1.0.15
 
-Recent hardening (v1.0.7 → v1.0.14), all shipped:
+Recent hardening (v1.0.7 → v1.0.15), all shipped:
 
 - **Owed-groups partial-delivery ledger** — when a run posts to only some of an account's groups (crash, rate-limit, pause), the undelivered groups are recorded and picked up next cycle instead of silently lost.
 - **Two-phase post-then-comment** — complete: the post is published first and confirmed, then the comment is attached in a second pass, so a comment failure no longer aborts or duplicates the post.
@@ -17,6 +17,7 @@ Recent hardening (v1.0.7 → v1.0.14), all shipped:
 - **Held-post recovery + login-cookie safety** — posts held in "Spam potentiel" are detected and recovered without duplicating; login/session cookies (incl. datr) are only persisted when actually logged in, so recovery and re-auth don't corrupt the profile.
 - **Persistent rotating tab pool (v1.0.13, ADR-0018)** — multi-tab posting reuses a small pool of open tabs (re-navigation) instead of opening/closing a fresh tab per group; more human, adversarially verified (no double-post/comment/leak), 242 tests green. Needs a live-FB run at `tabsPerBrowser=2`.
 - **Per-account membership check (v1.0.14)** — "🔎 Check membership" on each account card opens a hidden browser as that account and reports member/pending/not-member/logged-out per assigned group (read-only). A campaign started mid-check skips the account (new `isCheckOpen` guard) instead of killing its profile.
+- **App-wide gap hunt (v1.0.15)** — 8-subsystem adversarial hunt (find→refute→adjudicate) found 14 real gaps; **11 fixed** (comment-image handoff data-loss, held-record poster dedup, moderation re-open, server/renderer/store/migrate/lifecycle) — see CHANGELOG 1.0.15. Posting/recovery fixes cleared by a verify pass. 242 tests green.
 
 Process is now formalized (not just code):
 - **DEVELOPMENT.md** — engineering workflow, version/release discipline.
@@ -28,6 +29,7 @@ Open items:
 2. **License server** — bring live + issue real per-seat keys (enforcement marker exists; server does not).
 3. **Live-FB validations** — the tab pool, held-post recovery, two-phase comment, and owed-groups ledger still need confirmation against live Facebook at scale.
 4. **Keep committing per batch** — the v1.0.7→v1.0.12 backlog + engineering docs were checkpointed (commit `93bf9a1`); continue committing each batch.
+5. **DEFERRED from the v1.0.15 gap hunt** (a dedicated, separately-verified pass — they need coordinated persisted-state + resume changes; the no-over-post invariant is protected meanwhile): (a) moderation `markResult` notfound re-home — make the moderation write durable/ordered before the comment record is closed (a crash between the two write-chains can strand the link; moderation is off by default); (b) daily-schedule mode — an all-rate-limited fire-time cycle counts toward the day's quota, losing the day even after the fleet recovers; (c) daily N>1 sequence/unique — a mid-day crash drops the remaining cycles (persist + rehydrate the daily cycle counter).
 
 ---
 
