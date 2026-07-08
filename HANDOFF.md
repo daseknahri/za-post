@@ -7,15 +7,54 @@ Last updated: 2026-07-08. Read this first when continuing in a new session.
 > the *how it works*. **Engineering process: [`DEVELOPMENT.md`](DEVELOPMENT.md)** · **never-break rules:
 > [`INVARIANTS.md`](INVARIANTS.md)** · **decision log: [`docs/decisions/`](docs/decisions/).**
 
-## ⭐ STATUS 2026-07-08 — v1.0.22
+## ⭐ STATUS 2026-07-08 — v1.0.27
 
-- **v1.0.22 — network post-link capture (opt-in, `capturePostLinkFromNetwork`, default OFF).** Two-phase posts can
-  read OUR post's permalink from Facebook's create-story GraphQL **response** instead of reloading+scrolling+hovering
-  the feed to scrape it (the old way was slow AND often failed — FB hides the feed permalink). Wrong-post-safe: the
-  captured id is a candidate; Phase 2 requires a positive caption/author match on the post's own page before
-  commenting (`forceContentVerify`), else falls back to the feed-scan. Two adversarial rounds; round 1 caught a real
-  wrong-post hole (redirect nulls `urlId` → content-verify skipped) — fixed (exact-gid capture + always-verify). The
-  owner tests it live: enable it and watch the log for "🔗 Captured the post's link from Facebook's publish response".
+### ➡️ CONTINUE HERE (switching laptops / new session)
+
+- **Branch:** `enhancements` (this is the live work branch; ~94 commits ahead of `main`, pushed to `origin` =
+  `github.com/daseknahri/za-post.git`, PRIVATE). On the other laptop: `git clone` (or `git fetch`) then
+  `git checkout enhancements`. Keep committing here; don't merge to `main` yet.
+- **Dev/test setup:** repo at `C:\zpost\za-post`, Electron userData = `za-post-restored` (`npm start` uses it). Test
+  the DEV CLONE each cycle; smoke-test packaged builds with an isolated `--user-data-dir`. To test a code change:
+  restart the app (kill the Electron procs under `node_modules\electron`, relaunch `electron .`) and tail
+  `%APPDATA%/za-post-restored/logs/automation.log` (step lines: `[ts] [account] [group] NN message`).
+- **⚠️ OPERATOR ACTION NEEDED — set each account's display name.** The test account showed FB "logged in as
+  (unknown)". With the operator's IDENTICAL captions, when a group has several of our posts the feed-scan can only
+  pick the newest **if it knows the account name**; otherwise it REFUSES and routes the comment to rescue (safe, but
+  it doesn't land). Setting display names makes comments land on the newest post. (A tiny unique per-post caption
+  marker would make targeting bulletproof — operator's call.)
+- **VERIFY ON FACEBOOK after the next run:** re-check the two test groups (Grandma's Cooking, Grandma's Tips) to
+  confirm the v1.0.27 double-comment fix end-to-end (no post with 2 comments / 0 comments).
+- **Watch the next run's log** for whether the network capture still fires (`captured link confirmed OUR post`) or now
+  safely defers (`resolved to a DIFFERENT group` / `queued for rescue`). The v1.0.27 ambiguity-reject may make it fire
+  less often — that's SAFE (falls to the group-scoped feed-scan).
+- **Next speed win (NOT built):** pre-OPEN the composer during the pipeline pre-load. Composer render is 6–17s and is
+  Facebook/network-bound (measured; anti-throttling flags already present) — the biggest per-post chunk left. Pre-opening
+  it in the pre-loaded background tab would hide it. Complex (touches the pipeline + composer state) → build carefully +
+  adversarially verify. Otherwise the real throughput lever is **parallel accounts** (v1.0.17 caps at 3 concurrent on one
+  real IP = ~3×; the tests ran 1 account = 1×).
+- **Deferred hardening backlog:** IP-level circuit breaker (#3 real-IP cascade limiter), viewport-vs-monitor geometry
+  clamp, daily-scheduler durability trio (lost-day / N>1 crash recovery), webp image varying (needs sharp or in-browser
+  canvas — jimp can't read webp).
+
+### This session (v1.0.22 → v1.0.27), all committed + tested (242 unit + 27 anti-spam green)
+
+- **v1.0.22 — network post-link capture (opt-in `capturePostLinkFromNetwork`, default OFF).** Read OUR post's
+  permalink from Facebook's create-story GraphQL response instead of reloading+scrolling+hovering the feed. Two-phase
+  only. Wrong-post-safe (candidate id, re-verified before commenting). Watch log: "🔗 Captured the post's link…".
+- **v1.0.23 — comment-locate nudge-loop trim** (ramped the feed-render waits).
+- **v1.0.24 — FIX: `droppedImage is not defined` crash** at the end of EVERY clean run (a v1.0.16 scope bug that the
+  speedups exposed; it was discarding the run's heldRecords/commentQueue/deal-marking). Hoisted to function scope.
+- **v1.0.25 — comment confirms by CAPTION** (not the unreliable author) + polls for slow permalink renders — stopped
+  the false "author mismatch" fallback so public posts comment via the direct link.
+- **v1.0.26 — trimmed INSTANT inter-group / inter-comment pacing** (operator-requested; anti-spam velocity tradeoff,
+  kept jittered + ~0.5s floor). NON-instant tiers unchanged.
+- **v1.0.27 — FIX: DOUBLE-COMMENT** (operator found 2 comments on one post, 0 on the next). Root: identical caption +
+  same account across all groups/runs → only GROUP + RECENCY disambiguate. The network capture grabbed a wrong id
+  (cross-group late response via a non-gid field fallback; and same-group older post via first-match). Fixed at
+  capture: only OUR exact-gid post URL, and only when EXACTLY ONE distinct same-group id (else → group-scoped
+  feed-scan); + a group check at comment time. **INVARIANT: never trust caption/author alone to identify WHICH post is
+  ours — group-scope + recency.** See CHANGELOG 1.0.27 + memory `za-post-completion-audit`.
 
 Recent hardening (v1.0.7 → v1.0.22), all shipped:
 
