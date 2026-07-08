@@ -1774,7 +1774,7 @@ async function _credentialLoginOnce(page, email, password, log, name) {
 // Per-document stealth spoofs applied to EVERY posting tab (the main one AND each paced-multi-tab prefetch tab) via
 // evaluateOnNewDocument BEFORE it navigates: report the page as visible/focused and on-screen (the window is parked at
 // -32000) and keep navigator.webdriver false. sx/sy = the account's stable per-name screen offset.
-function stealthSpoof(sx, sy) {
+function stealthSpoof(sx, sy, hwc) {
   Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
   Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
   try { Object.defineProperty(Document.prototype, 'hasFocus', { configurable: true, value: () => true }); } catch { try { document.hasFocus = () => true; } catch {} }
@@ -1784,6 +1784,13 @@ function stealthSpoof(sx, sy) {
     catch { try { Object.defineProperty(window, pv[0], { configurable: true, get: () => pv[1] }); } catch {} }
   }
   try { Object.defineProperty(navigator, 'webdriver', { configurable: true, get: () => undefined }); } catch {}
+  // Per-account, COHERENT fingerprint de-clustering (real-IP fleet safety): all accounts run real Chrome on ONE host, so
+  // without this ~1/6 of the fleet shares one device fingerprint — a linked-account cluster from the one IP. Vary ONLY
+  // navigator.hardwareConcurrency — a JS-only axis with NO Sec-CH-* HTTP-header twin, so a JS override stays self-consistent.
+  // deviceMemory is DELIBERATELY NOT spoofed: it has a Sec-CH-Device-Memory header the network stack computes from the REAL
+  // host RAM (evaluateOnNewDocument can't touch it), so a JS override would CONTRADICT the header — the exact self-inconsistent
+  // fingerprint ADR-0001's captcha loop came from. Same reason UA/canvas/WebGL are not forged.
+  try { if (hwc) Object.defineProperty(navigator, 'hardwareConcurrency', { configurable: true, get: () => hwc }); } catch {}
 }
 
 async function runAccount(o) {
@@ -1989,6 +1996,12 @@ async function runAccount(o) {
     // present the SAME plausible on-screen position (not the -32000 off-screen truth). Distinct between accounts.
     let _scrH = 0; for (let _i = 0; _i < name.length; _i++) _scrH = (_scrH * 31 + name.charCodeAt(_i)) >>> 0;
     const _scrX = 60 + (_scrH % 900), _scrY = 30 + (_scrH % 500);
+    // Per-account, STABLE (name-seeded), PLAUSIBLE hardwareConcurrency — so 400 accounts on one host+IP don't share one
+    // device fingerprint. Capped at the REAL core count so it never over-reports cores (a mild tell). deviceMemory is NOT
+    // spoofed (Sec-CH-Device-Memory header would contradict it — see stealthSpoof / ADR-0001). Passed to every page.
+    const _cores = (os.cpus() && os.cpus().length) || 4;
+    const _hwPool = [2, 4, 6, 8, 12].filter((n) => n <= _cores);
+    const _acctHwc = _hwPool.length ? _hwPool[_scrH % _hwPool.length] : _cores;
     let cdpSession = null, hiddenWindowId = null; // H-1: keep the windowId so we can re-park later (H-2)
     try { cdpSession = await page.target().createCDPSession(); }
     catch (e) { log(`⚠️ [${name}] CDP attach failed (${e.message}) — focus/hide setup skipped, window may be visible`); }
@@ -2021,7 +2034,7 @@ async function runAccount(o) {
     }
     // The per-document spoofs (visible/focused + plausible on-screen screenX/Y + webdriver=false) — see stealthSpoof.
     // Applied here to the main tab; the paced-multi-tab path applies the SAME to each prefetch tab before it navigates.
-    try { await page.evaluateOnNewDocument(stealthSpoof, _scrX, _scrY); } catch {}
+    try { await page.evaluateOnNewDocument(stealthSpoof, _scrX, _scrY, _acctHwc); } catch {}
     // NOTE: we deliberately do NOT overridePermissions(clipboard) anymore. Caption/comment insertion uses CDP
     // Input.insertText + execCommand('insertText') — neither touches the OS clipboard — so the grant was unused, and
     // a pre-approved clipboard permission is itself a bot tell (navigator.permissions.query would read 'granted'
@@ -2322,7 +2335,7 @@ async function runAccount(o) {
       return { cdp, winId };
     };
     const _hardenTab = async (tab) => {
-      try { await tab.evaluateOnNewDocument(stealthSpoof, _scrX, _scrY); } catch {}
+      try { await tab.evaluateOnNewDocument(stealthSpoof, _scrX, _scrY, _acctHwc); } catch {}
       return _bindCdp(tab);
     };
     // ADR-0018 — PERSISTENT ROTATING TAB POOL. The old pipeline opened a FRESH tab per group and CLOSED it right after

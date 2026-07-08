@@ -18,6 +18,9 @@ Run real Chrome — never a fake or spoofed browser — through the single `laun
 ## Consequences
 This buys strong, correct per-account isolation: separate profiles, IPs, timezones, and locales, all funneled through one auditable launch path. The hard ceiling it accepts: every account shares the one hardware fingerprint that no software can honestly change. Therefore the real levers for scale are residential proxies (moving toward one clean IP per account) and human-like behavior — not the browser layer. Invariant to protect: the stealth `user-agent-override` evasion must stay disabled, and all launches must continue to go through `launchStealth` so no code path reintroduces UA forging or a fake browser.
 
+## Refinement (v1.0.17) — one COHERENT per-account fingerprint axis for real-IP fleet de-clustering
+The real-IP main method (whole fleet on ONE residential IP) exposed a gap this ADR's "share the one fingerprint" ceiling made worse: with only viewport varying, ~1/6 of a 400-account fleet was byte-identical — a linked-account cluster from one IP. So `stealthSpoof` now varies ONE axis: a stable (name-seeded), plausible `navigator.hardwareConcurrency`, capped at the real core count. This does NOT reverse "no fingerprint forging" — it is the narrow, ADR-consistent exception: `hardwareConcurrency` has **no `Sec-CH-*` HTTP-header twin**, so a JS override stays self-consistent. Deliberately **still not forged** (each would create the exact self-inconsistent fingerprint that caused the captcha loop): `deviceMemory` (has `Sec-CH-Device-Memory`, computed from real RAM by the network stack — `evaluateOnNewDocument` can't touch it), the UA/UA-CH, and canvas/WebGL (a detectable hook is a stronger tell than an identical hash). **New invariant:** only spoof fingerprint axes with no contradicting HTTP header. See `automation/worker.js` `stealthSpoof`, CHANGELOG 1.0.17.
+
 ## References
 - `lib/browser.js:22`
 - `lib/browser.js:70`

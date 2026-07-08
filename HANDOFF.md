@@ -7,9 +7,9 @@ Last updated: 2026-07-08. Read this first when continuing in a new session.
 > the *how it works*. **Engineering process: [`DEVELOPMENT.md`](DEVELOPMENT.md)** · **never-break rules:
 > [`INVARIANTS.md`](INVARIANTS.md)** · **decision log: [`docs/decisions/`](docs/decisions/).**
 
-## ⭐ STATUS 2026-07-08 — v1.0.16
+## ⭐ STATUS 2026-07-08 — v1.0.17
 
-Recent hardening (v1.0.7 → v1.0.16), all shipped:
+Recent hardening (v1.0.7 → v1.0.17), all shipped:
 
 - **Owed-groups partial-delivery ledger** — when a run posts to only some of an account's groups (crash, rate-limit, pause), the undelivered groups are recorded and picked up next cycle instead of silently lost.
 - **Two-phase post-then-comment** — complete: the post is published first and confirmed, then the comment is attached in a second pass, so a comment failure no longer aborts or duplicates the post.
@@ -19,6 +19,7 @@ Recent hardening (v1.0.7 → v1.0.16), all shipped:
 - **Per-account membership check (v1.0.14)** — "🔎 Check membership" on each account card opens a hidden browser as that account and reports member/pending/not-member/logged-out per assigned group (read-only). A campaign started mid-check skips the account (new `isCheckOpen` guard) instead of killing its profile.
 - **App-wide gap hunt (v1.0.15)** — 8-subsystem adversarial hunt (find→refute→adjudicate) found 14 real gaps; **11 fixed** (comment-image handoff data-loss, held-record poster dedup, moderation re-open, server/renderer/store/migrate/lifecycle) — see CHANGELOG 1.0.15. Posting/recovery fixes cleared by a verify pass. 242 tests green.
 - **Gap hunt round 2 (v1.0.16)** — 6 more fixed on the peripheral surfaces: Chrome-import account-destruction guard, licensing wrong-lockout (hwid sentinel + memoize), Quick-Setup account-removal, settings proxy-geo clobber, multi-image drop→auto-delete gate, login-close serialized write. Two HIGH + the auto-delete gate cleared by a verify pass. 242 tests green.
+- **Real-IP posting hardening (v1.0.17, the MAIN method)** — focused audit of the no-proxy path (whole fleet on ONE residential IP): capped real-IP concurrency at 3 (was ~16, RAM-driven; tunable `realIpMaxConcurrent`), paced real-IP top-ups (no back-to-back into the shared line), and de-clustered the fleet fingerprint (per-account `hardwareConcurrency`; deviceMemory NOT spoofed — Sec-CH header coherence, see ADR-0001 refinement). Reviewed; the review caught a deviceMemory header mismatch (fixed). 242 tests green.
 
 Process is now formalized (not just code):
 - **DEVELOPMENT.md** — engineering workflow, version/release discipline.
@@ -31,6 +32,7 @@ Open items:
 3. **Live-FB validations** — the tab pool, held-post recovery, two-phase comment, and owed-groups ledger still need confirmation against live Facebook at scale.
 4. **Keep committing per batch** — the v1.0.7→v1.0.12 backlog + engineering docs were checkpointed (commit `93bf9a1`); continue committing each batch.
 5. **DEFERRED from the v1.0.15 gap hunt** (a dedicated, separately-verified pass — they need coordinated persisted-state + resume changes; the no-over-post invariant is protected meanwhile): (a) moderation `markResult` notfound re-home — make the moderation write durable/ordered before the comment record is closed (a crash between the two write-chains can strand the link; moderation is off by default); (b) daily-schedule mode — an all-rate-limited fire-time cycle counts toward the day's quota, losing the day even after the fleet recovers; (c) daily N>1 sequence/unique — a mid-day crash drops the remaining cycles (persist + rehydrate the daily cycle counter).
+6. **DEFERRED from the v1.0.17 real-IP hardening** (dedicated pass; the v1.0.17 concurrency cap + fingerprint fix already attack the ROOT so the shared IP is far less likely to trip): (a) IP-level circuit breaker — after a cluster of same-cycle rate_limited drops, pause the shared IP fleet-wide instead of marching healthy reserves one-by-one into the same throttle (needs careful `coverDrop`/reserve-takeover surgery); (b) viewport-vs-monitor geometry — clamp/spoof so `innerWidth ≤ screen.width` coherently (needs standard-resolution modeling to avoid a NEW odd-resolution tell).
 
 ---
 

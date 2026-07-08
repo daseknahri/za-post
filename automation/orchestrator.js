@@ -1596,9 +1596,14 @@ class Orchestrator {
       // +1 slot if any account has no dedicated proxy (real IP). Floor 1 → never deadlocks.
       const _distinctIps = new Set(); let _haveReal = false;
       for (const a of queue) { const k = ipKey(a); if (k) _distinctIps.add(k); else _haveReal = true; }
+      // REAL-IP BAN-SAFETY CAP: with NO proxies the WHOLE fleet posts from ONE shared residential IP. hwCeil (RAM/CPU) is
+      // a memory-fit heuristic that scales the WRONG way (a beefier box posts MORE aggressively from the one line). Cap
+      // real-IP concurrency at a small, IP-plausible number (default 3 — "a home line runs a few browsers", not 16),
+      // independent of parallelAccounts/RAM. Tunable via settings.realIpMaxConcurrent (clamped 1..8). Only LOWERS concurrency.
+      const _realIpMax = Math.max(1, Math.min(8, Number(settings.realIpMaxConcurrent) || 3));
       const _proxyCeil = _distinctIps.size > 0
         ? _distinctIps.size + (_haveReal ? 1 : 0)              // proxies in play → bound concurrency to distinct proxies (+1 for any real-IP account)
-        : Math.max(1, Number(settings.parallelAccounts) || 2); // no proxies at all → fall back to the configured parallelism
+        : Math.min(Math.max(1, Number(settings.parallelAccounts) || 2), _realIpMax); // NO proxies → cap at _realIpMax so one shared IP is never driven by parallelAccounts/RAM alone
       // HARDWARE CEILING (400-account safety): each concurrent account is a headful Chrome + FB tabs (~450MB). On a
       // client laptop an operator can set parallelAccounts high and swap-thrash the machine into cascading 'transient'
       // failures. Cap the pool by free RAM (~450MB per headful Chrome, 60% of free) and ~2×cores. Min is 1 for deadlock
@@ -1701,6 +1706,17 @@ class Orchestrator {
         const _grp = (account.assignedGroups || []).length;
         if (cap > 0 && _grp > cap) { this._capWarned = this._capWarned || {}; if (!this._capWarned[account.name]) { this._capWarned[account.name] = 1; this.log(`⚠️ [${account.name}] daily cap ${cap} < its ${_grp} assigned groups — it won't reach all groups in a day (the cap counts group-posts, not distinct posts). Raise the cap to ≥${_grp} to cover all groups daily.`); } }
 
+        // REAL-IP PACING: with NO proxy the whole fleet posts from ONE shared IP, so completion-triggered TOP-UPS (which
+        // skip the initial-fill stagger above) must not fire back-to-back into that one line — a burst of fast-failing
+        // accounts would otherwise hammer it. Space each real-IP post-start by a jittered floor. Placed AFTER the
+        // skip-checks so a cooling/rested account isn't paced for nothing. Only ever LOWERS the launch rate.
+        if (myLaunch >= poolSize && !ipKey(account) && settings.staggerAccounts !== false && !this._shouldStop() && !stopPool && !this._finish) {
+          const _gap = settings.speedMode === 'instant' ? (5000 + Math.round(Math.random() * 8000)) : (15000 + Math.round(Math.random() * 30000)); // instant 5–13s, else 15–45s
+          this._lastRealIpLaunchAt = Math.max(Date.now(), (this._lastRealIpLaunchAt || 0) + _gap);
+          const _w = this._lastRealIpLaunchAt - Date.now();
+          if (_w > 0) await this._interruptibleSleep(_w);
+          if (this._shouldStop() || stopPool || this._finish) return;
+        }
         const t0 = Date.now(); if (!firstStart) firstStart = t0;
         this.log(`[${account.name}] Starting with ${(account.assignedGroups || []).length} groups`);
         this._setAcctState(account.name, 'running', { action: 'starting…' }); // flip the dashboard row to live

@@ -2,6 +2,32 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.17] — 2026-07-08 — Real-IP (no-proxy) posting hardening — the main method
+
+A focused audit of the real-IP path (the whole fleet posting from ONE residential IP — the main deployment) found
+and fixed the biggest ban-risk patterns for that configuration.
+
+### Changed / Fixed
+- **Concurrency on one IP is now capped for safety, not just by RAM.** With no proxies the fleet was limited only by
+  parallelAccounts/RAM — a beefy machine could run ~16 accounts posting simultaneously from one residential line (a
+  coordinated-inauthentic-behavior signal). Real-IP concurrency is now capped at a small, IP-plausible default (3,
+  tunable via `realIpMaxConcurrent`), independent of RAM. Your current default (2) is unchanged.
+- **Real-IP launches are paced.** Completion-triggered top-ups no longer fire back-to-back into the shared IP — each
+  real-IP start is spaced by a jittered gap (5–13s instant, 15–45s otherwise), so a burst of fast-failing accounts
+  can't hammer the line.
+- **The fleet no longer shares one browser fingerprint.** With every account on one host, only the viewport varied, so
+  ~1 in 6 accounts were byte-identical (a linked-account cluster). Each account now presents a stable, plausible
+  `hardwareConcurrency` (seeded by name, capped at the real core count) — the one axis safe to vary, because it has no
+  contradicting HTTP client-hint header (unlike `deviceMemory`, deliberately left alone; see ADR-0001).
+
+242 tests green. The pool changes only ever LOWER concurrency (no double-post/anti-link impact); the fingerprint change
+was reviewed for HTTP client-hint coherence (the ADR-0001 captcha-loop lesson — the review caught a deviceMemory
+header mismatch, which is why deviceMemory is not spoofed).
+
+### Deferred (a dedicated real-IP pass)
+- An IP-level circuit breaker (stop marching healthy reserves into an already-throttled shared IP).
+- Viewport-vs-monitor geometry coherence (avoid a window larger than the reported screen).
+
 ## [1.0.16] — 2026-07-08 — Gap hunt round 2 (6 fixes: Chrome-import, licensing, Quick Setup, settings, images)
 
 A second adversarial gap hunt on the surfaces round 1 didn't target (settings/UI, campaign-plan builder,
