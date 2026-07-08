@@ -1108,7 +1108,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       if (!navOk) { permalinkFailed = true; step('Comment: could not open the post link — falling back to the group feed'); }
       else {
         await page.waitForSelector('[aria-posinset], div[role="article"], [aria-label*="omment"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
-        const ready = await waitInteractive(10000);
+        const ready = await waitInteractive(4000); // permalink branch: the waitForSelector above (incl. [role=textbox]) + the commentBoxes/clickLeaveComment retry below are the REAL box gate, so this early-returns fast on a normal post page — a 4s budget is enough (the 10s stays on the busy-feed fallback where it's needed)
         step(ready ? 'Comment: post page ready' : 'Comment: post page not fully interactive (timeout) — trying anyway');
         await dismissPopups(page);
         const authBad = await withTimeout(page.evaluate(() => /continue as|use another profile|log in to facebook/i.test(document.body.innerText || '')), 8000, false);
@@ -2479,7 +2479,7 @@ async function runAccount(o) {
         if (offline) break;
         if (!navOk) { step('Navigation failed; skipping group'); errors++; report(groupName, gid, 'error', 'navigation failed', ''); continue; }
         for (let k = 1; k < _tabsWanted; k++) _prefetchGroup(i + k); // paced multi-tab: pre-load the next group(s) DURING this group's posting so their nav overlaps (no-op when tabsPerBrowser=1)
-        await sleep(settings.speedMode === 'instant' ? jitter(400, 0.3) : isFastMode(settings) ? jitter(1000, 0.3) : jitter(3000, 0.3)); // post-nav settle: instant = the operator's fire-fast tier (the auth/rate-limit checks below re-read the DOM anyway), fast/turbo shorter, normal/safe full ~3s
+        await sleep(settings.speedMode === 'instant' ? jitter(400, 0.3) : isFastMode(settings) ? jitter(1000, 0.3) : jitter(1500, 0.3)); // post-nav settle (OVERHEAD, not an anti-spam gap — the inter-group gap is applied at loop end): gotoGroup already resolved on domcontentloaded and the auth/rate-limit checks below re-read the live DOM with their own waits, so this fixed pre-settle only needs ~1.5s of React-hydration margin (instant/fast trim it further)
 
         // Per-group START banner — fired only after nav succeeds and before the auth checks.
         step('Group loaded');
@@ -2962,8 +2962,10 @@ async function runAccount(o) {
         step(_captureForTwoPhase ? 'Verifying the post landed + capturing its link for the comment pass…' : 'Verifying the post landed (reloading the group)…');
         await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
         await page.waitForSelector('[aria-posinset], div[role="article"]', { timeout: 25000 }).catch(() => {});
-        // Poll for the feed to actually render (slow feeds bury our fresh post) instead of a fixed 3s.
-        await page.waitForFunction(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length >= 3, { timeout: 15000 }).catch(() => {});
+        // Small render margin so the find-poll below has content (the waitForSelector above already gated the first article).
+        // Capped at 5s (was 15s): the find-poll loop that follows IS the real landed-verify — it scrolls + re-scans + caption+author
+        // matches OUR post on its own deadline, so this pre-wait only needs to give the feed a head start, not fully render it.
+        await page.waitForFunction(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length >= 3, { timeout: 5000 }).catch(() => {});
         await dismissPopups(page);
         // Find OUR post and capture its verified permalink. Caption-match the TOP-3 ONLY (a match further
         // down is an OLD duplicate, never our just-published post); scan top-8 for the newest-link

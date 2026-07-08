@@ -2,6 +2,27 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.18] — 2026-07-08 — Posting speedups for the single-IP setup (safe — no anti-spam change)
+
+With one IP the safe way to go faster is more groups/hour PER ACCOUNT, not more concurrency. A focused audit found
+four overhead/pipelining wins that recover wasted time WITHOUT touching the anti-spam gaps, the v1.0.17 concurrency
+cap, or any double-post/comment safety. (It also rejected the unsafe ideas — e.g. cutting the anti-spam pacing.)
+
+### Changed
+- **Multi-tab pipelining is now ON by default (`tabsPerBrowser` 1 → 2).** While an account posts to one group, the
+  NEXT group's page pre-loads in a hidden tab, so slow navigation OVERLAPS posting instead of blocking it (~1.5–4 min
+  saved per account per cycle at 20–30 groups). Publishing stays strictly sequential; every anti-spam gap and
+  double-post trap is unchanged; it's still one browser / one live IP per account (no extra IP concurrency). Set it
+  back to 1 for classic one-tab behavior, or 3–4 on strong hardware.
+- **Trimmed recoverable overhead in the posting/verify flow** (not anti-spam gaps): the normal post-nav settle 3s → 1.5s
+  (the auth/rate-limit checks re-read the DOM with their own waits anyway); the no-comment verify's redundant "≥3
+  articles" pre-wait 15s → 5s (the find-poll that follows is the real landed-check); the direct-permalink comment
+  interactivity wait 10s → 4s (the box-selector wait + retry are the real gate). ~30–90s more saved per account.
+
+242 tests green. All changes recover overhead only — the anti-spam floors, the real-IP concurrency cap + pacing
+(v1.0.17), and the double-post/comment/wrong-post guards are untouched. Validate on the dev clone that per-account
+wall-time drops with delivered counts identical and no double-posts.
+
 ## [1.0.17] — 2026-07-08 — Real-IP (no-proxy) posting hardening — the main method
 
 A focused audit of the real-IP path (the whole fleet posting from ONE residential IP — the main deployment) found

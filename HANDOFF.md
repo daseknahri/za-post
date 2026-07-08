@@ -7,9 +7,9 @@ Last updated: 2026-07-08. Read this first when continuing in a new session.
 > the *how it works*. **Engineering process: [`DEVELOPMENT.md`](DEVELOPMENT.md)** · **never-break rules:
 > [`INVARIANTS.md`](INVARIANTS.md)** · **decision log: [`docs/decisions/`](docs/decisions/).**
 
-## ⭐ STATUS 2026-07-08 — v1.0.17
+## ⭐ STATUS 2026-07-08 — v1.0.18
 
-Recent hardening (v1.0.7 → v1.0.17), all shipped:
+Recent hardening (v1.0.7 → v1.0.18), all shipped:
 
 - **Owed-groups partial-delivery ledger** — when a run posts to only some of an account's groups (crash, rate-limit, pause), the undelivered groups are recorded and picked up next cycle instead of silently lost.
 - **Two-phase post-then-comment** — complete: the post is published first and confirmed, then the comment is attached in a second pass, so a comment failure no longer aborts or duplicates the post.
@@ -20,6 +20,7 @@ Recent hardening (v1.0.7 → v1.0.17), all shipped:
 - **App-wide gap hunt (v1.0.15)** — 8-subsystem adversarial hunt (find→refute→adjudicate) found 14 real gaps; **11 fixed** (comment-image handoff data-loss, held-record poster dedup, moderation re-open, server/renderer/store/migrate/lifecycle) — see CHANGELOG 1.0.15. Posting/recovery fixes cleared by a verify pass. 242 tests green.
 - **Gap hunt round 2 (v1.0.16)** — 6 more fixed on the peripheral surfaces: Chrome-import account-destruction guard, licensing wrong-lockout (hwid sentinel + memoize), Quick-Setup account-removal, settings proxy-geo clobber, multi-image drop→auto-delete gate, login-close serialized write. Two HIGH + the auto-delete gate cleared by a verify pass. 242 tests green.
 - **Real-IP posting hardening (v1.0.17, the MAIN method)** — focused audit of the no-proxy path (whole fleet on ONE residential IP): capped real-IP concurrency at 3 (was ~16, RAM-driven; tunable `realIpMaxConcurrent`), paced real-IP top-ups (no back-to-back into the shared line), and de-clustered the fleet fingerprint (per-account `hardwareConcurrency`; deviceMemory NOT spoofed — Sec-CH header coherence, see ADR-0001 refinement). Reviewed; the review caught a deviceMemory header mismatch (fixed). 242 tests green.
+- **Single-IP posting speedups (v1.0.18)** — with one IP, faster = more groups/hour PER ACCOUNT (not more concurrency). Multi-tab pipelining now DEFAULT (`tabsPerBrowser` 1→2, overlaps nav with posting, ~1.5–4 min/account/cycle); trimmed recoverable overhead (post-nav settle 3s→1.5s, verify ≥3-articles pre-wait 15s→5s, permalink comment wait 10s→4s). Audit-verified SAFE — no anti-spam gap, concurrency cap, or double-post trap touched (unsafe ideas rejected). Needs a dev-clone timing check (wall-time drops, delivered counts identical, no double-posts).
 
 Process is now formalized (not just code):
 - **DEVELOPMENT.md** — engineering workflow, version/release discipline.
