@@ -1161,29 +1161,43 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         if (expectedPostId && urlId && urlId !== expectedPostId) {
           permalinkFailed = true; step('Comment: post link did not resolve to OUR post (id mismatch) — falling back to the group feed');
         } else if (forceContentVerify && expectedPostId) {
-          // NETWORK-CAPTURED id — provenance is Facebook's publish response, NOT a caption-verified feed article. So
-          // NOTHING about the id proves the page is OURS: a mis-parsed/foreign id builds a self-consistent link
-          // (urlId===expectedPostId but it's a STRANGER's post), AND a bad id can REDIRECT the page to the group root
-          // (nulling urlId). Therefore the ONLY thing that authorizes commenting here is a POSITIVE caption OR author
-          // match on the post's own page — checked for BOTH urlId===expectedPostId and urlId===null (closing the
-          // redirect gap the id-only branch below would otherwise leave open). Anything less demotes to the
-          // article-scoped, caption-matched feed-scan fallback → a network mis-grab can NEVER blind-comment.
-          const chk = await evalTimed(page, (arg) => {
-            const { s, author } = arg;
-            const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-            const a = document.querySelector('[aria-posinset], div[role="article"]');
-            if (!a) return { found: false };
-            const capOk = (s && s.length >= 12) ? norm(a.textContent).includes(norm(s)) : null;
-            const c = a.querySelector('h2 a, h3 a, h4 a, strong a, a strong, a[aria-label][href*="/user/"], a[aria-label][role="link"]');
-            const auth = norm(c ? (c.getAttribute('aria-label') || c.textContent) : '').slice(0, 60);
-            return { found: true, capOk, auth };
-          }, { s: snip.slice(0, 40), author: expAuthor }, 5000).catch(() => ({ found: false }));
-          const positiveCaption = chk.capOk === true;
-          const positiveAuthor = !!(expAuthor && chk.auth && chk.auth === expAuthor);
-          const authMismatch = !!(expAuthor && chk.auth && chk.auth !== expAuthor);
-          if (!chk.found || authMismatch || !(positiveCaption || positiveAuthor)) {
+          // NETWORK-CAPTURED id — its provenance is Facebook's publish response, NOT a caption-verified feed article,
+          // so the id/URL alone doesn't prove the page is OURS. Confirm on the POST'S OWN PAGE by a POSITIVE CAPTION
+          // match — the SAME single-article standard the feed-scan uses (see _scanFeedRaw: "caps.length === 1 → ours").
+          // The author is a positive CORROBORATOR only; a bare author mismatch does NOT reject a caption-confirmed post,
+          // because the account's configured display name is often stale/unknown (FB "logged in as (unknown)") — trusting
+          // it as a NEGATIVE was falsely rejecting our OWN posts and forcing a needless feed-scan on every comment.
+          // POLL: permalink pages render slowly on a real IP (a single early read misfires as a mismatch) — accept as
+          // soon as caption OR author matches; only after the deadline demote to the (wrong-post-guarded) feed-scan.
+          // Wrong-post safety holds: a foreign/mis-parsed id whose page does NOT carry our caption never confirms here
+          // (positiveCaption stays false → fall back for BOTH urlId===id and urlId===null), and the fallback is guarded.
+          let confirmed = false, sawArticle = false, lastAuth = '';
+          const cvDeadline = Date.now() + 5000;
+          do {
+            const chk = await evalTimed(page, (arg) => {
+              const { s } = arg;
+              const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+              const a = document.querySelector('[aria-posinset], div[role="article"]');
+              if (!a) return { found: false };
+              const capOk = (s && s.length >= 12) ? norm(a.textContent).includes(norm(s)) : null;
+              const c = a.querySelector('h2 a, h3 a, h4 a, strong a, a strong, a[aria-label][href*="/user/"], a[aria-label][role="link"]');
+              const auth = norm(c ? (c.getAttribute('aria-label') || c.textContent) : '').slice(0, 60);
+              return { found: true, capOk, auth };
+            }, { s: snip.slice(0, 40) }, 3000).catch(() => ({ found: false }));
+            if (chk.found) {
+              sawArticle = true; if (chk.auth) lastAuth = chk.auth;
+              const positiveCaption = chk.capOk === true;
+              const positiveAuthor = !!(expAuthor && chk.auth && chk.auth === expAuthor);
+              if (positiveCaption || positiveAuthor) { confirmed = true; break; }
+            }
+            if (Date.now() >= cvDeadline) break;
+            await sleep(600);
+          } while (true);
+          if (!confirmed) {
             permalinkFailed = true;
-            step(`Comment: the captured link did not positively confirm OUR post (${!chk.found ? 'unreadable' : authMismatch ? 'author mismatch' : 'no caption/author match'}) — falling back to the group feed`);
+            step(`Comment: the captured link didn't confirm OUR post (${sawArticle ? `caption not matched; author read="${lastAuth || '?'}"` : 'page not rendered'}) — falling back to the group feed`);
+          } else {
+            step('Comment: captured link confirmed OUR post (caption/author) — commenting directly');
           }
         } else if (expectedPostId && !urlId) {
           const domId = await evalTimed(page, () => { const a = document.querySelector('[aria-posinset], div[role="article"]'); const l = a && a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; }, null, 5000).catch(() => null);

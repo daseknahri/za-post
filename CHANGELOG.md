@@ -2,6 +2,27 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.25] — 2026-07-08 — Network-capture comment: confirm by caption (stop the false "author mismatch" fallback)
+
+Live monitoring showed the network-capture **post** phase working great (~6–8s, feed re-scan skipped), but **every
+comment** then logged *"the captured link did not positively confirm OUR post (author mismatch) — falling back to the
+group feed"* and did the slow feed-scan anyway. Root cause: the captured id was correct (the fallback found OUR post
+by caption at pos=1 every time), but the content-verify let an **author mismatch reject a good caption match** — and
+the account's display name is unreliable (FB reports *"logged in as (unknown)"*), plus the permalink page is often
+*"not fully interactive (timeout)"* when read. So a reliable positive signal (caption) was being overridden by an
+unreliable negative one (author).
+
+- **Confirm by caption, corroborate by author.** The network content-verify now confirms OUR post on a **positive
+  caption match** — the same single-article standard the feed-scan already uses (`_scanFeedRaw`: "one caption match →
+  ours"). Author match is a *positive* corroborator; a bare author mismatch no longer rejects a caption-confirmed post.
+- **Poll for slow renders.** It re-reads the post page for up to ~5s (accepting the instant it matches) instead of a
+  single early read that misfired on a not-yet-rendered permalink.
+- **Diagnostic.** On a genuine miss it now logs the author it actually read (`author read="…"`) to speed future triage.
+
+Wrong-post safety is preserved: a foreign/mis-parsed id whose page does not carry our caption never confirms here
+(→ feed-scan fallback, which is itself wrong-post-guarded via `idHit && capHit` for network ids). Net effect: public
+posts now comment via the **direct link** (skipping the feed-scan) instead of always falling back. 242 tests green.
+
 ## [1.0.24] — 2026-07-08 — Fix: `droppedImage is not defined` crash at the end of a clean run (live-monitor catch)
 
 Monitoring a live test run, an account **crashed at completion** with `droppedImage is not defined`, then retried.
