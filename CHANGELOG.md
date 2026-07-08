@@ -2,6 +2,22 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.23] — 2026-07-08 — Trim the comment-locate "nudge" loop (log-driven)
+
+Reading the owner's `automation.log` from a live run, the new dominant per-post cost (after the v1.0.20/1.0.21
+fixes) was the **comment-locate feed-scan**: `addFirstComment`'s fallback nudges the feed to lazy-render, up to 6
+times per check across **two** full checks (1st load + reload), with a flat `sleep(2000)` (1200 instant) between
+scans. On a silently-held post that never appears publicly, this burned ~30s only to conclude "held → moderator".
+
+- **Ramped the render-wait** in both nudge loops: flat `2000ms` (normal) / `1200ms` (instant) → `1100/1700ms`
+  (normal) and `700/1100ms` (fast/instant), shorter on the early passes. `scanFeed` re-checks the feed on **every**
+  pass, so a slow-rendering public post is still located — just sooner — and a genuinely-held post gives up faster
+  (~8–12s off the worst case). The wrong-post guard lives entirely inside `scanFeed` and is untouched: this changes
+  only *how often* we re-check, never *what* is accepted. 242 tests green.
+
+> Note: that logged run was executed by a stale Electron instance started **before** the v1.0.20–1.0.22 commits, so
+> it still showed the 12s image-vary and 19.5s verify-reload those versions already eliminated. Restart required.
+
 ## [1.0.22] — 2026-07-08 — Capture the post link from Facebook's publish response (skip the slow feed re-scan)
 
 The slowest, flakiest step of a comment-bearing post was **taking the post's URL**: reload the group, scroll,

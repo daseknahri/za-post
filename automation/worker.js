@@ -1319,7 +1319,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           step(`Comment: our post not matched yet — nudging the feed to render (try ${_cs + 1}/6)`);
           await page.evaluate((y) => window.scrollBy(0, y), 800 + _cs * 300).catch(() => {});
           await page.waitForFunction((minN) => document.querySelectorAll('[aria-posinset], div[role="article"]').length >= minN, { timeout: 8000 }, Math.min(6 + _cs * 2, 15)).catch(() => {});
-          await sleep(settings.speedMode === 'instant' ? 1200 : 2000); // feed-nudge render wait — tightened for instant (loop continues to the deadline until our post is found, so the post is still located)
+          await sleep(isFastMode(settings) ? (_cs < 2 ? 700 : 1100) : (_cs < 2 ? 1100 : 1700)); // ramped feed-nudge render wait (was flat 2000 / 1200 instant) — scanFeed re-checks the feed EACH pass so a slow-rendering post is still located, just sooner; a genuinely-held post also gives up faster. The wrong-post guard lives in scanFeed (untouched) — this only changes HOW OFTEN we re-check, never WHAT is accepted.
           res = await scanFeed();
           _cs++;
         }
@@ -1344,7 +1344,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
             step(`Comment: 2nd check — nudging the feed to render (try ${_cs2 + 1}/6)`);
             await page.evaluate((y) => window.scrollBy(0, y), 800 + _cs2 * 300).catch(() => {});
             await page.waitForFunction((minN) => document.querySelectorAll('[aria-posinset], div[role="article"]').length >= minN, { timeout: 8000 }, Math.min(6 + _cs2 * 2, 15)).catch(() => {});
-            await sleep(settings.speedMode === 'instant' ? 1200 : 2000);
+            await sleep(isFastMode(settings) ? (_cs2 < 2 ? 700 : 1100) : (_cs2 < 2 ? 1100 : 1700)); // ramped (was flat 2000 / 1200 instant) — same rationale as the 1st-check loop above; scanFeed re-checks each pass so the post is still found, just sooner
             res = await scanFeed();
             _cs2++;
           }
