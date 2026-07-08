@@ -2,6 +2,32 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.16] — 2026-07-08 — Gap hunt round 2 (6 fixes: Chrome-import, licensing, Quick Setup, settings, images)
+
+A second adversarial gap hunt on the surfaces round 1 didn't target (settings/UI, campaign-plan builder,
+Chrome-import, licensing, image/media, app lifecycle) found 7 gaps; **6 are fixed here** — the 7th (a client-side
+expiry re-check) was left in place deliberately as defense-in-depth. No double-post/comment invariant was touched.
+
+### Fixed
+- **Chrome import can no longer silently destroy an account.** A Chrome import whose typed label sanitized to the
+  same name as a DIFFERENT, already-set-up account would overwrite that account's login cookies + credentials with
+  the wrong Facebook identity. It now adopts a name-match only when the target is a genuine empty placeholder (no
+  saved login/session); a real collision creates a new, distinct account instead.
+- **A valid license can no longer be wrongly locked out on a transient hiccup.** Reading the machine id could
+  momentarily fail (antivirus/registry lock) and fall back to a different value that read as "bound to a different
+  machine" — locking out a paying customer (and even the owner) and tearing down a running overnight campaign. The
+  machine id is now remembered once read, and a transient failure is treated as "re-check later," never a lockout.
+- **Quick Setup can now remove an account by clearing its groups.** Deselecting all of an account's groups in the
+  wizard previously left the old assignment on disk, so it kept posting to its old groups; the wizard now clears it.
+- **Settings/post-set saves no longer clobber freshly auto-detected proxy timezone/locale** (a stale UI snapshot
+  could revert the detected geo, leaking the host clock/language over a proxy IP).
+- **A multi-image post with a missing image file is now loud and safe** — it logs the dropped file and keeps the
+  library post (blocks auto-delete) instead of silently publishing fewer images and then deleting the source.
+- **Login-window credential capture uses a serialized write** so it can't clobber a concurrent Chrome-bridge update.
+
+242 tests green. The two HIGH fixes + the auto-delete gate were cleared by an adversarial verify (which caught one
+follow-on defect, fixed).
+
 ## [1.0.15] — 2026-07-08 — App-wide gap hunt (11 fixes)
 
 A full-power adversarial gap hunt across eight subsystems (find → independent refute → adjudicate) surfaced 14 real

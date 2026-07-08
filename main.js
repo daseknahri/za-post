@@ -406,7 +406,16 @@ async function importFromChromeBridge(payload) {
     // HIJACK an unrelated account: rebind its chromeCUser + OVERWRITE its cookie jar/creds with the wrong session,
     // silently destroying one account. Never overwrite a different identity.
     let acc = data.accounts.find((a) => a.chromeCUser && String(a.chromeCUser) === cUser)
-      || data.accounts.find((a) => (!a.chromeCUser || String(a.chromeCUser) === cUser) && store.sanitizeName(a.name).toLowerCase() === desired.toLowerCase());
+      || data.accounts.find((a) => {
+        if (store.sanitizeName(a.name).toLowerCase() !== desired.toLowerCase()) return false;
+        if (a.chromeCUser) return String(a.chromeCUser) === cUser; // bound → adopt only the SAME FB identity
+        // Unbound name-match: adopt ONLY a truly-EMPTY placeholder (no stored creds AND no stored FB session). Never
+        // rebind + overwrite an account that already has real creds/a live jar with a DIFFERENT FB identity — that would
+        // silently destroy it (the hazard named above). A collision with a REAL account falls through to a NEW account.
+        if (a.email || a.password) return false;
+        try { const _j = store.readCookies(a.name); if (Array.isArray(_j) && _j.some((c) => c.name === 'c_user')) return false; } catch { return false; }
+        return true;
+      });
     if (acc) { name = acc.name; acc.chromeCUser = cUser; if (label && !acc.alias) acc.alias = label; if (encEmail) acc.email = encEmail; if (encPass) acc.password = encPass; if (acc.status === 'not_logged_in') acc.lastMessage = ''; if (health) acc.chromeHealth = health; acc.chromeSeen = Date.now(); if (groups) acc.chromeGroups = matchConfiguredGroups(data, groups); }
     else {
       // NO overLimit('accounts') gate here (deliberately, unlike the sibling creators): the owner's licensing is
@@ -1561,8 +1570,12 @@ async function openLoginBrowser(accountName, opts = {}) {
         // Auto-capture: persist the credentials the user typed so auto-login can reuse them.
         if (captured.id && captured.pass) {
           try {
-            const d = getData(); const acc = d.accounts.find((a) => a.name === accountName);
-            if (acc) { acc.email = secret.encrypt(captured.id); acc.password = secret.encrypt(captured.pass); store.save(d); send('data-updated'); emit('automation-log', `🔑 [${accountName}] login credentials saved ${secret.available() ? '(encrypted)' : '(⚠️ OS encryption unavailable — stored as PLAINTEXT in data.json)'} for auto-login`); }
+            // Serialize on _writeChain + re-read fresh disk (this runs AFTER an awaited multi-second checkStatus probe,
+            // during which the Chrome bridge can commit a beacon/new-account) and touch ONLY this account's creds — a raw
+            // getData()+store.save(d) full-blob snapshot here would clobber any bridge write that landed in that window.
+            let _saved = false;
+            await store.update((dd) => { const acc = (dd.accounts || []).find((a) => a.name === accountName); if (acc) { acc.email = secret.encrypt(captured.id); acc.password = secret.encrypt(captured.pass); _saved = true; } });
+            if (_saved) { send('data-updated'); emit('automation-log', `🔑 [${accountName}] login credentials saved ${secret.available() ? '(encrypted)' : '(⚠️ OS encryption unavailable — stored as PLAINTEXT in data.json)'} for auto-login`); }
           } catch {}
         }
         emit('automation-log', `✅ [${accountName}] logged in as ${res.fbName || '(unknown)'} (c_user=${res.fbUserId || '?'})`);
@@ -1819,7 +1832,13 @@ function clampSettings(s) { return store.clampSettings(s); }
 ipcMain.handle('save-settings', async (_e, settings) => {
   try {
     const clean = clampSettings(settings);
+    // proxyTimezone/proxyLocale/proxyGeo are AUTO-DETECTED in the background (_detectProxyGeo on save-proxies). A
+    // concurrent save-settings / add-post-set from the renderer spreads a STALE appData.settings snapshot (the
+    // data-updated refresh is debounced) that would clobber that fresh detection → a proxied browser leaks the host
+    // clock/locale. Don't let a BLANK auto-managed key overwrite a detected one, and MERGE proxyGeo rather than replace it.
+    for (const k of ['proxyTimezone', 'proxyLocale']) if (clean[k] === '' || clean[k] == null) delete clean[k];
     const merged = await store.update((data) => {
+      if (clean.proxyGeo && data.settings && data.settings.proxyGeo) clean.proxyGeo = { ...data.settings.proxyGeo, ...clean.proxyGeo };
       data.settings = { ...store.DEFAULT_SETTINGS, ...data.settings, ...clean };
       return data.settings;
     });

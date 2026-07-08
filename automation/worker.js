@@ -2245,11 +2245,16 @@ async function runAccount(o) {
     }
 
     // Resolve images once: local files, or download remote URLs to temp.
-    let resolvedImages = (basePost.imagePaths && basePost.imagePaths.length ? basePost.imagePaths : (basePost.imagePath ? [basePost.imagePath] : []))
-      .filter((p) => p && fs.existsSync(p));
+    const _srcImgPaths = (basePost.imagePaths && basePost.imagePaths.length ? basePost.imagePaths : (basePost.imagePath ? [basePost.imagePath] : []));
+    let resolvedImages = _srcImgPaths.filter((p) => {
+      const ok = p && fs.existsSync(p);
+      if (p && !ok) log(`⚠️ [${name}] image file not found, dropping: ${p}`); // was SILENT for a MULTI-image post → it published fewer images than intended yet still reported fullyPosted → auto-delete could permanently lose the content
+      return ok;
+    });
+    let droppedImage = _srcImgPaths.length > resolvedImages.length; // ≥1 intended local image was missing → publish the survivors, but keep the library post (fullyPosted=false blocks auto-delete so the operator can fix the asset + re-run)
     if (!resolvedImages.length && basePost.imageUrl) {
       const dl = await downloadImage(basePost.imageUrl, (m) => log(`[${name}] ${m}`));
-      if (dl) { resolvedImages = [dl]; tempImages.push(dl); log(`⬇️ [${name}] image downloaded from URL`); }
+      if (dl) { resolvedImages = [dl]; tempImages.push(dl); droppedImage = false; log(`⬇️ [${name}] image downloaded from URL`); } // the URL image fully satisfies the requirement (stale local paths + a working imageUrl) → the post is COMPLETE, clear droppedImage so auto-delete is allowed
       else log(`⚠️ [${name}] image URL set but download failed — posting without image`);
     }
     // Comment image: explicit comment image, remote URL, or the post image when commentWithImage is on.
@@ -3371,7 +3376,7 @@ async function runAccount(o) {
   }
   // fullyPosted = the post landed in EVERY targeted group, none pending, no errors — only then is it
   // safe to auto-delete from the library (a partial publish must be kept). See orchestrator deal gate.
-  return { posted, errors, pendingApproval, noRetry, flag, rlKind, offline, heldRecords, commentQueue, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length };
+  return { posted, errors, pendingApproval, noRetry, flag, rlKind, offline, heldRecords, commentQueue, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length && !droppedImage };
 }
 
 // Cookie normalizer — consolidated into lib/store (SINGLE source, shared with main.js). Re-exported below so

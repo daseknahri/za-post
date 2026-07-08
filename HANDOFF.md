@@ -7,9 +7,9 @@ Last updated: 2026-07-08. Read this first when continuing in a new session.
 > the *how it works*. **Engineering process: [`DEVELOPMENT.md`](DEVELOPMENT.md)** · **never-break rules:
 > [`INVARIANTS.md`](INVARIANTS.md)** · **decision log: [`docs/decisions/`](docs/decisions/).**
 
-## ⭐ STATUS 2026-07-08 — v1.0.15
+## ⭐ STATUS 2026-07-08 — v1.0.16
 
-Recent hardening (v1.0.7 → v1.0.15), all shipped:
+Recent hardening (v1.0.7 → v1.0.16), all shipped:
 
 - **Owed-groups partial-delivery ledger** — when a run posts to only some of an account's groups (crash, rate-limit, pause), the undelivered groups are recorded and picked up next cycle instead of silently lost.
 - **Two-phase post-then-comment** — complete: the post is published first and confirmed, then the comment is attached in a second pass, so a comment failure no longer aborts or duplicates the post.
@@ -18,6 +18,7 @@ Recent hardening (v1.0.7 → v1.0.15), all shipped:
 - **Persistent rotating tab pool (v1.0.13, ADR-0018)** — multi-tab posting reuses a small pool of open tabs (re-navigation) instead of opening/closing a fresh tab per group; more human, adversarially verified (no double-post/comment/leak), 242 tests green. Needs a live-FB run at `tabsPerBrowser=2`.
 - **Per-account membership check (v1.0.14)** — "🔎 Check membership" on each account card opens a hidden browser as that account and reports member/pending/not-member/logged-out per assigned group (read-only). A campaign started mid-check skips the account (new `isCheckOpen` guard) instead of killing its profile.
 - **App-wide gap hunt (v1.0.15)** — 8-subsystem adversarial hunt (find→refute→adjudicate) found 14 real gaps; **11 fixed** (comment-image handoff data-loss, held-record poster dedup, moderation re-open, server/renderer/store/migrate/lifecycle) — see CHANGELOG 1.0.15. Posting/recovery fixes cleared by a verify pass. 242 tests green.
+- **Gap hunt round 2 (v1.0.16)** — 6 more fixed on the peripheral surfaces: Chrome-import account-destruction guard, licensing wrong-lockout (hwid sentinel + memoize), Quick-Setup account-removal, settings proxy-geo clobber, multi-image drop→auto-delete gate, login-close serialized write. Two HIGH + the auto-delete gate cleared by a verify pass. 242 tests green.
 
 Process is now formalized (not just code):
 - **DEVELOPMENT.md** — engineering workflow, version/release discipline.

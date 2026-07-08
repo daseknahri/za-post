@@ -2943,6 +2943,16 @@ async function qsApplyAccountGroups(thenStart, order, extraSettings, summaryFn) 
     acc.postSetId = ((qsState.batchPostSet || {})[_sig]) || null; // POST-SETS: this batch draws only from its assigned set ('' / none → whole library)
     if (acc.standby) reserveN++; else activeN++;
   }
+  // An account whose groups were DESELECTED in Quick Setup is excluded from `participating`, so the loop above never
+  // rewrites it — it would keep its OLD assignedGroups + campaign-plan order and silently keep posting, contradicting
+  // the previewed plan. Reset the EXCLUDED posters the wizard actually showed so deselecting an account removes it.
+  const _participatingNames = new Set(participating.map((a) => a.name));
+  for (const a of qsPosters()) {
+    if (_participatingNames.has(a.name)) continue;
+    const acc = fresh.accounts.find((x) => x.name === a.name);
+    if (!acc || acc.isModerator || acc.enabled === false) continue;
+    if ((acc.assignedGroups || []).length || acc.postingOrder === 'campaign-plan') { acc.assignedGroups = []; acc.postingOrder = 'post-centric-unique'; acc.standby = false; }
+  }
   // If batches were given proxies, turn the global proxy toggle ON so the engine enforces the different-IP rule
   // (per-account proxies are honored regardless, but this also makes readiness + the pool fallback consistent).
   if (Object.values(batchProx).some(Boolean)) fresh.useProxies = true;
