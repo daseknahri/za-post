@@ -2,6 +2,27 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.14] — 2026-07-08 — Per-account group membership check
+
+A new operator tool: for any account, check whether it's actually a **member** of each of its assigned groups
+*before* running a campaign — so you catch "not a member yet / pending / logged out" groups up front instead of
+discovering them as failed posts.
+
+### Added
+- **"🔎 Check membership" button on each account card.** Opens a hidden browser as that account (through its own
+  proxy, same identity as posting) and visits each assigned group, reporting **member / pending / not a member /
+  logged out / unavailable** as a status list, with live progress in the log. Read-only — it never posts. Refuses
+  to run while a campaign or a login window is using that account's profile (one browser per profile). Detection is
+  tuned for the English Facebook UI (set accounts to English).
+
+### Fixed
+- **A campaign started *during* an in-flight check can no longer disturb the profile.** The worker now sees an
+  in-flight membership check (a new `isCheckOpen` guard, threaded exactly like the existing login-browser guard) and
+  **skips** that account for the cycle instead of force-killing the check's browser and deleting its lock files —
+  which risked profile corruption. (Found by the code review of this feature.)
+
+242 tests green.
+
 ## [1.0.13] — 2026-07-08 — Persistent rotating tab pool (ADR-0018)
 
 Implements [ADR-0018](docs/decisions/ADR-0018-persistent-rotating-tab-pool.md). With multi-tab posting

@@ -120,6 +120,7 @@ class Orchestrator {
     this.options = options || {};
     this._proxyHealth = new ProxyHealthManager(); // E-X3: per-proxy failure tracking + cool-down
     this.isLoginOpen = (this.options && typeof this.options.isLoginOpen === 'function') ? this.options.isLoginOpen : () => false;
+    this.isCheckOpen = (this.options && typeof this.options.isCheckOpen === 'function') ? this.options.isCheckOpen : () => false; // a read-only membership check holds this account's profile → skip it (don't profile-kill a live check)
     this.running = false;
     this._stop = false;
     this._paused = false;
@@ -701,7 +702,7 @@ class Orchestrator {
             useProxies: !!data.useProxies, proxies: data.proxies || [], assignedProxy: (this._proxyForAccount ? this._proxyForAccount(account) : null), // cycle-pinned pool proxy the anti-link gate serialized on — worker must use the SAME one
             log: (m) => { this.log(m); this._setAcctAction(account.name, m); }, // mirror each worker step into the live dashboard panel
             shouldStop: () => this._shouldStop(),
-            isLoginOpen: this.isLoginOpen,
+            isLoginOpen: this.isLoginOpen, isCheckOpen: this.isCheckOpen,
             registerAborter: (abort) => this._registerAborter(abort),
             isOnline: () => isOnline(), // lets the worker bail fast when offline instead of burning nav timeouts
             reportProxy: (p, ok, reason) => this.reportProxy(p, ok, reason), // E-X3: per-proxy health from the worker
@@ -2081,7 +2082,7 @@ class Orchestrator {
                 permalink: rec.postPermalink || null, expectedPostId: rec.postId || null, expectedAuthor: rec.fbDisplayName || '', // permalink-direct + author-aware liveness → no duplicate re-post of an auto-released post, no strand on a stranger's same-caption post
                 settings, useProxies: !!data.useProxies, proxies: data.proxies || [],
                 log: (m) => this.log(m), shouldStop: () => this._shouldStop(),
-                isLoginOpen: this.isLoginOpen, registerAborter: (ab) => this._registerAborter(ab),
+                isLoginOpen: this.isLoginOpen, isCheckOpen: this.isCheckOpen, registerAborter: (ab) => this._registerAborter(ab),
                 onResult: (rc) => { try { store.appendReport(rc); } catch {} },
                 isOnline: () => isOnline(), waitIfPaused: () => this._waitWhilePaused(), isPaused: () => this._paused,
               }).catch((e) => { this.log(`♻️ re-post error: ${e.message}`); return { posted: 0, heldRecords: [], commentQueue: [] }; });

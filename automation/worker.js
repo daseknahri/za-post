@@ -1776,7 +1776,7 @@ function stealthSpoof(sx, sy) {
 }
 
 async function runAccount(o) {
-  const { account, post: basePost, groups, useProxies, proxies, assignedProxy, log, shouldStop, isLoginOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused, isDisabled, maxThisRun } = o;
+  const { account, post: basePost, groups, useProxies, proxies, assignedProxy, log, shouldStop, isLoginOpen, isCheckOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused, isDisabled, maxThisRun } = o;
   const reportProxy = typeof o.reportProxy === 'function' ? o.reportProxy : () => {}; // E-X3: proxy health (no-op if absent)
   const isOnCooldown = typeof o.isOnCooldown === 'function' ? o.isOnCooldown : () => false; // E-X3: skip a cooling POOL proxy
   // Per-(post,group) dedup ledger — the orchestrator passes these ONLY in deal-once modes (campaign-plan/unique/
@@ -1807,10 +1807,13 @@ async function runAccount(o) {
     } catch {}
   };
 
-  // Fix #4: profile-lock guard — two Chromium instances can't share a userDataDir.
-  if (isLoginOpen && isLoginOpen(name)) {
-    log(`🚫 [${name}] login browser is open for this account — skipping`);
-    report('', '', 'skipped', 'login browser open for this account', '');
+  // Fix #4: profile-lock guard — two Chromium instances can't share a userDataDir. Also covers a read-only membership
+  // check in flight (isCheckOpen): SKIP the account this cycle rather than let the launch below force-kill the check's
+  // live Chromium + delete its Singleton lock files (which could corrupt the profile).
+  if ((isLoginOpen && isLoginOpen(name)) || (isCheckOpen && isCheckOpen(name))) {
+    const _why = (isCheckOpen && isCheckOpen(name)) ? 'membership check is running for this account' : 'login browser is open for this account';
+    log(`🚫 [${name}] ${_why} — skipping`);
+    report('', '', 'skipped', _why, '');
     return { posted: 0, errors: 1, pendingApproval: 0, noRetry: false, flag: null, postedIds: [] };
   }
 

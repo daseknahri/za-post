@@ -1505,6 +1505,54 @@ function openGroupPage(groupId, sub) {
     .catch((e) => showNotification('Could not open the group: ' + (e.message || e), 'error'));
 }
 
+// Membership check: ask main to open a hidden browser AS this account and report member/pending/not-member per assigned
+// group (read-only). Shows live progress in the automation log; renders a per-group status panel when done.
+async function checkMemberships(accountName, btn) {
+  if (btn && btn.disabled) return;
+  const hint = document.getElementById(`mem-hint-${accountName}`);
+  const box = document.getElementById(`mem-status-${accountName}`);
+  if (btn) { btn.disabled = true; btn.textContent = '🔎 Checking…'; }
+  if (hint) hint.textContent = 'opening a hidden browser as this account — watch the log…';
+  if (box) { box.style.display = 'none'; box.innerHTML = ''; }
+  try {
+    const res = await window.electronAPI.invoke('check-account-memberships', accountName);
+    if (res && Array.isArray(res.results) && res.results.length && box) renderMembershipResults(box, res.results);
+    if (!res || !res.success) { showNotification((res && res.error) || 'Membership check failed', 'error'); if (hint) hint.textContent = ''; return; }
+    const memberN = (res.results || []).filter((x) => x.status === 'member').length;
+    if (hint) hint.textContent = `${memberN}/${(res.results || []).length} member`;
+  } catch (e) {
+    showNotification('Membership check failed: ' + (e.message || e), 'error');
+    if (hint) hint.textContent = '';
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔎 Check membership'; }
+  }
+}
+function renderMembershipResults(box, results) {
+  const M = {
+    member:      { i: '✅', t: 'Member',        c: '#22c55e' },
+    pending:     { i: '⏳', t: 'Pending',       c: '#f59e0b' },
+    not_member:  { i: '❌', t: 'Not a member',  c: '#ef4444' },
+    logged_out:  { i: '🔒', t: 'Logged out',    c: '#ef4444' },
+    unavailable: { i: '🚫', t: 'Unavailable',   c: '#9ca3af' },
+    unknown:     { i: '❓', t: 'Unknown',        c: '#9ca3af' },
+    error:       { i: '⚠️', t: 'Error',          c: '#9ca3af' },
+  };
+  const rows = results.map((r) => {
+    const m = M[r.status] || M.unknown;
+    return `<div style="display:flex; align-items:center; gap:6px; padding:3px 0; border-bottom:1px solid #273244;">
+      <span title="${escapeHtml(r.status)}">${m.i}</span>
+      <span style="flex:1; color:#e5e7eb;">${escapeHtml(r.name || r.groupId)}</span>
+      <span style="color:${m.c}; font-weight:600; white-space:nowrap;">${m.t}</span>
+    </div>`;
+  }).join('');
+  const cantPost = results.filter((r) => r.status === 'not_member' || r.status === 'pending' || r.status === 'logged_out').length;
+  const summary = cantPost
+    ? `<div style="margin-top:5px; color:#f59e0b;">⚠️ ${cantPost} group(s) this account can't post to yet — not a member / pending / logged out.</div>`
+    : `<div style="margin-top:5px; color:#22c55e;">All assigned groups are joinable ✓</div>`;
+  box.innerHTML = rows + summary;
+  box.style.display = 'block';
+}
+
 function openAddGroupModal() {
   document.getElementById('group-id').value = '';
   document.getElementById('group-name').value = '';
@@ -1962,8 +2010,13 @@ function renderAccounts() {
               ${groupOptionsHtml}
             </div>
           </div>
+          <div style="display:flex; gap:6px; margin-top:6px; align-items:center;">
+            <button class="btn-secondary" onclick="checkMemberships('${account.name}', this)" title="Open a hidden browser AS this account and check whether it is a MEMBER of each assigned group (member / pending / not a member / logged out). Read-only — never posts. Stop the campaign first (one browser per profile)." style="font-size:11px; padding:5px 9px; white-space:nowrap;">🔎 Check membership</button>
+            <span id="mem-hint-${account.name}" style="font-size:10px; color:#94a3b8;"></span>
+          </div>
+          <div id="mem-status-${account.name}" style="display:none; margin-top:6px; font-size:11px;"></div>
         </div>
-        
+
         <!-- Posting options (compact): method (read-only) · speed · post-filter · auto-login -->
         <div class="account-posting-method" style="margin:7px 0;padding:8px 10px;background:#1e293b;border-radius:8px;display:flex;flex-direction:column;gap:6px;">
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">

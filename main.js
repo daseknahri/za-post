@@ -242,6 +242,7 @@ async function applyTunnelState(enabled) {
 let orchestrator = null;
 let userPauseActions = 0; // bumped on every USER pause/resume so suspend/resume can detect user intent
 const loginBrowsers = new Map(); // accountName -> { browser, interval }
+const membershipChecks = new Set(); // accounts with a read-only membership check in flight (one Chromium per profile — the worker skips these, see isCheckOpen)
 
 // ---- helpers -----------------------------------------------------------
 function getData() { return store.load(); }
@@ -529,7 +530,7 @@ app.whenReady().then(async () => {
 
   ensureDesktopShortcut(); // first-run: drop a desktop icon (portable build has no installer)
 
-  orchestrator = new Orchestrator(emit, { isLoginOpen: (name) => loginBrowsers.has(name) });
+  orchestrator = new Orchestrator(emit, { isLoginOpen: (name) => loginBrowsers.has(name), isCheckOpen: (name) => membershipChecks.has(name) });
 
   // Survive laptop sleep: a suspend drops every Chromium CDP connection, so HOLD the run on
   // suspend and continue on wake. We only auto-resume a pause WE triggered (not a user pause).
@@ -1724,6 +1725,85 @@ ipcMain.handle('open-account-browser', async (_e, accountName, groupId) => {
 ipcMain.handle('auto-login-account', async (_e, accountName) => {
   try { await openLoginBrowser(accountName, { mode: 'autologin' }); return ok(); }
   catch (e) { return fail(e); }
+});
+// MEMBERSHIP CHECK — for the given account, open a HIDDEN browser AS that account (its own proxy/geo, same identity as
+// posting) and visit each ASSIGNED group to report member / pending / not-member / logged-out. READ-ONLY: it never posts,
+// so it can't double-post or trip any posting trap. Refuses while automation OR a login window is using the profile (one
+// Chromium per profile — a second launch on the same userDataDir would collide). Emits per-group progress to the log for
+// live feedback; returns the full status list for the UI. Mirrors openLoginBrowser's launch so the read is identity-accurate.
+// (`membershipChecks` is declared up near `loginBrowsers` so the Orchestrator's isCheckOpen predicate sees it — the worker
+// SKIPS an account whose check is in flight rather than force-killing its profile, so a campaign started mid-check is safe.)
+ipcMain.handle('check-account-memberships', async (_e, accountName) => {
+  if (orchestrator && orchestrator.isRunning()) return { success: false, error: 'Stop the campaign first — automation is using this account’s browser.' };
+  if (loginBrowsers.has(accountName)) return { success: false, error: 'A login/browse window is open for this account — close it first.' };
+  if (membershipChecks.has(accountName)) return { success: false, error: 'A membership check is already running for this account.' };
+  const _d = getData();
+  const acct = (_d.accounts || []).find((a) => a.name === accountName);
+  if (!acct) return { success: false, error: 'account not found' };
+  const groups = (acct.assignedGroups || []).map((id) => (_d.groups || []).find((g) => g.id === id || g.groupId === id)).filter((g) => g && (g.groupId || g.id));
+  if (!groups.length) return { success: false, error: 'This account has no assigned groups to check.' };
+  membershipChecks.add(accountName);
+  emit('automation-log', `🔎 [${accountName}] checking membership of ${groups.length} assigned group(s)… (opens a hidden browser as this account)`);
+  // Route through the account's OWN proxy + geo, exactly like the posting/login browser — otherwise the group reads from a
+  // different IP than it posts from, which both skews the result and risks an "unusual location" flag. Same pool pick as the worker.
+  const _useProxies = !!_d.useProxies, _proxies = _d.proxies || [];
+  let _proxyArg = '', _anonLocal = null, _proxyAuth = null;
+  try {
+    const { parseProxy } = require('./automation/worker');
+    let pstr = (acct.proxy && String(acct.proxy).trim()) || '';
+    if (!pstr && _useProxies && _proxies.length) { let h = 0; for (let i = 0; i < accountName.length; i++) h = (h * 31 + accountName.charCodeAt(i)) >>> 0; pstr = _proxies[h % _proxies.length]; }
+    if (pstr) { const pp = parseProxy(pstr); if (pp) { if (pp.username && proxyChain) { _anonLocal = await proxyChain.anonymizeProxy(pp.upstream).catch(() => null); if (_anonLocal) _proxyArg = `--proxy-server=${_anonLocal}`; else { _proxyArg = `--proxy-server=${pp.server}`; _proxyAuth = pp; } } else { _proxyArg = `--proxy-server=${pp.server}`; if (pp.username) _proxyAuth = pp; } } }
+  } catch {}
+  const _vp = viewportFor(accountName);
+  try { store.sanitizeProfile(accountName, false); } catch {} // headless probe: clear saved tabs / off-screen bounds so it doesn't restore 40 old tabs
+  let browser = null; const results = [];
+  try {
+    browser = await launchStealth({ headless: true, userDataDir: store.profileDir(accountName), defaultViewport: { width: _vp.width, height: _vp.height }, args: [...(_proxyArg ? [_proxyArg] : [])] });
+    const _pgs = await browser.pages(); const page = _pgs[0] || (await browser.newPage());
+    if (_proxyAuth && _proxyAuth.username) { try { await page.authenticate({ username: _proxyAuth.username, password: _proxyAuth.password || '' }); } catch {} }
+    if (_proxyArg) { try { await applyProxyGeo(page, acct, _d.settings || {}, _useProxies, _proxies, () => {}); } catch {} }
+    let consecErr = 0;
+    for (const g of groups) {
+      const gid = g.groupId || g.id; let status = 'error', detail = '';
+      try {
+        await page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await new Promise((r) => setTimeout(r, 3500 + Math.floor(_vp.width % 1500))); // let the SPA settle (deterministic small pad, no Math.random)
+        const r = await page.evaluate(() => {
+          const txts = Array.from(document.querySelectorAll('[role="button"],span,div,a')).map((e) => (e.textContent || '').trim());
+          const has = (re) => txts.some((t) => re.test(t));
+          return {
+            write: has(/write something|what'?s on your mind|start a discussion|create a public post|create a post/i),
+            join: has(/^join group$/i),
+            pending: has(/^cancel request$/i) || has(/request to join sent|your request is pending|awaiting approval/i),
+            login: has(/^log in$/i) || has(/log in to continue|you must log in/i),
+            unavailable: has(/this content isn'?t available|content isn'?t available right now|isn'?t available at the moment/i),
+          };
+        });
+        if (r.login) status = 'logged_out';
+        else if (r.unavailable) status = 'unavailable';
+        else if (r.pending) status = 'pending';
+        else if (r.write && !r.join) status = 'member';
+        else if (r.join) status = 'not_member';
+        else status = 'unknown';
+        consecErr = 0;
+      } catch (e) { status = 'error'; detail = (e && e.message) || String(e); consecErr++; }
+      const icon = { member: '✅', pending: '⏳', not_member: '❌', logged_out: '🔒', unavailable: '🚫', unknown: '❓', error: '⚠️' }[status] || '❓';
+      emit('automation-log', `🔎 [${accountName}] ${icon} ${status.replace('_', '-')} — ${g.name || gid}`);
+      results.push({ groupId: gid, name: g.name || gid, status, detail });
+      if (consecErr >= 3) { emit('automation-log', `🔎 [${accountName}] 3 group loads failed in a row — the session/proxy looks broken; stopping the check early`); break; }
+    }
+  } catch (e) {
+    membershipChecks.delete(accountName);
+    if (browser) { try { await browser.close().catch(() => {}); } catch {} }
+    if (_anonLocal && proxyChain) { try { await Promise.race([proxyChain.closeAnonymizedProxy(_anonLocal, true).catch(() => {}), new Promise((r) => setTimeout(r, 8000))]); } catch {} }
+    return { success: false, error: 'Could not open the account browser: ' + ((e && e.message) || e) + (results.length ? ' (partial results returned)' : ''), results };
+  }
+  if (browser) { try { await browser.close().catch(() => {}); } catch {} }
+  if (_anonLocal && proxyChain) { try { await Promise.race([proxyChain.closeAnonymizedProxy(_anonLocal, true).catch(() => {}), new Promise((r) => setTimeout(r, 8000))]); } catch {} }
+  membershipChecks.delete(accountName);
+  const memberN = results.filter((x) => x.status === 'member').length;
+  emit('automation-log', `🔎 [${accountName}] membership check done — ${memberN}/${results.length} member`);
+  return { success: true, results };
 });
 
 // =======================================================================
