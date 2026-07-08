@@ -125,6 +125,7 @@ async function isContentLive(account, gid, captionSnip, settings, log, shouldSto
   } catch { return 'absent'; } // best-effort: an error shouldn't permanently block delivery (cap-1 bounds any dup)
   finally {
     try { if (browser) await Promise.race([browser.close().catch(() => {}), sleep(8000)]); } catch {} // BOUNDED — browser.close() is an OS process-shutdown that bypasses protocolTimeout; a proxied Chromium can hang on a CLOSE_WAIT socket forever and wedge the whole re-post phase (matches worker.js/rescue.js/moderator.js)
+    try { const proc = browser && browser.process && browser.process(); if (proc && !proc.killed) proc.kill('SIGKILL'); } catch {} // HARD-KILL if the bounded close hung — else the Chromium orphans on the reserve's profile (holds the lock + RAM until next launch); mirrors worker.js's proc.kill fallback
     if (anonLocal && proxyChain) { try { await Promise.race([proxyChain.closeAnonymizedProxy(anonLocal, true).catch(() => {}), sleep(8000)]); } catch {} } // free the local proxy port (bounded)
   }
 }

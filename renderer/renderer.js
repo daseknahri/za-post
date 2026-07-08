@@ -373,6 +373,7 @@ async function bulkImportAccounts() {
   if (!raw) { showNotification('Paste some accounts first', 'error'); return; }
   const seen = new Set();
   const accounts = [];
+  let invalid = 0;
   for (const line of raw.split('\n')) {
     const t = line.trim();
     if (!t) continue;
@@ -380,16 +381,18 @@ async function bulkImportAccounts() {
     const parts = t.split(sep).map((s) => s.trim());
     const name = parts[0];
     if (!name || /^name$/i.test(name)) continue;           // skip blanks + a header row
+    if (!/^[a-zA-Z0-9_]+$/.test(name)) { invalid++; continue; } // account.name is an identifier (profile dir + DOM ids) — reject non-[A-Za-z0-9_] like single-add, so a pasted name can't corrupt a profile path or inject into a card's id=""
     if (seen.has(name.toLowerCase())) continue;            // de-dupe within the paste
     seen.add(name.toLowerCase());
     accounts.push({ name, alias: parts[1] || '', proxy: parts[2] || '', email: parts[3] || '', password: parts[4] || '' });
   }
-  if (!accounts.length) { showNotification('No valid accounts found (each line needs at least a name)', 'error'); return; }
+  if (!accounts.length) { showNotification('No valid accounts found (each line needs a name using only letters, numbers, underscores)' + (invalid ? ` — ${invalid} line(s) had invalid name characters` : ''), 'error'); return; }
   const opts = _bulkAccountsCookiesDir ? { cookiesDir: _bulkAccountsCookiesDir } : {};
   const res = await window.electronAPI.addAccountsBulk(accounts, opts);
   if (res && res.success) {
     let msg = `Imported ${res.added} account(s)`;
     if (res.skipped) msg += `, ${res.skipped} skipped/duplicate`;
+    if (invalid) msg += ` · ${invalid} skipped (invalid name)`;
     if (res.withProxy) msg += ` · ${res.withProxy} with proxy`;
     if (res.withCreds) msg += ` · ${res.withCreds} with login`;
     if (res.cookiesLoaded) msg += ` · ${res.cookiesLoaded} cookie jar(s)`;
@@ -2006,15 +2009,15 @@ function renderAccounts() {
               <span>Select Groups</span>
               <span>▼</span>
             </button>
-            <div id="group-dropdown-${account.name}" class="group-dropdown-menu" style="display: none; position: absolute; top: 100%; left: 0; right: 0; background: #1f2937; border: 1px solid #374151; border-radius: 6px; max-height: 200px; overflow-y: auto; z-index: 100; margin-top: 4px;">
+            <div id="group-dropdown-${escapeAttr(account.name)}" class="group-dropdown-menu" style="display: none; position: absolute; top: 100%; left: 0; right: 0; background: #1f2937; border: 1px solid #374151; border-radius: 6px; max-height: 200px; overflow-y: auto; z-index: 100; margin-top: 4px;">
               ${groupOptionsHtml}
             </div>
           </div>
           <div style="display:flex; gap:6px; margin-top:6px; align-items:center;">
             <button class="btn-secondary" onclick="checkMemberships('${account.name}', this)" title="Open a hidden browser AS this account and check whether it is a MEMBER of each assigned group (member / pending / not a member / logged out). Read-only — never posts. Stop the campaign first (one browser per profile)." style="font-size:11px; padding:5px 9px; white-space:nowrap;">🔎 Check membership</button>
-            <span id="mem-hint-${account.name}" style="font-size:10px; color:#94a3b8;"></span>
+            <span id="mem-hint-${escapeAttr(account.name)}" style="font-size:10px; color:#94a3b8;"></span>
           </div>
-          <div id="mem-status-${account.name}" style="display:none; margin-top:6px; font-size:11px;"></div>
+          <div id="mem-status-${escapeAttr(account.name)}" style="display:none; margin-top:6px; font-size:11px;"></div>
         </div>
 
         <!-- Posting options (compact): method (read-only) · speed · post-filter · auto-login -->
@@ -2033,7 +2036,7 @@ function renderAccounts() {
           </div>
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px;">
             <span style="color:#94a3b8;white-space:nowrap;">📝 Filter</span>
-            <select id="post-filter-${account.name}" onchange="updatePostFilter('${account.name}', this.value)" title="Which posts this account sends" style="min-width:130px;padding:5px 8px;background:#1f2937;border:1px solid #374151;border-radius:6px;color:#e5e7eb;font-size:12px;cursor:pointer;">
+            <select id="post-filter-${escapeAttr(account.name)}" onchange="updatePostFilter('${account.name}', this.value)" title="Which posts this account sends" style="min-width:130px;padding:5px 8px;background:#1f2937;border:1px solid #374151;border-radius:6px;color:#e5e7eb;font-size:12px;cursor:pointer;">
               <option value="all" ${(account.postFilter || 'all') === 'all' ? 'selected' : ''}>📋 All Posts</option>
               <option value="with-comments" ${account.postFilter === 'with-comments' ? 'selected' : ''}>💬 With Comments</option>
               <option value="without-comments" ${account.postFilter === 'without-comments' ? 'selected' : ''}>📄 Without Comments</option>
@@ -2205,7 +2208,13 @@ function toggleGroupDropdown(accountName) {
 }
 
 // Toggle group assignment for an account
+// Serialize renderer structural account writes (assignedGroups / pace / filter) through ONE chain: each does
+// getData→mutate→saveData, so two rapid overlapping toggles would otherwise each carry a full snapshot and the later
+// save clobbers the earlier's edit (a lost update). The chain makes each read-modify-write finish before the next starts.
+let _acctWriteChain = Promise.resolve();
+function queueAcctWrite(fn) { const run = _acctWriteChain.then(fn, fn); _acctWriteChain = run.then(() => {}, () => {}); return run; }
 async function toggleGroupAssignment(accountName, groupId) {
+ return queueAcctWrite(async () => {
   // Work against FRESH backend data so we don't overwrite backend changes (e.g. auto-delete
   // during a running campaign) with a stale local appData.
   const fresh = await window.electronAPI.getData();
@@ -2239,6 +2248,7 @@ async function toggleGroupAssignment(accountName, groupId) {
       }
     }
   });
+ });
 }
 
 
@@ -2994,6 +3004,7 @@ async function doStartOverReset() {
 // object — so a per-field change can't clobber a concurrent backend write (e.g. the running orchestrator
 // updating an account's status). Returns the mutated account, or null if not found / save failed.
 async function patchAccount(accountName, mutate) {
+ return queueAcctWrite(async () => {
   const fresh = await window.electronAPI.getData();
   if (!fresh || !Array.isArray(fresh.accounts)) return null;
   const a = fresh.accounts.find((x) => x.name === accountName);
@@ -3003,6 +3014,7 @@ async function patchAccount(accountName, mutate) {
   if (res && res.success === false) { showNotification('Failed to save: ' + (res.error || 'unknown error'), 'error'); return null; }
   appData = fresh;
   return a;
+ });
 }
 
 // Update post filter for an account
@@ -4388,7 +4400,7 @@ function parseProxyStringTable(proxyStr) {
     ip: parts[0] || '',
     port: parts[1] || '',
     user: parts[2] || '',
-    pass: parts[3] || ''
+    pass: parts.slice(3).join(':') // password may contain ':' — keep the whole remainder (matches the backend's greedy parseProxy) so the load→edit→save round-trip is lossless
   };
 }
 

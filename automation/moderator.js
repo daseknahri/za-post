@@ -323,6 +323,7 @@ async function runModerator(o) {
     log(`❌ [moderator:${name}] ${e.message}`); out.errors++; return out;
   } finally {
     try { if (browser) await Promise.race([browser.close().catch(() => {}), sleep(8000)]); } catch {}
+    try { const proc = browser && browser.process && browser.process(); if (proc && !proc.killed) proc.kill('SIGKILL'); } catch {} // HARD-KILL if the bounded close hung — else the moderator Chromium orphans on the profile; mirrors worker.js's proc.kill fallback
     if (anonLocal && proxyChain) { try { await Promise.race([proxyChain.closeAnonymizedProxy(anonLocal, true).catch(() => {}), sleep(8000)]); } catch {} } // free the per-run local proxy port — BOUNDED (a Windows CLOSE_WAIT socket drain from the `true` flag can hang forever, which would wedge the whole moderation phase + every later cycle; matches worker.js/repost.js/rescue.js)
   }
 }

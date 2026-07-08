@@ -98,10 +98,15 @@ function main() {
 
   // ---- accounts: map + copy cookies.json from old per-account dir
   let cookieCopied = 0, cookieMissing = 0, withSession = 0;
+  const _sanitizeName = require('../lib/store').sanitizeName; // the app resolves each account's dir via sanitizeName — the DEST must use the same key or readCookies() returns [] and the migrated session is orphaned
+  const _seenDestKey = new Set();
   const accounts = (src.accounts || []).map((a) => {
     const name = a.name;
+    const key = _sanitizeName(name);
+    if (_seenDestKey.has(key)) console.warn(`⚠️ migrate: "${name}" sanitizes to the same dir "${key}" as another account — the app cannot distinguish them; rename one before running.`);
+    _seenDestKey.add(key);
     const srcCookies = path.join(SRC_ROOT, 'accounts', name, 'cookies.json');
-    const destDir = ensure(path.join(DEST_ACCOUNTS, name));
+    const destDir = ensure(path.join(DEST_ACCOUNTS, key));
     ensure(path.join(destDir, 'chrome-profile'));
     if (fs.existsSync(srcCookies)) {
       try {

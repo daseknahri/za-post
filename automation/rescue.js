@@ -123,7 +123,7 @@ async function runRescue(o) {
     log(`💬 [rescue:${name}] done — placed=${out.placed} failed=${out.failed}${out.blocked ? ' (stopped: rate-limited)' : ''}`);
     return out;
   } catch (e) { log(`❌ [rescue:${name}] ${e.message}`); return out; }
-  finally { try { if (sessionWatchdog) clearTimeout(sessionWatchdog); } catch {} try { if (browser) await Promise.race([browser.close().catch(() => {}), sleep(8000)]); } catch {} try { if (anonLocal && proxyChain) await Promise.race([proxyChain.closeAnonymizedProxy(anonLocal, true).catch(() => {}), sleep(8000)]); } catch {} }
+  finally { try { if (sessionWatchdog) clearTimeout(sessionWatchdog); } catch {} try { if (browser) await Promise.race([browser.close().catch(() => {}), sleep(8000)]); } catch {} try { const proc = browser && browser.process && browser.process(); if (proc && !proc.killed) proc.kill('SIGKILL'); } catch {} try { if (anonLocal && proxyChain) await Promise.race([proxyChain.closeAnonymizedProxy(anonLocal, true).catch(() => {}), sleep(8000)]); } catch {} }
 }
 
 module.exports = { runRescue };

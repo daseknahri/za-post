@@ -175,7 +175,8 @@ function startServer(port, injected) {
   app.get('/api/automation/logs', (_req, res) => res.json({ logs: logs.slice(-150).map(shapeLog) }));
   app.get('/api/tunnel-url', (_req, res) => res.json({ url: hooks.getTunnelUrl() || '' }));
   app.post('/api/automation/interval', async (req, res) => {
-    const minutes = parseInt(req.body.minutes ?? req.body.interval, 10);
+    const _b = req.body || {}; // Express 5 leaves req.body undefined on an empty/non-JSON body — guard before deref (else a token-bearing empty POST 500s with a stack)
+    const minutes = parseInt(_b.minutes ?? _b.interval, 10);
     if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
       return res.json({ success: false, error: 'Invalid interval. Must be between 1 and 1440 minutes.' });
     }
@@ -214,6 +215,16 @@ function startServer(port, injected) {
       await hooks.toggleAccount(req.params.name, req.body && req.body.enabled);
       res.json({ success: true });
     } catch (e) { apiErr(res, e); }
+  });
+
+  // Terminal error-handling middleware (AFTER all routes). Body-parser malformed-JSON SyntaxError and multer LIMIT_*
+  // errors are raised at the middleware layer BEFORE any route try/catch, so without this they fall to Express's
+  // finalhandler which returns err.stack (userData/asar paths) to the possibly-tunnel-exposed client. Route them
+  // through the SAME generic-message-only contract as apiErr — log the real error server-side, leak nothing over the wire.
+  app.use((err, _req, res, _next) => {
+    try { addLog(`API error (mw): ${(err && err.stack) || (err && err.message) || err}`); } catch {}
+    const code = (err && (err.status || err.statusCode)) || (err instanceof SyntaxError ? 400 : (err && err.code && String(err.code).startsWith('LIMIT_') ? 413 : 500));
+    if (!res.headersSent) res.status(code).json({ success: false, error: 'Operation failed' });
   });
 
   // Bind localhost-only by default (no LAN exposure). The Cloudflare tunnel still
