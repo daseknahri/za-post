@@ -2,6 +2,24 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.26] — 2026-07-08 — Trim the INSTANT inter-group / inter-comment pacing (operator-requested)
+
+Operator asked to cut the wait between groups. These gaps are **anti-spam velocity pacing** (not dead overhead — the
+next group already pre-loads during them), so this is a deliberate speed↔block-risk tradeoff, kept measured: still
+jittered, still floored (~0.5s) so the cadence never goes metronomic/sub-human on a single IP.
+
+- **Inter-group gap (instant):** `rand(1000, 3000)` → `rand(500, 1800)` (posting pass + the held-post exit path).
+- **Comment-to-comment cadence (Phase 2, instant):** `rand(800, 2500)` → `rand(500, 1600)` (kept slightly above the
+  post gap — link-drops are a touch more spam-sensitive).
+
+Left unchanged (load-bearing, not overhead): the post→comment aging gap, the ~1.8s post-publish settle (held-toast
+hydration), `waitForPublish`'s confirm + ceiling, and all non-instant tiers. 242 unit + 27 anti-spam checks green.
+
+> The within-post steps are already trimmed to the bone (v1.0.19–1.0.25); the remaining per-post time is mostly
+> Facebook's own publish (~5s) + render (~2s), which we can't cut. The real throughput multiplier is running the safe
+> max **parallel accounts** (capped at 3 concurrent on one real IP by v1.0.17) — that's 3× the posts/hour without
+> touching any per-post safety.
+
 ## [1.0.25] — 2026-07-08 — Network-capture comment: confirm by caption (stop the false "author mismatch" fallback)
 
 Live monitoring showed the network-capture **post** phase working great (~6–8s, feed re-scan skipped), but **every

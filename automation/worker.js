@@ -3047,7 +3047,7 @@ async function runAccount(o) {
           consecPubTimeouts = 0; // a HELD post is a CONFIRMED publish (FB accepted it, just gated) — it must NOT count toward the silent-throttle streak
           heldRecords.push({ postId: basePost.id || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip, postCaption: (post.caption || '').slice(0, 220), groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: null, source: 'pending_at_publish' });
           report(groupName, gid, 'pending', 'awaiting admin approval (immediate signal)', 'skipped');
-          if (i < targetGroups.length - 1) await sleepInterruptible(settings.speedMode === 'instant' ? rand(1000, 3000) : withFloor(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).group), softStop, 1000, isPaused, pauseHold);
+          if (i < targetGroups.length - 1) await sleepInterruptible(settings.speedMode === 'instant' ? rand(500, 1800) : withFloor(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).group), softStop, 1000, isPaused, pauseHold); // INSTANT inter-group gap after a HELD post — trimmed 1–3s→0.5–1.8s to match the main gap above
           continue;
         }
 
@@ -3336,7 +3336,7 @@ async function runAccount(o) {
       // Interruptible delay between groups (respects Stop + configurable groupDelay), jittered ±30%
       // so the cadence is never metronomic (a fixed gap is itself a bot signal).
       if (i < targetGroups.length - 1) {
-        const d = settings.speedMode === 'instant' ? rand(1000, 3000) : withFloor(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).group); // T2: randomized inter-group gap (instant=1–10s; turbo ~8s floor)
+        const d = settings.speedMode === 'instant' ? rand(500, 1800) : withFloor(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).group); // T2: randomized inter-group gap. INSTANT trimmed 1–3s→0.5–1.8s (operator-requested; the next group already pre-loads during this, so it's pure anti-spam pacing — kept a 500ms floor + jitter so the cadence is never metronomic/sub-human on a single IP)
         if (d > 0) {
           step(`Wait ${d >= 60000 ? Math.round(d / 60000) + 'min' : Math.round(d / 1000) + 's'} before next group`);
           await sleepInterruptible(d, softStop, 1000, isPaused, pauseHold);
@@ -3421,7 +3421,7 @@ async function runAccount(o) {
           for (let k = 1; k < _tabsWanted; k++) _prefetchComment(d + k);
           // Comment-to-comment cadence ONLY (no post→comment settle wait — the post already aged during Phase 1).
           if (d > 0 && !softStop()) {
-            const g = settings.speedMode === 'instant' ? rand(800, 2500) : withFloor(Math.round(rangeMs(settings, 'commentDelayMin', 'commentDelayMax', 60, 180, 30) * 0.4) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).comment);
+            const g = settings.speedMode === 'instant' ? rand(500, 1600) : withFloor(Math.round(rangeMs(settings, 'commentDelayMin', 'commentDelayMax', 60, 180, 30) * 0.4) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).comment); // INSTANT comment-to-comment cadence trimmed 0.8–2.5s→0.5–1.6s (link-drops are a touch more spam-sensitive than posts, so kept slightly above the post gap's floor)
             if (g > 0) await sleepInterruptible(g, softStop, 1000, isPaused, pauseHold);
           }
           let cres = commentLimited ? 'comment_limited' : 'failed';
