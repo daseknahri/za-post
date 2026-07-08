@@ -826,7 +826,7 @@ async function clickPostButton(page) {
 // Confirm the post actually published: the composer dialog closes OR the enabled
 // "Post" button disappears. Returns 'published' or 'timeout'.
 async function waitForPublish(page, dialogCountBefore, timeout = 45000, shouldStop = () => false, fast = false) {
-  await sleep(jitter(fast ? 500 : 1500, 0.3)); // let the click take effect before the first check (avoid a false positive) — jittered; instant polls sooner (the dialog-count-drop check below is authoritative, so a too-early first poll just loops)
+  await sleep(jitter(fast ? 200 : 1500, 0.3)); // let the click take effect before the first check — jittered; fast/instant polls sooner (the dialog-count-drop check below is authoritative + idempotent, so a too-early first poll just harmlessly loops — no false positive)
   const deadline = Date.now() + timeout;
   let timeouts = 0;
   while (Date.now() < deadline) {
@@ -858,7 +858,7 @@ async function waitForPublish(page, dialogCountBefore, timeout = 45000, shouldSt
     else timeouts = 0;
     if (sig === 'error') return 'error';
     if (sig === 'gone' || sig === 'submitted') return 'published';
-    await sleep(fast ? 900 : 2000); // poll cadence — instant detects the composer-close sooner; the timeout CEILING is unchanged (never shorten it → false 'timeout' → re-post → duplicate)
+    await sleep(fast ? 500 : 2000); // poll cadence — fast/instant detects the composer-close (the authoritative publish confirm) sooner; the timeout CEILING is unchanged (never shorten it → false 'timeout' → re-post → duplicate)
   }
   return 'timeout';
 }
@@ -933,23 +933,26 @@ async function humanType(page, text, settings = {}) {
 // Dismiss the modals Facebook throws up (cookie banner, "Turn on notifications",
 // "Your post might be reviewed", generic dialogs). Best-effort, never throws.
 async function dismissPopups(page) {
+  let _clicked = false;
   try {
-    await page.evaluate(() => {
+    _clicked = await page.evaluate(() => {
       const wants = ['allow all cookies', 'decline optional cookies', 'only allow essential', 'not now', 'ok', 'close', 'cancel', 'maybe later', 'got it',
         // FRENCH popup/cookie/dialog buttons
         'tout accepter', 'autoriser tous les cookies', 'refuser les cookies optionnels', 'uniquement les cookies essentiels', 'autoriser les cookies essentiels',
         'pas maintenant', "d'accord", 'fermer', 'annuler', 'plus tard', 'compris', 'continuer', 'accepter'];
       const clickable = Array.from(document.querySelectorAll('[role="button"], button, [aria-label]'));
+      let hit = false;
       for (const el of clickable) {
         const label = (el.getAttribute('aria-label') || el.textContent || '').trim().toLowerCase();
         if (label === 'close' || wants.includes(label)) {
           const r = el.getBoundingClientRect();
-          if (r.width && r.height) { el.click(); }
+          if (r.width && r.height) { el.click(); hit = true; }
         }
       }
+      return hit;
     });
   } catch {}
-  await sleep(jitter(500, 0.4)); // jittered settle (was a flat 500ms on every dismissPopups call)
+  if (_clicked) await sleep(jitter(300, 0.4)); // settle ONLY when something was actually clicked (let the click register) — the common NO-popup path pays nothing (was a flat 500ms every call)
 }
 
 // Classify a rate-limit / block wall by SEVERITY so the caller picks a proportionate cooldown:
@@ -1624,7 +1627,7 @@ async function verifyCaptionLanded(page, caption, ms = 6000) {
     // caption that didn't prefix-match (normalization) by re-entering ours — harmless.
     if (probe && norm.includes(probe)) return { landed: true, len };
     if (!r.marked && len >= need) return { landed: true, len };
-    await sleep(400);
+    await sleep(150); // poll granularity only (the landed test above + the caller's deadline are unchanged) — 400→150ms so a caption that commits late is detected a tick sooner, not after a full slice
   }
   return { landed: false, len };
 }
@@ -2479,7 +2482,7 @@ async function runAccount(o) {
         if (offline) break;
         if (!navOk) { step('Navigation failed; skipping group'); errors++; report(groupName, gid, 'error', 'navigation failed', ''); continue; }
         for (let k = 1; k < _tabsWanted; k++) _prefetchGroup(i + k); // paced multi-tab: pre-load the next group(s) DURING this group's posting so their nav overlaps (no-op when tabsPerBrowser=1)
-        await sleep(settings.speedMode === 'instant' ? jitter(400, 0.3) : isFastMode(settings) ? jitter(1000, 0.3) : jitter(1500, 0.3)); // post-nav settle (OVERHEAD, not an anti-spam gap — the inter-group gap is applied at loop end): gotoGroup already resolved on domcontentloaded and the auth/rate-limit checks below re-read the live DOM with their own waits, so this fixed pre-settle only needs ~1.5s of React-hydration margin (instant/fast trim it further)
+        await sleep(settings.speedMode === 'instant' ? jitter(400, 0.3) : isFastMode(settings) ? jitter(500, 0.3) : jitter(1500, 0.3)); // post-nav settle (OVERHEAD, not an anti-spam gap — the inter-group gap is applied at loop end): gotoGroup already resolved on domcontentloaded and the auth/rate-limit checks below re-read the live DOM with their own waits; keep ~500ms React-hydration margin (fast trimmed 1000→500; instant already 400; normal 1500) so the auth read doesn't false-flag on a bare pre-paint body
 
         // Per-group START banner — fired only after nav succeeds and before the auth checks.
         step('Group loaded');
@@ -2628,7 +2631,7 @@ async function runAccount(o) {
             await sleep(settleMs);
             try { if (!cdpSession) throw new Error('no cdp session'); await cdpSession.send('Input.insertText', { text: String(post.caption) }); }
             catch { try { await page.evaluate((t) => { const el = document.querySelector('[data-zp-editor="1"]') || document.activeElement; if (el) { el.focus(); document.execCommand('insertText', false, t); } }, post.caption); } catch {} }
-            await sleep(settings.speedMode === 'instant' ? 120 : 300); // let FB's React commit the inserted text before we read it
+            await sleep(settings.speedMode === 'instant' ? 60 : 300); // let FB's React commit the inserted text before we read it (instant 120→60ms — verifyCaptionLanded polls at 150ms right after, so an under-committed read just re-polls, never mis-verifies)
             return verifyCaptionLanded(page, post.caption, settings.speedMode === 'instant' ? 1000 : 3000);
           }
           await humanType(page, post.caption, settings);
@@ -2973,7 +2976,7 @@ async function runAccount(o) {
         // Small render margin so the find-poll below has content (the waitForSelector above already gated the first article).
         // Capped at 5s (was 15s): the find-poll loop that follows IS the real landed-verify — it scrolls + re-scans + caption+author
         // matches OUR post on its own deadline, so this pre-wait only needs to give the feed a head start, not fully render it.
-        await page.waitForFunction(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length >= 3, { timeout: 5000 }).catch(() => {});
+        await page.waitForFunction(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length >= 3, { timeout: 1500 }).catch(() => {}); // pre-wait HEAD-START only (waitForSelector above already gated ≥1 article; the find-poll below is the real landed-verify) — trimmed 5s→1.5s so a sparse chronological feed doesn't burn fixed time before the poll
         await dismissPopups(page);
         // Find OUR post and capture its verified permalink. Caption-match the TOP-3 ONLY (a match further
         // down is an OLD duplicate, never our just-published post); scan top-8 for the newest-link
@@ -3050,7 +3053,7 @@ async function runAccount(o) {
           // scrolls (lazy content) — that's why the post can be invisible to the scan. Nudge the feed a
           // couple of times so our post's caption renders, then re-scan.
           if (_renderScrolls < 3) { try { await page.evaluate((y) => window.scrollBy(0, y), 500 + _renderScrolls * 200); } catch {} _renderScrolls++; }
-          await sleep(1500);
+          await sleep(_renderScrolls < 2 ? 500 : 900); // inter-MISS re-scan gap (break-on-match above fires first) — shortened from a fixed 1500ms so a freshly-hydrated post is SEEN sooner; the 16s deadline + caption+author guard are unchanged
         } while (Date.now() < findDeadline);
 
         if (find && find.matched) {

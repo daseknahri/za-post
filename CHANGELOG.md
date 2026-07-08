@@ -2,6 +2,28 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.21] — 2026-07-08 — Question-every-step: trim the verify/publish/caption deadlines (fast/instant)
+
+A systematic "question every step" pass over the per-post flow (grounded in the test-log timings) confirmed the
+remaining time is mostly Facebook render + safety confirms — plus a handful of over-long fixed waits *between*
+re-checks. Trimmed only those: each keeps the SAME confirmation and just samples for it faster. Ten unsafe candidates
+were rejected (the tested 800ms composer render floor; the clear-editor settle that guards against a double-caption;
+the toast-hydration gate that catches held posts; skipping any auth/rate-limit check).
+
+### Changed (fast/instant tiers)
+- **Post-landed verify (the biggest chunk, ~19.5s):** the find-poll's inter-miss re-scan sleep 1.5s → 0.5–0.9s
+  (~2–4s/group), and the "≥3 articles" pre-wait 5s → 1.5s (up to ~3.5s on a sparse feed). The caption+author
+  wrong-post guard, the 16s ceiling, and break-on-match are unchanged — it just finds your post sooner.
+- **Caption verify:** poll interval 400ms → 150ms (~1s), so a late-committing caption is seen a tick sooner (the
+  landed test + survival re-entry unchanged); instant React-commit pad 120ms → 60ms.
+- **Publish confirm (waitForPublish):** poll cadence fast 900ms → 500ms, pre-check settle fast 500ms → 200ms
+  (~0.5–0.8s). The dialog-close confirmation (the double-post guard) and the timeout ceiling are untouched.
+- **Post-nav settle** fast tier 1000ms → 500ms (kept a 500ms hydration floor); **dismissPopups** only settles when it
+  actually clicked a popup (the common no-popup path pays nothing).
+
+242 tests green. Every trim samples an existing confirmation faster or removes a fixed pad — no publish-confirm,
+wrong-post guard, caption-drop guard, or anti-spam gap was weakened.
+
 ## [1.0.20] — 2026-07-08 — Fix the ~8s per-group image-vary stall (the "long pause after the composer opens")
 
 Reading the test log, the long pause right after the composer opens was **image variation**: jimp's hue rotation
