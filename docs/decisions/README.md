@@ -58,4 +58,4 @@ ADRs are append-only: to change a decision, write a new ADR and mark the old one
 | [0015](ADR-0015-remote-http-api-bulk-post-fill.md) | Token-gated remote HTTP API to fill the post library from an external server | Accepted |
 | [0016](ADR-0016-portable-zip-delivery-enforce-marker-migration.md) | Portable-zip delivery with a separate userData folder, build-time enforce marker, and non-overwriting first-run migration | Accepted |
 | [0017](ADR-0017-robustness-over-security-priority.md) | Robustness-over-security as the guiding priority for remaining work | Accepted |
-| [0018](ADR-0018-persistent-rotating-tab-pool.md) | Persistent rotating tab pool for multi-tab posting (reuse tabs by re-navigation instead of newPage/close churn) | Proposed |
+| [0018](ADR-0018-persistent-rotating-tab-pool.md) | Persistent rotating tab pool for multi-tab posting (reuse tabs by re-navigation instead of newPage/close churn) | Accepted |

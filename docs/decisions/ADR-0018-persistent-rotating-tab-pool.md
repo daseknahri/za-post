@@ -1,6 +1,6 @@
 # ADR-0018: Persistent rotating tab pool for multi-tab posting (reuse tabs by re-navigation instead of newPage/close churn)
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented in v1.0.13)
 - **Date:** 2026-07-08
 - **Deciders:** owner + engineering
 
@@ -19,12 +19,21 @@ This keeps the prefetch speed win (a second tab can still pre-load the next grou
 - **(b) One tab per group, all kept open (e.g. 40 tabs)** — rejected. At 400 accounts this is a memory blowup, and 40 simultaneous open Facebook tabs is itself an automation tell.
 
 ## Consequences
-On every tab switch we must rebind the CDP session, `hiddenWindowId`, and focus-emulation to the now-active tab. The current adopt path already performs exactly this rebinding, so the implementation keeps that logic and drops only the `_old.close()` call; the occasional recycle is added on top to release SPA memory. Double-post traps are keyed by `(post, group)`, so pool reuse cannot weaken them. The cost is a modest, bounded increase in resident memory per browser.
+On every tab switch we must rebind the CDP session, `hiddenWindowId`, and focus-emulation to the now-active tab. The adopt path already performed exactly this rebinding, so the implementation keeps that logic and drops only the `_old.close()` call; the occasional recycle is added on top to release SPA memory. Double-post traps are keyed by `(post, group)`, so pool reuse cannot weaken them. The cost is a modest, bounded increase in resident memory per browser.
 
-Not yet implemented. Because it touches the posting pipeline, it requires the standard change loop: audit -> fix -> multi-agent verify -> tests -> version bump.
+## Implementation (v1.0.13)
+
+The prefetch pipeline was converted to a bounded pool (`_pool = { free, live, activeNavs, epoch }`) shared by both the Phase-1 posting pass and the Phase-2 two-phase comment pass:
+
+- `_acquireTab` takes an idle tab from `_pool.free` (recycling any whose `navs >= _RECYCLE_EVERY` = 12), else grows the pool up to `tabsPerBrowser`, else returns `null` (the group then navigates on the active tab — graceful, never blocks).
+- On adopt, the just-finished active tab is `_releaseTab`'d back to `_pool.free` (reused, not closed); the pre-loaded tab becomes `page`.
+- `_hardenTab` was split so `_bindCdp` can re-bind a CDP session to an adopted tab if its original harden failed — so `cdpSession`/`hiddenWindowId` **always** track the active tab (never the just-released one).
+- A phase `epoch` guards a late `_dropPrefetch` release from leaking a stale-phase tab into the next pool.
+
+Cleared by a 5-dimension adversarial verify (double-post, double-comment, tab-accounting, CDP-rebind, async-races) — **no sacred-invariant violation**; two non-blocker defects it surfaced (the CDP-null adopt drift and the cross-phase drop leak) were fixed. With `tabsPerBrowser=1` the pool is never grown or rotated (byte-identical to before).
 
 ## References
-- `automation/worker.js:2302`
-- `automation/worker.js:2385`
-- `automation/worker.js:2280`
-- BRIEF (E), proposed 2026-07-08
+- `automation/worker.js` — `_pool` / `_makeTab` / `_acquireTab` / `_releaseTab` / `_bindCdp` (pool infra)
+- `automation/worker.js` — Phase-1 adopt block (comment `ROTATE (ADR-0018)`) and the `_cpf` Phase-2 mirror
+- `CHANGELOG.md` 1.0.13
+- proposed + accepted 2026-07-08

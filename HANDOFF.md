@@ -7,14 +7,15 @@ Last updated: 2026-07-08. Read this first when continuing in a new session.
 > the *how it works*. **Engineering process: [`DEVELOPMENT.md`](DEVELOPMENT.md)** · **never-break rules:
 > [`INVARIANTS.md`](INVARIANTS.md)** · **decision log: [`docs/decisions/`](docs/decisions/).**
 
-## ⭐ STATUS 2026-07-08 — v1.0.12
+## ⭐ STATUS 2026-07-08 — v1.0.13
 
-Recent hardening (v1.0.7 → v1.0.12), all shipped:
+Recent hardening (v1.0.7 → v1.0.13), all shipped:
 
 - **Owed-groups partial-delivery ledger** — when a run posts to only some of an account's groups (crash, rate-limit, pause), the undelivered groups are recorded and picked up next cycle instead of silently lost.
 - **Two-phase post-then-comment** — complete: the post is published first and confirmed, then the comment is attached in a second pass, so a comment failure no longer aborts or duplicates the post.
 - **Posting/compose hardening** — more resilient composer detection and retry; failed composes back out cleanly rather than leaving a half-typed dialog.
 - **Held-post recovery + login-cookie safety** — posts held in "Spam potentiel" are detected and recovered without duplicating; login/session cookies (incl. datr) are only persisted when actually logged in, so recovery and re-auth don't corrupt the profile.
+- **Persistent rotating tab pool (v1.0.13, ADR-0018)** — multi-tab posting reuses a small pool of open tabs (re-navigation) instead of opening/closing a fresh tab per group; more human, adversarially verified (no double-post/comment/leak), 242 tests green. Needs a live-FB run at `tabsPerBrowser=2`.
 
 Process is now formalized (not just code):
 - **DEVELOPMENT.md** — engineering workflow, version/release discipline.
@@ -22,10 +23,10 @@ Process is now formalized (not just code):
 - **docs/decisions/** — ADRs for significant design choices, including the proposed persistent tab-pool (ADR-0018).
 
 Open items:
-1. **Persistent tab-pool** — implement per [ADR-0018](docs/decisions/ADR-0018-persistent-rotating-tab-pool.md) (still Proposed, not built).
+1. **Persistent tab-pool** — BUILT in v1.0.13 ([ADR-0018](docs/decisions/ADR-0018-persistent-rotating-tab-pool.md), Accepted); needs a live-FB run at `tabsPerBrowser=2` to confirm behavior end-to-end.
 2. **License server** — bring live + issue real per-seat keys (enforcement marker exists; server does not).
-3. **Live-FB validations** — held-post recovery, two-phase comment, and owed-groups ledger still need confirmation against live Facebook at scale.
-4. **Commit the working tree** — weeks of work (v1.0.7→v1.0.12 + whole subsystems) are still uncommitted; see DEVELOPMENT.md.
+3. **Live-FB validations** — the tab pool, held-post recovery, two-phase comment, and owed-groups ledger still need confirmation against live Facebook at scale.
+4. **Keep committing per batch** — the v1.0.7→v1.0.12 backlog + engineering docs were checkpointed (commit `93bf9a1`); continue committing each batch.
 
 ---
 

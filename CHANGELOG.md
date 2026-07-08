@@ -2,6 +2,35 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.13] — 2026-07-08 — Persistent rotating tab pool (ADR-0018)
+
+Implements [ADR-0018](docs/decisions/ADR-0018-persistent-rotating-tab-pool.md). With multi-tab posting
+(`tabsPerBrowser` ≥ 2), the app no longer opens a fresh browser tab for every group and throws it away —
+it keeps a small pool of tabs open and reuses them by re-navigating, which is more like a real person and
+avoids a constantly-churning set of Facebook tabs.
+
+### Changed
+- **Multi-tab posting reuses a persistent pool instead of a new tab per group.** Up to `tabsPerBrowser`
+  hardened tabs are opened once and rotated: while a group is being posted on the active tab, an idle pool
+  tab pre-loads the next group; on advance, the just-finished tab returns to the pool (it is no longer
+  closed) for a later group. This preserves in-tab history/referrer continuity and a stable, small tab
+  count. Tabs are recycled after ~12 navigations to avoid Facebook single-page-app memory creep. The
+  two-phase comment pass shares the same pool. Publishing stays sequential; every double-post/double-comment
+  guard is unchanged (they are keyed by post+group, independent of which tab is used).
+- **`tabsPerBrowser = 1` is unchanged** — the pool is never grown or rotated, so single-tab behavior is
+  byte-identical to before.
+
+### Fixed (found by the adversarial verify of this change)
+- **Caption could land in the wrong (idle) tab** if an adopted tab's CDP session failed to initialize: the
+  session binding is now always rebound to the active tab (re-created if missing), so the caption paste and
+  the off-screen window parking always target the tab being posted to — never the just-released one.
+- A tab dropped mid-prefetch across the post→comment phase boundary is now closed rather than briefly
+  leaked back into the next pool.
+
+Verified by a 5-dimension adversarial pass (double-post, double-comment, tab-accounting, CDP rebind,
+async races) → no double-post/double-comment/wrong-group/leak; the two non-blocking defects above were the
+only findings and are fixed. 242 tests green.
+
 ## [1.0.12] — 2026-07-08 — Held-post recovery + login-cookie safety
 
 An audit of the "held for review" recovery flow (moderator approval + backup re-post) and the manual-login window

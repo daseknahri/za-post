@@ -2284,14 +2284,17 @@ async function runAccount(o) {
     // ONLY the navigation step; the whole post/publish/comment flow below is untouched. tabsPerBrowser=1 → no prefetch
     // (byte-identical to before). New tabs inherit the account's proxy/auth/geo automatically (attachGeoToNewTargets).
     const _tabsWanted = Math.max(1, Math.min(4, parseInt(settings.tabsPerBrowser, 10) || 1));
-    const _prefetch = new Map(); // groupIndex → Promise<{ tab, ok, cdp, winId }>
-    // Harden a prefetch tab EXACTLY like the main tab BEFORE it navigates: the per-document spoofs, its OWN CDP session,
+    const _prefetch = new Map(); // groupIndex → Promise<{ entry, ok } | null>
+    // Harden a pool tab EXACTLY like the main tab BEFORE it navigates: the per-document spoofs, its OWN CDP session,
     // off-screen parking (hidden) + focus emulation. Otherwise a swapped-in posting tab leaks the off-screen/unfocused
     // state, and the CDP paste + periodic re-park (which target a SESSION, not `page`) break once the original tab closes.
-    // Returns the tab's cdp + windowId so the adopt step can rebind cdpSession/hiddenWindowId to the live tab.
-    const _hardenTab = async (tab) => {
+    // Returns the tab's cdp + windowId so the adopt step can rebind cdpSession/hiddenWindowId to the live tab. Done ONCE
+    // per tab — evaluateOnNewDocument re-applies on every navigation, and the CDP session + off-screen window persist —
+    // so a REUSED pool tab stays hardened without re-hardening.
+    // Bind a fresh CDP session to a tab + off-screen park + focus emulation. Split out of _hardenTab so the adopt step
+    // can RE-bind a session to an adopted tab whose original harden failed (cdp:null) — without re-registering the spoof.
+    const _bindCdp = async (tab) => {
       let cdp = null, winId = null;
-      try { await tab.evaluateOnNewDocument(stealthSpoof, _scrX, _scrY); } catch {}
       try { cdp = await tab.target().createCDPSession(); } catch {}
       if (cdp) {
         if (hidden) { try { const { windowId } = await cdp.send('Browser.getWindowForTarget'); winId = windowId; await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } }); await cdp.send('Browser.setWindowBounds', { windowId, bounds: { left: -32000, top: -32000, width: vp.width, height: vp.height } }); } catch {} }
@@ -2299,20 +2302,55 @@ async function runAccount(o) {
       }
       return { cdp, winId };
     };
+    const _hardenTab = async (tab) => {
+      try { await tab.evaluateOnNewDocument(stealthSpoof, _scrX, _scrY); } catch {}
+      return _bindCdp(tab);
+    };
+    // ADR-0018 — PERSISTENT ROTATING TAB POOL. The old pipeline opened a FRESH tab per group and CLOSED it right after
+    // adopting it (per-group churn: resets in-tab history/referrer continuity, and a constantly-churning set of FB tabs
+    // is itself a weak automation signal). Instead we keep a small pool of up to tabsPerBrowser hardened tabs OPEN and
+    // REUSE them by re-navigation: while posting group i on the active tab, an idle pool tab pre-loads group i+1; on
+    // advance the pre-loaded tab becomes active and the just-finished tab returns to the pool (NOT closed) for a later
+    // group. Bounded to <= tabsPerBrowser tabs; publishing stays sequential; a tab is recycled after _RECYCLE_EVERY
+    // navigations to dodge Facebook SPA memory creep. Every double-post/comment trap is keyed by (post,gid) and the
+    // target group is set by the pre-nav/goto before posting, so pool reuse cannot post to the wrong group or double-post.
+    // With tabsPerBrowser=1 the pool is never grown or rotated (byte-identical to the pre-pool behaviour).
+    const _RECYCLE_EVERY = 12;
+    const _pool = { free: [], live: 1, activeNavs: 1, epoch: 0 }; // 'live' counts open tabs we own (starts at the main page); 'free' = idle reusable entries {tab,cdp,winId,navs}; 'epoch' bumps at each phase-boundary reset
+    const _makeTab = async () => {
+      try {
+        const tab = await browser.newPage();
+        const h = await _hardenTab(tab); // spoofs + own cdp + off-screen park BEFORE any FB nav (persists across re-nav)
+        try { await applyProxyGeo(tab, account, settings, useProxies, proxies, () => {}); } catch {}
+        return { tab, cdp: h.cdp, winId: h.winId, navs: 0 };
+      } catch { return null; }
+    };
+    // Take an idle pool tab (recycling any past the nav ceiling), else grow the pool up to tabsPerBrowser, else null
+    // (pool momentarily saturated → the caller falls back to navigating the active tab — graceful, never blocks).
+    const _acquireTab = async () => {
+      while (_pool.free.length) {
+        const e = _pool.free.shift();
+        if (!e || !e.tab) { _pool.live = Math.max(0, _pool.live - 1); continue; }
+        if (e.navs >= _RECYCLE_EVERY) { try { e.tab.close().catch(() => {}); } catch {} _pool.live = Math.max(0, _pool.live - 1); continue; }
+        return e;
+      }
+      if (_pool.live < _tabsWanted && browser && browser.isConnected()) { const e = await _makeTab(); if (e) { _pool.live++; return e; } }
+      return null;
+    };
+    const _releaseTab = (e) => { if (e && e.tab) _pool.free.push(e); }; // return a tab to the pool for REUSE (never closed mid-run)
     const _prefetchGroup = (idx) => {
       if (_tabsWanted <= 1 || idx >= targetGroups.length || _prefetch.has(idx) || !browser || !browser.isConnected()) return;
       const gg = targetGroups[idx]; const gid2 = gg.groupId || gg.id;
-      _prefetch.set(idx, browser.newPage()
-        .then(async (tab) => {
-          const h = await _hardenTab(tab); // spoofs + cdp + off-screen BEFORE the FB nav
-          try { await applyProxyGeo(tab, account, settings, useProxies, proxies, () => {}); } catch {}
-          const ok = await tab.goto(`https://www.facebook.com/groups/${gid2}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
-          return { tab, ok, cdp: h.cdp, winId: h.winId };
-        })
-        .catch(() => ({ tab: null, ok: false })));
+      _prefetch.set(idx, (async () => {
+        const e = await _acquireTab();
+        if (!e) return null; // pool saturated → group i will navigate on the active tab instead
+        e.navs++;
+        const ok = await e.tab.goto(`https://www.facebook.com/groups/${gid2}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
+        return { entry: e, ok };
+      })().catch(() => null));
     };
-    const _dropPrefetch = (idx) => { const p = _prefetch.get(idx); if (!p) return; _prefetch.delete(idx); p.then((x) => { if (x && x.tab) x.tab.close().catch(() => {}); }).catch(() => {}); }; // discard a pre-loaded tab we won't use (e.g. an already-delivered group)
-    const _closePrefetch = () => { for (const p of _prefetch.values()) p.then((x) => { if (x && x.tab) x.tab.close().catch(() => {}); }).catch(() => {}); _prefetch.clear(); };
+    const _dropPrefetch = (idx) => { const p = _prefetch.get(idx); if (!p) return; _prefetch.delete(idx); const ep = _pool.epoch; p.then((x) => { if (!x || !x.entry) return; if (_pool.epoch !== ep) { try { if (x.entry.tab) x.entry.tab.close().catch(() => {}); } catch {} } else _releaseTab(x.entry); }).catch(() => {}); }; // don't need this group's tab → reuse it; but if a phase boundary passed while its nav was still in-flight, CLOSE it instead so a stale-phase tab can't leak into the next pool
+    const _closePrefetch = () => { for (const e of _pool.free) { try { if (e && e.tab) e.tab.close().catch(() => {}); } catch {} } _pool.free.length = 0; for (const p of _prefetch.values()) p.then((x) => { if (x && x.entry && x.entry.tab) x.entry.tab.close().catch(() => {}); }).catch(() => {}); _prefetch.clear(); _pool.live = 1; _pool.activeNavs = 0; _pool.epoch++; }; // phase/account end: close idle + in-flight tabs (the active page is torn down with the browser); reset accounting + bump epoch so a following phase re-grows the pool cleanly
     // TWO-PHASE posting (opt-in): when on, the per-group loop below POSTS every group but DEFERS each post's comment
     // into _deferredComments; a second pass (after the loop) places them all. The post is already published +
     // markDelivered'd BEFORE the comment step, so deferring the comment changes NOTHING about double-post safety.
@@ -2377,17 +2415,24 @@ async function runAccount(o) {
         // missing/failed. Only the navigation is pipelined — publishing stays sequential + paced.
         if (_prefetch.has(i)) {
           const pre = await _prefetch.get(i); _prefetch.delete(i);
-          if (pre && pre.tab && pre.ok) {
-            const _old = page; page = pre.tab;
-            // REBIND the CDP session + windowId to the tab we're now posting on (the prefetch tab has its OWN, made in
-            // _hardenTab). Closing _old would otherwise detach the original cdpSession → the CDP paste + off-screen re-park
-            // would silently break for the rest of the run.
-            if (pre.cdp) cdpSession = pre.cdp; if (pre.winId != null) hiddenWindowId = pre.winId;
-            try { _old.close().catch(() => {}); } catch {}
-            navOk = true; step('Group pre-loaded (pipelined)');
-          } else if (pre && pre.tab) { try { pre.tab.close().catch(() => {}); } catch {} }
+          if (pre && pre.entry && pre.ok) {
+            // ROTATE (ADR-0018): the just-finished active tab returns to the pool for REUSE (not closed); the pre-loaded
+            // tab becomes active. Rebind cdpSession + windowId to it (its OWN, made in _hardenTab) so the CDP paste +
+            // off-screen re-park keep working. Identical control flow to the old churn adopt, minus the _old.close().
+            _releaseTab({ tab: page, cdp: cdpSession, winId: hiddenWindowId, navs: _pool.activeNavs });
+            page = pre.entry.tab;
+            // Rebind cdpSession + hiddenWindowId to the ADOPTED tab. If the prefetch tab never got its own CDP session
+            // (_hardenTab's createCDPSession failed → cdp:null), bind one NOW — never leave cdpSession pointing at the
+            // just-released old tab, or the caption CDP-paste would land in that (pooled) tab and the off-screen re-park
+            // would target the wrong window. If binding still fails, cdpSession becomes null → enterCaptionOnce's
+            // `if (!cdpSession)` forces the execCommand-on-`page` fallback into the ACTIVE tab (never a stale insert).
+            if (pre.entry.cdp) { cdpSession = pre.entry.cdp; if (pre.entry.winId != null) hiddenWindowId = pre.entry.winId; }
+            else { const _rb = await _bindCdp(pre.entry.tab); cdpSession = _rb.cdp; if (_rb.winId != null) hiddenWindowId = _rb.winId; pre.entry.cdp = _rb.cdp; pre.entry.winId = _rb.winId; }
+            _pool.activeNavs = pre.entry.navs;
+            navOk = true; step('Group pre-loaded (pipelined, pooled)');
+          } else if (pre && pre.entry) { _releaseTab(pre.entry); } // nav failed but the tab is fine → back to the pool; fall through to nav the active tab
         }
-        const gotoGroup = () => page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
+        const gotoGroup = () => page.goto(`https://www.facebook.com/groups/${gid}`, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => { _pool.activeNavs++; return true; }).catch(() => false);
         if (!navOk) navOk = await gotoGroup();
         // Up to 3 nav attempts (was 2) with growing backoff — a slow-proxy nav timeout is a recoverable "small error",
         // and skipping the group here permanently misses that (post,group) in campaign-plan. Still offline-aware: if the
@@ -3182,21 +3227,20 @@ async function runAccount(o) {
         // setting as the posting pass. Only posts whose permalink was captured in Phase 1 are prefetched; the rest fall
         // back to addFirstComment's own navigation. addFirstComment(preNavigated=true) skips its goto but keeps every
         // wrong-post + double-comment guard (the id/caption/author verify + the retry-only-on-pre-Enter-'failed' rule).
-        const _cpf = new Map(); // deferredIndex → Promise<{ tab, ok, cdp, winId }>
+        const _cpf = new Map(); // deferredIndex → Promise<{ entry, ok } | null>  (shares the ADR-0018 tab pool)
         const _prefetchComment = (idx) => {
           if (_tabsWanted <= 1 || idx >= _deferredComments.length || _cpf.has(idx) || !browser || !browser.isConnected()) return;
           const pdc = _deferredComments[idx];
           if (!pdc || !pdc.postPermalink) return; // no captured permalink → addFirstComment navigates it itself
-          _cpf.set(idx, browser.newPage()
-            .then(async (tab) => {
-              const h = await _hardenTab(tab); // spoofs + own cdp + off-screen park BEFORE the FB nav (same as the posting prefetch)
-              try { await applyProxyGeo(tab, account, settings, useProxies, proxies, () => {}); } catch {}
-              const ok = await tab.goto(pdc.postPermalink, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
-              return { tab, ok, cdp: h.cdp, winId: h.winId };
-            })
-            .catch(() => ({ tab: null, ok: false })));
+          _cpf.set(idx, (async () => {
+            const e = await _acquireTab();
+            if (!e) return null; // pool saturated → this comment navigates on the active tab (addFirstComment does its own goto)
+            e.navs++;
+            const ok = await e.tab.goto(pdc.postPermalink, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
+            return { entry: e, ok };
+          })().catch(() => null));
         };
-        const _closeCpf = () => { for (const p of _cpf.values()) p.then((x) => { if (x && x.tab) x.tab.close().catch(() => {}); }).catch(() => {}); _cpf.clear(); };
+        const _closeCpf = () => { for (const e of _pool.free) { try { if (e && e.tab) e.tab.close().catch(() => {}); } catch {} } _pool.free.length = 0; for (const p of _cpf.values()) p.then((x) => { if (x && x.entry && x.entry.tab) x.entry.tab.close().catch(() => {}); }).catch(() => {}); _cpf.clear(); };
         let d = 0;
         for (; d < _deferredComments.length; d++) {
           if (shouldStop() || acctDown()) break;
@@ -3208,12 +3252,16 @@ async function runAccount(o) {
           let _preNav = false;
           if (_cpf.has(d)) {
             const pre = await _cpf.get(d); _cpf.delete(d);
-            if (pre && pre.tab && pre.ok) {
-              const _old = page; page = pre.tab;
-              if (pre.cdp) cdpSession = pre.cdp; if (pre.winId != null) hiddenWindowId = pre.winId;
-              try { _old.close().catch(() => {}); } catch {}
+            if (pre && pre.entry && pre.ok) {
+              _releaseTab({ tab: page, cdp: cdpSession, winId: hiddenWindowId, navs: _pool.activeNavs }); // rotate: old active tab back to the pool (ADR-0018), don't close
+              page = pre.entry.tab;
+              // Rebind to the adopted tab (re-bind a CDP session if the prefetch tab lacked one) so cdpSession never
+              // points at the released tab — mirrors the Phase-1 adopt fix.
+              if (pre.entry.cdp) { cdpSession = pre.entry.cdp; if (pre.entry.winId != null) hiddenWindowId = pre.entry.winId; }
+              else { const _rb = await _bindCdp(pre.entry.tab); cdpSession = _rb.cdp; if (_rb.winId != null) hiddenWindowId = _rb.winId; pre.entry.cdp = _rb.cdp; pre.entry.winId = _rb.winId; }
+              _pool.activeNavs = pre.entry.navs;
               _preNav = true;
-            } else if (pre && pre.tab) { try { pre.tab.close().catch(() => {}); } catch {} }
+            } else if (pre && pre.entry) { _releaseTab(pre.entry); }
           }
           // Pre-load the NEXT deferred post(s) so they render DURING this comment's cadence gap + placement.
           for (let k = 1; k < _tabsWanted; k++) _prefetchComment(d + k);
