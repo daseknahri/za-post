@@ -1,0 +1,12 @@
+{
+  "name": "za-post-restored",
+  "appId": "com.zapost.commenttool",
+  "productName": "Za Post Comment Tool",
+  "windowTitle": "Za Post Comment Tool King",
+  "shortName": "Za Post Comment",
+  "icon": "assets/icon.ico",
+  "remotePort": 3000,
+  "apiTokenEnv": "ZAPOST_API_TOKEN",
+  "autostartTask": "za-post-autostart",
+  "accentColor": "#6366f1"
+}

@@ -252,8 +252,8 @@
   background: rgba(21, 27, 48, 0.5);
   backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.05);
-  border-radius: 16px;
-  padding: 20px;
+  border-radius: 12px;
+  padding: 12px 14px;
   transition: all 0.3s ease;
 }
 
@@ -325,6 +325,104 @@
   background: rgba(99, 102, 241, 0.1);
   border-color: rgba(99, 102, 241, 0.2);
   color: #c7d2fe;
+}
+
+/* ---------- Account card layout (header/avatar/info) ---------- */
+.account-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.account-avatar {
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+  box-shadow: 0 2px 8px rgba(99,102,241,0.35);
+  letter-spacing: -0.5px;
+}
+
+.account-info {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Status dot (shown in the account status row) */
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #22c55e;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+/* ---------- Collapsible card section (proxy / fb-name) ---------- */
+.acc-section {
+  margin: 10px 0;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.acc-toggle-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px;
+  background: none;
+  border: none;
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s, color 0.15s;
+}
+
+.acc-toggle-btn:hover {
+  background: rgba(99, 102, 241, 0.08);
+  color: #c7d2fe;
+}
+
+.acc-toggle-arrow {
+  font-size: 11px;
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+
+.acc-section-body {
+  padding: 0 12px 12px;
+}
+
+.acc-badge-set {
+  background: rgba(99, 102, 241, 0.25);
+  color: #a5b4fc;
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 700;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.acc-badge-opt {
+  color: #4b5563;
+  font-size: 11px;
+  margin-left: 4px;
+  font-weight: 400;
 }
 
 /* ---------- Post Filter (dynamic in accounts) ---------- */
@@ -435,6 +533,21 @@
 .log-entry.warning {
   color: #fbbf24;
 }
+
+/* Event-type colours for the live log stream (used by addLog → classifyLog) */
+.log-entry.held { color: #fbbf24; }
+.log-entry.moderator { color: #38bdf8; }
+.log-entry.reserve { color: #a78bfa; }
+.log-entry.ratelimit { color: #fb923c; }
+
+/* Live-log filter bar */
+.log-filter-btn {
+  font-size: 11px; font-weight: 600; padding: 4px 11px; border-radius: 999px; cursor: pointer;
+  background: #1c2440; color: #94a3b8; border: 1px solid rgba(255,255,255,0.08);
+  transition: all .14s ease; white-space: nowrap;
+}
+.log-filter-btn:hover { color: #cbd5e1; border-color: rgba(99,102,241,0.4); }
+.log-filter-btn.active { background: #6366f1; color: #fff; border-color: #6366f1; box-shadow: 0 0 14px rgba(99,102,241,0.3); }
 
 /* ---------- Checkbox Styling ---------- */
 input[type="checkbox"] {

@@ -10,6 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const secret = require('../lib/secret'); // cookies.json is byte-copied (encryption envelope preserved); secret only decrypts for the best-effort session count
 
 const VARIANT = (process.argv[2] || 'king').toLowerCase();
 const SRC_NAME = VARIANT === 'base' ? 'za-post-comment-tool' : 'za-post-comment-tool-king';
@@ -105,10 +106,10 @@ function main() {
     if (fs.existsSync(srcCookies)) {
       try {
         const raw = fs.readFileSync(srcCookies, 'utf8');
-        fs.writeFileSync(path.join(destDir, 'cookies.json'), raw);
+        fs.writeFileSync(path.join(destDir, 'cookies.json'), raw); // byte-copy preserves the enc:v1: envelope — the jar still decrypts on the SAME OS user/machine; a cross-machine migrate degrades to the usual re-login (migrated cookies are often stale regardless).
         cookieCopied++;
-        const ck = JSON.parse(raw);
-        if (Array.isArray(ck) && ck.some((c) => c.name === 'c_user') && ck.some((c) => c.name === 'xs')) withSession++;
+        // session count is BEST-EFFORT + must not mislabel a copied jar: an encrypted jar can only be parsed where it decrypts (this runs in plain node → encrypted jars are skipped from the count, NOT counted as "missing").
+        try { const txt = secret.isEncrypted(raw) ? secret.decrypt(raw) : raw; const ck = txt ? JSON.parse(txt) : []; if (Array.isArray(ck) && ck.some((c) => c.name === 'c_user') && ck.some((c) => c.name === 'xs')) withSession++; } catch {}
       } catch { cookieMissing++; }
     } else { cookieMissing++; }
     return {

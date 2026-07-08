@@ -25,6 +25,7 @@ function normalizeCookie(c) {
   if (typeof c.secure === 'boolean') out.secure = c.secure;
   const ss = String(c.sameSite || '').toLowerCase();
   out.sameSite = ss === 'lax' ? 'Lax' : ss === 'strict' ? 'Strict' : 'None';
+  if (out.sameSite === 'None') out.secure = true; // Chrome rejects SameSite=None without secure → the cookie would be dropped
   return out;
 }
 
@@ -70,9 +71,9 @@ function probe() {
 
 (async () => {
   const report = { account: ACC, ts: new Date().toISOString(), steps: {} };
-  const cookiesPath = path.join(ROOT, 'accounts', ACC, 'cookies.json');
-  if (!fs.existsSync(cookiesPath)) { console.error('No cookies for', ACC); process.exit(1); }
-  const cookies = JSON.parse(fs.readFileSync(cookiesPath, 'utf8'));
+  const store = require('../lib/store'); store.init(ROOT);
+  const cookies = store.readCookies(ACC); // decrypts the at-rest jar (or [] if unreadable here)
+  if (!cookies.length) { console.error('No usable cookies for', ACC, '(missing, or encrypted and not decryptable in this context — run via the app or re-login).'); process.exit(1); }
 
   const data = JSON.parse(fs.readFileSync(path.join(ROOT, 'data.json'), 'utf8'));
   const acct = data.accounts.find((a) => a.name === ACC) || {};

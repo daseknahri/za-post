@@ -10,9 +10,16 @@ const os = require('os');
 const path = require('path');
 const store = require('../lib/store');
 
-test('todayKey uses UTC (so DST/local-clock shifts never change the day)', () => {
-  const d = new Date(Date.UTC(2026, 5, 20, 1, 30, 0)); // 2026-06-20 01:30 UTC
+test('todayKey uses the LOCAL calendar date (aligns the daily cap with local-day pacing + the daily schedule)', () => {
+  // Local date, not UTC — so the cap window matches _localDayKey (pacing) and the operator's local schedule,
+  // removing the ~1h near-midnight straddle where the two used different calendar days. Backward-clock abuse is
+  // still blocked by the MONOTONIC dailyRolledOver (forward-only — tested below); a DST shift changes the hour,
+  // not the calendar date, so the key is stable across DST.
+  const d = new Date(2026, 5, 20, 12, 0, 0); // local 2026-06-20 midday → same date in any timezone
   assert.equal(store.todayKey(d), '2026-06-20');
+  const p = (n) => String(n).padStart(2, '0');
+  const now = new Date();
+  assert.equal(store.todayKey(), `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}`, 'defaults to the local calendar date');
 });
 
 test('dailyRolledOver: only a genuinely LATER day rolls the window over', () => {

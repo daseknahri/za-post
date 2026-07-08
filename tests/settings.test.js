@@ -33,6 +33,18 @@ test('clampSettings: only touches keys present in the patch', () => {
   assert.equal(c.waitInterval, 30);
 });
 
+test('clampSettings: tabsPerBrowser is clamped to 1..4 (0/garbage → 1, over-max → 4, floats round)', () => {
+  // Out of range would open 0 tabs (nothing posts → missed posts) or many tabs (RAM blowout → crash mid-run).
+  assert.equal(store.clampSettings({ tabsPerBrowser: 0 }).tabsPerBrowser, 1, '0 → 1 (never zero tabs)');
+  assert.equal(store.clampSettings({ tabsPerBrowser: -3 }).tabsPerBrowser, 1, 'negative → 1');
+  assert.equal(store.clampSettings({ tabsPerBrowser: 'abc' }).tabsPerBrowser, 1, 'garbage → 1');
+  assert.equal(store.clampSettings({ tabsPerBrowser: 99 }).tabsPerBrowser, 4, 'over-max → 4');
+  assert.equal(store.clampSettings({ tabsPerBrowser: 3.7 }).tabsPerBrowser, 4, 'rounds then clamps');
+  assert.equal(store.clampSettings({ tabsPerBrowser: 2 }).tabsPerBrowser, 2, 'a valid value passes through');
+  // the "only touches keys present" invariant must hold for the new key too
+  assert.deepEqual(Object.keys(store.clampSettings({ waitInterval: 30 })), ['waitInterval'], 'no tabsPerBrowser key emitted when absent');
+});
+
 test('preserveAttentionStatus: keeps an ACTIVE rate-limit flag against a status check', () => {
   const future = Date.now() + 3600000;
   assert.equal(store.preserveAttentionStatus('rate_limited', future, 'logged_in'), true);

@@ -56,3 +56,23 @@ test('proxyFormatHint: suggests a schemed form for the common no-scheme mistakes
   assert.equal(w.proxyFormatHint('socks5://1.2.3.4:8080'), '', 'already-schemed string gets no hint');
   assert.equal(w.proxyFormatHint(''), '');
 });
+
+test('parseProxy: https is normalised to http (Chrome treats https:// as a TLS proxy, which iProyal/ISP proxies are not)', () => {
+  assert.equal(w.parseProxy('https://1.2.3.4:8080').server, 'http://1.2.3.4:8080', 'https→http server');
+  const a = w.parseProxy('https://user:pass@1.2.3.4:8080');
+  assert.equal(a.scheme, 'http');
+  assert.equal(a.upstream, 'http://user:pass@1.2.3.4:8080', 'auth preserved on the normalised scheme');
+  assert.equal(w.parseProxy('socks5://1.2.3.4:1080').server, 'socks5://1.2.3.4:1080', 'socks5 is left intact');
+});
+
+test('classifyProxyError + proxyErrorHint: name the real cause so a 2nd-laptop proxy failure is diagnosable', () => {
+  assert.equal(w.classifyProxyError('net::ERR_PROXY_CONNECTION_FAILED 407 proxy authentication required'), 'AUTH_407');
+  assert.equal(w.classifyProxyError('net::ERR_PROXY_CONNECTION_FAILED'), 'CONN_REFUSED');
+  assert.equal(w.classifyProxyError('net::ERR_TUNNEL_CONNECTION_FAILED'), 'CONN_REFUSED');
+  assert.equal(w.classifyProxyError('net::ERR_SOCKS_CONNECTION_FAILED'), 'SOCKS_MISMATCH');
+  assert.equal(w.classifyProxyError('getaddrinfo net::ERR_NAME_NOT_RESOLVED'), 'DNS_FAIL');
+  assert.equal(w.classifyProxyError('something weird'), 'UNKNOWN');
+  // the AUTH hint must mention the iProyal IP-whitelist (the usual "works here, not there" cause)
+  assert.match(w.proxyErrorHint('AUTH_407'), /whitelist|username\/password/i);
+  assert.match(w.proxyErrorHint('SOCKS_MISMATCH'), /http:\/\//);
+});

@@ -1,10 +1,33 @@
 # Za Post Comment Tool - Session Handoff
 
-Last updated: 2026-06-20. Read this first when continuing in a new session.
+Last updated: 2026-07-08. Read this first when continuing in a new session.
 
 > **Full project reference: [`DOCS.md`](DOCS.md)** — architecture, run lifecycle, settings,
 > data layout, packaging internals, and dev scripts. This file is the live *status*; DOCS.md is
-> the *how it works*.
+> the *how it works*. **Engineering process: [`DEVELOPMENT.md`](DEVELOPMENT.md)** · **never-break rules:
+> [`INVARIANTS.md`](INVARIANTS.md)** · **decision log: [`docs/decisions/`](docs/decisions/).**
+
+## ⭐ STATUS 2026-07-08 — v1.0.12
+
+Recent hardening (v1.0.7 → v1.0.12), all shipped:
+
+- **Owed-groups partial-delivery ledger** — when a run posts to only some of an account's groups (crash, rate-limit, pause), the undelivered groups are recorded and picked up next cycle instead of silently lost.
+- **Two-phase post-then-comment** — complete: the post is published first and confirmed, then the comment is attached in a second pass, so a comment failure no longer aborts or duplicates the post.
+- **Posting/compose hardening** — more resilient composer detection and retry; failed composes back out cleanly rather than leaving a half-typed dialog.
+- **Held-post recovery + login-cookie safety** — posts held in "Spam potentiel" are detected and recovered without duplicating; login/session cookies (incl. datr) are only persisted when actually logged in, so recovery and re-auth don't corrupt the profile.
+
+Process is now formalized (not just code):
+- **DEVELOPMENT.md** — engineering workflow, version/release discipline.
+- **INVARIANTS.md** — the properties every change must preserve (ledger integrity, no double-post, profile/cookie safety).
+- **docs/decisions/** — ADRs for significant design choices, including the proposed persistent tab-pool (ADR-0018).
+
+Open items:
+1. **Persistent tab-pool** — implement per [ADR-0018](docs/decisions/ADR-0018-persistent-rotating-tab-pool.md) (still Proposed, not built).
+2. **License server** — bring live + issue real per-seat keys (enforcement marker exists; server does not).
+3. **Live-FB validations** — held-post recovery, two-phase comment, and owed-groups ledger still need confirmation against live Facebook at scale.
+4. **Commit the working tree** — weeks of work (v1.0.7→v1.0.12 + whole subsystems) are still uncommitted; see DEVELOPMENT.md.
+
+---
 
 ## ⭐ STATUS 2026-06-20 — anti-spam hardening (full build-out)
 

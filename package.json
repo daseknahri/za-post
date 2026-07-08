@@ -1,6 +1,6 @@
 {
   "name": "za-post-restored",
-  "version": "1.0.0",
+  "version": "1.0.12",
   "description": "Za Post Comment Tool - Facebook Automation (restored, clean source)",
   "main": "main.js",
   "author": "Abdelilah",
@@ -56,9 +56,12 @@
       "!.git/**",
       "!.gitignore",
       "!chrome-bin/**",
-      "!**/*.jsc",
       "!**/*.log",
-      "!**/.cache/**"
+      "!**/.cache/**",
+      "!**/*.md",
+      "!tests/**",
+      "!docs/**",
+      "!devboot.*"
     ],
     "extraResources": [
       {

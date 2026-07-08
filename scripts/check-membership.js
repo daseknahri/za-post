@@ -8,13 +8,15 @@ puppeteer.use(require('puppeteer-extra-plugin-stealth')());
 const ACC = process.argv[2] || 'account17';
 const ROOT = path.join(process.env.APPDATA, 'za-post-restored');
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const norm = (c) => { const o = { name: c.name, value: c.value, domain: c.domain, path: c.path || '/' }; if (c.expires > 0) o.expires = c.expires; if (typeof c.secure === 'boolean') o.secure = c.secure; const s = String(c.sameSite || '').toLowerCase(); o.sameSite = s === 'lax' ? 'Lax' : s === 'strict' ? 'Strict' : 'None'; return o; };
+const norm = (c) => { const o = { name: c.name, value: c.value, domain: c.domain, path: c.path || '/' }; if (c.expires > 0) o.expires = c.expires; if (typeof c.secure === 'boolean') o.secure = c.secure; const s = String(c.sameSite || '').toLowerCase(); o.sameSite = s === 'lax' ? 'Lax' : s === 'strict' ? 'Strict' : 'None'; if (o.sameSite === 'None') o.secure = true; return o; };
 
 (async () => {
   const data = JSON.parse(fs.readFileSync(path.join(ROOT, 'data.json'), 'utf8'));
   const acct = data.accounts.find(a => a.name === ACC) || {};
   const groups = (acct.assignedGroups || []).map(id => data.groups.find(g => g.id === id || g.groupId === id)).filter(Boolean);
-  const cookies = JSON.parse(fs.readFileSync(path.join(ROOT, 'accounts', ACC, 'cookies.json'), 'utf8'));
+  const store = require('../lib/store'); store.init(ROOT);
+  const cookies = store.readCookies(ACC); // decrypts the at-rest jar (or [] if unreadable here — the chrome-profile session may still auth)
+  if (!cookies.length) console.log(`⚠️ ${ACC}: no readable cookies (missing, or encrypted + not decryptable in plain node) — results rely on the profile session.`);
   const browser = await puppeteer.launch({ headless: true, userDataDir: path.join(ROOT, 'accounts', ACC, 'chrome-profile'),
     args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'] });
   const page = (await browser.pages())[0];

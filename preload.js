@@ -5,16 +5,18 @@ const { contextBridge, ipcRenderer } = require('electron');
 // (bulk-delete accounts + wipe profiles). Only these explicitly-known channels are reachable.
 const ALLOWED_CHANNELS = new Set([
   'get-data', 'save-data',
-  'add-post', 'delete-post', 'edit-post', 'add-posts-bulk', 'add-groups-bulk',
-  'add-group', 'delete-group',
-  'create-account', 'login-account', 'check-account-status', 'delete-account', 'import-cookies',
+  'add-post', 'delete-post', 'delete-posts', 'edit-post', 'add-posts-bulk', 'add-groups-bulk', 'bulk-assign-post-set', 'delete-post-set',
+  'add-group', 'delete-group', 'delete-groups',
+  'create-account', 'login-account', 'auto-login-account', 'open-account-browser', 'check-account-status', 'delete-account', 'import-cookies',
   'close-login-browser', 'toggle-account', 'set-account-credentials', 'get-account-credentials',
-  'rename-account', 'batch-account-action',
+  'rename-account', 'batch-account-action', 'add-accounts-bulk', 'pick-cookies-folder',
+  'setup-chrome-import', 'open-chrome-import-folder', 'chrome-import-info', 'assign-chrome-groups',
   'start-automation', 'stop-automation', 'pause-automation', 'resume-automation', 'finish-automation',
-  'get-automation-status', 'reset-rotation', 'approve-held-now',
+  'get-automation-status', 'reset-rotation', 'approve-held-now', 'open-external',
+  'set-autostart', 'get-autostart-status', 'get-plan', 'get-warmup-counts',
   'select-image', 'save-settings',
   'get-proxies', 'save-proxies', 'toggle-proxies',
-  'get-remote-url', 'get-license-info', 'get-server-url', 'update-server-url',
+  'get-remote-url', 'get-license-info', 'get-server-url', 'update-server-url', 'get-proxy-health', 'detect-proxy-geo',
   'open-logs-folder', 'rdp-status', 'open-rdp-setup',
 ]);
 
@@ -31,11 +33,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Post operations
   addPost: (post) => ipcRenderer.invoke('add-post', post),
   deletePost: (postId) => ipcRenderer.invoke('delete-post', postId),
+  deletePosts: (ids) => ipcRenderer.invoke('delete-posts', ids),
   editPost: (postId, updates) => ipcRenderer.invoke('edit-post', postId, updates),
+  bulkAssignPostSet: (postIds, setId) => ipcRenderer.invoke('bulk-assign-post-set', postIds, setId),
+  deletePostSet: (setId) => ipcRenderer.invoke('delete-post-set', setId),
 
   // Group operations
   addGroup: (group) => ipcRenderer.invoke('add-group', group),
   deleteGroup: (groupId) => ipcRenderer.invoke('delete-group', groupId),
+  deleteGroups: (ids) => ipcRenderer.invoke('delete-groups', ids),
   addPostsBulk: (posts) => ipcRenderer.invoke('add-posts-bulk', posts),
   addGroupsBulk: (items) => ipcRenderer.invoke('add-groups-bulk', items),
 
@@ -45,18 +51,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
   checkAccountStatus: (accountName) => ipcRenderer.invoke('check-account-status', accountName),
   deleteAccount: (accountName) => ipcRenderer.invoke('delete-account', accountName),
   importCookies: (accountName, cookies) => ipcRenderer.invoke('import-cookies', accountName, cookies),
+  addAccountsBulk: (accounts, opts) => ipcRenderer.invoke('add-accounts-bulk', accounts, opts),
+  pickCookiesFolder: () => ipcRenderer.invoke('pick-cookies-folder'),
   closeLoginBrowser: (name) => ipcRenderer.invoke('close-login-browser', name),
   toggleAccount: (name, enabled) => ipcRenderer.invoke('toggle-account', name, enabled),
   setAccountCredentials: (name, email, password) => ipcRenderer.invoke('set-account-credentials', name, email, password),
   getAccountCredentials: (name) => ipcRenderer.invoke('get-account-credentials', name),
 
   // Automation operations
-  startAutomation: () => ipcRenderer.invoke('start-automation'),
+  startAutomation: (runNow) => ipcRenderer.invoke('start-automation', runNow),
   stopAutomation: () => ipcRenderer.invoke('stop-automation'),
   pauseAutomation: () => ipcRenderer.invoke('pause-automation'),
   resumeAutomation: () => ipcRenderer.invoke('resume-automation'),
   finishAutomation: () => ipcRenderer.invoke('finish-automation'),
   getAutomationStatus: () => ipcRenderer.invoke('get-automation-status'),
+  setAutostart: (enabled, time) => ipcRenderer.invoke('set-autostart', { enabled, time }),
+  getAutostartStatus: () => ipcRenderer.invoke('get-autostart-status'),
+  getPlan: () => ipcRenderer.invoke('get-plan'),
+  getWarmupCounts: () => ipcRenderer.invoke('get-warmup-counts'),
 
   // File operations
   selectImage: () => ipcRenderer.invoke('select-image'),
@@ -66,14 +78,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Settings
   saveSettings: (settings) => ipcRenderer.invoke('save-settings', settings),
 
-  // Proxies
-  getProxies: () => ipcRenderer.invoke('get-proxies'),
-  saveProxies: (proxies) => ipcRenderer.invoke('save-proxies', proxies),
-  toggleProxies: (enabled) => ipcRenderer.invoke('toggle-proxies', enabled),
-
-  // Remote dashboard + licensing
-  getRemoteUrl: () => ipcRenderer.invoke('get-remote-url'),
-  getLicenseInfo: () => ipcRenderer.invoke('get-license-info'),
+  // Remote dashboard + licensing (proxies + remote-url + license-info are reached via the gated invoke()).
+  // get-server-url / update-server-url are used by the separate license window's renderer.
   getServerUrl: () => ipcRenderer.invoke('get-server-url'),
   updateServerUrl: (url) => ipcRenderer.invoke('update-server-url', url),
 
@@ -113,6 +119,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   onAccountAttention: (callback) => {
     ipcRenderer.on('account-attention', (_e, info) => callback(info));
+  },
+  onLicenseUpdate: (callback) => {
+    ipcRenderer.on('license-updated', () => callback()); // main pushes this on the ~6h re-validation so the badge/limits refresh without a restart
   },
 
   // Open the logs folder in the OS file explorer

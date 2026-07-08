@@ -225,12 +225,10 @@ contains macOS symlinks whose extraction needs admin / Windows Developer Mode. S
 |---|---|
 | `build-portable.js` | the portable build (`npm run pack:portable`) |
 | `bundle-chromium.js` | copy Puppeteer Chromium → `chrome-bin` |
-| `test-hidden-full.js` | verify the full hidden path (off-screen + focus/visibility) |
-| `test-hide.js` | verify the CDP off-screen move isn't clamped by Windows |
-| `test-bg-window.js` | verify visible-mode "send window to background" |
-| `test-notif.js` | verify Windows toast notifications work |
-| `test-comment.js`, `diag-comment.js`, `inspect-fb.js`, … | FB DOM diagnostics |
-| `migrate.js`, `prep-accounts.js`, `sync-memberships.js` | data/account utilities |
+| `migrate.js`, `prep-accounts.js`, `sync-memberships.js`, `check-membership.js` | data/account utilities (legacy import, batch login-check + membership sync/prune) |
+| `live-post.js` | one account → one group → one post end-to-end check before a wider run (`node scripts/live-post.js <acct> <groupId> <postIdx>`) |
+| `diagnose-proxies.js` | offline proxy health / parse-error diagnostics CLI |
+| `inspect-fb.js` | FB DOM selector reconnaissance → `scripts/fb-recon/` (run on selector drift) |
 | `test-fingerprint.js` | **live** browser fingerprint test — launches the real Chromium as the worker does and asserts the bot-tells are gone (webdriver, WebGL renderer, screenX, focus/visibility). `node scripts/test-fingerprint.js` |
 | `test-antispam.js` | backend suite — spintax, image variation, link variation, jitter, and a real Orchestrator+store run proving daily-cap / cool-down / persistence. `node scripts/test-antispam.js` |
 

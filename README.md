@@ -3,7 +3,9 @@
 > **🧭 Running campaigns? Start with [`OPERATOR-GUIDE.md`](OPERATOR-GUIDE.md)** (day-to-day: accounts, groups,
 > posts, posting modes, Standby backups, speed, unattended/RDP). **Unattended on a laptop over RDP:**
 > [`SETUP-RDP.md`](SETUP-RDP.md). **Architecture / internals:** [`DOCS.md`](DOCS.md) · **Latest status:**
-> [`HANDOFF.md`](HANDOFF.md). **Build the installer:** `npm install` → `npm run pack` (NSIS) — or
+> [`HANDOFF.md`](HANDOFF.md). **Contributing / engineering:** [`DEVELOPMENT.md`](DEVELOPMENT.md) (workflow &
+> release discipline) · [`INVARIANTS.md`](INVARIANTS.md) (the never-break rules) · [`docs/decisions/`](docs/decisions/)
+> (ADR decision log). **Build the installer:** `npm install` → `npm run pack` (NSIS) — or
 > `npm run pack:portable` for a portable zip.
 
 Facebook multi-account auto-poster (Electron + Puppeteer-extra/stealth). This is a

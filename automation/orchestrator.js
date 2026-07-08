@@ -24,8 +24,9 @@
 //                      cap for the others. maxCycles caps cycles but is ignored while completion is draining.
 
 const path = require('path');
+const os = require('os');
 const store = require('../lib/store');
-const { runAccount } = require('./worker');
+const { runAccount, applyPace } = require('./worker');
 const { ProxyHealthManager } = require('../lib/proxy');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -34,6 +35,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = (ms, pct = 0.25) => Math.round(Math.max(0, Number(ms) || 0) * (1 - pct + Math.random() * pct * 2));
 // A random integer in [min,max] — the primitive for unpredictable, never-constant cadence.
 const rand = (min, max) => { let lo = Math.max(0, Math.floor(Number(min) || 0)), hi = Math.max(0, Math.floor(Number(max) || 0)); if (hi < lo) { const t = lo; lo = hi; hi = t; } return lo + Math.floor(Math.random() * (hi - lo + 1)); };
+// Per-account flags that mean the account DROPPED this cycle (delivered nothing): rate-limit, logout,
+// checkpoint/verification, disabled, block, or an unusable proxy. Drives the reserve-takeover pass.
+const DROP_FLAGS = new Set(['rate_limited', 'needs_login', 'needs_verification', 'account_disabled', 'likely_blocked', 'proxy_invalid']);
 // Random ms drawn from a settings min/max range (in the given unit ms-per-unit; floor keeps it safe).
 const rangeMs = (settings, minKey, maxKey, defMin, defMax, unitMs = 1000, floorUnit = 0) => {
   settings = settings || {};
@@ -69,7 +73,7 @@ function probe(url, ms) {
 // and the cap is INTERRUPTIBLE — a graceful Stop resolves it within ~250ms instead of blocking for
 // the full window on a dead network.
 async function isOnline(shouldStop = () => false, timeoutMs = 12000) {
-  const urls = ['https://connectivitycheck.gstatic.com/generate_204', 'https://www.facebook.com'];
+  const urls = ['https://connectivitycheck.gstatic.com/generate_204', 'https://www.google.com/generate_204']; // NEUTRAL connectivity endpoints only — never ping facebook.com from the operator's REAL IP (this probe runs un-proxied via Node axios, so it would touch FB directly + be correlatable). General internet reachability is all we need here.
   const all = Promise.all(urls.map((u) => probe(u, timeoutMs))).then((r) => r.some(Boolean));
   let iv;
   const cap = new Promise((resolve) => {
@@ -84,6 +88,14 @@ function matchesFilter(post, filter) {
   if (filter === 'with-comments') return !!(post.comment && post.comment.trim());
   if (filter === 'without-comments') return !(post.comment && post.comment.trim());
   return true;
+}
+
+// POST-SETS gate: an account assigned to a post-set draws ONLY from that set; no set (null/absent) = the whole
+// library (backward-compatible default). The single choke-point so every post-selection path honors the set.
+function postsForSet(allPosts, account) {
+  const sid = account && account.postSetId;
+  if (!sid) return allPosts;
+  return allPosts.filter((p) => (p.postSetId || null) === sid);
 }
 
 // Deterministic shuffle seeded by a number (so a given cycle/account is reproducible).
@@ -113,7 +125,11 @@ class Orchestrator {
     this._paused = false;
     this._finish = false;
     this._aborters = new Set();
-    this._progress = { running: false, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0 };
+    this._progress = { running: false, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0, accounts: [] };
+    this._owed = {};          // PERSISTENT partial-delivery ledger { agentName -> { postId, gids[] } }: a daily-rotation / campaign-plan agent that delivered its post to SOME but not all of its groups still owes the un-reached groups the SAME post; carried across cycles/days (loaded from rotation.json owedLedger) so the un-reached groups are never silently skipped and a delivered group is never re-posted. [7][8]
+    this._acctLive = {};      // name → { state, action, posted } live per-account view for the dashboard
+    this._cycleAccts = [];    // the active accounts of the current cycle (snapshot source)
+    this._lastAcctEmit = 0;   // throttle for high-frequency per-account action updates
   }
   isRunning() { return this.running; }
   // F4: operator "start fresh" — clear the dealt-state + rotation so the next Start re-deals every post
@@ -132,14 +148,25 @@ class Orchestrator {
     this._perAccountRotation = {};
     this._campaignPlan = null;
     this._lastDailyRunDate = null;
-    const wrote = store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: 0, lastDailyRunDate: null, perAccountRotation: {}, campaignPlan: null });
+    this._owed = {}; // Start Fresh clears the partial-delivery owed ledger too (a new run starts every post at #1 to ALL groups)
+    const wrote = store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: 0, lastDailyRunDate: null, perAccountRotation: {}, campaignPlan: null, owedLedger: {} });
     if (!wrote) return { ok: false, error: 'Could not write rotation state (disk full / permissions).' };
-    this.log('🔄 Campaign rotation reset — all modes restart from #1 on the next Start (shared deal + per-agent daily/campaign pointers cleared).');
+    // Also reset the DASHBOARD progress ledger so the plan view restarts clean (the permanent run-report.jsonl
+    // audit is preserved). Best-effort — a ledger-clear failure must not fail the rotation reset.
+    try { store.clearProgress(); } catch {}
+    // ALSO clear the HELD (moderation) + pending-comment RECOVERY queues — a "Start Fresh" must NOT carry over
+    // un-recovered held posts from a previous run, which a reserve would otherwise re-post DURING the new run
+    // (the "a different/old post just appeared" surprise). Best-effort: a clear failure must not fail the reset.
+    try { store.saveModeration({ held: [] }); } catch {}
+    try { store.saveComments({ pending: [] }); } catch {}
+    this.log('🔄 Campaign rotation reset — all modes restart from #1 on the next Start (shared deal + per-agent daily/campaign pointers cleared; held/comment recovery queues cleared; dashboard progress reset).');
     return { ok: true };
   }
   stop() {
     this._stop = true;
     this._paused = false;
+    this._stopNetMonitor();
+    if (this._progressTimer) { try { clearTimeout(this._progressTimer); } catch {} this._progressTimer = null; } // cancel any pending coalesced live-ops emit
     this._progress.paused = false;
     for (const abort of [...this._aborters]) {
       try { abort(); } catch {}
@@ -152,6 +179,12 @@ class Orchestrator {
     return () => this._aborters.delete(abort);
   }
   _shouldStop() { return this._stop; }
+  // #5 multi-drop-per-reserve. _jobbedThisCycle is a Map(accountName → #browser jobs this cycle). An account may do up
+  // to reserveMaxJobsPerCycle jobs (default 1 = today's one-job/account/cycle). Re-clamped 1..5 here so a hand-edited
+  // data.json can't yield 0 or unbounded. _jobbedOut also tolerates a legacy Set (some tests set one) → binary.
+  _reserveMaxJobs() { const v = Math.round(Number((this._data && this._data.settings && this._data.settings.reserveMaxJobsPerCycle)) || 1); return Math.min(5, Math.max(1, v || 1)); }
+  _jobbedOut(name) { const j = this._jobbedThisCycle; if (!j) return false; const c = (typeof j.get === 'function') ? (j.get(name) || 0) : (j.has && j.has(name) ? 1 : 0); return c >= this._reserveMaxJobs(); }
+  _markJob(name) { if (!(this._jobbedThisCycle instanceof Map)) this._jobbedThisCycle = new Map(); this._jobbedThisCycle.set(name, (this._jobbedThisCycle.get(name) || 0) + 1); }
   pause() {
     if (!this.running || this._paused) return;
     this._paused = true;
@@ -172,14 +205,21 @@ class Orchestrator {
     if (!this.running) return;
     this._finish = true;
     this.log('🏁 Finishing after the current batch — no new work will start');
+    // If the run is PAUSED, Finish would otherwise deadlock: the loop is parked in _waitWhilePaused (which only exits
+    // on resume or stop), so the "current batch" can never complete and the run hangs forever showing "Finishing…".
+    // Resume so the in-flight batch drains, then the _finish flag ends the run cleanly. resume() self-guards.
+    if (this._paused) this.resume();
   }
   isPaused() { return this._paused; }
+  // Is this account posting RIGHT NOW (its profile browser is open)? Used to allow logging in any OTHER account
+  // mid-run without a profile conflict — only the actively-posting account is off-limits.
+  isAccountInFlight(name) { const l = this._acctLive && this._acctLive[name]; return !!(l && l.state === 'running'); }
   async _waitWhilePaused() { while (this._paused && !this._stop) await sleep(500); }
 
   async _waitForConnectivity() {
     let offlineLogged = false;
-    while (!this._shouldStop()) {
-      if (await isOnline(() => this._shouldStop())) {
+    while (!this._shouldStop() && !this._finish) { // honor Finish too — an offline Finish must DRAIN + end, not park here forever
+      if (await isOnline(() => this._shouldStop() || this._finish)) {
         if (offlineLogged) {
           this.log('🌐 Connection restored — continuing');
           if (this._progress) { this._progress.offline = false; this.emit('automation-progress', { ...this._progress }); }
@@ -195,8 +235,113 @@ class Orchestrator {
     }
     return false;
   }
+  // CONTINUOUS connectivity monitor: while a run is active, probe every ~15s (faster while down). Going offline
+  // flags `_netOnline=false` (the pool stops launching new accounts) + shows "offline" in the dashboard; coming
+  // back clears it + the run resumes. This is the PROACTIVE companion to the per-account fast-bail and the
+  // cycle-top _waitForConnectivity hold (which remain the authoritative resume gates / re-probe directly).
+  _startNetMonitor() {
+    this._netOnline = true;
+    const tick = async () => {
+      this._netTimer = null;
+      if (!this.running) return;
+      let up = true;
+      try { up = await isOnline(() => this._shouldStop() || !this.running, 8000); } catch { up = false; }
+      if (!this.running) return;
+      if (!up && this._netOnline !== false) {
+        this._netOnline = false;
+        this.log('🌐 Connection lost — auto-pausing; the run resumes on its own when you\'re back online.');
+        if (this._progress) { this._progress.offline = true; this.emit('automation-progress', { ...this._progress }); }
+      } else if (up && this._netOnline === false) {
+        this._netOnline = true;
+        this.log('🌐 Connection restored — resuming.');
+        if (this._progress) { this._progress.offline = false; this.emit('automation-progress', { ...this._progress }); }
+      }
+      this._netTimer = setTimeout(tick, this._netOnline === false ? 5000 : 15000); // poll faster while down
+    };
+    this._netTimer = setTimeout(tick, 15000);
+  }
+  _stopNetMonitor() { if (this._netTimer) { try { clearTimeout(this._netTimer); } catch {} this._netTimer = null; } this._netOnline = true; }
 
   log(msg) { this.emit('automation-log', msg); }
+
+  // ── LIVE PER-ACCOUNT SNAPSHOT ──────────────────────────────────────────────
+  // Powers the dashboard "Live Operations" panel: every active account of the current cycle with its live
+  // state (queued → running → done/error/...) and current action. Shipped inside each automation-progress
+  // event so the UI shows ALL accounts at once, not just the few running in parallel.
+  _buildAcctSnapshot() {
+    const accts = this._cycleAccts || [];
+    const useProx = !!(this._data && this._data.useProxies);
+    const poolN = ((this._data && this._data.proxies) || []).filter((p) => p && String(p).trim()).length;
+    const proxyHost = (s) => { const m = String(s || '').replace(/^\w+:\/\//, ''); return m.split(':')[0] || ''; };
+    return accts.map((a) => {
+      const l = (this._acctLive && this._acctLive[a.name]) || {};
+      const ip = a.proxy && String(a.proxy).trim() ? proxyHost(a.proxy) : (useProx && poolN ? 'pool' : 'real IP');
+      return { name: a.name, alias: a.alias || a.name, role: a.standby ? 'reserve' : 'active', groups: (a.assignedGroups || []).length, state: l.state || 'queued', action: l.action || '', posted: l.posted || 0, ip };
+    });
+  }
+  // Coalesced live-ops emit (leading + trailing throttle, ~400ms). At 400 accounts the snapshot is a 400-element
+  // array; emitting it on EVERY per-account state/action tick serialized it over IPC hundreds of times per cycle
+  // (renderer churn that steals CPU from the posting pool on the one client laptop). The _acctLive map is updated
+  // SYNCHRONOUSLY by the callers, so no state is lost — only the EMIT is rate-limited. The leading edge fires
+  // immediately when idle (snappy for a small fleet); a trailing timer guarantees the FINAL state is delivered.
+  _emitLiveOps() {
+    // Keep _progress.accounts CURRENT synchronously (building the JS array is cheap; the expensive part we throttle is
+    // the cross-process IPC serialization + renderer re-render). This guarantees the always-fired end-of-run emit
+    // carries the final states even if a pending throttled emit is cancelled by stop().
+    this._progress.accounts = this._buildAcctSnapshot();
+    if (this._progressTimer) return; // an emit is already scheduled → it will ship the latest snapshot on fire
+    const now = Date.now();
+    const MIN = 400;
+    const doEmit = () => { this._lastLiveEmit = Date.now(); this._progress.accounts = this._buildAcctSnapshot(); this.emit('automation-progress', Object.assign({}, this._progress)); };
+    const since = now - (this._lastLiveEmit || 0);
+    if (since >= MIN) doEmit();
+    else this._progressTimer = setTimeout(() => { this._progressTimer = null; doEmit(); }, MIN - since);
+  }
+  // ── DISK-SPACE SAFETY (400-account fleets) ────────────────────────────────
+  // Each account keeps a persistent Chrome profile (+ caches) under userData/accounts/<name>/. 400 profiles are tens
+  // of GB; if the drive fills, writeFileAtomic throws ENOSPC and posting dies FLEET-WIDE (data.json/cookies/rotation
+  // can't save). These give the operator warning before that happens. Best-effort + non-blocking (never stop a run
+  // the operator wants) — fs.statfsSync is Node 18.15+/20+ (Electron 35); older/edge → null → silently skipped.
+  _freeDiskBytes() {
+    try {
+      const fsx = require('fs');
+      if (typeof fsx.statfsSync !== 'function') return null;
+      const dir = (store.paths && store.paths.USER_DATA) || process.cwd();
+      const s = fsx.statfsSync(dir);
+      return (Number(s.bavail) || 0) * (Number(s.bsize) || 0);
+    } catch { return null; }
+  }
+  // Warn if free space looks insufficient. Called once at Start and periodically per cycle (throttled ~15min).
+  _diskPreflight(getData) {
+    try {
+      const free = this._freeDiskBytes();
+      if (free == null) return;
+      const now = Date.now();
+      if (this._lastDiskWarn && now - this._lastDiskWarn < 15 * 60 * 1000) return; // don't spam
+      const data = (typeof getData === 'function' ? getData() : this._data) || {};
+      const nAcc = (data.accounts || []).filter((a) => a && a.enabled !== false && !a.isModerator).length;
+      const GB = 1024 * 1024 * 1024;
+      const PER = 200 * 1024 * 1024; // ~200 MB per persistent Chrome profile (profile + capped caches + images)
+      const need = nAcc * PER;
+      const freeGB = (free / GB).toFixed(1);
+      if (free < 2 * GB) { this._lastDiskWarn = now; this.log(`⚠️ LOW DISK: only ${freeGB} GB free on the data drive. A FULL disk stops ALL accounts mid-run (posts/cookies can't save → ENOSPC). Free up space now.`); }
+      else if (nAcc >= 20 && free < need) { this._lastDiskWarn = now; this.log(`⚠️ DISK: ${freeGB} GB free may not hold ${nAcc} account profiles (~${Math.round(need / GB)} GB at ~200 MB each). If it fills mid-run, posting halts fleet-wide — add space or reduce accounts.`); }
+    } catch {}
+  }
+  // State change (queued/running/done/error/...). Map updated now; emit is coalesced (see _emitLiveOps).
+  _setAcctState(name, state, extra) {
+    if (!this._acctLive) this._acctLive = {};
+    this._acctLive[name] = Object.assign({}, this._acctLive[name] || {}, { state }, extra || {});
+    this._emitLiveOps();
+  }
+  // Current action (one per worker log line) — high frequency, coalesced like state changes.
+  _setAcctAction(name, msg) {
+    if (!this._acctLive) this._acctLive = {};
+    const a = String(msg || '').replace(/^\s*\[[^\]]*\]\s*/, '').trim().slice(0, 140);
+    if (!a) return;
+    this._acctLive[name] = Object.assign({}, this._acctLive[name] || {}, { action: a });
+    this._emitLiveOps();
+  }
 
   // E-X3/E-X4: proxy health tracking. reportProxy is handed to the worker; getProxyHealth feeds the
   // /api/proxies/health endpoint + the diagnostics. Health tracking never blocks a post.
@@ -218,13 +363,27 @@ class Orchestrator {
     return MAP[order] || order;
   }
 
-  async start(getData) {
+  async start(getData, opts = {}) {
     if (this.running) return { success: false, error: 'Automation already running' };
+    // A manual operator Start (opts.manual — the dashboard Start button AND "Save & Start") is a fresh "run NOW":
+    // runNow fires the first cycle immediately AND we reset the in-memory daily-cycle counter + bypass today's
+    // per-account pacing quota (_dailyQuotaBlocks) so clicking Start actually posts even if today's scheduled run
+    // already happened. The daily fire-time then only governs the UNATTENDED next-day auto-start (the scheduled-task
+    // path passes runNow WITHOUT manual → it still respects the schedule + quota). Consumed on the first gate pass.
+    this._runNow = !!(opts.runNow || opts.manual);
+    this._manualRun = !!opts.manual;
+    this._manualBypassUsed = new Set(); // per-account ONE-SHOT quota bypass for a manual Start (reset each Start) — see _dailyQuotaBlocks
+    if (this._manualRun) { this._dailyCycleDate = this._localDayKey(); this._dailyCycleCount = 0; }
     this._stop = false; this._paused = false; this._finish = false; this.running = true;
     this._modLoop = false; // reset so a quick Stop→Start re-arms the concurrent moderator loop (a still-draining prior loop must not block the new one)
+    this._runGen = (this._runGen || 0) + 1; // generation token: a moderator loop from a PRIOR Start self-terminates when this bumps — the _modLoop flag alone can't tear it down because start() flips running/_stop back before the old loop re-checks them (it would otherwise survive a quick Stop→Start that landed mid-approval, accumulating duplicate loops over a multi-day run)
     this._approving = false; // never start a run with a stuck approval guard
+    this._modBackoffUntil = 0; this._modLoggedOutWarned = null; // moderator logged-out back-off (so a dead admin doesn't re-launch every 75s)
     this._aborters.clear();
-    this._progress = { running: true, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0, offline: false };
+    this._progress = { running: true, paused: false, cycle: 0, posted: 0, errors: 0, pending: 0, accountsDone: 0, accountsTotal: 0, offline: false, accounts: [] };
+    this._acctLive = {}; this._cycleAccts = []; this._lastLiveEmit = 0;
+    if (this._progressTimer) { try { clearTimeout(this._progressTimer); } catch {} this._progressTimer = null; }
+    this._lastDiskWarn = 0;
     this._runStartedAt = Date.now();
     this._runStats = {}; // per-account totals across the whole run (for the end-of-run summary)
     this._runFlags = {}; // accountName -> flag set THIS run (rate_limited/checkpoint/etc.)
@@ -234,8 +393,11 @@ class Orchestrator {
     this.emit('automation-started');
     this.emit('automation-progress', { ...this._progress });
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
+    this._diskPreflight(getData); // warn BEFORE a long run if the drive can't hold the fleet's profiles (a full disk halts all accounts)
+    this._startNetMonitor(); // watch connectivity for the whole run (auto-pause offline / auto-resume online)
     this._loop(getData).catch((e) => this.log(`❌ Orchestrator crashed: ${e.message}`))
       .finally(() => {
+        this._stopNetMonitor();
         this.running = false;
         this._aborters.clear();
         this._progress.running = false;
@@ -257,10 +419,16 @@ class Orchestrator {
   _emitSummary(reason) {
     const durationMs = Date.now() - (this._runStartedAt || Date.now());
     const byAccount = this._runStats || {};
+    // "Pending" = work still OUTSTANDING at run end — posts held for moderator approval + link-comments
+    // not yet placed — read from the authoritative stores. NOT the cumulative tally of everything ever sent
+    // to approval (which never decremented as items got approved/delivered, so it over-reported).
+    let pendingNow = 0;
+    try { pendingNow += (store.loadModeration().held || []).filter((h) => h.status === 'held').length; } catch {}
+    try { pendingNow += (store.loadComments().pending || []).filter((c) => c.status === 'pending' && (c.attempts || 0) < 3).length; } catch {}
     const summary = {
       reason,
       posted: this._progress.posted || 0,
-      pending: this._progress.pending || 0,
+      pending: pendingNow,
       errors: this._progress.errors || 0,
       cycles: this._progress.cycle || 0,
       durationMs,
@@ -298,9 +466,52 @@ class Orchestrator {
   // Choose the posts a given account publishes this cycle. `claim`=true (at run time) reserves
   // the post for this account so a parallel account can't grab the same one; failed claims are
   // released so another account picks them up (see _runAccount).
+  // DAILY PACING for daily-rotation / campaign-plan: an account posts up to settings.cyclesPerDay posts per LOCAL day,
+  // spaced so they can't cluster. Returns TRUE when the account must NOT post yet. For N=1 this is BYTE-IDENTICAL to the
+  // original "posted today (1/day)" + "~20h midnight-straddle floor". N>1 only relaxes the daily PACING — the SAME post
+  // is never re-delivered (the caller advances the per-agent pointer; dealt-set + _cycleDelivered still block duplicates).
+  _dailyQuotaBlocks(rec, name, claim) {
+    // Manual Start = a fresh "run now": let EACH account bypass the daily pacing cap ONCE (post immediately even if it
+    // already posted today), then fall through to the normal cap on every LATER cycle — a ONE-SHOT per account, NOT a
+    // persistent bypass (a persistent one would defeat the 1/day-or-cyclesPerDay cap for the whole run → real
+    // over-posting on any Stop→Start or long unattended run). The dealt-set + pointer-advance still prevent any
+    // same-post→same-group duplicate; only this account's per-day COUNT/spacing cap is skipped for its first cycle.
+    if (this._manualRun && name && this._manualBypassUsed && !this._manualBypassUsed.has(name)) { if (claim) this._manualBypassUsed.add(name); return false; } // consume the one-shot ONLY on the REAL run (claim=true). A read-only plan-preview probe (claim=false, the daily/campaign planning header) must NOT burn it — otherwise the actual run finds the name already "used", falls through to the normal cap, and a daily-rotation/campaign account that already posted today posts NOTHING on a manual Start (defeating the whole feature).
+    const s = (this._data && this._data.settings) || {};
+    const N = Math.max(1, Math.min(8, parseInt(s.cyclesPerDay, 10) || 1));
+    const today = this._localDayKey();
+    // posts-today count. A pre-cyclesPerDay (or externally-stamped) record has lastPostedDate but no postsToday — treat
+    // its "posted today" as 1 so N=1 stays BYTE-IDENTICAL to the old lastPostedDate===today guard and legacy jars are safe.
+    const done = (rec && rec.postsTodayDate === today) ? (Number(rec.postsToday) || 0)
+      : ((rec && rec.lastPostedDate === today) ? 1 : 0);
+    if (done >= N) return true; // hit today's N-post quota
+    // spacing floor: N=1 → the original ~20h straddle trap (unchanged). N>1 → smaller (< the inter-cycle gap so each
+    // cycle can post, but ≥25min so posts never cluster); the gate's rest-until-tomorrow prevents a midnight straddle.
+    const gapMin = (Number(s.cycleGapMin) > 0) ? Number(s.cycleGapMin) : (Number(s.waitIntervalMin) || 90); // the inter-cycle gap the floor scales off
+    const floorMs = (N <= 1) ? (20 * 60 * 60 * 1000) : Math.max(5 * 60 * 1000, Math.floor(gapMin * 60000 * 0.5)); // N>1: a small anti-glitch floor (≥5min, ~half the cycle gap) — the cycle STRUCTURE spaces the posts, so "time between cycles" is yours to set
+    if ((Date.now() - (Number((rec && rec.lastPostedAt)) || 0)) < floorMs) return true;
+    return false;
+  }
+
+  // The wait BETWEEN cycles: an explicit cycleGapMin (minutes, +up to 30% jitter so the cadence isn't a fixed spam
+  // tell) if the operator set one, else the speed preset's waitInterval range. Floored at 5min. Used by BOTH the
+  // daily-run inter-cycle gap and the continuous-mode "next cycle" wait.
+  _interCycleMs(settings) {
+    const g = Number(settings && settings.cycleGapMin) || 0;
+    // cycleGapMin (store-clamped ≥5min) + up to 30% jitter, else the speed preset's waitInterval range VERBATIM — which
+    // may be 0 (instant / back-to-back cycles). NO floor here: continuous + daily-N=1 must honor 0; only the multi-cycle
+    // DAILY gate applies its own ≥5min floor (where cycles must not fire faster than the per-account spacing).
+    return (g > 0) ? Math.floor(g * 60000 * (1 + Math.random() * 0.3)) : rangeMs(settings, 'waitIntervalMin', 'waitIntervalMax', 90, 180, 60000, 1);
+  }
+
   _postsForAccount(account, cycle, claim = false, claimedSet = this._claimed) {
     const data = this._data;
-    const filtered = data.posts.filter((p) => matchesFilter(p, account.postFilter || 'all'));
+    // Reserve STAND-IN (campaign takeover) — handled FIRST, before any set/filter/group gate: a reserve covering a
+    // dropped campaign-plan agent must deliver that agent's EXACT pre-assigned post regardless of the reserve's OWN
+    // postSetId or postFilter (otherwise a reserve in a different set would filter the stand-in post out → no takeover).
+    const _stand = (this._campaignTakeover || {})[account.name];
+    if (_stand) { const sp = data.posts.find((p) => p.id === _stand.postId); return sp ? [sp] : []; }
+    const filtered = postsForSet(data.posts, account).filter((p) => matchesFilter(p, account.postFilter || 'all'));
     if (!filtered.length) return [];
     // An account with NO assigned groups can't post anywhere — never assign it a post. Otherwise, in
     // unique mode, it would "claim" a post it can't deliver and the campaign-complete probe could never
@@ -308,6 +519,8 @@ class Orchestrator {
     if (!(account.assignedGroups && account.assignedGroups.length)) return [];
     const order = account.postingOrder || 'post-centric';
     const unique = order.includes('unique') || order === 'sequence';
+    // (Reserve stand-in is resolved at the TOP of this method now — before the set/filter gate — so a takeover
+    // reserve delivers the dropped agent's exact post even when its own postSetId points to a different set.)
 
     // DAILY ROTATION (per-agent): this account posts ONE post per LOCAL DAY to its groups, advancing its
     // OWN pointer one step each day (independent of other agents and of the shared dealt-set). Anti-repeat:
@@ -318,7 +531,19 @@ class Orchestrator {
     if (order === 'daily-rotation') {
       const list = filtered; // stable library order = the rotation order
       const rec = (this._perAccountRotation && this._perAccountRotation[account.name]) || {};
-      if (rec.lastPostedDate === this._localDayKey()) return []; // already posted today → one per day
+      if (this._dailyQuotaBlocks(rec, account.name, claim)) return []; // daily PACING: up to cyclesPerDay posts/day (N=1 = the original 1/day + ~20h midnight-straddle floor). Never re-posts the SAME post (pointer advances below). Pass `claim` so the manual one-shot bypass is spent by the real run, not the read-only plan preview.
+      // PERSISTENT OWED (partial-delivery carry-over, [7]): if a prior cycle/day left groups un-reached for a post,
+      // finish THAT post FIRST — return it (its delivery is scoped to ONLY the owed groups in _runAccount's onlyGroups)
+      // instead of advancing to the next post, so the un-reached groups are never skipped and no delivered group is
+      // ever re-posted. Advancing waits until the owed post is fully covered (then the pointer moves on normally).
+      const owedDR = this._owed && this._owed[account.name];
+      if (owedDR && owedDR.postId && (owedDR.gids || []).length) {
+        const _asg = this._groupIdsOf(account); // prune owed groups the operator has since UN-assigned — otherwise a removed group keeps re-picking an undeliverable owed post forever (targetGroups empties → nothing lands → owed never clears → the rotation livelocks)
+        const _live = owedDR.gids.filter((gid) => _asg.has(gid));
+        const op = _live.length ? list.find((p) => p.id === owedDR.postId) : null;
+        if (op) { if (claim && _live.length !== owedDR.gids.length) this._owed[account.name] = { postId: owedDR.postId, gids: _live }; return [op]; }
+        if (claim) { try { delete this._owed[account.name]; } catch {} } // owed post gone from the library OR all owed groups un-assigned → drop the stale obligation, fall through to the normal next pick
+      }
       const li = rec.lastPostId ? list.findIndex((p) => p.id === rec.lastPostId) : -1;
       let nextIdx = li < 0 ? 0 : (li + 1) % list.length;
       let pick = list[nextIdx];
@@ -331,10 +556,24 @@ class Orchestrator {
     // order, until its slice is done. The slice + daily pacing are tracked exactly like daily-rotation
     // (perAccountRotation pointer). Returns [] once the agent finished its slice OR already posted today.
     if (order === 'campaign-plan') {
+      // (Reserve stand-in is handled above, before the order dispatch, so it covers any reserve postingOrder.)
       const plan = this._campaignPlan;
       const listIds = (plan && plan.agentLists && plan.agentLists[account.name]) || [];
       if (!listIds.length) return [];
-      if (((this._perAccountRotation || {})[account.name] || {}).lastPostedDate === this._localDayKey()) return []; // 1/day
+      const crec = (this._perAccountRotation || {})[account.name] || {};
+      if (this._dailyQuotaBlocks(crec, account.name, claim)) return []; // daily PACING: up to cyclesPerDay posts/day (N=1 = the original 1/day + ~20h floor). The per-agent slice pointer (below) still advances → never the same post twice. Pass `claim` so the manual one-shot bypass is spent by the real run, not the read-only plan preview.
+      // PERSISTENT OWED (partial-delivery carry-over, [8]): finish an earlier slice-post's un-reached groups FIRST
+      // (scoped to only those groups in _runAccount) before advancing the slice pointer, so a campaign agent that
+      // dropped mid-slice never permanently skips groups and never re-posts a delivered one. Looked up in the full
+      // library (not the slice) so a reshuffled plan still finds it.
+      const owedCP = this._owed && this._owed[account.name];
+      if (owedCP && owedCP.postId && (owedCP.gids || []).length) {
+        const _asg = this._groupIdsOf(account); // prune un-assigned owed groups (see daily-rotation above) so a removed group can't livelock the slice on an undeliverable owed post
+        const _live = owedCP.gids.filter((gid) => _asg.has(gid));
+        const op = _live.length ? (data.posts || []).find((p) => p.id === owedCP.postId) : null;
+        if (op) { if (claim && _live.length !== owedCP.gids.length) this._owed[account.name] = { postId: owedCP.postId, gids: _live }; return [op]; }
+        if (claim) { try { delete this._owed[account.name]; } catch {} } // owed post gone from the library OR all owed groups un-assigned → drop the stale obligation, fall through to the slice pointer
+      }
       const n = this._campaignNextIdx(account.name);
       if (n.idx >= n.len) return []; // this agent finished its slice (batch done for it)
       const post = data.posts.find((p) => p.id === listIds[n.idx]);
@@ -377,7 +616,22 @@ class Orchestrator {
     const data = this._data;
     const accountStart = Date.now();
     const posts = this._postsForAccount(account, cycle, true); // claim at run time so parallel accounts don't collide
-    if (!posts.length) { this.log(`↪️ [${account.name}] no eligible posts`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [], dealtIds: [] }; }
+    if (!posts.length) {
+      // Surface WHY this account posted nothing. Otherwise a MISCONFIGURED account (no groups / empty post-set /
+      // filter excludes everything) idles all run, reading as a healthy 'done' on the dashboard with no stated reason.
+      // Read-only, using the SAME gate helpers as _postsForAccount so the label is accurate. Only the misconfig
+      // branches set lastMessage; the legitimate cases (already posted today / pool exhausted) get the soft else
+      // string and persist nothing, so the dashboard is untouched for them. Additive — the [] return is unchanged.
+      const _inSet = postsForSet(data.posts, account);
+      const _eligible = _inSet.filter((p) => matchesFilter(p, account.postFilter || 'all'));
+      let _why = '';
+      if (!(account.assignedGroups && account.assignedGroups.length)) _why = 'no assigned groups — assign groups in the Accounts tab';
+      else if (account.postSetId && _inSet.length === 0) _why = "its post-set has 0 posts — tag posts to that set (Posts tab) or clear the account's post-set";
+      else if (_eligible.length === 0) _why = `the '${account.postFilter || 'all'}' filter excludes every post`;
+      this.log(`↪️ [${account.name}] no eligible posts${_why ? ' — ' + _why : ' (its content for this cycle is already dealt / posted today — nothing to do)'}`);
+      if (_why) { try { await store.update((d) => { const a = d.accounts.find((x) => x.name === account.name); if (a) a.lastMessage = '⏭️ Posted nothing — ' + _why; }); this.emit('data-updated'); } catch {} }
+      return { progressed: false, posted: 0, pendingApproval: 0, errors: 0, postedIds: [], dealtIds: [] };
+    }
     const order = account.postingOrder || 'post-centric';
     const isUnique = order.includes('unique') || order === 'sequence';
     const modeLabel = this._modeLabel(order);
@@ -397,11 +651,38 @@ class Orchestrator {
     } else {
       this.log(`[${account.name}] 📋 Mode: ${modeLabel} → all ${kGroups} groups`);
     }
+    // Effective pace = explicit per-account pace, else the fleet defaultPace (now can be turbo/instant too). Label ALL 5 tiers
+    // truthfully so the run log/dashboard never understates how aggressively an account is running (matters for ban/rate-limit triage).
+    const _PACE_LABELS = { safe: '🐢 Safe (slower, more human)', fast: '⚡ Fast (quicker)', turbo: '🚀 Turbo (¼ gaps)', instant: '⚡ Instant (max speed, 0–7s gaps)' };
+    const _effPace = (account.pace && account.pace !== 'normal') ? account.pace
+      : ((data.settings && data.settings.defaultPace && data.settings.defaultPace !== 'normal') ? data.settings.defaultPace : null);
+    if (_effPace) this.log(`[${account.name}] ⏱ Pace: ${_PACE_LABELS[_effPace] || _effPace}${account.pace ? '' : ' (inherited)'}`);
     this.log(`[${account.name}] 🚀 Starting...`);
     let progressed = false, posted = 0, pendingApproval = 0, errors = 0, accountFlag = null, accountOffline = false;
     let accountCrashes = 0; // M3-09: consecutive posts that crashed out for this account
     const postedIds = []; // posts confirmed PUBLISHED — safe to auto-delete
     const dealtIds = [];  // posts dealt this cycle (published OR pending) — don't re-deal
+    // Per-(post,group) dedup applies in deal-once modes (campaign-plan/unique/sequence), the per-agent daily-rotation
+    // (so a partial delivery's delivered groups are TRACKED for the owed ledger AND a crash-retry never re-posts a
+    // group it already reached), OR when this account is a reserve STAND-IN — NEVER in broadcast modes
+    // (post-centric/random). _onlyGroups routes an OWED cover to ONLY the un-reached groups.
+    const _ord = account.postingOrder || 'post-centric';
+    const _stand = (this._campaignTakeover || {})[account.name] || null;
+    const _dedup = (_ord === 'campaign-plan' || _ord.includes('unique') || _ord === 'sequence' || _ord === 'daily-rotation' || !!_stand);
+    // Ledger-key scope of the RESPONSIBLE agent (the covered agent when this run is a reserve stand-in, else this
+    // account). Per-agent for daily-rotation, fleet-wide otherwise — see _dkScope. Keeps two daily-rotation accounts
+    // that share a group from clobbering each other's delivery, while a stand-in's deliveries still count for the
+    // covered agent's owed reconcile.
+    const _dkPrefix = this._dkScope(_stand ? _stand.forAgent : account.name);
+    // An agent DISCHARGING its own PERSISTENT owed post (daily-rotation / campaign-plan, from a prior cycle) covers
+    // ONLY its still-owed groups — tied to the actually-picked post so a stale/deleted owed entry can't mis-scope a
+    // different post. A reserve STAND-IN's onlyGroups (the dropped agent's un-reached groups) takes precedence. [7][8]
+    const _owedSelf = (!_stand && this._owed && this._owed[account.name]
+      && posts.length === 1 && posts[0] && posts[0].id === this._owed[account.name].postId
+      && Array.isArray(this._owed[account.name].gids) && this._owed[account.name].gids.length)
+      ? this._owed[account.name] : null;
+    const _onlyGroups = (_stand && Array.isArray(_stand.gids)) ? _stand.gids
+      : (_owedSelf ? _owedSelf.gids : null);
     try {
     postsLoop:
     for (const post of posts) {
@@ -413,17 +694,27 @@ class Orchestrator {
       for (let attempt = 1; attempt <= MAX; attempt++) {
         try {
           const r = await runAccount({
-            account, maxThisRun, post, groups: data.groups, settings: data.settings,
-            useProxies: !!data.useProxies, proxies: data.proxies || [],
-            log: (m) => this.log(m),
+            // Per-account PACE overlay: scale this account's timing windows by its profile (safe 2× / fast 0.5× /
+            // turbo 0.25× / instant 0.1× / normal = global). Only the WORKER gets the paced copy — orchestrator-level gaps (cycle/stagger)
+            // keep reading the unscaled data.settings, so a per-account pace never changes pool cadence.
+            account, maxThisRun, post, groups: data.groups, settings: applyPace(data.settings, account.pace),
+            useProxies: !!data.useProxies, proxies: data.proxies || [], assignedProxy: (this._proxyForAccount ? this._proxyForAccount(account) : null), // cycle-pinned pool proxy the anti-link gate serialized on — worker must use the SAME one
+            log: (m) => { this.log(m); this._setAcctAction(account.name, m); }, // mirror each worker step into the live dashboard panel
             shouldStop: () => this._shouldStop(),
             isLoginOpen: this.isLoginOpen,
             registerAborter: (abort) => this._registerAborter(abort),
             isOnline: () => isOnline(), // lets the worker bail fast when offline instead of burning nav timeouts
             reportProxy: (p, ok, reason) => this.reportProxy(p, ok, reason), // E-X3: per-proxy health from the worker
+            isOnCooldown: (p) => { try { return this._proxyHealth.isOnCooldown(p); } catch { return false; } }, // skip a dead POOL proxy at pick time
             waitIfPaused: () => this._waitWhilePaused(), // Pause holds between groups, mid-account
             isPaused: () => this._paused,                // so the worker can suspend its watchdog while paused
             isDisabled: () => { try { const a = store.load().accounts.find((x) => x.name === account.name); return !!(a && a.enabled === false); } catch { return false; } }, // user turned this account OFF mid-run (read DISK fresh — this._data is frozen per cycle) → end its waits early
+
+            // Per-(post,group) delivery ledger (deal-once / stand-in only): record a confirmed/held delivery and let
+            // the worker skip a group already delivered this cycle. onlyGroups restricts a stand-in to the owed groups.
+            markDelivered: _dedup ? (gid) => { try { if (post.id) this._cycleDelivered.add(_dkPrefix + post.id + '::' + gid); } catch {} } : undefined,
+            alreadyDelivered: _dedup ? (gid) => { try { return !!post.id && this._cycleDelivered.has(_dkPrefix + post.id + '::' + gid); } catch { return false; } } : undefined,
+            onlyGroups: _onlyGroups,
 
             // Per-(account,group,post) outcome → append to the persistent audit trail.
             onResult: (rec) => { try { if (!store.appendReport(rec) && !this._auditWarned) { this._auditWarned = true; this.log('⚠️ Could not write an audit-log row (disk full / permissions?) — the run continues but run-report.jsonl/.csv may be incomplete. Fix disk/permissions to restore the audit trail.'); } } catch {} },
@@ -489,7 +780,15 @@ class Orchestrator {
               const { ok: _csOk, result: added } = await store.updateComments((cs) => {
                 let n = 0;
                 for (const c of r.commentQueue) {
-                  if (!cs.pending.some((x) => x.gid === c.gid && (x.postId && c.postId ? x.postId === c.postId : x.captionSnip === c.captionSnip) && x.status !== 'done')) {
+                  // Dedup key, strongest-available identifier first: postId, else the post PERMALINK, else
+                  // captionSnip SCOPED BY the posting account. At scale many distinct posts share a templated
+                  // caption lead (and FB held-cards rarely carry a postId), so a bare gid+captionSnip key collapses
+                  // DIFFERENT posts and silently drops a real orphaned comment — scope by posterAccount to avoid that.
+                  if (!cs.pending.some((x) => x.gid === c.gid && x.status !== 'done' && (
+                    (x.postId && c.postId) ? x.postId === c.postId
+                    : (x.postPermalink && c.postPermalink) ? x.postPermalink === c.postPermalink
+                    : (x.captionSnip === c.captionSnip && (x.posterAccount || '') === (c.posterAccount || ''))
+                  ))) {
                     cs.pending.push({ ...c, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null }); n++;
                   }
                 }
@@ -574,10 +873,24 @@ class Orchestrator {
       const ms0 = store.loadModeration();
       if (!ms0.held || !ms0.held.length) return;
       const now0 = Date.now(); let changed0 = false;
-      const STALE = 30 * 60 * 1000, PRUNE = 24 * 3600 * 1000;
+      const STALE = 90 * 60 * 1000, PRUNE = 24 * 3600 * 1000; // 90min so the moderator gets many more approval passes (it loops ~75s) before a held post is given up
+      const repostOn = !!(this._data && this._data.settings && this._data.settings.repostEnabled);
+      const FAILED_PRUNE = repostOn ? 7 * 24 * 3600 * 1000 : PRUNE; // with repost ON a 'failed' record is STILL a Phase-4 re-post candidate — keep it ~7d so a multi-run campaign keeps re-attempting it (it may simply never have had a free in-group reserve), instead of silently giving up at 24h
       const before = ms0.held.length;
-      for (const h of ms0.held) { if (h.status === 'held' && h.heldAt && (now0 - h.heldAt) > STALE) { h.status = 'failed'; h.heldFailedAt = now0; h.note = 'not approvable within 30min (removed/auto-approved/unmatchable)'; changed0 = true; } } // heldFailedAt = repost-grace reference
-      ms0.held = ms0.held.filter((h) => h.status === 'held' || ((h.heldFailedAt || h.approvedAt || h.heldAt || 0) > now0 - PRUNE)); // anchor failed/superseded/failed_held on their failure time so Phase 4 can still see eligible 'failed' records
+      for (const h of ms0.held) { if (h.status === 'held' && h.heldAt && (now0 - h.heldAt) > STALE) { h.status = 'failed'; h.heldFailedAt = now0; h.note = 'not approvable within 90min (removed/auto-approved/unmatchable)'; changed0 = true; } } // heldFailedAt = repost-grace reference
+      // Recover an INTERRUPTED Phase-4 re-post. A record is flipped to 'superseded' + persisted BEFORE runRepost is
+      // awaited (~1707). A HARD process kill mid-re-post (Electron quit / power loss / OOM) skips every in-process
+      // resolution path (→approved/failed_held/failed), leaving the record durably stuck as 'superseded' — INVISIBLE
+      // to the Phase-4 'failed' candidate filter AND to _outstandingWork (so completion mode falsely reports
+      // 'completed') AND silently pruned at 24h: a fully silent undelivered drop. A 'superseded' record can ONLY
+      // survive to here when NO re-post is in flight (_approving blocks every prune during a genuine re-post), so a
+      // stale one IS an interrupted re-post → revert to 'failed' to re-queue it. 30min ≫ any real re-post.
+      for (const h of ms0.held) { if (h.status === 'superseded' && (now0 - (h.repostAt || h.heldFailedAt || h.heldAt || 0)) > 30 * 60 * 1000) { h.status = 'failed'; h.repostedBy = null; h.note = 're-post interrupted before completion (process killed mid-re-post) — re-queued'; changed0 = true; } }
+      const _ageRef = (h) => (h.heldFailedAt || h.approvedAt || h.heldAt || 0);
+      const _keep = (h) => h.status === 'held' || (_ageRef(h) > now0 - (h.status === 'failed' ? FAILED_PRUNE : PRUNE)); // 'failed' gets the longer ceiling so Phase-4 isn't cut off; approved/failed_held prune at 24h
+      const _givenUp = ms0.held.filter((h) => h.status === 'failed' && !_keep(h)).length;
+      ms0.held = ms0.held.filter(_keep);
+      if (_givenUp) this.log(`⚠️ ${_givenUp} held post(s) GIVEN UP undelivered (held past the recovery window, never re-posted). Lead with warmed/trusted accounts + a moderator so Facebook doesn't hold them.`);
       if (changed0 || ms0.held.length !== before) store.saveModeration(ms0);
     } catch {}
   }
@@ -585,6 +898,10 @@ class Orchestrator {
   async _runModeratorApproval(data, shouldStop) {
     shouldStop = shouldStop || (() => false);
     const settings = data.settings || {};
+    // HARD CHOKEPOINT: every moderator-approval path goes through here, so this single gate GUARANTEES the moderator
+    // account NEVER launches or acts when "Moderator Approval" is unchecked — re-read live each call, so toggling it
+    // off (even mid-run) stops the very next pass. (The callers also gate, but this makes it impossible to bypass.)
+    if (!settings.moderationEnabled) return { held: 0, moderators: 0, disabled: true };
     this._pruneModeration(); // hygiene FIRST so the queue can't wedge/grow
     const heldNow = (store.loadModeration().held || []).filter((h) => h.status === 'held');
     const moderators = (data.accounts || []).filter((a) => a.isModerator);
@@ -606,13 +923,18 @@ class Orchestrator {
       if (shouldStop()) break;
       const gids = new Set(held.map((h) => h.gid));
       const modGroups = (data.groups || []).filter((g) => gids.has(g.groupId || g.id));
-      const r = await runModerator({ account: mod, groups: modGroups, settings, held, posterNames, log: (m) => this.log(m), shouldStop });
+      const r = await runModerator({ account: mod, groups: modGroups, settings, held, posterNames, useProxies: !!data.useProxies, proxies: data.proxies || [], log: (m) => this.log(m), shouldStop });
+      // Moderator logged out → back off (stop re-launching it every cycle) + flag it for the operator. Otherwise a
+      // usable moderator run clears any prior back-off so approvals resume the moment it's logged back in.
+      if (r && r.flag === 'needs_login') { this._noteModeratorLoggedOut(mod.name); }
+      else if (r && r.flag === 'proxy_invalid') { this._noteModeratorProxyInvalid(mod.name); } // else this fell into the clear below → re-launched a doomed browser every ~75s with no operator notice
+      else if (r) { this._modBackoffUntil = 0; this._modLoggedOutWarned = null; this._modProxyWarned = null; }
       // APPROVE → COMMENT HANDOFF: for every post the moderator actually APPROVED (now public), mark its
       // moderation record approved (so it's never re-approved) and move its comment payload into the
       // pending-comments queue so the existing Phase-3 rescue runner adds the link-comment via a healthy
       // in-group account. Gated on !dryRun (a "would approve" must NOT queue anything).
       if (r && r.dryRun === false && Array.isArray(r.approvedRecords) && r.approvedRecords.length) {
-        try { queued += this._handoffApprovedToComments(r.approvedRecords); }
+        try { queued += await this._handoffApprovedToComments(r.approvedRecords); }
         catch (e) { this.log(`⚠️ approve→comment handoff failed: ${e.message}`); }
       }
     }
@@ -626,33 +948,37 @@ class Orchestrator {
   // Phase-3 rescue runner places the link-comment via a healthy in-group account. Dedup is captionSnip-
   // PRIMARY (held cards usually have no postId, while an orphan-path entry may carry one — keying on
   // postId-first could miss a cross-path duplicate and double-comment). Returns the # of NEW comment tasks.
-  _handoffApprovedToComments(approvedRecords) {
+  async _handoffApprovedToComments(approvedRecords) {
     const recs = (approvedRecords || []).filter((h) => h && h.gid);
     if (!recs.length) return 0;
     // A record with NEITHER a captionSnip NOR a postId can't be deduped (every same() check would be
     // false → repeated double-comments + a held record that never marks approved). Drop those up front.
     const safe = recs.filter((h) => (h.captionSnip && String(h.captionSnip).trim()) || h.postId);
     const same = (x, h) => x.gid === h.gid && (
-      (h.captionSnip && x.captionSnip) ? x.captionSnip === h.captionSnip
+      (h.captionSnip && x.captionSnip) ? (x.captionSnip === h.captionSnip && (x.posterAccount || '') === (h.posterAccount || '')) // scope by poster: two DIFFERENT accounts' same-caption held posts in one group are distinct payloads — collapsing them silently drops the 2nd account's comment. Same post+account still dedups (and the postId branch also still catches them).
       : (!!x.postId && !!h.postId) ? x.postId === h.postId
       : (!!(h.postPermalink || h.permalink) && !!(x.postPermalink || x.permalink)) ? (h.postPermalink || h.permalink) === (x.postPermalink || x.permalink)
       : false);
-    try {
-      const ms = store.loadModeration(); let changed = false;
-      for (const h of safe) { const rec = (ms.held || []).find((x) => x.status === 'held' && same(x, h)); if (rec) { rec.status = 'approved'; rec.approvedAt = Date.now(); changed = true; } }
-      if (changed) store.saveModeration(ms);
-    } catch (e) { this.log(`⚠️ could not mark approved held record(s): ${e.message}`); }
+    // ORDER + DURABILITY: queue the comment FIRST (serialized via _comChain), and flip the held record to
+    // 'approved' ONLY after that save succeeded. The old order flipped approved first, so a failed comment-save
+    // left an 'approved' record with NO comment and no recovery path (a silently lost link). Leaving it 'held'
+    // on failure means the next moderator cycle retries + the 90-min prune escalates it to 'failed' for Phase-4.
     let added = 0;
     try {
-      const cs = store.loadComments();
-      for (const h of safe) {
-        if (!(h.comment && String(h.comment).trim())) continue; // nothing to comment (caption-only post) — skip
-        if (cs.pending.some((x) => x.status !== 'done' && same(x, h))) continue; // already queued (orphan or earlier approve) — no double-comment
-        cs.pending.push({ gid: h.gid, postId: h.postId || null, posterAccount: h.posterAccount || null, fbDisplayName: h.fbDisplayName || null, groupName: h.groupName || null, captionSnip: h.captionSnip || null, postCaption: h.postCaption || h.captionSnip || null, comment: h.comment, commentImg: h.commentImg || null, postPermalink: h.permalink || h.postPermalink || null, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null, source: 'approved' });
-        added++;
-      }
-      if (added) store.saveComments(cs);
-    } catch (e) { this.log(`⚠️ could not queue approved post comment(s): ${e.message}`); }
+      await store.updateComments((cs) => {
+        for (const h of safe) {
+          if (!(h.comment && String(h.comment).trim())) continue; // caption-only post — nothing to comment
+          if (cs.pending.some((x) => x.status !== 'done' && same(x, h))) continue; // already queued — no double-comment
+          cs.pending.push({ gid: h.gid, postId: h.postId || null, posterAccount: h.posterAccount || null, fbDisplayName: h.fbDisplayName || null, groupName: h.groupName || null, captionSnip: h.captionSnip || null, postCaption: h.postCaption || h.captionSnip || null, comment: h.comment, commentImg: h.commentImg || null, postPermalink: h.permalink || h.postPermalink || null, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null, source: 'approved' });
+          added++;
+        }
+      });
+    } catch (e) { this.log(`⚠️ could not queue approved post comment(s): ${e.message}`); return 0; } // do NOT approve if the comment couldn't be saved
+    try {
+      await store.updateModeration((ms) => {
+        for (const h of safe) { const rec = (ms.held || []).find((x) => x.status === 'held' && same(x, h)); if (rec) { rec.status = 'approved'; rec.approvedAt = Date.now(); } }
+      });
+    } catch (e) { this.log(`⚠️ could not mark approved held record(s): ${e.message}`); }
     return added;
   }
 
@@ -669,18 +995,62 @@ class Orchestrator {
   // SEPARATE browser. So spam-held posts get approved automatically, in the background, without the
   // operator ever stopping the run. Self-gates each tick (moderationEnabled can be toggled mid-run);
   // shares the _approving guard with the end-of-cycle sweep + manual trigger so passes never overlap.
+  // Are moderator-approval passes currently BACKED OFF because the moderator account is logged out? (Set by
+  // _noteModeratorLoggedOut after a probe returns needs_login.) Resumes EARLY the moment the operator re-logs the
+  // moderator in (its status flips back to 'logged_in'); otherwise stays off for ~20 min so a dead admin browser
+  // isn't re-launched every 75s (which competes with the posting browsers and slows the whole run).
+  _modBackedOff(data) {
+    if (!this._modBackoffUntil || Date.now() >= this._modBackoffUntil) return false;
+    const reLoggedIn = ((data && data.accounts) || []).some((a) => a.isModerator && a.status === 'logged_in');
+    if (reLoggedIn) { this._modBackoffUntil = 0; this._modLoggedOutWarned = null; this._modProxyWarned = null; return false; }
+    return true;
+  }
+  // Unlink the LOCAL image files of auto-deleted posts — ONLY those UNDER the app's images dir (path containment:
+  // imagePaths can come from the remote bulk API or a hand-edited data.json, so an outside/traversal/URL path must
+  // NEVER be removed). Pure + best-effort; extracted so the containment guard is unit-testable.
+  _unlinkDeletedImages(files, dir) {
+    const _fs = require('fs');
+    const base = dir ? path.resolve(dir) + path.sep : ''; // trailing sep so a SIBLING like "<images>-evil/" can't prefix-match
+    for (const f of (files || [])) {
+      try { if (f && base && path.resolve(f).startsWith(base)) _fs.unlinkSync(f); } catch {}
+    }
+  }
+  // A moderator probe came back PROXY-INVALID — same back-off + operator alert as logged-out (else it re-launched a
+  // doomed browser every ~75s with no UI signal). Held posts aren't lost: _pruneModeration graduates them to Phase-4 after 90 min.
+  _noteModeratorProxyInvalid(name) {
+    this._modBackoffUntil = Date.now() + 20 * 60 * 1000;
+    try { store.update((d) => { const a = (d.accounts || []).find((x) => x.name === name); if (a) { a.status = 'error'; a.lastMessage = '🚫 Invalid proxy — fix it to approve held posts'; } }); } catch {}
+    if (this._modProxyWarned !== name) {
+      this._modProxyWarned = name;
+      this.log(`🚫 Moderator "${name}" has an INVALID/UNREACHABLE proxy — held "Spam potentiel" posts can't be approved until you fix it (Accounts → ${name} → proxy). Pausing moderator checks ~20 min so it stops re-launching a dead browser.`);
+      try { this.emit('account-attention', { name, flag: 'proxy_invalid', message: 'Moderator proxy is invalid — held posts are waiting for approval' }); } catch {}
+    }
+  }
+  // A moderator probe came back LOGGED OUT — stop hammering it, mark it logged-out in the UI, and tell the operator
+  // ONCE. Held posts aren't lost: _pruneModeration graduates them to the Phase-4 reserve re-post after 90 min.
+  _noteModeratorLoggedOut(name) {
+    this._modBackoffUntil = Date.now() + 20 * 60 * 1000;
+    try { store.update((d) => { const a = (d.accounts || []).find((x) => x.name === name); if (a) { a.status = 'not_logged_in'; a.lastMessage = '🔐 Logged out — log in to approve held posts'; } }); } catch {}
+    if (this._modLoggedOutWarned !== name) {
+      this._modLoggedOutWarned = name;
+      this.log(`🔐 Moderator "${name}" is LOGGED OUT — held "Spam potentiel" posts can't be approved until you log it back in (Accounts → ${name} → 🔄 Check, or 🔐 Login). Pausing moderator checks ~20 min so it stops re-launching a dead browser.`);
+      try { this.emit('account-attention', { name, flag: 'needs_login', message: 'Moderator logged out — held posts are waiting for approval' }); } catch {}
+    }
+  }
+
   _startModeratorLoop(getData) {
     if (this._modLoop) return;
     this._modLoop = true;
     const CHECK_MS = 75000;
+    const myGen = this._runGen; // own THIS run only — a Stop→Start parked inside _runModeratorApproval must not survive into the next run
     (async () => {
       await this._modSleep(8000); // brief settle, then approve early — also catches posts held on a PRIOR run before this one even produces a hold
-      while (this.running && !this._stop) {
+      while (this.running && !this._stop && this._runGen === myGen) {
         try {
           const data = (typeof getData === 'function') ? getData() : (this._data || {});
           const on = !!(data.settings && data.settings.moderationEnabled);
           const held = on ? (store.loadModeration().held || []).filter((h) => h.status === 'held') : [];
-          if (on && held.length && !this._approving && !this._paused) {
+          if (on && held.length && !this._approving && !this._paused && !this._modBackedOff(data)) {
             this._approving = true;
             this.log(`🛡️ Concurrent moderator: ${held.length} held post(s) detected — approving in the background (posting continues)…`);
             try { await this._runModeratorApproval(data, () => this._stop); }
@@ -705,6 +1075,7 @@ class Orchestrator {
     if (this._approving || this._paused || this._stop || !this.running) return;
     if (!(data.settings && data.settings.moderationEnabled)) return;
     if (!(data.accounts || []).some((a) => a.isModerator)) return;
+    if (this._modBackedOff(data)) return; // moderator logged out → don't re-launch its dead browser on every new hold
     this._approving = true; // claim the guard synchronously so the periodic loop / a 2nd kick can't overlap
     (async () => {
       this.log('🛡️ Held post(s) just detected — kicking a moderator-approval pass now (posting continues)…');
@@ -737,15 +1108,22 @@ class Orchestrator {
     const today = store.todayKey();
     const baseHours = Number.isFinite(settings.rateLimitCooldownHours) ? settings.rateLimitCooldownHours : 4;
     let note = null;
+    // 400-SCALE WRITE ELISION: most per-cycle outcomes are pure no-ops (reserves, already-posted-today, no-groups,
+    // skipped) — posted nothing AND carry no flag → there is NOTHING to persist, yet each still triggered a full
+    // data.json rewrite (+fsync +.bak) = the bulk of the per-cycle write amplification at 400 accounts. Skip those:
+    // a new-day count reset is applied LAZILY on READ (dailyUsed/dailyRolledOver), and every state that DOES need
+    // persisting — a delivery (daily.count), a flag (rate-limit cooldown / warm-up reset), or a recovery/un-stick
+    // (both require a delivery) — still writes immediately, UNCHANGED. Zero durability loss; only wasted writes removed.
+    if (((res.posted || 0) + (res.pendingApproval || 0)) === 0 && !res.flag) return;
     try {
       await store.update((d) => {
         const acc = d.accounts.find((a) => a.name === name);
         if (!acc) return;
-        // Monotonic daily-cap reset (see store.dailyRolledOver): only a genuinely later UTC day
-        // resets the count; a clock moved backward keeps counting, so the cap can't be cleared
-        // by rewinding the clock.
+        // Monotonic daily-cap reset (see store.dailyRolledOver): only a genuinely later LOCAL day (todayKey is
+        // now the local calendar date, matching the pacing/schedule day) resets the count; a clock moved backward
+        // keeps counting, so the cap can't be cleared by rewinding the clock.
         if (store.dailyRolledOver(acc.daily, today)) acc.daily = { date: today, count: 0 };
-        acc.daily.count = (Number(acc.daily.count) || 0) + (res.posted || 0);
+        acc.daily.count = (Number(acc.daily.count) || 0) + (res.posted || 0) + (res.pendingApproval || 0); // held posts DID reach FB (gated for review) — count them so tomorrow's cap reflects real volume
         if (res.flag === 'rate_limited') {
           acc.rlStrikes = (acc.rlStrikes || 0) + 1;
           // THREE tiers, proportionate to what Facebook actually blocked (× the exponential per-strike
@@ -758,13 +1136,48 @@ class Orchestrator {
           acc.rateLimitedUntil = Date.now() + Math.round(hours * 3600000);
           const human = hours >= 1 ? `${Math.round(hours)}h` : `${Math.round(hours * 60)}min`;
           note = `⏸️ ${name}: ${kind === 'account' ? 'ACCOUNT temporarily blocked by Facebook (the big one)' : kind === 'comment' ? 'COMMENT rate-limit' : 'POSTING rate-limit'} — resting it ${human} (strike ${acc.rlStrikes}); skipped until then, others keep working.`;
+        } else if (res.flag === 'needs_login' || res.flag === 'needs_verification' || res.flag === 'account_disabled' || res.flag === 'likely_blocked') {
+          // NON-rate-limit block (logged-out / checkpoint / disabled / posted-nothing). REST it so it is NOT re-launched
+          // EVERY cycle: re-navigating a CHECKPOINTED account into the wall, or re-submitting the FB login form on a dead
+          // session, is a ban-escalation (invariant #3) and burns a browser slot the healthy fleet needs. A reserve
+          // covers its groups (the runOne rest guard), and it AUTO-RETRIES after the window — so a logged-out account can
+          // recover unattended (Tier-3 auto-login) without hammering. Manual states (checkpoint/disabled) rest longer
+          // since only the operator/FB can truly clear them; a clean delivery clears the rest immediately (below).
+          const restH = res.flag === 'needs_login' ? 3 : res.flag === 'likely_blocked' ? 3 : res.flag === 'needs_verification' ? 6 : 12;
+          acc.nextAttnRetry = Date.now() + restH * 3600000;
+          note = `⛔ ${name}: ${res.flag === 'needs_login' ? 'logged out' : res.flag === 'needs_verification' ? 'needs a checkpoint/verification' : res.flag === 'account_disabled' ? 'disabled/restricted by Facebook' : 'posted nothing (likely blocked)'} — resting it ${restH}h (a reserve covers its groups; it retries automatically, or sooner once you fix + re-check it).`;
         } else if (((res.posted || 0) + (res.pendingApproval || 0)) > 0 && !res.flag && (acc.rateLimitedUntil || acc.rlStrikes)) {
           // Recovered (posted OR queued for approval with no flag) — clear the cool-down.
           acc.rateLimitedUntil = 0; acc.rlStrikes = 0;
         }
+        // A clean delivery clears any attention-rest so a RECOVERED account rejoins the very next cycle (never a
+        // permanent skip). Covers the logged-out-then-recovered case, which sets no rateLimitedUntil/rlStrikes.
+        if (((res.posted || 0) + (res.pendingApproval || 0)) > 0 && !res.flag && Number(acc.nextAttnRetry)) acc.nextAttnRetry = 0;
+        // Un-stick a STALE attention status after a clean outcome so a RECOVERED account is not barred from reserve
+        // roles (takeover / Phase-4 re-post / Phase-3 comment-rescue all require status==='logged_in') for the rest of
+        // the run. OUTSIDE the cooldown guard on purpose: a status:'error' case has NO rateLimitedUntil/rlStrikes set,
+        // so it would otherwise stick permanently even though the account is posting fine. Guarded on a real delivery +
+        // no NEW flag this call + not actually still cooling → never un-sticks a genuinely rate-limited account, and only
+        // WIDENS eligibility (dealt-set + markDelivered still govern actual posting → no re-post / double-post).
+        if (((res.posted || 0) + (res.pendingApproval || 0)) > 0 && !res.flag && acc.status && acc.status !== 'logged_in' && (Number(acc.rateLimitedUntil) || 0) <= Date.now()) {
+          acc.status = 'logged_in';
+          if (acc.lastMessage) acc.lastMessage = '';
+        }
       });
       if (note) this.log(note);
-    } catch {}
+      // Account got FLAGGED (rate-limit / checkpoint / logout / block) → RESET its warm-up counter so it
+      // EASES BACK IN (browses + reacts before posting) over its next runs instead of immediately resuming
+      // full posting — reduces re-flagging. Skips proxy_invalid (a config issue, not the account's health).
+      if (settings.enableWarmup && res.flag && res.flag !== 'proxy_invalid' && DROP_FLAGS.has(res.flag)) {
+        try { if (store.loadRunCount(name) > 0) { store.saveRunCount(name, 0); this.log(`🌱 ${name}: flagged (${res.flag}) — warm-up reset; it'll ease back in (browse + react) before posting again.`); } } catch {}
+      }
+    } catch (e) {
+      // This is the ONLY place the rate-limit COOL-DOWN (rateLimitedUntil/rlStrikes) + the DAILY-CAP count are
+      // persisted after a run. A silently-swallowed write here means next cycle reads a STALE cooldown → the account
+      // re-launches straight into the rate-limited group (deepening the block) and posts past its cap. Surface it —
+      // the sibling rotation-pointer / held-record / comment-queue writes all log on a failed save too.
+      this.log(`⚠️ [${name}] could NOT persist its rate-limit cool-down / daily count (${e.message}) — it may re-post while blocked or exceed its daily cap. Free disk space / fix data-folder permissions.`);
+    }
   }
 
   // Persist this cycle's dealt post-ids to disk, THEN mirror them into the in-memory _dealt set.
@@ -774,13 +1187,13 @@ class Orchestrator {
   // Write the FULL current in-memory rotation state (every field) — used by the mid-cycle saves so a
   // load-then-patch can never drop a sibling field (dealt / staggerRotation / lastDailyRunDate / etc.).
   _saveRotationState() {
-    try { return store.saveRotation({ dealt: [...(this._dealt || [])], roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null }); } catch { return false; }
+    try { return store.saveRotation({ dealt: [...(this._dealt || [])], roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null, owedLedger: this._owed || {} }); } catch { return false; }
   }
 
   _persistDealt(cycleDealtIds) {
     if (!cycleDealtIds || !cycleDealtIds.length) return true;
     const merged = [...new Set([...this._dealt, ...cycleDealtIds])];
-    if (store.saveRotation({ dealt: merged, roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null })) {
+    if (store.saveRotation({ dealt: merged, roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null, owedLedger: this._owed || {} })) {
       this._dealt = new Set(merged);
       return true;
     }
@@ -794,9 +1207,11 @@ class Orchestrator {
     const _st = store.loadRotation();
     this._dealt = new Set(Array.isArray(_st.dealt) ? _st.dealt : []); // post-ids already dealt (unique modes)
     this._zeroProgressCycles = 0; // consecutive cycles that dealt nothing -> stall breaker
+    this._emptyConfigCycles = 0;  // consecutive cycles with no posts / no posting accounts -> give-up threshold (reset per run so a prior run's count can't carry over and false-stop)
     this._lastOutstanding = null; this._noDrain = 0; // completion engine: detect when drain stops progressing -> undeliverable
     this._drainingCompletion = false; // true while the completion engine is fast-draining queues — bypasses the daily-schedule 24h gate
     this._proxyWarned = false;    // one-time per-run "proxies off / shared IP" warning
+    this._profileWarned = false;  // one-time per-run "two account names map to the same Chromium profile" warning
     this._auditWarned = false;    // one-time per-run "audit-log write failed" warning
     this._completionWarned = false; // one-time per-run completion-mode advisory (else suppressed forever after a Stop/Start)
     this._loopNoopWarned = false;   // one-time per-run "Loop Campaign has no finite fleet" advisory
@@ -806,6 +1221,7 @@ class Orchestrator {
     this._lastDailyRunDate = _st.lastDailyRunDate || null; // 'daily' schedule: local day-key of the last run (same-day-restart dedupe)
     this._perAccountRotation = (_st.perAccountRotation && typeof _st.perAccountRotation === 'object') ? _st.perAccountRotation : {}; // daily-rotation + campaign-plan: per-agent { lastPostId, lastPostedDate }
     this._campaignPlan = (_st.campaignPlan && typeof _st.campaignPlan === 'object') ? _st.campaignPlan : null; // campaign-plan: { batchId, agentLists{}, clusters[] }
+    this._owed = (_st.owedLedger && typeof _st.owedLedger === 'object') ? _st.owedLedger : {}; // PERSISTENT partial-delivery ledger { agent -> { postId, gids[] } } — un-reached groups of a partial delivery, carried across cycles/days so they get the SAME post next time (never re-posting a delivered group). [7][8]
     this._retryCount = {}; // E-N4: per-account consecutive rate-limit retries → stagger decay (in-memory)
     try { this._proxyHealth.load(this._proxyHealthFile()); } catch {} // E-X3: restore proxy health (prunes >1h)
     let cycle = 0;
@@ -813,34 +1229,82 @@ class Orchestrator {
       this._data = getData(); // re-read each cycle so mid-run edits take effect
       const data = this._data; // the moderator/rescue phases below reference `data` — bind it (was a latent ReferenceError swallowed by their try/catch, silently disabling rescue + the end-of-cycle approval sweep)
       const { posts, accounts, settings } = this._data;
-      if (!posts.length) { this.log('⚠️ No posts configured — stopping.'); break; }
+      if (!posts.length) {
+        // Don't kill a 24/7 run on a transient empty read or a mid-edit moment — wait + re-check; only give
+        // up after several consecutive empty cycles (a genuinely-empty library).
+        this._emptyConfigCycles = (this._emptyConfigCycles || 0) + 1;
+        if (this._emptyConfigCycles >= 5) { this.log('⚠️ No posts configured for several cycles — stopping. Add posts, then Start again.'); break; }
+        this.log('⚠️ No posts configured — waiting 60s and re-checking (add posts on the Posts tab). The run will not stop yet.');
+        await this._waitWithCountdown(60000, 'Waiting for posts');
+        if (this._shouldStop() || this._finish) break;
+        continue;
+      }
       const enabledNonMod = accounts.filter((a) => a.enabled !== false && !a.isModerator); // MOD: the moderator only approves, never posts
+      // Profile-folder collision warning: two account names that sanitize to the SAME folder share ONE Chromium
+      // profile → they fight over the login/lock and can corrupt each other in parallel. Warn once (we don't
+      // change the path scheme — that would log existing accounts out — the operator renames one of each pair).
+      if (!this._profileWarned) {
+        this._profileWarned = true;
+        try {
+          const seen = {}; for (const a of accounts.filter((x) => !x.isModerator)) { const d = store.sanitizeName(a.name); (seen[d] = seen[d] || []).push(a.name); }
+          const col = Object.values(seen).filter((n) => n.length > 1);
+          if (col.length) this.log(`⚠️ Account-name COLLISION — ${col.map((n) => n.join(' / ')).join('; ')} map to the SAME Chromium profile folder, so they share one login/lock and can corrupt each other in parallel. Rename one of each pair (avoid names that differ only in spaces/underscores/special characters).`);
+        } catch {}
+      }
       // STANDBY (backup) accounts NEVER post in normal cycles — they're held as on-demand reserves for THEIR
       // groups (added to this._reserve below). So the posting fleet is the enabled, non-moderator, non-standby set.
       const standbyAccounts = enabledNonMod.filter((a) => a.standby === true);
       const allPosters = enabledNonMod.filter((a) => a.standby !== true);
       if (!allPosters.length) {
-        this.log(standbyAccounts.length
-          ? '⚠️ Every enabled account is set to Standby — there is no primary to post. Turn Standby OFF on at least one account (Standby accounts only step in when a primary in their groups needs help).'
-          : '⚠️ No enabled accounts — stopping.');
-        break;
+        // Wait + re-check rather than hard-stop (an account toggled off mid-run, or a transient empty read,
+        // shouldn't kill the run); only give up after several consecutive empty cycles.
+        this._emptyConfigCycles = (this._emptyConfigCycles || 0) + 1;
+        const _msg = standbyAccounts.length
+          ? 'Every enabled account is set to Standby — turn Standby OFF on at least one account so there is a primary to post'
+          : 'No enabled posting accounts';
+        if (this._emptyConfigCycles >= 5) { this.log(`⚠️ ${_msg} (several cycles) — stopping. Fix, then Start again.`); break; }
+        this.log(`⚠️ ${_msg} — waiting 60s and re-checking. The run will not stop yet.`);
+        await this._waitWithCountdown(60000, 'Waiting for a posting account');
+        if (this._shouldStop() || this._finish) break;
+        continue;
       }
+      this._emptyConfigCycles = 0; // valid config this cycle — reset the transient-empty counter
       // DAILY SCHEDULE: run exactly ONE cycle/day at the local dailyPostTime (the operator's "1 post/day
       // per account into its groups; next day the next post" model — pair with sequence mode + Loop). Wait
       // until the fire time; if today's run already happened, wait until tomorrow. Survives a same-day
       // restart via the persisted lastDailyRunDate. continuous mode is unchanged (no gate).
+      // DAILY SCHEDULE: run settings.cyclesPerDay cycles per LOCAL day — the FIRST at dailyPostTime, the rest SPACED by
+      // the inter-cycle interval — then rest until tomorrow. cyclesPerDay=1 (default) is the classic one-cycle/day, byte-
+      // identical. Each account still posts at most cyclesPerDay of ITS posts/day (enforced in _postsForAccount) and never
+      // re-posts the same post. _dailyCycleCount is IN-MEMORY (a crash re-derives it; the persisted per-account postsToday
+      // is the real cap, so a lost gate counter only costs harmless empty cycles, never an over-post).
       if (settings.scheduleMode === 'daily' && !this._drainingCompletion) { // skip the 24h gate while fast-draining the completion queues
-        const waitMs = this._msUntilDailyFire(settings.dailyPostTime, this._lastDailyRunDate);
+        const N = Math.max(1, Math.min(8, parseInt(settings.cyclesPerDay, 10) || 1));
+        const today = this._localDayKey();
+        if (this._dailyCycleDate !== today) { this._dailyCycleDate = today; this._dailyCycleCount = 0; } // new local day → reset the day's cycle counter
+        const doneToday = this._dailyCycleCount || 0;
+        const runNow = this._runNow; this._runNow = false; // consume — "Save & Start" runs the NEXT cycle immediately
+        let waitMs;
+        if (doneToday >= N) waitMs = this._msUntilDailyFire(settings.dailyPostTime, today); // all N done today → rest until TOMORROW's fire time
+        else if (doneToday === 0) waitMs = runNow ? 0 : this._msUntilDailyFire(settings.dailyPostTime, this._lastDailyRunDate); // first cycle of the day → wait for dailyPostTime
+        else waitMs = runNow ? 0 : Math.max(5 * 60 * 1000, this._interCycleMs(settings)); // subsequent cycle in a MULTI-cycle run → "time between cycles" (cycleGapMin override, else waitInterval), floored 5min so a run can't fire cycles faster than the per-account spacing
+        if (runNow && waitMs === 0 && doneToday === 0) this.log(`▶️ Running the first cycle now; the daily schedule (${settings.dailyPostTime}) applies from the next cycle.`);
         if (waitMs > 0) {
-          this.log(`📅 Daily mode — next run at ${settings.dailyPostTime} (in ~${Math.round(waitMs / 360000) / 10}h).`);
-          await this._waitWithCountdown(waitMs, `Daily run at ${settings.dailyPostTime}`);
+          // Overnight wait (all cycles done → waiting for TOMORROW) may sleep the laptop. Waiting for a TODAY cycle must stay awake.
+          const overnight = (doneToday >= N);
+          const hrs = Math.round(waitMs / 360000) / 10;
+          this.log(N > 1
+            ? (overnight
+              ? `✅ Run complete — ${N} cycle(s) delivered this run; next run auto-starts at ${settings.dailyPostTime} tomorrow (in ~${hrs}h, may sleep).`
+              : `📅 Run (${N} cycles) — ${doneToday === 0 ? `starting at ${settings.dailyPostTime}` : `cycle ${doneToday + 1}/${N}`} (in ~${hrs}h) — staying awake.`)
+            : `📅 Daily mode — next run at ${settings.dailyPostTime} (in ~${hrs}h)${overnight ? ' — resting until tomorrow (laptop may sleep)' : ' — staying awake to post on time'}.`);
+          await this._waitWithCountdown(waitMs, N > 1 ? `Daily cycle ${Math.min(doneToday + 1, N)}/${N}` : `Daily run at ${settings.dailyPostTime}`, overnight);
           if (this._shouldStop() || this._finish) break;
           continue; // re-enter: now it's fire time → falls through and runs one cycle
         }
-        // Mark today's run as STARTED (not only at the end) + persist NOW — so if the app crashes mid-cycle and
-        // resume-on-startup re-fires, the daily gate sees "ran today" and waits for tomorrow instead of
-        // RE-RUNNING the whole cycle (which at dailyCap=0 would re-post to every group = duplicates).
-        if (this._lastDailyRunDate !== this._localDayKey()) { this._lastDailyRunDate = this._localDayKey(); try { this._saveRotationState(); } catch {} }
+        // Fire time → count this cycle toward today's quota; persist lastDailyRunDate (resume dedupe) as before.
+        this._dailyCycleCount = doneToday + 1;
+        if (this._lastDailyRunDate !== today) { this._lastDailyRunDate = today; try { this._saveRotationState(); } catch {} }
       }
       // RESERVE POOL: never run the whole fleet. Hold back `reserveAccounts` healthy accounts — they stay
       // available to RESCUE orphaned link-comments (a post whose own account got blocked before commenting)
@@ -910,9 +1374,9 @@ class Orchestrator {
       // either no plan yet OR the library/agent-set changed (batchId mismatch). Recompute preserves each
       // agent's delivered pointer (perAccountRotation) — only future slots change — so edits don't re-post.
       {
-        const planAgents = active.filter((a) => (a.postingOrder || '') === 'campaign-plan');
+        const planAgents = active.filter((a) => (a.postingOrder || '') === 'campaign-plan' && (a.assignedGroups || []).length); // exclude group-less agents — they can't deliver a slice, so they'd never finish → block completion/loop forever
         if (planAgents.length) {
-          const planPosts = (this._data.posts || []).filter((p) => matchesFilter(p, (planAgents[0].postFilter) || 'all'));
+          const planPosts = (this._data.posts || []); // full library — _computeCampaignPlan applies EACH cluster's own postFilter (+ post-set) so clusters with different filters aren't all gated by the first agent's
           const fresh = this._computeCampaignPlan(planPosts, planAgents, this._roundOffset || 0);
           if (!this._campaignPlan || this._campaignPlan.batchId !== fresh.batchId) {
             // A CHANGED plan (content/roster edited) → reset the per-agent slice pointers so distribution
@@ -924,7 +1388,11 @@ class Orchestrator {
             if (wasExisting) for (const a of planAgents) delete (this._perAccountRotation || (this._perAccountRotation = {}))[a.name];
             this._saveRotationState();
             const totalDays = Math.max(0, ...fresh.clusters.map((c) => c.days));
-            this.log(`🗓️ Campaign Plan: ${planPosts.length} post(s) split across ${planAgents.length} agent(s) in ${fresh.clusters.length} group-set(s) → ~${totalDays} day(s); each group-set receives the whole library.`);
+            const _setsUsed = planAgents.some((a) => a.postSetId);
+            this.log(`🗓️ Campaign Plan: ${planPosts.length} post(s) split across ${planAgents.length} agent(s) in ${fresh.clusters.length} group-set(s) → ~${totalDays} day(s); ${_setsUsed ? 'each batch delivers its assigned post-set' : 'each group-set receives the whole library'}.`);
+            // Empty-set trap: an agent assigned to a post-set with zero matching posts would idle silently every cycle.
+            const _emptySets = fresh.clusters.filter((c) => c.totalPosts === 0);
+            if (_emptySets.length) this.log(`⚠️ ${_emptySets.length} batch(es) have an assigned post-set with NO posts — those accounts will post NOTHING. Tag posts to that set (Posts tab) or clear the batch's set in Quick Setup.`);
           }
         } else if (this._campaignPlan) {
           this._campaignPlan = null; // no campaign-plan agents this cycle
@@ -955,7 +1423,15 @@ class Orchestrator {
 
       cycle++;
       this._claimed = new Set(); // fresh per-cycle claim ledger (released claims free a post for another account)
-      this._jobbedThisCycle = new Set(); // accounts that already ran a browser job this cycle (poster takeover / Phase-4 re-post / Phase-3 rescue) — so no account does 2+ jobs/cycle (anti-spam)
+      this._jobbedThisCycle = new Map(); // accountName → #browser jobs this cycle (poster / takeover / Phase-4 / Phase-3); _jobbedOut caps at reserveMaxJobsPerCycle (default 1) — anti-spam (#5)
+      this._cycleDrops = new Set(); // accounts that DROPPED (delivered nothing) THIS cycle — drives the reserve-takeover pass
+      this._immediateCovered = new Set(); // campaign-plan agents an immediate takeover was DISPATCHED for this cycle (so the end-of-pool backstop never double-covers them)
+      this._immediateDelivered = new Set(); // campaign agents whose slice a stand-in (immediate OR end-of-pool) ACTUALLY delivered this cycle — vs merely dispatched; gates the "deferred" warning so a FAILED cover still warns
+      this._cycleDelivered = new Set(); // "postId::gid" delivered (published OR held) THIS cycle — the no-double-post net + the source for OWED-groups
+      this._cycleOwed = {}; // { agentName -> { postId, gids[] } }: an account that delivered its post to SOME but not all groups → a reserve covers the un-reached groups
+      this._cycleObligation = {}; // { agentName -> { postId, expectedGids[] } }: what each daily-rotation/campaign-plan agent (or the agent a stand-in covered) TRIED to deliver this cycle → reconciled against the FINAL delivered set at end-of-pool into the PERSISTENT this._owed ledger (carry a partial delivery across cycles/days). [7][8]
+      this._postCountedThisCycle = new Set(); // agents whose postsToday was already incremented THIS cycle — a partial delivery + N split reserves all advance the SAME forAgent pointer for ONE logical daily post, so count it once (else _dailyQuotaBlocks under-delivers cyclesPerDay).
+      this._campaignTakeover = {}; // { reserveName -> { postId, forAgent, gids? } }: reserve stand-ins covering a dropped/partial agent's slice this cycle (gids = the owed subset, absent = whole group set)
       // Unique modes deal each post once across accounts. When every active account is unique
       // and no un-dealt posts remain, the campaign is complete — stop and reset for the next run.
       // Only FINITE modes (unique/sequence) can "complete"; daily-rotation and post-centric are ongoing
@@ -986,7 +1462,7 @@ class Orchestrator {
           this.log('🔁 All posts distributed — looping (recycling, rotating content across accounts)...');
           this._dealt.clear();
           this._roundOffset = (this._roundOffset || 0) + 1;
-          try { store.saveRotation({ dealt: [], roundOffset: this._roundOffset, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null }); } catch {} // keep the daily + per-agent + campaign markers so a same-day restart can't double-run
+          try { store.saveRotation({ dealt: [], roundOffset: this._roundOffset, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null, owedLedger: this._owed || {} }); } catch {} // keep the daily + per-agent + campaign + owed markers so a same-day restart can't double-run
           // fall through: this cycle now re-deals the full library
         } else {
           // Finite content is fully distributed. Only STOP THE WHOLE RUN when there are no ONGOING-mode accounts
@@ -996,7 +1472,7 @@ class Orchestrator {
           const ongoingActive = active.filter((a) => { const o = a.postingOrder || 'post-centric'; return !o.includes('unique') && o !== 'sequence' && o !== 'campaign-plan'; });
           if (!ongoingActive.length) {
             this.log('✅ All posts have been distributed — campaign complete.');
-            this._dealt.clear(); try { store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null }); } catch {}
+            this._dealt.clear(); try { store.saveRotation({ dealt: [], roundOffset: 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null, owedLedger: this._owed || {} }); } catch {}
             break;
           } else if (!this._finiteDoneLogged) {
             this._finiteDoneLogged = true;
@@ -1007,6 +1483,13 @@ class Orchestrator {
       this._progress.cycle = cycle;
       this._progress.accountsTotal = active.length;
       this._progress.accountsDone = 0;
+      this._diskPreflight(getData); // periodic (self-throttled ~15min): catch a disk filling up DURING a multi-day run, before ENOSPC halts the fleet
+      // Seed the live per-account snapshot: every active account starts 'queued' so the dashboard shows them ALL
+      // immediately, then each flips to running → done/error as the pool works through them.
+      this._cycleAccts = active;
+      this._acctLive = {};
+      for (const a of active) this._acctLive[a.name] = { state: 'queued', action: '', posted: 0 };
+      this._progress.accounts = this._buildAcctSnapshot();
       this.emit('automation-progress', { ...this._progress });
 
       // ── PLANNING HEADER ──────────────────────────────────────────────────────
@@ -1074,7 +1557,7 @@ class Orchestrator {
       // freshest/first). Rotation affects START ORDER ONLY — this._active stays unrotated so unique-
       // mode post assignment (which keys off positional index + roundOffset) is unchanged.
       const rot = active.length ? (this._staggerRotation || 0) % active.length : 0;
-      const queue = active.slice(rot).concat(active.slice(0, rot));
+      const queue = this._orderLaunchQueue(active.slice(rot).concat(active.slice(0, rot)), settings.fireOrder, (this._staggerRotation || 0) + 1);
       const cyclePostedIds = []; // published this cycle (auto-deletable)
       const cycleDealtIds = [];  // dealt this cycle (published OR pending — rotation)
       const cycleFlags = [];     // per-account flags (needs_login / rate_limited) seen this cycle
@@ -1085,10 +1568,83 @@ class Orchestrator {
       // account; dealt-ids are persisted PER COMPLETION (halt-on-write-failure intact); stagger
       // spaces the initial fill to avoid a coordinated burst; offline drains + holds; Finish drains
       // the in-flight set then exits.
-      const poolSize = Math.max(1, Number(settings.parallelAccounts) || 2);
-      this.log(`🧵 Pool: ${queue.length} account(s), up to ${poolSize} at a time (${new Date().toLocaleTimeString()})`);
+      // ANTI-LINK CONCURRENCY: never run two accounts that exit from the SAME proxy IP at once (FB links
+      // accounts seen simultaneously on one IP). ipKey = the account's own proxy, else the LIVE (non-cooldown)
+      // shared-pool proxy it hashes to (same formula as the worker), else null (real IP — not gated).
+      const _poolProx = (this._data && this._data.proxies) || [];
+      const _useProx = !!(this._data && this._data.useProxies); // useProxies is a TOP-LEVEL data field, NOT in settings (normalize never copies it) — reading settings.useProxies was always undefined, forcing all pool-proxy accounts to serialize on the 'real-ip' sentinel
+      // PIN the live (non-cooldown) pool ONCE for the whole cycle. Re-filtering cooldown on every ipKey() call let a
+      // proxy flapping cooldown mid-cycle RE-BUCKET an account onto a proxy another account is already posting on —
+      // defeating the anti-link gate (two accounts on one live IP at once). A fixed cycle snapshot keeps the gate
+      // stable, and proxyForAccount is also handed to the WORKER (assignedProxy) so its pick can't diverge from the gate.
+      const _liveSnap = _poolProx.filter((p) => { try { return !this._proxyHealth.isOnCooldown(p); } catch { return true; } });
+      const _cyclePool = _liveSnap.length ? _liveSnap : _poolProx;
+      const proxyForAccount = (a) => {
+        const px = a.proxy && String(a.proxy).trim();
+        if (px) return px;
+        if (_useProx && _cyclePool.length) { let h = 0; const n = a.name || ''; for (let i = 0; i < n.length; i++) h = (h * 31 + n.charCodeAt(i)) >>> 0; return _cyclePool[h % _cyclePool.length]; }
+        return null; // real IP — not IP-gated
+      };
+      this._proxyForAccount = proxyForAccount; // so _runAccount (a method, not this closure) hands the SAME proxy to the worker
+      const ipKey = (a) => { const p = proxyForAccount(a); return p ? 'px:' + p : null; };
+      // Concurrency = DISTINCT usable proxies (one proxy per concurrent batch), capped by parallelAccounts.
+      // +1 slot if any account has no dedicated proxy (real IP). Floor 1 → never deadlocks.
+      const _distinctIps = new Set(); let _haveReal = false;
+      for (const a of queue) { const k = ipKey(a); if (k) _distinctIps.add(k); else _haveReal = true; }
+      const _proxyCeil = _distinctIps.size > 0
+        ? _distinctIps.size + (_haveReal ? 1 : 0)              // proxies in play → bound concurrency to distinct proxies (+1 for any real-IP account)
+        : Math.max(1, Number(settings.parallelAccounts) || 2); // no proxies at all → fall back to the configured parallelism
+      // HARDWARE CEILING (400-account safety): each concurrent account is a headful Chrome + FB tabs (~450MB). On a
+      // client laptop an operator can set parallelAccounts high and swap-thrash the machine into cascading 'transient'
+      // failures. Cap the pool by free RAM (~450MB per headful Chrome, 60% of free) and ~2×cores. Min is 1 for deadlock
+      // safety ONLY — never floor above that, so a genuine low-memory moment CAN drop the ceiling (even to 1); an earlier
+      // floor-at-4 re-inflated the ceiling and defeated this very protection. Only ever LOWERS concurrency (can't affect
+      // the anti-link/double-post guarantees) and re-computes each cycle so it adapts to live memory.
+      const _wanted = Math.max(1, Number(settings.parallelAccounts) || 2);
+      const _cores = (os.cpus() && os.cpus().length) || 4;
+      // Memory-based ceiling, read LIVE at each top-up rather than frozen once per cycle. Each concurrent headful Chrome
+      // (~450MB) is capped by 60% of free RAM and ~2×cores; floor 1 for deadlock safety ONLY (never floor above that —
+      // an earlier static floor re-inflated the ceiling and defeated this very protection). Re-reading os.freemem() on
+      // every top-up (in the launch loops below) is the key: a single unlucky LOW snapshot at cycle start no longer
+      // serializes the WHOLE 400-account cycle — as browsers close and RAM frees the pool re-expands, while genuinely
+      // tight RAM still throttles it DOWN (even to 1). It only ever LOWERS concurrency vs _wanted/_proxyCeil, so it
+      // can't affect the anti-link/double-post guarantees.
+      const _liveHwCeil = () => Math.min(Math.max(1, Math.floor((os.freemem() * 0.6) / (450 * 1024 * 1024))), _cores * 2);
+      const _livePoolTarget = () => Math.min(_wanted, _proxyCeil, _liveHwCeil()); // re-evaluated per top-up
+      const poolSize = _livePoolTarget(); // nominal (initial) size — used for the stagger window, logs, and pool-util stats
+      if (poolSize < Math.min(_wanted, _proxyCeil)) this.log(`⚠️ Pool capped to ${poolSize} by this machine's free RAM/CPU (you asked for ${_wanted}). Close other apps or lower "parallel accounts" — running more browsers than the laptop can hold causes slow, failing runs.`);
+      this.log(`🧵 Pool: ${queue.length} account(s), up to ${poolSize} at a time (≤${_proxyCeil} distinct prox${_proxyCeil === 1 ? 'y' : 'ies'}) (${new Date().toLocaleTimeString()})`);
       let launchIdx = 0, stopPool = false, sawOffline = false;
       let firstStart = 0, lastEnd = 0, cpuMs = 0, ranCount = 0;
+
+      // IMMEDIATE TAKEOVER (operator-requested): the MOMENT a campaign-plan account drops (logout / rate-limit /
+      // crash / turned-off / cooling-down), pull a healthy covering reserve straight into the LIVE `queue` so the
+      // pool launches it on the next freed slot — concurrently with the still-running actives — instead of waiting
+      // for the whole pool to drain and the end-of-pool pass. ADDITIVE + safe: it's SYNCHRONOUS (the reserve pick +
+      // state mutation is atomic, so two near-simultaneous drops can't grab the same reserve), it only APPENDS to
+      // this._active (existing indices preserved; the reserve's post is resolved by the _campaignTakeover stand-in,
+      // index-independent), and anything it can't cover right now (no free reserve, partial deliveries, non-campaign
+      // modes) still falls to the end-of-pool takeover pass. Reserve health is read FRESH from disk, so a just-re-
+      // logged-in account is eligible again and a rate-limited one stays excluded until its cool-down expires.
+      const coverDrop = (A) => {
+        if (this._finish || stopPool || this._shouldStop()) return;
+        const nowT = Date.now();
+        const _cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
+        const healthy = (r) => { const live = (getData().accounts || []).find((x) => x.name === r.name) || r; return live.enabled !== false && live.status === 'logged_in' && (Number(live.rateLimitedUntil) || 0) <= nowT && (_cap <= 0 || store.dailyUsed(live.daily) < _cap); };
+        const pick = this._immediateStandin(A, healthy);
+        if (!pick) return; // not a coverable campaign drop, or no free covering reserve this instant → end-of-pool backstop handles it
+        const R = pick.reserve;
+        if (this._campaignTakeover && this._campaignTakeover[R.name]) return; // defensive: R is already covering another drop this cycle — never overwrite its stand-in (guards a future await between pick + the _jobbedThisCycle add)
+        this._immediateCovered.add(A.name);
+        this._campaignTakeover = this._campaignTakeover || {};
+        this._campaignTakeover[R.name] = { postId: pick.postId, forAgent: A.name }; // route A's exact slice to R (index-independent)
+        this._reserve = (this._reserve || []).filter((x) => x.name !== R.name);     // don't also use R for the backstop / Phase-3 rescue
+        this._active = (this._active || active).concat([R]);                        // APPEND-only (existing indices preserved)
+        this._markJob(R.name);                                                      // R does a job this cycle (#5: up to reserveMaxJobsPerCycle)
+        this._progress.accountsTotal += 1; this.emit('automation-progress', { ...this._progress });
+        queue.push(R);                                                              // LIVE queue → the pool launches R on the next freed slot
+        this.log(`🔁 Immediate takeover: ${R.alias || R.name} stepping in for ${A.alias || A.name} (dropped) — same post, same groups, now.`);
+      };
 
       const runOne = async (account) => {
         const myLaunch = launchIdx++;
@@ -1101,23 +1657,39 @@ class Orchestrator {
           // accounts never start in a synchronized burst.
           const staggerBase = rangeMs(settings, 'accountDelayMin', 'accountDelayMax', 1, 4, 60000, 0);
           const capMs = (Number.isFinite(settings.accountDelayMax) ? settings.accountDelayMax : 4) * 60000;
-          const base = Math.round(Math.min(staggerBase * myLaunch, capMs) * Math.pow(0.5, retries));
+          // INSTANT: operator wants a small 1–10s gap between accounts, not the minute-scale stagger.
+          const base = settings.speedMode === 'instant'
+            ? (1000 + Math.round(Math.random() * 4000))
+            : Math.round(Math.min(staggerBase * myLaunch, capMs) * Math.pow(0.5, retries));
           if (base > 0) await this._interruptibleSleep(base);
         }
         if (this._shouldStop() || stopPool || this._finish) return;
         // Mid-run toggle: if the user turned this account OFF since the cycle began, skip it now.
         const live = (getData().accounts || []).find((a) => a.name === account.name);
-        const idle = (msg) => { this.log(msg); this._progress.accountsDone++; this.emit('automation-progress', { ...this._progress }); };
-        if (live && live.enabled === false) return idle(`⏸️ [${account.name}] turned OFF — skipping for the rest of this run`);
+        const idle = (msg, state) => { this.log(msg); this._progress.accountsDone++; this._setAcctState(account.name, state || 'skipped', { action: String(msg || '').replace(/^\s*\[[^\]]*\]\s*/, '').trim().slice(0, 140) }); };
+        if (live && live.enabled === false) { this._cycleDrops.add(account.name); coverDrop(account); return idle(`⏸️ [${account.name}] turned OFF — skipping for the rest of this run (a reserve steps in immediately)`, 'off'); }
         // Rate-limit COOL-DOWN: a recently rate-limited account rests for hours instead of re-hammering FB.
         if (live && live.rateLimitedUntil && live.rateLimitedUntil > Date.now()) {
           const mins = Math.ceil((live.rateLimitedUntil - Date.now()) / 60000);
-          return idle(`🧊 [${account.name}] cooling down after a rate-limit — ${mins} min left; skipping this cycle`);
+          this._cycleDrops.add(account.name); // cooling down → a healthy reserve covers its groups (it itself stays idle through the cool-down)
+          coverDrop(account); // operator spec: a rate-limited account becomes reserve AND stops for its cool-down; a healthy reserve takes over now
+          return idle(`🧊 [${account.name}] cooling down after a rate-limit — ${mins} min left; skipping this cycle (a reserve steps in)`, 'cooldown');
+        }
+        // ATTENTION REST (logged-out / checkpoint / disabled / posted-nothing): don't re-launch a browser into the SAME
+        // block every cycle (ban-escalation + a wasted slot). Skip while resting and let a reserve cover its groups; it
+        // auto-rejoins after the window (Tier-3 auto-login can recover a logout unattended) or immediately once a clean
+        // run / re-check clears the rest. Keyed on nextAttnRetry, which _recordAccountOutcome clears on any delivery.
+        if (live && Number(live.nextAttnRetry) > Date.now()) {
+          const mins = Math.ceil((Number(live.nextAttnRetry) - Date.now()) / 60000);
+          const st = live.status;
+          this._cycleDrops.add(account.name);
+          coverDrop(account);
+          return idle(`⛔ [${account.name}] ${st === 'checkpoint' ? 'awaiting checkpoint/verification' : st === 'not_logged_in' ? 'logged out — waiting before the next auto-login attempt' : 'needs attention (blocked/disabled)'} — resting ${mins >= 60 ? Math.round(mins / 60) + 'h' : mins + 'min'}; a reserve covers its groups`, st === 'checkpoint' ? 'checkpoint' : st === 'not_logged_in' ? 'not_logged_in' : 'error');
         }
         // Per-account DAILY CAP on group-posts (0 = off).
         const cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
         const usedToday = (cap > 0 && live) ? store.dailyUsed(live.daily) : 0;
-        if (cap > 0 && usedToday >= cap) return idle(`📵 [${account.name}] daily cap reached (${usedToday}/${cap} group-posts today) — skipping until tomorrow`);
+        if (cap > 0 && usedToday >= cap) return idle(`📵 [${account.name}] daily cap reached (${usedToday}/${cap} group-posts today) — skipping until tomorrow`, 'capped');
         const maxThisRun = cap > 0 ? (cap - usedToday) : Infinity;
         // Advisory (once/account/run): dailyCap counts GROUP-POSTS, not distinct posts — so a cap below the
         // account's assigned-group count silently leaves some groups un-posted each day. Warn so it's not a footgun.
@@ -1126,6 +1698,7 @@ class Orchestrator {
 
         const t0 = Date.now(); if (!firstStart) firstStart = t0;
         this.log(`[${account.name}] Starting with ${(account.assignedGroups || []).length} groups`);
+        this._setAcctState(account.name, 'running', { action: 'starting…' }); // flip the dashboard row to live
         const r = await this._runAccount(account, cycle, maxThisRun)
           .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [], offline: false }; });
         const dur = Date.now() - t0; lastEnd = Date.now(); cpuMs += dur; ranCount++;
@@ -1138,6 +1711,17 @@ class Orchestrator {
         if (res.flag === 'rate_limited') this._retryCount[account.name] = (this._retryCount[account.name] || 0) + 1;
         else if (res.progressed) this._retryCount[account.name] = 0;
         this._progress.accountsDone++; this._progress.posted += res.posted; this._progress.errors += res.errors; this._progress.pending += res.pendingApproval;
+        // Final live state for this account's row: rate-limited / needs-login / dropped flag / error / done.
+        let _finalState = 'done';
+        if (res.flag === 'rate_limited') _finalState = 'rate_limited';
+        else if (res.flag === 'needs_login' || res.flag === 'needs_verification') _finalState = 'needs_login';
+        else if (res.flag && DROP_FLAGS.has(res.flag)) _finalState = res.flag;
+        else if (!res.progressed && res.errors > 0) _finalState = 'error';
+        this._setAcctState(account.name, _finalState, { posted: res.posted, action: res.posted ? `✓ posted to ${res.posted} group${res.posted === 1 ? '' : 's'}${res.errors ? ` · ⚠️ ${res.errors} failed` : ''}` : (res.pendingApproval ? `⏳ ${res.pendingApproval} pending approval` : (res.errors ? '⚠️ no posts (error)' : 'done')) });
+        // Dropped, delivered nothing → reserve-takeover candidate this cycle. Covers BOTH a flagged drop AND a
+        // silent CRASH (supervisor catch returns flag:null, errors≥1) — a crashed account must not leave its post uncovered.
+        if ((res.flag && DROP_FLAGS.has(res.flag) && !res.progressed) || (!res.progressed && res.posted === 0 && res.errors > 0)) this._cycleDrops.add(account.name);
+        this._markJob(account.name); // it opened a browser this cycle → counts toward its per-cycle job cap (Phase-3 rescue gated by _jobbedOut) — anti-spam (#5)
         const st = (this._runStats[account.name] = this._runStats[account.name] || { posted: 0, pending: 0, errors: 0 });
         st.posted += res.posted; st.pending += res.pendingApproval; st.errors += res.errors;
         this.emit('automation-progress', { ...this._progress });
@@ -1145,21 +1729,94 @@ class Orchestrator {
         // single pick if it published OR pended). A failure leaves the pointer so it retries the SAME post
         // next day. Strip postedIds so rotation content is never auto-deleted (it recycles). Keep dealtIds
         // for the cycle's progress/stall bookkeeping but do NOT let it pollute the shared dealt-set.
-        if ((account.postingOrder || '') === 'daily-rotation' || (account.postingOrder || '') === 'campaign-plan') {
-          // Both modes track per-agent progress by a daily pointer (perAccountRotation) and own their own
-          // persistence (the shared _persistDealt is skipped below). Advance ONLY on a successful post
-          // (dealtIds = the single pick) so a failure retries the SAME slot next day. Strip postedIds so the
-          // content is never auto-deleted. Keep dealtIds for cycle progress/stall bookkeeping only.
+        const isStandin = !!((this._campaignTakeover || {})[account.name]); // a reserve (any postingOrder) covering a dropped campaign agent
+        // PARTIAL-DELIVERY coverage: a deal-once / campaign agent that delivered its post to SOME but not all of its
+        // groups (it PROGRESSED → it's NOT a _cycleDrops full-drop) leaves the un-reached groups OWED. Record them,
+        // keyed by the post it dealt, so the takeover pass below can have a healthy in-set reserve finish those EXACT
+        // groups; the worker's per-(post,group) ledger then guarantees the reserve skips already-delivered groups (no
+        // double-post). NORMAL-pass runs only — a stand-in that partially covers is the bounded cascade edge (deferred).
+        if (!isStandin && res.dealtIds.length && !this._cycleDrops.has(account.name)) {
+          const _po = account.postingOrder || 'post-centric';
+          if (_po === 'campaign-plan' || _po.includes('unique') || _po === 'sequence' || _po === 'daily-rotation') {
+            const _pid = res.dealtIds[0];
+            // Groups this run was RESPONSIBLE for: if it was discharging an existing owed obligation for THIS post,
+            // just those owed groups (it only targeted them); otherwise its whole assigned group set (a fresh post).
+            const _prevOwed = (this._owed && this._owed[account.name] && this._owed[account.name].postId === _pid && Array.isArray(this._owed[account.name].gids)) ? this._owed[account.name].gids : null;
+            const _expected = _prevOwed ? _prevOwed.slice() : [...this._groupIdsOf(account)];
+            const _owedNow = _expected.filter((gid) => !this._cycleDelivered.has(this._dkScope(account.name) + _pid + '::' + gid));
+            if (_owedNow.length) this._cycleOwed[account.name] = { postId: _pid, gids: _owedNow }; // same-cycle: a healthy reserve finishes these un-reached groups (unchanged for unique/sequence/campaign)
+            // PERSISTENT carry-over ([7][8]) — only the per-agent-pointer modes (daily-rotation / campaign-plan) can
+            // re-pick the SAME post next cycle via the owed pick-override; record the obligation so end-of-pool
+            // reconciliation writes what's STILL un-reached (after any same-cycle reserve cover) into this._owed.
+            if (_po === 'daily-rotation' || _po === 'campaign-plan') this._cycleObligation[account.name] = { postId: _pid, expectedGids: _expected };
+          }
+        }
+        if ((account.postingOrder || '') === 'daily-rotation' || (account.postingOrder || '') === 'campaign-plan' || isStandin) {
           if (res.dealtIds.length) {
             this._perAccountRotation = this._perAccountRotation || {};
-            this._perAccountRotation[account.name] = { lastPostId: res.dealtIds[0], lastPostedDate: this._localDayKey() };
+            // Reserve stand-in: advance the DROPPED agent's slice pointer (the slice it just covered), not the
+            // reserve's own (the reserve has no slice). Normal agents advance their own pointer.
+            const stand = (this._campaignTakeover || {})[account.name];
+            const ptrName = stand ? stand.forAgent : account.name;
+            { const _dk = this._localDayKey(); const _pr = this._perAccountRotation[ptrName] || {}; const _pt = (_pr.postsTodayDate === _dk) ? (Number(_pr.postsToday) || 0) : 0; // count today's posts for the cyclesPerDay quota (persisted → survives a restart, so resume can't over-post)
+              // Increment postsToday ONCE per (agent, cycle): a partial delivery + N split reserves all advance the SAME
+              // forAgent pointer for ONE logical daily post; re-bumping would trip _dailyQuotaBlocks early and make the
+              // covered agent silently under-deliver its cyclesPerDay. Always refresh the pointer/lastPostedAt.
+              const _counted = (this._postCountedThisCycle || (this._postCountedThisCycle = new Set())).has(ptrName);
+              this._perAccountRotation[ptrName] = { lastPostId: res.dealtIds[0], lastPostedDate: _dk, lastPostedAt: Date.now(), postsToday: _counted ? _pt : _pt + 1, postsTodayDate: _dk }; // lastPostedAt + postsToday feed _dailyQuotaBlocks (daily pacing / midnight-straddle guard)
+              this._postCountedThisCycle.add(ptrName); }
+            if (stand) {
+              // Only suppress the "deferred" warning if the stand-in covered ALL of forAgent's slice groups. A PARTIAL
+              // takeover (posted to some groups, then hit an emerging block) must STILL warn + OWE the un-reached groups,
+              // or they are silently uncovered by anyone. The pointer was already advanced above (stops the COVERED
+              // groups being re-posted → no double-post); recording _cycleOwed routes ONLY the un-reached groups to the
+              // same-cycle _owedStandins pass (exactly like a non-stand-in partial delivery).
+              const _P = stand.postId || res.dealtIds[0];
+              // stand.forAgent is a NAME string, but _groupIdsOf expects an account OBJECT (reads .assignedGroups) — so
+              // resolve it. Prefer stand.gids (the specific groups a split-cover / owed stand-in was asked to cover);
+              // fall back to forAgent's full group set for a whole-set immediate takeover. (Passing the name yielded an
+              // empty set → _unreached always [] → the owed-routing below was dead code and partial delivery stranded.)
+              const _faObj = (this._active || []).find((x) => x.name === stand.forAgent);
+              const _target = (stand.gids && stand.gids.length) ? stand.gids : [...this._groupIdsOf(_faObj || {})];
+              const _unreached = _target.filter((gid) => !this._cycleDelivered.has(this._dkScope(stand.forAgent) + _P + '::' + gid));
+              if (!_unreached.length) (this._immediateDelivered || (this._immediateDelivered = new Set())).add(stand.forAgent); // fully covered → suppress the (now-correct) "deferred" warning
+              else this._cycleOwed[stand.forAgent] = { postId: _P, gids: _unreached }; // partial → cover ONLY the missing groups + let the deferred warning fire as a backstop
+              // PERSISTENT carry-over ([8]): if the agent a stand-in covered is a daily-rotation/campaign-plan agent whose
+              // pointer just advanced (so it will NOT itself re-pick this post), record its obligation so end-of-pool
+              // reconciliation carries any still-un-reached groups into this._owed → the agent (or a later reserve)
+              // finishes them next cycle/day. (unique/sequence forAgents keep the same-cycle-only _cycleOwed path.)
+              // Record forAgent's FULL responsibility (its prior-owed groups, or its whole assigned set) — NOT this
+              // stand-in's _target subset: with SPLIT coverage several reserves each cover a subset, so keying the
+              // obligation off one subset would drop the groups the OTHER reserves were meant to reach. And only when
+              // forAgent didn't already record it via its OWN partial run this cycle (that record is authoritative).
+              const _faOrd = (_faObj && _faObj.postingOrder) || '';
+              if ((_faOrd === 'daily-rotation' || _faOrd === 'campaign-plan') && !this._cycleObligation[stand.forAgent]) {
+                const _prevFa = (this._owed && this._owed[stand.forAgent] && this._owed[stand.forAgent].postId === _P && Array.isArray(this._owed[stand.forAgent].gids)) ? this._owed[stand.forAgent].gids : null;
+                this._cycleObligation[stand.forAgent] = { postId: _P, expectedGids: _prevFa ? _prevFa.slice() : [...this._groupIdsOf(_faObj || {})] };
+              }
+            }
+            // CRASH-SAFE OWED: reconcile THIS agent's owed entry (expected − delivered-so-far) into this._owed NOW, so
+            // the save below persists the ledger ATOMICALLY with the pointer advance. Without this the pointer would be
+            // persisted (and, on failure, HALT) while this._owed still held its stale pre-cycle value → a hard crash
+            // before the end-of-pool reconcile would re-post an already-delivered group (discharge) or drop an
+            // un-reached one (fresh partial). ptrName is the agent whose pointer just moved (the stand-in's forAgent, or
+            // this account) — exactly the one whose obligation was recorded above. [7][8]
+            this._reconcileOwedFor(ptrName);
             // Write the FULL current in-memory rotation state (not a load-then-patch) so a concurrent
             // _persistDealt from a unique-mode account in the same pool can't clobber dealt/perAccountRotation
             // — every writer writes the complete, authoritative in-memory truth.
-            try { if (!store.saveRotation({ dealt: [...this._dealt], roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation, campaignPlan: this._campaignPlan || null })) throw new Error('saveRotation returned false'); }
-            catch (e) { this.log(`⚠️ [${account.name}] could not persist its rotation pointer (${e.message}) — it may re-post today's post tomorrow. Free disk space / fix data-folder permissions.`); }
+            try { if (!store.saveRotation({ dealt: [...this._dealt], roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation, campaignPlan: this._campaignPlan || null, owedLedger: this._owed || {} })) throw new Error('saveRotation returned false'); }
+            catch (e) {
+              // FATAL, like _persistDealt: we advanced the pointer in memory but couldn't persist it — a crash+restart
+              // would reload the STALE pointer and RE-POST this exact (already-live) post. Halt + drain rather than risk
+              // a double-post. Do NOT roll the pointer back: the post is already live, so a rollback would make THIS run
+              // re-pick + re-post it (a same-run double-post).
+              this.log(`🛑 [${account.name}] could not persist its rotation pointer (${e.message}) — STOPPING to avoid re-posting after a restart. Free disk / fix data-folder permissions, then restart.`);
+              this._stop = true; stopPool = true; return;
+            }
           }
-          cyclePostedIds.push(...[]); cycleDealtIds.push(...res.dealtIds); if (res.flag) cycleFlags.push(res.flag);
+          // Never push postedIds (rotation content recycles, is never auto-deleted); keep dealtIds for cycle bookkeeping only.
+          cycleDealtIds.push(...res.dealtIds); if (res.flag) cycleFlags.push(res.flag);
         } else {
           cyclePostedIds.push(...res.postedIds); cycleDealtIds.push(...res.dealtIds); if (res.flag) cycleFlags.push(res.flag);
         }
@@ -1167,24 +1824,55 @@ class Orchestrator {
         // already-published post. _persistDealt halts the run (sets _stop) on a write failure. SKIP for
         // daily-rotation: it owns its per-agent pointer (persisted above) and must NOT grow the shared
         // dealt-set (which is for finite unique/sequence distribution only).
-        if ((account.postingOrder || '') !== 'daily-rotation' && (account.postingOrder || '') !== 'campaign-plan' && res.dealtIds.length && !this._persistDealt(res.dealtIds)) { stopPool = true; return; }
+        if ((account.postingOrder || '') !== 'daily-rotation' && (account.postingOrder || '') !== 'campaign-plan' && !isStandin && res.dealtIds.length && !this._persistDealt(res.dealtIds)) { stopPool = true; return; }
         if (res.offline) { sawOffline = true; stopPool = true; } // connection lost mid-flight → drain + hold
+        // IMMEDIATE TAKEOVER: this account just dropped at RUNTIME (logout / rate-limit / crash) → pull a covering
+        // reserve into the LIVE queue NOW instead of waiting for the pool to drain. No-op if it didn't drop or no
+        // free reserve covers it (the end-of-pool pass remains the backstop).
+        if (this._cycleDrops.has(account.name)) coverDrop(account);
       };
 
+      // (ipKey + the distinct-proxy poolSize were computed above, before the pool launched.)
+      // The pool launches the next account whose IP is FREE; same-IP accounts run sequentially, different-IP
+      // accounts run in parallel.
       const inFlight = new Set();
+      // PROXY exit IPs currently posting — keeps concurrent PROXIED accounts on DISTINCT IPs (one account per proxy at a
+      // time = anti-link). Real-IP (no-proxy) accounts are NOT serialized: a real residential home line legitimately runs
+      // several accounts at once (how many operators actually post — e.g. 4 browsers on one home connection), so the pool
+      // size (= parallelAccounts, hardware-capped) is the ONLY limiter for them. Set "parallel accounts" to your proven
+      // number (e.g. 4). Proxy accounts are unaffected — still strictly one at a time per distinct proxy.
+      const inFlightIps = new Set();
+      let _ipDeferLogged = false;
       const launchNext = () => {
-        if (stopPool || this._shouldStop() || this._finish || !queue.length) return;
-        const account = queue.shift();
-        const p = runOne(account).catch((e) => { this.log(`❌ pool error: ${e.message}`); }).finally(() => inFlight.delete(p));
+        if (stopPool || this._shouldStop() || this._finish || !queue.length) return false;
+        if (this._netOnline === false) return false; // offline (per the connectivity monitor) → don't launch doomed accounts; the cycle holds + resumes when back online
+        const idx = queue.findIndex((a) => { const k = ipKey(a); return !k || !inFlightIps.has(k); }); // PROXY account → its proxy IP must be free (one at a time); NO-proxy (real-IP) account → always eligible (poolSize caps it)
+        if (idx === -1) { // every queued account's PROXY is busy with one already running → hold for a free proxy slot
+          if (!_ipDeferLogged && inFlight.size) { _ipDeferLogged = true; this.log(`⏳ ${queue.length} account(s) waiting — each PROXY runs one account at a time (anti-link); they start as each proxy frees.`); }
+          return false;
+        }
+        const account = queue.splice(idx, 1)[0];
+        const key = ipKey(account); // null (no proxy = real IP) → NOT tracked as a one-at-a-time slot; poolSize caps real-IP concurrency
+        if (key) inFlightIps.add(key);
+        const p = runOne(account).catch((e) => { this.log(`❌ pool error: ${e.message}`); }).finally(() => { inFlight.delete(p); if (key) inFlightIps.delete(key); });
         inFlight.add(p);
+        return true;
       };
       while ((queue.length || inFlight.size) && !this._shouldStop()) {
         await this._waitWhilePaused(); if (this._shouldStop()) break;
-        while (inFlight.size < poolSize && queue.length && !stopPool && !this._finish && !this._shouldStop()) launchNext();
-        if (!inFlight.size) break; // nothing running and nothing launchable (finish / stop / drained)
+        while (inFlight.size < _livePoolTarget() && queue.length && !stopPool && !this._finish && !this._shouldStop()) { if (!launchNext()) break; } // live RAM-aware target: re-expands as memory frees so a low snapshot at cycle start can't serialize the whole cycle
+        if (!inFlight.size) break; // nothing running and nothing launchable (finish / stop / drained / all IPs busy)
         await Promise.race([...inFlight]); // wake as soon as ONE slot frees, then top the pool back up
       }
       await Promise.allSettled([...inFlight]); // drain whatever is still running before the cycle ends
+      // IMMEDIATE-TAKEOVER cleanup: coverDrop() may have APPENDED reserves to this._active during the pool. Restore it
+      // to the clean per-cycle `active` UNCONDITIONALLY now (the pool has drained; those reserves already ran and were
+      // read out of _campaignTakeover at launch). The end-of-pool backstop below re-derives from `active` and re-appends
+      // as needed — but it's GATED on (this._reserve.length && !sawOffline && !stopPool), so if coverDrop consumed the
+      // LAST reserve (or the pool bailed) that block is skipped, and a leaked reserve left in this._active would pollute
+      // the campaign replan (line ~1845: planAgents = this._active.filter(campaign-plan) → batchId change → next-cycle
+      // pointer wipe → duplicate posting) and _campaignAllFinished/_campaignRemaining. So restore it here, always.
+      this._active = active;
 
       // RESERVE TAKEOVER (unique/sequence modes only): if an active account DROPPED this cycle
       // (rate-limit, logout, checkpoint, block, disabled, bad proxy), its post(s) were released and are
@@ -1193,17 +1881,53 @@ class Orchestrator {
       // and run a BOUNDED second pass through the SAME pool machinery (so claims, dealt-persist, daily-cap
       // and stagger all apply unchanged). Reused reserves are removed from this._reserve so Phase-3 rescue
       // can't double-use them. Continuous/non-unique modes have no dealt-set, so this is a no-op there.
-      const _dropFlags = new Set(['rate_limited', 'needs_login', 'needs_verification', 'account_disabled', 'likely_blocked', 'proxy_invalid']);
+      const _dropFlags = DROP_FLAGS;
       const _uniqueMode = active.some((a) => { const o = a.postingOrder || 'post-centric'; return o.includes('unique') || o === 'sequence' || o === 'daily-rotation' || o === 'campaign-plan'; });
-      if (!sawOffline && !stopPool && !this._shouldStop() && !this._finish && _uniqueMode && cycleFlags.some((f) => _dropFlags.has(f)) && (this._reserve || []).length) {
+      if (!sawOffline && !stopPool && !this._shouldStop() && !this._finish && _uniqueMode && (this._cycleDrops.size > 0 || Object.keys(this._cycleOwed || {}).length > 0) && (this._reserve || []).length) {
         const nowT = Date.now();
         const capT = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
-        // Bound promotions to roughly the number of accounts that DROPPED (each released ~1 post), capped at 3.
-        const maxTakeover = Math.min(3, Math.max(1, cycleFlags.filter((f) => _dropFlags.has(f)).length));
+        // Cover EVERY dropped account this cycle (flagged drop, silent crash, or cool-down skip — all in
+        // _cycleDrops), bounded only by how many healthy reserves actually have an undealt post to deliver.
+        // (The takeover pool runs at poolSize concurrency, so a large count just queues — it can't burst.)
+        const maxTakeover = Math.max(1, this._cycleDrops.size + Object.keys(this._cycleOwed || {}).length); // cover BOTH full drops AND partial-delivery owed agents
+        // CAMPAIGN-PLAN same-day takeover: pair each dropped campaign-plan agent with a healthy in-cluster
+        // reserve so it delivers that agent's slice-for-today into the same groups (the reserve has no
+        // agentLists of its own — _postsForAccount routes its pick through this map; the dropped agent's
+        // pointer is what advances). Built BEFORE the probe so those reserves return a post and get promoted.
+        const _isHealthyReserve = (r) => {
+          const live = (getData().accounts || []).find((x) => x.name === r.name) || r; // FRESH disk state, not the stale cycle snapshot
+          return live.enabled !== false && live.status === 'logged_in' && (Number(live.rateLimitedUntil) || 0) <= nowT && (capT <= 0 || store.dailyUsed(live.daily) < capT);
+        };
+        this._campaignTakeover = this._campaignStandins(active, this._reserve, _isHealthyReserve, maxTakeover);
+        // PERSISTENT-OWED coverage ([7][8] × drop/rest): an agent that FULL-dropped (delivered nothing, e.g. an
+        // unsupported-language block → dealtIds=0) or was REST-skipped this cycle records no same-cycle _cycleOwed, yet
+        // may still carry an UNFINISHED partial-delivery owed post in the persistent ledger. Without this, its owed
+        // groups are stranded forever (an unsupported-language/disabled account NEVER self-recovers to discharge them).
+        // Synthesize a _cycleOwed entry from the persistent ledger (still-assigned groups only) so _owedStandins
+        // dispatches an in-set reserve to deliver ONLY the un-reached groups. The stand-in pickers SKIP these agents
+        // (above), so there is exactly ONE coverage path — no over-delivery, and the per-(post,group) ledger blocks any
+        // double-post if the agent later self-recovers.
+        for (const [name, ow] of Object.entries(this._owed || {})) {
+          if ((this._cycleOwed || {})[name] || !ow || !ow.postId || !((ow.gids) || []).length) continue; // a same-cycle partial already recorded it authoritatively
+          if (!((this._data && this._data.posts) || []).some((p) => p.id === ow.postId)) continue; // owed post gone from the library → the agent's own owed pick will drop it
+          const acc = ((this._data && this._data.accounts) || []).find((a) => a.name === name);
+          const asg = acc ? this._groupIdsOf(acc) : new Set();
+          const live = ow.gids.filter((g) => asg.has(g)); // prune groups the operator has since un-assigned
+          if (live.length) this._cycleOwed[name] = { postId: ow.postId, gids: live };
+        }
+        // PARTIAL-DELIVERY covers: pair each OWED agent (delivered its post to some-but-not-all of its groups) with a
+        // healthy reserve that covers ALL its owed groups, targeting ONLY those groups. The worker's per-(post,group)
+        // ledger guarantees the reserve skips any already-delivered group → it lands only the un-reached ones.
+        {
+          const _owedCov = this._owedStandins(this._cycleOwed, this._reserve, _isHealthyReserve, new Set(Object.keys(this._campaignTakeover)));
+          for (const [rName, t] of Object.entries(_owedCov.assigned)) { this._campaignTakeover[rName] = t; const _R = (this._reserve || []).find((x) => x.name === rName); this.log(`🧩 Reserve finishing a partial post: ${(_R && (_R.alias || _R.name)) || rName} delivers it to ${t.gids.length} group(s) that ${t.forAgent} couldn't reach this cycle.`); }
+          for (const d of _owedCov.deferred) this.log(`⚠️ ${d.owner} partially delivered — ${d.count} group(s) un-reached and no healthy in-set reserve could finish them; deferred (add another account to that group-set).`);
+        }
         // Healthy, in-headroom reserve candidates.
-        const cand = (this._reserve || []).filter((a) =>
-          a.enabled !== false && !a.isModerator && a.status === 'logged_in' && (Number(a.rateLimitedUntil) || 0) <= nowT &&
-          (capT <= 0 || store.dailyUsed(((getData().accounts || []).find((x) => x.name === a.name) || a).daily) < capT));
+        // Reuse the FRESH-read predicate (status + rateLimitedUntil + daily-cap from disk) the campaign/owed paths use,
+        // instead of reading status/rateLimitedUntil off the stale cycle snapshot — else a reserve whose session expired
+        // or got rate-limited mid-cycle (e.g. an operator 'Check') would be promoted, wasting the takeover slot.
+        const cand = (this._reserve || []).filter((a) => !a.isModerator && _isHealthyReserve(a));
         // CRITICAL: _postsForAccount finds an account's index in this._active and returns [] otherwise — so a
         // reserve must be IN this._active to be probed/claimed for. Temporarily include all candidates, probe,
         // then narrow this._active to the chosen takeovers (their appended index falls back to remaining[0]).
@@ -1217,25 +1941,48 @@ class Orchestrator {
         if (takeovers.length) {
           const tnames = new Set(takeovers.map((a) => a.name));
           this._reserve = (this._reserve || []).filter((a) => !tnames.has(a.name)); // don't also use them for Phase-3 rescue
-          tnames.forEach((n) => this._jobbedThisCycle.add(n)); // promoted reserves did a posting job this cycle → no 2nd job (Phase 3/4)
+          tnames.forEach((n) => this._markJob(n)); // promoted reserves did a posting job this cycle → counts toward their per-cycle cap (Phase 3/4 gated by _jobbedOut)
           this._progress.accountsTotal += takeovers.length; this.emit('automation-progress', { ...this._progress });
           this.log(`🔁 Reserve takeover: ${takeovers.length} healthy reserve account(s) delivering posts a dropped account left undealt — ${takeovers.map((a) => a.alias || a.name).join(', ')}`);
           for (const a of takeovers) queue.push(a);
           while ((queue.length || inFlight.size) && !this._shouldStop()) {
             await this._waitWhilePaused(); if (this._shouldStop()) break;
-            while (inFlight.size < poolSize && queue.length && !stopPool && !this._finish && !this._shouldStop()) launchNext();
+            while (inFlight.size < _livePoolTarget() && queue.length && !stopPool && !this._finish && !this._shouldStop()) { if (!launchNext()) break; } // MUST break when launchNext can't place a queued account (all its proxy IPs busy = the anti-link gate holding) — else this synchronous loop spins forever at 100% CPU, the event loop never yields, and no in-flight promise, Stop, or _finish can ever resolve. Mirrors the main pool at ~1702. (live RAM-aware target — same as the main pool.)
             if (!inFlight.size) break;
             await Promise.race([...inFlight]);
           }
           await Promise.allSettled([...inFlight]);
         } else {
           this._active = active; // no takeover → restore the unmodified active set
-          // A campaign-plan agent's slice is pinned to that agent (a reserve isn't in agentLists), so takeover
-          // can't fill it — surface the gap so the operator adds reserves to the plan / warms accounts.
-          if (active.some((a) => (a.postingOrder || '') === 'campaign-plan')) this.log('⚠️ A campaign-plan agent dropped this cycle and no reserve can deliver its pinned slice — that cluster\'s group(s) miss today\'s post (it resumes when the agent recovers, or add more agents to that group-set).');
-          if (active.some((a) => (a.postingOrder || '') === 'daily-rotation')) this.log('ℹ️ A daily-rotation agent dropped this cycle — it RETRIES the same post automatically next cycle/day (its pointer only advances on a successful post), so nothing is permanently skipped.');
+          if (active.some((a) => (a.postingOrder || '') === 'daily-rotation')) this.log('ℹ️ A daily-rotation agent dropped this cycle — a FULL drop retries the same post next cycle/day (its pointer only advanced on a successful post); a PARTIAL delivery carries its un-reached groups in the owed ledger, so nothing is permanently skipped.');
         }
+        // Campaign agents that dropped with NO healthy in-cluster reserve to cover them: surface the deferral.
+        const _covered = new Set(Object.values(this._campaignTakeover || {}).map((t) => t.forAgent));
+        for (const a of active) {
+          if ((a.postingOrder || '') === 'campaign-plan' && this._cycleDrops.has(a.name) && !_covered.has(a.name) && !(this._immediateDelivered && this._immediateDelivered.has(a.name))) {
+            const n = this._campaignNextIdx(a.name);
+            if (n.idx < n.len) this.log(`⚠️ [${a.alias || a.name}] campaign agent dropped and no healthy reserve in its group-set could cover it — today's post is deferred (resumes when it recovers, or add another account to that batch).`);
+          }
+        }
+        this._campaignTakeover = {}; // clear the per-cycle stand-in map so it never leaks into Phase 3/4 _postsForAccount
+      } else if (!sawOffline && !stopPool && !this._shouldStop() && !this._finish && _uniqueMode && this._cycleDrops && this._cycleDrops.size && !(this._reserve || []).length) {
+        // No reserve remained (the IMMEDIATE path may have consumed the last one) — the gated block above is skipped
+        // because it REQUIRES a reserve, so a later same-cycle drop would get ZERO signal. Surface any campaign drop
+        // whose slice was NOT actually delivered so it's never silent (gated on _immediateDelivered, not mere dispatch).
+        for (const a of active) {
+          if ((a.postingOrder || '') === 'campaign-plan' && this._cycleDrops.has(a.name) && !(this._immediateDelivered && this._immediateDelivered.has(a.name))) {
+            const n = this._campaignNextIdx(a.name);
+            if (n.idx < n.len) this.log(`⚠️ [${a.alias || a.name}] campaign agent dropped and no free reserve remained to cover it this cycle — today's post is deferred (resumes when it recovers, or add another account to that batch).`);
+          }
+        }
+        this._campaignTakeover = {};
       }
+
+      // PERSISTENT OWED-LEDGER: reconcile AFTER all delivery this cycle (primary + reserve takeover) so a partial
+      // daily-rotation / campaign-plan delivery carries its un-reached groups to the next cycle/day and a fully-
+      // covered one clears (no double-post). Unconditional — a partial delivery with no reserve skips both takeover
+      // branches above, so this must run outside them. No-op when nothing was obligated this cycle. [7][8]
+      this._reconcileOwedLedger();
 
       // E-N2: pool-utilization metric — how busy the slots were kept (cpu busy time vs the wall-clock
       // span × slots). Low util ⇒ the pool was starved (few eligible accounts) or accounts were uneven.
@@ -1249,9 +1996,10 @@ class Orchestrator {
       try { this._proxyHealth.save(this._proxyHealthFile()); } catch {} // E-X3: persist proxy health each cycle
       // Connection lost mid-cycle (a worker bailed fast on offline): HOLD until it returns, then the
       // un-posted posts stay un-dealt and are re-run next cycle.
-      if (sawOffline && !this._shouldStop()) {
+      if ((sawOffline || this._netOnline === false) && !this._shouldStop()) { // also hold on the MONITOR signal — covers the start-of-pool race where launchNext refused everyone without setting sawOffline
         this.log('🌐 Connection lost mid-cycle — holding until it returns...');
         await this._waitForConnectivity();
+        this._zeroProgressCycles = 0; // an offline hold is NOT a stall — don't let offline-empty cycles trip the dead-fleet STOP (mirrors the rotation/cool-down hold resets)
       }
       // Dealt-ids were already persisted incrementally per batch by _persistDealt (above), which
       // mirrors them into this._dealt and halts the run on a write failure — so there is nothing
@@ -1302,19 +2050,27 @@ class Orchestrator {
               const reserve = (this._reserve || [])
                 .filter((a) => { const la = liveAccts.find((x) => x.name === a.name) || a;
                   return la.enabled !== false && !a.isModerator && la.status === 'logged_in' && (Number(la.rateLimitedUntil) || 0) <= nowR
-                    && a.name !== rec.posterAccount && !this._jobbedThisCycle.has(a.name) && inGroup(a, rec.gid)
+                    && a.name !== rec.posterAccount && !this._jobbedOut(a.name) && inGroup(a, rec.gid)
                     && (cap <= 0 || store.dailyUsed(la.daily) < cap); })
                 .sort((x, y) => (((this._heldCount || {})[x.name]) || 0) - (((this._heldCount || {})[y.name]) || 0))[0]; // prefer the least-held reserve
               if (!reserve) { this.log(`♻️ held re-post: no idle healthy in-group reserve for "${rec.groupName || rec.gid}" — left undeliverable (raise Reserve Accounts / assign+warm an account in that group).`); continue; }
               // Re-read under the guard; if it changed (moderator approved it, or another pass took it), skip. Claim it as
               // superseded BEFORE launching. Disambiguate by captionSnip so a null-postId record can't match the wrong row.
-              const recMatch = (x) => x.postId === rec.postId && x.gid === rec.gid && (!rec.captionSnip || !x.captionSnip || x.captionSnip === rec.captionSnip);
+              // Require at least ONE non-null identifier to match — a null-postId AND null-captionSnip record
+              // must NOT match every other unidentified record at the same gid (that could mark the wrong row).
+              // Match by ALL present identifiers (postId AND captionSnip when both exist) so a reserve can never
+              // claim a SIBLING held record — e.g. the same account holding a different post in the same group
+              // (a reused/blank postId after a library edit could otherwise match the wrong row). Narrows only.
+              const recMatch = (x) => x.gid === rec.gid
+                && ((rec.postId && x.postId) ? x.postId === rec.postId : true)
+                && ((rec.captionSnip && x.captionSnip) ? x.captionSnip === rec.captionSnip : true)
+                && (!!(rec.postId && x.postId) || !!(rec.captionSnip && x.captionSnip)); // require ≥1 real identifier
               const ms2 = store.loadModeration();
               const live = (ms2.held || []).find(recMatch);
               if (!live || live.status !== 'failed') continue;
               live.status = 'superseded'; live.repostedBy = reserve.name; live.repostAt = Date.now();
               if (!store.saveModeration(ms2)) { this.log(`⚠️ couldn't claim the held record for "${rec.groupName || rec.gid}" (disk full/locked?) — skipping this cycle to avoid double-dispatch.`); continue; }
-              this._jobbedThisCycle.add(reserve.name); // it's now doing a re-post job this cycle
+              this._markJob(reserve.name); // it's now doing a re-post job this cycle (counts toward its per-cycle cap)
               this._reserve = (this._reserve || []).filter((a) => a.name !== reserve.name); // don't reuse this account for Phase-3 rescue this cycle
               // On a resolved re-post, advance the record OFF 'superseded' to terminal 'approved' so the Phase-1 dedup
               // (which blocks held/superseded/failed_held) doesn't permanently block a FUTURE re-hold of the same post.
@@ -1322,6 +2078,7 @@ class Orchestrator {
               this.log(`♻️ [${reserve.name}] re-posting held content to "${rec.groupName || rec.gid}" (original by ${rec.posterAccount} stayed in Spam potentiel)…`);
               const result = await runRepost({
                 account: reserve, post, gid: rec.gid, groupName: rec.groupName, captionSnip: rec.captionSnip, group: grpObj,
+                permalink: rec.postPermalink || null, expectedPostId: rec.postId || null, expectedAuthor: rec.fbDisplayName || '', // permalink-direct + author-aware liveness → no duplicate re-post of an auto-released post, no strand on a stranger's same-caption post
                 settings, useProxies: !!data.useProxies, proxies: data.proxies || [],
                 log: (m) => this.log(m), shouldStop: () => this._shouldStop(),
                 isLoginOpen: this.isLoginOpen, registerAborter: (ab) => this._registerAborter(ab),
@@ -1331,9 +2088,10 @@ class Orchestrator {
               if (result && result.alreadyLive) {
                 // FB auto-released the original → re-home the link-comment onto the now-live post (no duplicate).
                 try {
-                  const cs = store.loadComments();
-                  const dup = (cs.pending || []).some((c) => c.gid === rec.gid && ((rec.captionSnip && c.captionSnip === rec.captionSnip) || (rec.postId && c.postId === rec.postId)) && c.status !== 'failed'); // pending/done/rehomed all count as already-covered
-                  if (!dup && (rec.comment || rec.commentImg)) { cs.pending.push({ gid: rec.gid, postId: rec.postId || null, posterAccount: rec.posterAccount || null, fbDisplayName: rec.fbDisplayName || null, groupName: rec.groupName || null, captionSnip: rec.captionSnip || null, postCaption: rec.postCaption || null, comment: rec.comment || '', commentImg: rec.commentImg || null, postPermalink: null, status: 'pending', queuedAt: Date.now(), attempts: 0, source: 'repost_alreadylive' }); store.saveComments(cs); }
+                  await store.updateComments((cs) => { // serialized via _comChain so a concurrent moderator-loop/Phase-3 write can't clobber it
+                    const dup = (cs.pending || []).some((c) => c.gid === rec.gid && ((rec.captionSnip && c.captionSnip === rec.captionSnip) || (rec.postId && c.postId === rec.postId)) && c.status !== 'failed'); // pending/done/rehomed all count as already-covered
+                    if (!dup && (rec.comment || rec.commentImg)) { cs.pending.push({ gid: rec.gid, postId: rec.postId || null, posterAccount: rec.posterAccount || null, fbDisplayName: rec.fbDisplayName || null, groupName: rec.groupName || null, captionSnip: rec.captionSnip || null, postCaption: rec.postCaption || null, comment: rec.comment || '', commentImg: rec.commentImg || null, postPermalink: null, status: 'pending', queuedAt: Date.now(), attempts: 0, source: 'repost_alreadylive' }); }
+                  });
                   this.log(`♻️ "${rec.groupName || rec.gid}" was already live (FB released it) — link-comment queued for rescue; no duplicate post.`);
                 } catch {}
                 markResolved();
@@ -1343,7 +2101,11 @@ class Orchestrator {
                 // NOT the pool, so the pool's _recordAccountOutcome never ran) — keeps the cap accurate so
                 // it isn't re-picked past its limit next cycle.
                 try { await this._recordAccountOutcome(reserve.name, { posted: result.posted || 0, pendingApproval: result.pendingApproval || 0, errors: result.errors || 0, flag: null, postedIds: [], dealtIds: [] }, settings); } catch {}
-                try { const cq = (result.commentQueue || []); if (cq.length) { const cs = store.loadComments(); for (const c of cq) cs.pending.push({ ...c, status: 'pending', queuedAt: Date.now(), attempts: 0 }); store.saveComments(cs); } } catch {}
+                // Count the LIVE re-post in the run totals: it went via runRepost (NOT the pool), so the pool's posted
+                // counters never saw it → the run summary + completion report were UNDER-counting real deliveries. Gated
+                // on the confirmed delivery above (result.posted>=1) → pure reporting, no re-dispatch / double-post.
+                try { if (this._progress) { this._progress.posted = (this._progress.posted || 0) + (result.posted || 0); this.emit('automation-progress', { ...this._progress }); } if (this._runStats) { const _st = (this._runStats[reserve.name] = this._runStats[reserve.name] || { posted: 0, pending: 0, errors: 0 }); _st.posted = (_st.posted || 0) + (result.posted || 0); } } catch {}
+                try { const cq = (result.commentQueue || []); if (cq.length) { await store.updateComments((cs) => { for (const c of cq) { const dup = (cs.pending || []).some((x) => x.gid === c.gid && ((c.captionSnip && x.captionSnip === c.captionSnip) || (c.postId && x.postId === c.postId)) && x.status !== 'failed'); if (!dup) cs.pending.push({ ...c, status: 'pending', queuedAt: Date.now(), attempts: 0 }); } }); } } catch {}
                 markResolved();
               } else if (result && (result.heldRecords || []).length > 0) {
                 // Replacement was ALSO HELD → a group-level spam gate (2 accounts held). Cap at 1, mark
@@ -1359,7 +2121,15 @@ class Orchestrator {
                 // reserve; do NOT consume the cap (repostAttempts stays 0).
                 const msF = store.loadModeration();
                 const rF = (msF.held || []).find(recMatch);
-                if (rF && rF.status === 'superseded') { rF.status = 'failed'; rF.repostedBy = null; store.saveModeration(msF); }
+                if (rF && rF.status === 'superseded') {
+                  // Cap transient re-post failures: a broken reserve (logged out / profile-lock / crash) never
+                  // produces heldRecords, so without a counter it would re-attempt the SAME post every cycle
+                  // forever. After 3 transient failures, mark terminal failed_held + alert the operator.
+                  rF.transientFailures = (rF.transientFailures || 0) + 1;
+                  if (rF.transientFailures >= 3) { rF.status = 'failed_held'; rF.repostAttempts = 1; rF.note = `re-post failed ${rF.transientFailures}× (reserve broken: logged out / profile-lock / crash) — no further attempts`; this.log(`🚧 [${reserve.name}] re-post to "${rec.groupName || rec.gid}" failed ${rF.transientFailures}× → reported UNDELIVERABLE; check/replace the reserve account for this group.`); }
+                  else { rF.status = 'failed'; rF.repostedBy = null; } // revert for one more retry next cycle (cap not consumed)
+                  store.saveModeration(msF);
+                }
                 const why = (result && result.flag) ? result.flag : 'transient failure';
                 // Surface a logged-out reserve so the operator can re-login it (its status was otherwise stale).
                 if (result && (result.flag === 'needs_login' || result.flag === 'needs_verification')) await this._markLoggedOut(reserve.name, result.flag === 'needs_verification' ? '🔐 Needs verification — re-posting skipped' : '⚠️ Logged out — re-posting skipped; re-login required');
@@ -1392,65 +2162,93 @@ class Orchestrator {
             const eligibleFor = (c) => liveAccts3.filter((a) =>
               a.enabled !== false && !a.isModerator && a.status === 'logged_in' &&
               (Number(a.rateLimitedUntil) || 0) <= now && a.name !== c.posterAccount && inGroup(a, c.gid) &&
-              !(this._jobbedThisCycle && this._jobbedThisCycle.has(a.name))) // not an account that already ran a takeover/re-post job this cycle
+              !this._jobbedOut(a.name)) // not an account that already used up its per-cycle job cap (takeover/re-post)
               .sort((a, b) => (reserveNames.has(b.name) ? 1 : 0) - (reserveNames.has(a.name) ? 1 : 0)); // reserve first
             const PER_RESCUER = 5; // cap per rescuer per cycle so it doesn't burst-comment links and get itself blocked
+            // BIG-RUN SAFETY: also cap a rescuer's TOTAL rescue comments per LOCAL day. PER_RESCUER only bounds per
+            // cycle, but a long completion-mode drain (≤3-min cycles) re-selects the same healthy in-group reserve
+            // every cycle → dozens of link-comments/day from ONE account → it earns a comment block. Per-run day
+            // counter (a fresh run resets it — fine; comments don't otherwise go through the dailyCap gate at all).
+            const RESCUE_PER_DAY = 15;
+            const _rday = this._localDayKey();
+            if (!this._rescueDay || this._rescueDay.day !== _rday) this._rescueDay = { day: _rday, count: {} };
+            const _rescuedToday = (nm) => this._rescueDay.count[nm] || 0;
             const byAccount = new Map(); const unassigned = [];
             for (const c of pending) {
-              const pick = eligibleFor(c).find((a) => ((byAccount.get(a.name) || { tasks: [] }).tasks.length) < PER_RESCUER);
+              const pick = eligibleFor(c).find((a) => { const cur = (byAccount.get(a.name) || { tasks: [] }).tasks.length; return cur < PER_RESCUER && (_rescuedToday(a.name) + cur) < RESCUE_PER_DAY; });
               if (!pick) { unassigned.push(c); continue; }
               if (!byAccount.has(pick.name)) byAccount.set(pick.name, { account: pick, tasks: [] });
               byAccount.get(pick.name).tasks.push(c);
+              this._rescueDay.count[pick.name] = (this._rescueDay.count[pick.name] || 0) + 1; // count toward the per-day rescue ceiling
             }
             if (unassigned.length) this.log(`⚠️ ${unassigned.length} orphaned comment(s) have no free healthy in-group account this cycle — they stay queued (assign a reserve account to those groups, or they retry next cycle).`);
             if (byAccount.size) {
               const { runRescue } = require('./rescue');
               const hidden = settings.hideBrowser !== false;
               const markResult = (task, outcome) => {
-                try {
-                  const d2 = store.loadComments();
-                  const rec = d2.pending.find((x) => x.gid === task.gid && (x.postId && task.postId ? x.postId === task.postId : x.captionSnip === task.captionSnip) && x.status === 'pending');
-                  if (rec) {
-                    rec.attempts = (rec.attempts || 0) + 1;
-                    if (outcome === 'done') { rec.status = 'done'; rec.commentedAt = Date.now(); }
-                    else if (outcome === 'notfound') {
-                      // Live-but-not-in-public-feed → actually HELD in Spam potentiel. RE-HOME it into the
-                      // moderator queue (so the moderator approves it → the comment is re-queued), and close
-                      // this comment record so it can never sit in a status no phase ever reads.
+                // Serialized via _comChain (fire-and-forget — rescue calls onResult without await; the chain preserves
+                // order) so a concurrent moderator-loop/handoff write can't clobber this update.
+                store.updateComments((d2) => {
+                  // Scope by posterAccount too (as the enqueue-dedup does): two DIFFERENT accounts can each hold a live
+                  // pending record in the SAME group with an empty captionSnip + null postId (comment_notfound path), so
+                  // an account-agnostic match could mark the WRONG account's record done/failed.
+                  const rec = d2.pending.find((x) => x.gid === task.gid && x.posterAccount === task.posterAccount && (x.postId && task.postId ? x.postId === task.postId : x.captionSnip === task.captionSnip) && x.status === 'pending');
+                  if (!rec) return;
+                  if (outcome === 'blocked') return; // the RESCUER hit its OWN rate-limit — the comment never landed (rescue.js returns 'blocked' only when nothing was placed). Leave the record 'pending' with attempts UNCHANGED so a rested/different rescuer retries next cycle, instead of burning one of the post's 3 attempts on the rescuer's fault. No double-comment risk.
+                  rec.attempts = (rec.attempts || 0) + 1;
+                  if (outcome === 'done') { rec.status = 'done'; rec.commentedAt = Date.now(); }
+                  else if (outcome === 'notfound') {
+                    if (settings.moderationEnabled) {
+                      // MODERATION ON: live-but-not-in-public-feed → actually HELD in Spam potentiel. RE-HOME it into the
+                      // moderator queue (so the moderator approves it → the comment is re-queued), and close this record.
                       rec.status = 'rehomed'; rec.note = 're-homed to moderator approval (held in Spam potentiel)';
                       if (task.captionSnip || task.postId) {
-                        try {
-                          const ms = store.loadModeration();
-                          const dup = (ms.held || []).some((x) => x.gid === task.gid && ((task.captionSnip && x.captionSnip) ? x.captionSnip === task.captionSnip : (!!x.postId && !!task.postId && x.postId === task.postId)) && (x.status === 'held' || x.status === 'approved'));
-                          if (!dup) { ms.held.push({ postId: task.postId || null, gid: task.gid, posterAccount: task.posterAccount || null, fbDisplayName: '', captionSnip: task.captionSnip || '', postCaption: task.postCaption || null, groupName: task.groupName || null, comment: task.comment || '', commentImg: task.commentImg || null, postPermalink: task.postPermalink || null, status: 'held', heldAt: Date.now(), approvedAt: null, source: 'rescue_notfound' }); store.saveModeration(ms); this.log(`🔁 [${task.groupName || task.gid}] orphaned comment looks HELD — re-homed to moderator approval`); }
-                        } catch {}
+                        store.updateModeration((ms) => { // serialized moderation write
+                          // Veto re-insertion on ALL non-pruned statuses including the TERMINAL ones (failed_held =
+                          // capped undeliverable, superseded = a re-post is mid-flight) so a capped post isn't re-homed every cycle.
+                          const dup = (ms.held || []).some((x) => x.gid === task.gid && ((task.captionSnip && x.captionSnip) ? x.captionSnip === task.captionSnip : (!!x.postId && !!task.postId && x.postId === task.postId)) && (x.status === 'held' || x.status === 'approved' || x.status === 'failed_held' || x.status === 'superseded'));
+                          if (!dup) { ms.held.push({ postId: task.postId || null, gid: task.gid, posterAccount: task.posterAccount || null, fbDisplayName: '', captionSnip: task.captionSnip || '', postCaption: task.postCaption || null, groupName: task.groupName || null, comment: task.comment || '', commentImg: task.commentImg || null, postPermalink: task.postPermalink || null, status: 'held', heldAt: Date.now(), approvedAt: null, source: 'rescue_notfound' }); this.log(`🔁 [${task.groupName || task.gid}] orphaned comment looks HELD — re-homed to moderator approval`); }
+                        });
                       }
+                    } else if (rec.attempts >= 3) {
+                      // MODERATION OFF (the owner's config): there is NO moderator to release a re-home, AND re-homing can
+                      // be VETOED by a stale 'approved' held record left by an alreadyLive re-post → the link-comment would
+                      // vanish with no record + a false "100% delivered". So keep it RETRYABLE (attempts already incremented
+                      // above), and once the 3 attempts are exhausted SURFACE it as failed instead of silently dropping it.
+                      rec.status = 'failed'; rec.note = 'post looks HELD in "Spam potentiel" and there is no moderator to release it — live WITHOUT its comment';
+                      this.log(`❌ [${task.groupName || task.gid}] link-comment could NOT be placed — post held with no moderator to release it (live without its comment); place it manually.`);
                     }
-                    else if (outcome === 'skipped') {
-                      // The rescuer can NEVER safely identify the post (no permalink, caption too short, or an
-                      // ambiguous feed) — retrying won't help. Mark terminal + surface, instead of silently
-                      // burning 3 attempts then vanishing as 'failed' with no operator signal.
-                      rec.status = 'skipped'; rec.note = 'cannot identify the post safely (no permalink / short caption / ambiguous feed)';
-                      this.log(`⚠️ [${task.groupName || task.gid}] orphaned comment could NOT be placed safely (ambiguous post) — left for manual handling (will not retry).`);
-                    }
-                    else if (rec.attempts >= 3) { rec.status = 'failed'; }
+                    // else (moderation OFF, attempts < 3): leave rec 'pending' → a rested/different rescuer retries next cycle (still counted as outstanding, so completion won't falsely report 100% while it's owed).
                   }
-                  store.saveComments(d2);
-                } catch {}
+                  else if (outcome === 'skipped') {
+                    // The rescuer can NEVER safely identify the post — retrying won't help. Mark terminal + surface.
+                    rec.status = 'skipped'; rec.note = 'cannot identify the post safely (no permalink / short caption / ambiguous feed)';
+                    this.log(`⚠️ [${task.groupName || task.gid}] orphaned comment could NOT be placed safely (ambiguous post) — left for manual handling (will not retry).`);
+                  }
+                  else if (rec.attempts >= 3) {
+                    // Exhausted 3 placement attempts — surface it so the operator knows this post is LIVE without its link.
+                    rec.status = 'failed'; rec.note = rec.note || 'link-comment could not be placed after 3 attempts — post is live WITHOUT its comment';
+                    this.log(`❌ [${task.groupName || task.gid}] link-comment FAILED after 3 attempts — post is live without its comment; place it manually.`);
+                  }
+                });
               };
               this.log(`💬 Comment rescue: ${pending.length - unassigned.length} orphaned comment(s) across ${byAccount.size} healthy account(s)…`);
               for (const { account, tasks } of byAccount.values()) {
                 if (this._shouldStop()) break;
-                const rres = await runRescue({ account, tasks, settings, hidden, log: (m) => this.log(m), shouldStop: () => this._shouldStop(), isPaused: () => this._paused, waitIfPaused: () => this._waitWhilePaused(), onResult: markResult });
+                const rres = await runRescue({ account, tasks, settings, hidden, useProxies: !!data.useProxies, proxies: data.proxies || [], log: (m) => this.log(m), shouldStop: () => this._shouldStop(), isPaused: () => this._paused, waitIfPaused: () => this._waitWhilePaused(), onResult: markResult });
                 // A logged-out rescuer leaves its comments pending; mark it so the operator re-logs it in.
                 if (rres && rres.needsLogin) await this._markLoggedOut(account.name, '⚠️ Logged out — comment rescue skipped; re-login required');
+                // A rescuer that hit a rate-limit/block wall (incl. a comment that LANDED then walled → blocked_*_landed)
+                // must REST too — else it's re-picked as a rescuer next cycle and immediately re-walled (reserve burn).
+                // Mirror the poster path with a short COMMENT-level cooldown so it's excluded until it settles.
+                else if (rres && rres.blocked) { try { await this._recordAccountOutcome(account.name, { posted: 0, pendingApproval: 0, errors: 0, flag: 'rate_limited', rlKind: 'comment', postedIds: [], dealtIds: [] }, settings); } catch {} }
               }
             }
           }
           // Prune resolved records (done/failed/rehomed) so the queue keeps ONLY retryable 'pending'. OUTSIDE
           // `if (pending.length)` → resolved records are reaped even on cycles with zero pending (else
           // pending-comments.json grows unbounded once everything resolves). Only writes when it changed.
-          try { const d3 = store.loadComments(); const b = (d3.pending || []).length; d3.pending = (d3.pending || []).filter((c) => c.status === 'pending'); if (d3.pending.length !== b) store.saveComments(d3); } catch {}
+          try { const _cCut = Date.now() - 24 * 3600 * 1000; await store.updateComments((d3) => { d3.pending = (d3.pending || []).filter((c) => c.status === 'pending' || ((c.status === 'failed' || c.status === 'skipped') && (Number(c.commentedAt || c.queuedAt) || 0) > _cCut)); }); } catch {} // KEEP recent terminally-failed comments (a LIVE post without its link) 24h so the completion report can surface them (and the enqueue-dedup won't futilely re-queue them); done/rehomed + old failed are pruned
         } catch (e) { this.log(`⚠️ comment-rescue phase error: ${e.message}`); }
       }
 
@@ -1460,11 +2258,17 @@ class Orchestrator {
       // concurrent UI/remote edit can't be clobbered.
       if (settings.autoDeletePosted && cyclePostedIds.length) {
         const del = new Set(cyclePostedIds);
-        const { removed, remaining } = await store.update((d) => {
+        const { removed, remaining, files } = await store.update((d) => {
           const before = d.posts.length;
+          const removedFiles = [];
+          for (const p of d.posts) if (del.has(p.id)) { for (const f of (p.imagePaths || [])) if (f) removedFiles.push(f); if (p.commentImagePath) removedFiles.push(p.commentImagePath); }
           d.posts = d.posts.filter((p) => !del.has(p.id));
-          return { removed: before - d.posts.length, remaining: d.posts.length };
+          return { removed: before - d.posts.length, remaining: d.posts.length, files: removedFiles };
         });
+        // Unlink the deleted posts' LOCAL image files (only ones under the app's images dir — never a path outside it).
+        // Without this, auto-delete orphans every posted image forever → unbounded disk growth → eventually the atomic
+        // data.json/cookies writes fail. (imageUrl/commentImageUrl are remote → no local file to remove.)
+        try { this._unlinkDeletedImages(files, (store.paths && store.paths.IMAGES_DIR) || ''); } catch {}
         this.emit('data-updated');
         this.log(`🗑️ Auto-deleted ${removed} posted post(s) — ${remaining} remaining`);
       }
@@ -1476,9 +2280,10 @@ class Orchestrator {
       // If OFF, the completion engine just below drains any last comments/held, then reports + stops.
       if (this._campaignPlan && settings.loopCampaign && this._campaignAllFinished()) {
         this._roundOffset = (this._roundOffset || 0) + 1;
-        const planAgents = (this._active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan');
-        for (const a of planAgents) (this._perAccountRotation || (this._perAccountRotation = {}))[a.name] = { lastPostId: null, lastPostedDate: this._localDayKey() }; // reset slice; pace round 2 to next day
-        const planPosts = (this._data.posts || []).filter((p) => matchesFilter(p, (planAgents[0] && planAgents[0].postFilter) || 'all'));
+        const planAgents = (this._active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan' && (a.assignedGroups || []).length);
+        { const _dk = this._localDayKey(); const _N = Math.max(1, Math.min(8, parseInt(settings.cyclesPerDay, 10) || 1));
+          for (const a of planAgents) (this._perAccountRotation || (this._perAccountRotation = {}))[a.name] = { lastPostId: null, lastPostedDate: _dk, postsToday: _N, postsTodayDate: _dk }; } // reset slice; mark today's quota FULL so a new round paces to next day (matches "resumes next day")
+        const planPosts = (this._data.posts || []); // full library — per-cluster postFilter applied inside _computeCampaignPlan
         this._campaignPlan = this._computeCampaignPlan(planPosts, planAgents, this._roundOffset);
         this._saveRotationState();
         this.log('🔁 Campaign Plan: every group-set received the full library — new round started (reshuffled who posts what); resumes next day.');
@@ -1517,8 +2322,15 @@ class Orchestrator {
       // account reported it was logged out, looping again would just relaunch browsers that all
       // bail. Stop with a clear reason instead of spinning forever unattended.
       if (cycleDealtIds.length === 0 && (cycleFlags.includes('needs_login') || cycleFlags.includes('account_disabled') || cycleFlags.includes('needs_verification') || cycleFlags.includes('proxy_invalid'))) {
-        this.log('🛑 No account could post this cycle — accounts need attention (logged out, disabled, or identity-verification required). Stopping. Fix the flagged accounts, then Start again.');
-        break;
+        // Don't hard-stop if any active account is merely COOLING DOWN — those self-recover, so defer to the
+        // rate-limit hold below (a mixed fleet of one logged-out + others cooling must not kill the whole run).
+        const _n = Date.now();
+        const _liveA = getData().accounts || [];
+        const anyCooling = (this._active || []).some((a) => { const live = _liveA.find((x) => x.name === a.name) || a; return (Number(live.rateLimitedUntil) || 0) > _n; });
+        if (!anyCooling) {
+          this.log('🛑 No account could post this cycle — accounts need attention (logged out, disabled, or identity-verification required) and auto-login could not recover them. Stopping. Fix the flagged accounts, then Start again.');
+          break;
+        }
       }
       // DAILY-CAP HOLD: if every active poster simply hit today's cap (not cooling, not flagged), the run
       // is DONE FOR TODAY — wait for the UTC day to roll over and resume, instead of tripping the stall-
@@ -1558,7 +2370,14 @@ class Orchestrator {
         // fleet and the stall-breaker wrongly STOPPED the run, killing the daily-rotation agents). The
         // cycleDealtIds===0 guard above already means nothing else produced this cycle, so holding to the next
         // day is safe — everyone retries tomorrow.
-        const drAgents = (this._active || []).filter((a) => { const o = a.postingOrder || ''; return o === 'daily-rotation' || o === 'campaign-plan'; });
+        const drAgents = (this._active || []).filter((a) => {
+          const o = a.postingOrder || '';
+          if (o === 'daily-rotation') return true;
+          // campaign-plan: EXCLUDE surplus-idle agents (empty slice from the spread pass) — they never post, so
+          // requiring them to have "posted today" would block the hold forever and trip the stall-breaker.
+          if (o === 'campaign-plan') return this._campaignNextIdx(a.name).len > 0;
+          return false;
+        });
         const _allRotatedToday = drAgents.length > 0 && drAgents.every((a) => ((this._perAccountRotation || {})[a.name] || {}).lastPostedDate === _today);
         if (_allRotatedToday) {
           const d = new Date();
@@ -1571,10 +2390,28 @@ class Orchestrator {
           continue;
         }
       }
+      // ALL-RATE-LIMITED HOLD: if nothing posted (reserves included) and EVERY active poster is cooling down
+      // from a rate-limit, the fleet isn't dead — it just needs to wait out the cool-down. Sleep until the
+      // earliest expiry, then resume — instead of burning cycles into the stall-breaker and STOPPING (which
+      // would leave the app dead for hours when it would have recovered on its own). The single wait is capped
+      // at ~1h so it re-checks periodically (an account may re-login or the operator may intervene sooner).
+      if (cycleDealtIds.length === 0 && (this._active || []).length > 0) {
+        const _now = Date.now();
+        const _live = (getData().accounts || []);
+        const _posters = (this._active || []).filter((a) => a.enabled !== false && !a.isModerator);
+        const _until = _posters.map((a) => Number((_live.find((x) => x.name === a.name) || a).rateLimitedUntil) || 0);
+        if (_posters.length > 0 && _until.every((t) => t > _now)) {
+          const waitMs = Math.max(60000, Math.min(Math.min(..._until) - _now + 30000, 3600000)); // earliest expiry +30s, capped at 1h
+          this._zeroProgressCycles = 0; // a deliberate cool-down hold is NOT a stall
+          this.log(`🧊 All active accounts are cooling down from rate-limits — waiting ~${Math.round(waitMs / 60000)} min for the earliest to recover, then resuming automatically (the run does not stop).`);
+          await this._waitWithCountdown(waitMs, 'Rate-limit cool-down');
+          if (this._shouldStop() || this._finish) break;
+          continue;
+        }
+      }
       // Dead-fleet / stall breaker: if the run dealt NOTHING for several cycles in a row (every account
-      // rate-limited, likely-blocked, group-less, or disabled), STOP instead of relaunching browsers
-      // forever unattended. This catches the zero-progress cases the flag-specific guard above doesn't
-      // (especially an all-rate-limited fleet, which would otherwise loop and keep burning the accounts).
+      // likely-blocked, group-less, or disabled — NOT merely cooling, which the hold above now handles), STOP
+      // instead of relaunching browsers forever unattended.
       this._zeroProgressCycles = (cycleDealtIds.length === 0) ? (this._zeroProgressCycles || 0) + 1 : 0;
       if (this._zeroProgressCycles >= 3) {
         // M4-09: name the most likely root cause so the operator knows whether to WAIT (cool-down)
@@ -1606,12 +2443,14 @@ class Orchestrator {
         // Mark today's run done + persist (survives a same-day restart) so the top-of-loop daily gate now
         // waits until TOMORROW's fire time. The continuous inter-cycle wait below is skipped in daily mode.
         this._drainingCompletion = false; // a normal daily cycle finished → resume the 24h gate
-        this._lastDailyRunDate = this._localDayKey();
-        this._saveRotationState();
-        this.log(`📅 Daily run complete — next run tomorrow at ${settings.dailyPostTime}.`);
-        continue; // the top-of-loop daily gate performs the ~24h wait until the next fire
+        // Do NOT re-derive _lastDailyRunDate from the wall clock here — it was already set to the FIRE-day at the top
+        // of this cycle (line ~1073) and persisted. If this cycle crossed LOCAL midnight, _localDayKey() now returns
+        // D+1; marking D+1 as "already ran" would SKIP D+1's scheduled fire entirely (a dropped day every time a long
+        // or late cycle runs past midnight). The top-of-loop gate already waits ~24h from the fire-day.
+        this.log(`📅 Cycle complete.`); // the top-of-loop daily gate logs the real next step (another cycle this run, or "run complete → next run tomorrow")
+        continue; // the top-of-loop daily gate decides: another cycle (cyclesPerRun not reached) or wait until tomorrow's fire
       }
-      const cycleWaitMs = rangeMs(settings, 'waitIntervalMin', 'waitIntervalMax', 90, 180, 60000, 1); // T3: randomized inter-cycle wait
+      const cycleWaitMs = this._interCycleMs(settings); // T3: randomized inter-cycle wait ("time between cycles" — cycleGapMin override, else waitInterval)
       this.log(`✅ Cycle ${cycle} complete. Waiting ~${Math.round(cycleWaitMs / 60000)} min (randomized) before next cycle…`);
       await this._waitWithCountdown(cycleWaitMs, 'Next cycle');
     }
@@ -1627,8 +2466,15 @@ class Orchestrator {
 
   // Sleep with a live countdown so the log keeps updating during long waits (between
   // cycles/batches) instead of going silent. Logs every 30s; interruptible by Stop.
-  async _waitWithCountdown(ms, label) {
+  async _waitWithCountdown(ms, label, allowSleep = true) {
     if (!(ms > 0)) return;
+    // Long REST (daily wait until TOMORROW, or a long cool-down): release the keep-awake sleep-block so the
+    // operator CAN let the laptop sleep; it re-acquires when this wait ends and posting resumes. Short
+    // inter-cycle pauses (<5 min) keep the laptop awake (no point sleeping that briefly).
+    // allowSleep=false → KEEP AWAKE even on a long wait: used while waiting for TODAY's still-pending scheduled
+    // post (e.g. set 20:00 at 15:00) so the laptop can't doze off and miss the fire. Overnight rests pass true.
+    const restMode = ms > 5 * 60 * 1000 && allowSleep;
+    if (restMode) { try { this.emit('keep-awake', false); } catch {} this.log('😴 At rest until the next scheduled run — the laptop may sleep now; it resumes automatically (no posts lost).'); }
     let end = Date.now() + ms;
     let lastLog = 0;
     const fmt = (sec) => { const m = Math.floor(sec / 60), s = sec % 60; return (m > 0 ? m + 'm ' : '') + s + 's'; };
@@ -1648,6 +2494,7 @@ class Orchestrator {
       }
       await sleep(1000);
     }
+    if (restMode) { try { this.emit('keep-awake', true); } catch {} } // rest over → re-block sleep so the resuming posts render reliably
     if (this._progress) { this._progress.waitingLabel = null; this._progress.waitRemainingSec = 0; this.emit('automation-progress', { ...this._progress }); }
   }
 
@@ -1684,19 +2531,33 @@ class Orchestrator {
     let undealt = 0;
     if (finite.length) {
       const seen = new Set();
-      for (const a of finite) for (const p of (data.posts || []).filter((p) => matchesFilter(p, a.postFilter || 'all'))) if (!this._dealt.has(p.id)) seen.add(p.id);
+      // Per account, count only undealt posts IN THAT ACCOUNT'S SET (postsForSet) — otherwise a set-restricted
+      // unique/sequence agent inflates the outstanding count with posts it can never deliver, so the run never completes.
+      for (const a of finite) for (const p of postsForSet(data.posts || [], a).filter((p) => matchesFilter(p, a.postFilter || 'all'))) if (!this._dealt.has(p.id)) seen.add(p.id);
       undealt = seen.size;
     }
     // Campaign-plan posts not yet delivered (tracked by per-agent pointers, not the shared dealt-set).
-    const campaignAgents = (active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan');
+    const campaignAgents = (active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan' && (a.assignedGroups || []).length);
     const campaignRemaining = campaignAgents.length ? this._campaignRemaining() : 0;
     undealt += campaignRemaining;
-    let pending = 0, held = 0, failedHeld = 0;
+    // PARTIAL-DELIVERY owed ([8]): un-reached (post,group) pairs a campaign agent still owes are outstanding work —
+    // count them so completionMode doesn't declare "100% delivered" and stop before those groups get the post.
+    for (const a of campaignAgents) { const o = (this._owed || {})[a.name]; if (o && (o.gids || []).length) undealt += o.gids.length; }
+    let pending = 0, held = 0, failed = 0, failedHeld = 0, superseded = 0;
     try { pending = (store.loadComments().pending || []).filter((c) => c.status === 'pending' && (c.attempts || 0) < 3).length; } catch {}
-    try { const hh = (store.loadModeration().held || []); held = hh.filter((h) => h.status === 'held').length; failedHeld = hh.filter((h) => h.status === 'failed_held').length; } catch {}
-    // failedHeld = undeliverable even after a replacement re-post (capped) — informational, NOT counted in
-    // total (it must not block completion; it's surfaced in the report instead).
-    return { undealt, pending, held, failedHeld, total: undealt + pending + held, hasFinite: finite.length > 0 || campaignAgents.length > 0 };
+    try { const hh = (store.loadModeration().held || []); held = hh.filter((h) => h.status === 'held').length; failed = hh.filter((h) => h.status === 'failed').length; failedHeld = hh.filter((h) => h.status === 'failed_held').length; superseded = hh.filter((h) => h.status === 'superseded').length; } catch {}
+    // 'failed' = a held post escalated past the 90-min approval window. With repost ON it's a Phase-4 re-post
+    // candidate → STILL OUTSTANDING (counted, so completion waits for the re-post). With repost OFF it has NO
+    // recovery path → NOT counted (else a held-heavy run could never complete) BUT it is UNDELIVERED, so
+    // _emitCompletionReport surfaces it loudly instead of a silent drop + a false "100% delivered". (Before this
+    // fix a held post that aged to 'failed' with repost off was dropped from `total` → completion lied at scale.)
+    // failedHeld = terminal undeliverable (surfaced, never counted).
+    // 'superseded' = a Phase-4 re-post is mid-flight (status persisted BEFORE awaiting runRepost). A hard-kill mid-re-post
+    // leaves it durably 'superseded'; count it as outstanding (repost ON) so a stop-and-report can't fire a false "100%
+    // delivered" before _pruneModeration reverts it (30-min window) → 'failed' → a re-post. Only DELAYS completion; the
+    // Phase-1 re-hold dedup already excludes superseded, so counting it can never cause a double-post.
+    const repostOn = !!(this._data && this._data.settings && this._data.settings.repostEnabled);
+    return { undealt, pending, held, failed, failedHeld, superseded, total: undealt + pending + held + (repostOn ? failed + superseded : 0), hasFinite: finite.length > 0 || campaignAgents.length > 0 };
   }
 
   // Final report when a completion-mode run ends: what got delivered, what's left (if undeliverable), and
@@ -1710,7 +2571,13 @@ class Orchestrator {
     const bad = (data.accounts || []).filter((a) => !a.isModerator && (
       (this._runFlags && this._runFlags[a.name]) || (Number(a.rateLimitedUntil) || 0) > now ||
       (a.status && a.status !== 'logged_in' && a.status !== 'idle')));
-    if (reason === 'completed') this.log('🎉 Campaign complete — every post published and every comment delivered. Stopping.');
+    let undeliv = 0; try { const hh = store.loadModeration().held || []; undeliv = hh.filter((h) => h.status === 'held' || h.status === 'failed' || h.status === 'superseded').length; } catch {}
+    // Posts that are LIVE but whose link-comment terminally FAILED (3 attempts / held with no moderator) — a silent
+    // "live without its comment" gap the held-only count above misses. Surface them so 'every comment delivered' never
+    // fires while a live post lacks its link.
+    let noLink = []; try { noLink = (store.loadComments().pending || []).filter((c) => c.status === 'failed' || c.status === 'skipped'); } catch {}
+    if (reason === 'completed' && !undeliv && !noLink.length) this.log('🎉 Campaign complete — every post published and every comment delivered. Stopping.');
+    else if (reason === 'completed') this.log(`🏁 Campaign delivered its posting work${undeliv ? `, but ${undeliv} post(s) are still HELD / undelivered — Facebook held them and there's no moderator or reserve to recover them (turn on 🛡️ Moderator Approval, or Reserve Re-post)` : ''}${noLink.length ? `${undeliv ? '; also ' : ', but '}${noLink.length} live post(s) are WITHOUT their link-comment (place manually): ${[...new Set(noLink.map((c) => c.groupName || c.gid))].slice(0, 20).join(', ')}` : ''}. Stopping.`);
     else this.log(`🏁 Stopping: ${out ? out.total : '?'} item(s) could not be delivered (${out ? `${out.undealt} unposted, ${out.pending} comments, ${out.held} held` : ''}) — see below.`);
     this.log(`📊 Delivered this run: ${posted} published, ${pending} pending-approval, ${errors} error(s).`);
     if (bad.length) this.log(`🔧 Accounts to REPLACE/check (went bad this run): ${bad.map((a) => `${a.alias || a.name}${(Number(a.rateLimitedUntil) || 0) > now ? ' (rate-limited)' : (this._runFlags && this._runFlags[a.name] ? ` (${this._runFlags[a.name]})` : '')}`).join(', ')}`);
@@ -1724,25 +2591,80 @@ class Orchestrator {
   // across the cluster's agents (round-robin) — so every group-set receives the entire campaign, split
   // across its team of agents, 1 post/agent/day. Returns per-agent ordered lists (each agent walks its
   // own list via the daily pointer) plus a cluster preview. Pure + deterministic (agent order preserved).
+  // Launch ORDER across batches (start-order only — post assignment keys off this._active, untouched). A "batch"
+  // = accounts sharing an identical group-set. 'batch' keeps the natural grouped order (A1 A2 A3 B1 B2 B3);
+  // 'interleave' round-robins across batches (A1 B1 A2 B2 …) so consecutive launches hit DIFFERENT groups;
+  // 'random' shuffles (seeded by the cycle so it stays reproducible for tests/resume).
+  _orderLaunchQueue(queue, mode, seed) {
+    if (!Array.isArray(queue) || queue.length < 2) return queue || [];
+    if (mode === 'random') return seededShuffle(queue, seed);
+    if (mode === 'interleave') {
+      const byBatch = new Map();
+      for (const a of queue) { const k = (a.assignedGroups || []).slice().sort().join('|'); if (!byBatch.has(k)) byBatch.set(k, []); byBatch.get(k).push(a); }
+      const lists = [...byBatch.values()]; const out = [];
+      for (let i = 0, more = true; more; i++) { more = false; for (const l of lists) { if (i < l.length) { out.push(l[i]); more = true; } } }
+      return out;
+    }
+    return queue; // 'batch' (default) — natural grouped order, unchanged
+  }
+
   _computeCampaignPlan(posts, agents, roundOffset = 0) {
-    const sig = (a) => (a.assignedGroups || []).slice().sort().join('|');
+    // 🔀 Random work-pattern: shuffle the library before partitioning (seeded by the round → reproducible, and
+    // reshuffles on each reloop). Keeps the batch-split model; just removes the predictable #1,#2,#3 order.
+    if (this._data && this._data.settings && this._data.settings.shuffleCampaign) posts = seededShuffle(posts, (roundOffset || 0) + 1);
+    // Cluster signature = shared groups + assigned post-set. Including the set means two agents with the SAME groups
+    // but DIFFERENT post-sets land in SEPARATE clusters (each draws its own set) instead of colliding into one where
+    // only cAgents[0]'s set would win. No set assigned → '::' suffix is uniform, so behavior is unchanged.
+    const sig = (a) => (a.assignedGroups || []).slice().sort().join('|') + '::' + (a.postSetId || '');
     const clusters = new Map(); // group signature -> [agents] (insertion order = deterministic)
     for (const a of agents) { const k = sig(a); if (!clusters.has(k)) clusters.set(k, []); clusters.get(k).push(a); }
+    // POST-SETS: each cluster (group-signature) draws ONLY from its assigned post-set (cAgents[0].postSetId) so
+    // different batches deliver different content. No set assigned (null) → the whole library, so existing
+    // single-library campaigns are 100% unchanged. Resolve each cluster's post list ONCE here.
+    const _setOf = (cAgents) => (cAgents[0] && cAgents[0].postSetId) || null;
+    const _postsForCluster = (cAgents) => { const sid = _setOf(cAgents); const pf = (cAgents[0] && cAgents[0].postFilter) || 'all'; return (sid ? posts.filter((p) => (p.postSetId || null) === sid) : posts).filter((p) => matchesFilter(p, pf)); };
+    const clusterPosts = new Map();
+    for (const [k, cAgents] of clusters) clusterPosts.set(k, _postsForCluster(cAgents));
     const agentLists = {};
-    const preview = [];
+    // Pass 1: each cluster of K agents round-robin-partitions ITS post-set → ~ceil(P/K) posts/agent, 1/day.
+    // roundOffset rotates WHICH agent starts the partition so a new big-cycle reshuffles who posts what.
     for (const [k, cAgents] of clusters) {
       const K = cAgents.length;
-      // roundOffset rotates WHICH agent in the cluster starts the partition, so a new big-cycle reshuffles.
-      cAgents.forEach((a, j) => {
-        const slot = (j + roundOffset) % K;
-        agentLists[a.name] = posts.filter((_, idx) => idx % K === slot).map((p) => p.id);
-      });
+      const cPosts = clusterPosts.get(k);
+      cAgents.forEach((a, j) => { const slot = (j + roundOffset) % K; agentLists[a.name] = cPosts.filter((_, idx) => idx % K === slot).map((p) => p.id); });
+    }
+    // Pass 2 — SPREAD TO MAX DURATION: a bigger cluster finishes in fewer days and would then IDLE while a slower
+    // cluster keeps posting (and _campaignAllFinished can't reloop until ALL agents are done). Instead make every
+    // cluster span the SLOWEST cluster's day-count: a faster cluster uses only as many agents (Keff) as needed to
+    // pace the library over those days, at an even daily volume. The active subset ROTATES by roundOffset, so no
+    // agent idles forever — across rounds every agent takes a turn. Net: no idle gap (all clusters finish together
+    // → the existing reloop restarts the campaign), and the fast cluster's groups aren't flooded in one day.
+    const globalMaxLen = Math.max(0, ...Object.values(agentLists).map((l) => l.length));
+    if (globalMaxLen > 0) {
+      for (const [k, cAgents] of clusters) {
+        const K = cAgents.length;
+        const cPosts = clusterPosts.get(k);
+        const curLen = Math.max(0, ...cAgents.map((a) => agentLists[a.name].length));
+        if (curLen >= globalMaxLen) continue; // the pace-setting (slowest) cluster — already spans max days
+        const Keff = Math.max(1, Math.min(K, Math.ceil(cPosts.length / globalMaxLen))); // agents needed to span max days (this set's count)
+        const shift = ((roundOffset % K) + K) % K; // rotate WHICH agents are active this round
+        cAgents.forEach((a, j) => {
+          const rank = (((j - shift) % K) + K) % K; // ranks 0..Keff-1 are the active posters this round
+          agentLists[a.name] = rank < Keff ? cPosts.filter((_, idx) => idx % Keff === rank).map((p) => p.id) : [];
+        });
+      }
+    }
+    const preview = [];
+    for (const [k, cAgents] of clusters) {
+      const cPosts = clusterPosts.get(k);
       const maxLen = Math.max(0, ...cAgents.map((a) => agentLists[a.name].length));
       const days = [];
       for (let d = 0; d < maxLen; d++) days.push(cAgents.map((a) => ({ agentName: a.name, postId: agentLists[a.name][d] || null })).filter((s) => s.postId));
-      preview.push({ groupKey: k, agents: cAgents.map((a) => a.name), totalPosts: posts.length, days: days.length, grid: days });
+      preview.push({ groupKey: k, agents: cAgents.map((a) => a.name), totalPosts: cPosts.length, days: days.length, grid: days });
     }
-    const fp = posts.map((p) => p.id).join(',') + '::' + agents.map((a) => a.name + ':' + sig(a)).join(',');
+    // Hash includes each POST's set tag and each agent's sig (which already carries the agent's set) → re-tagging a
+    // post to a different set, or reassigning an agent's set, changes the batchId and triggers a clean recompute.
+    const fp = posts.map((p) => p.id + ':' + (p.postSetId || '')).join(',') + '::' + agents.map((a) => a.name + ':' + sig(a)).join(',');
     let h = 5381; for (let i = 0; i < fp.length; i++) h = ((h * 33) ^ fp.charCodeAt(i)) >>> 0; // djb2 change-detection hash
     return { batchId: String(h), planStartDate: this._localDayKey(), roundOffset, agentLists, clusters: preview };
   }
@@ -1761,16 +2683,214 @@ class Orchestrator {
   // Every active campaign-plan agent has reached the end of its list → the whole library has been
   // delivered to every group-set (the batch is complete).
   _campaignAllFinished() {
-    const agents = (this._active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan');
+    const agents = (this._active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan' && (a.assignedGroups || []).length);
     if (!agents.length) return false;
+    // An agent assigned an EMPTY post-set has len=0, so idx>=len is trivially true. If EVERY agent is empty the
+    // campaign is MISCONFIGURED, not "finished" — returning true would loop-restart it forever delivering nothing.
+    if (agents.every((a) => this._campaignNextIdx(a.name).len === 0)) return false;
+    // A partial-delivery obligation (un-reached groups owe an earlier post) means the campaign is NOT finished — else
+    // a loopCampaign reshuffle / completionMode stop would fire while a group still permanently misses that post. [8]
+    if (agents.some((a) => { const o = (this._owed || {})[a.name]; return o && (o.gids || []).length; })) return false;
     return agents.every((a) => { const n = this._campaignNextIdx(a.name); return n.idx >= n.len; });
   }
 
   // Posts still to deliver across all active campaign-plan agents (for completionMode / outstanding work).
   _campaignRemaining() {
-    let r = 0; for (const a of (this._active || []).filter((x) => (x.postingOrder || '') === 'campaign-plan')) { const n = this._campaignNextIdx(a.name); r += Math.max(0, n.len - n.idx); }
+    let r = 0; for (const a of (this._active || []).filter((x) => (x.postingOrder || '') === 'campaign-plan' && (x.assignedGroups || []).length)) { const n = this._campaignNextIdx(a.name); r += Math.max(0, n.len - n.idx); }
     return r;
+  }
+
+  // Same-day reserve takeover for Campaign Plan: pair each campaign-plan agent that DROPPED this cycle
+  // (delivered nothing) with a healthy campaign-plan reserve in the SAME cluster (identical assignedGroups),
+  // so the reserve delivers that agent's slice-for-today into the same groups. The reserve has no agentLists
+  // of its own, so its pick is routed through this map by _postsForAccount; the post-bookkeeping then advances
+  // the DROPPED agent's pointer (not the reserve's). Returns { [reserveName]: { postId, forAgent } }. One
+  // reserve covers one agent/cycle; bounded by `limit` (the cycle's takeover cap). `isHealthy` gates the
+  // reserve (logged-in, off cooldown, daily headroom).
+  _campaignStandins(active, reserve, isHealthy, limit = 3) {
+    const out = {};
+    const plan = this._campaignPlan;
+    if (!plan || !plan.agentLists || !this._cycleDrops || !this._cycleDrops.size) return out;
+    const dropped = (active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan' && this._cycleDrops.has(a.name));
+    const used = new Set();
+    let n = 0;
+    for (const A of dropped) {
+      if (n >= limit) break;
+      // OWED-FIRST: A owes an EARLIER partial post → the owed-standins path (fed from _cycleOwed, synthesized from the
+      // persistent ledger) finishes THAT post to only its un-reached groups. Do NOT advance A to its next slice here
+      // (that would strand the owed groups and, on reconcile, silently drop them). One coverage path, no over-delivery.
+      if (this._owed && this._owed[A.name] && this._owed[A.name].postId && ((this._owed[A.name].gids) || []).length) continue;
+      if (((this._perAccountRotation || {})[A.name] || {}).lastPostedDate === this._localDayKey()) continue; // A already posted today → slice covered; don't double-post
+      const idx = this._campaignNextIdx(A.name);
+      if (idx.idx >= idx.len) continue; // A's slice is already complete — nothing to cover
+      const postId = (plan.agentLists[A.name] || [])[idx.idx];
+      if (!postId || !(this._data.posts || []).some((p) => p.id === postId)) continue; // post gone from library
+      // A reserve that is a MEMBER of every group A targets (its assignedGroups ⊇ A's) can stand in — exact
+      // set-equality was too strict (a catch-all Standby with extra groups was wrongly rejected). A's groups are
+      // fully covered; any extra groups on the reserve also receive the post (acceptable). Standby of ANY order OK.
+      const covers = (r) => { const rg = r.assignedGroups || []; return (A.assignedGroups || []).length > 0 && (A.assignedGroups || []).every((g) => rg.includes(g)); };
+      const R = this._bestReserve((reserve || []).filter((r) => !used.has(r.name) && !r.isModerator && covers(r) && isHealthy(r)), (A.assignedGroups || []).length);
+      if (R) { used.add(R.name); out[R.name] = { postId, forAgent: A.name }; n++; }
+      else { // #1 no single superset reserve → SPLIT A's groups across multiple in-group reserves (each delivers A's slice to ONLY its subset)
+        for (const s of this._splitCover([...this._groupIdsOf(A)], reserve, used, isHealthy)) {
+          if (n >= limit) break;
+          out[s.reserve.name] = { postId, forAgent: A.name, gids: s.gids }; n++;
+        }
+      }
+    }
+    return out;
+  }
+
+  // RESERVE RANKING (#2 smarter selection): among equally-eligible covering reserves, pick the BEST instead of the
+  // first-found. Order: (1) least OVER-EXPOSURE — fewest groups beyond what the cover needs (a superset reserve posts
+  // the slice to ALL its groups, so extras get the post too; `exposureBaseline` = the count of groups the cover should
+  // reach, or 0/null for a gids-restricted cover that can't over-expose); (2) fewest recent rate-limit STRIKES (safer);
+  // (3) WARMEST (more prior runs = more established). Deterministic tiebreak by name. Returns the best reserve or null.
+  _bestReserve(candidates, exposureBaseline) {
+    if (!candidates || !candidates.length) return null;
+    const base = Number(exposureBaseline) || 0;
+    const scored = candidates.map((r) => ({
+      r,
+      extra: base ? Math.max(0, (r.assignedGroups || []).length - base) : 0,
+      strikes: Number(r.rlStrikes) || 0,
+      runs: (() => { try { return store.loadRunCount(r.name); } catch { return 0; } })(),
+    }));
+    scored.sort((a, b) => (a.extra - b.extra) || (a.strikes - b.strikes) || (b.runs - a.runs) || (a.r.name < b.r.name ? -1 : 1));
+    return scored[0].r;
+  }
+
+  // Resolve an account's assigned groups to their canonical ids (groupId||id) — the form used by onlyGroups / the
+  // per-(post,group) ledger / the worker's gid. (assignedGroups may hold either g.id or g.groupId.)
+  _groupIdsOf(acc) {
+    return new Set((this._data.groups || []).filter((g) => (acc.assignedGroups || []).includes(g.id) || (acc.assignedGroups || []).includes(g.groupId)).map((g) => g.groupId || g.id));
+  }
+
+  // #1 SPLIT COVERAGE: when NO single reserve is a full superset of the groups that need covering, assign a SET of
+  // reserves whose union covers them — each routed (via gids/onlyGroups) to only its subset. Greedy set-cover: each
+  // step takes the reserve covering the MOST still-needed groups (ties broken by _bestReserve: fewest strikes / warmest),
+  // routes it to that subset, removes those groups, repeats. Returns [{reserve, gids:[...]}] (partial if some group has
+  // no member reserve — the caller reports the shortfall). `used` is mutated so a reserve isn't double-assigned.
+  _splitCover(neededGids, reserves, used, isHealthy) {
+    const out = [];
+    const need = new Set(neededGids);
+    while (need.size) {
+      const cand = (reserves || [])
+        .filter((r) => !used.has(r.name) && !r.isModerator && isHealthy(r))
+        .map((r) => { const rg = this._groupIdsOf(r); return { r, cover: [...need].filter((G) => rg.has(G)) }; })
+        .filter((x) => x.cover.length);
+      if (!cand.length) break; // remaining groups have no eligible member reserve
+      const maxCover = Math.max(...cand.map((x) => x.cover.length));
+      const top = cand.filter((x) => x.cover.length === maxCover);
+      const best = this._bestReserve(top.map((x) => x.r), 0) || top[0].r; // gids-restricted → no over-exposure term
+      const chosen = top.find((x) => x.r.name === best.name) || top[0];
+      out.push({ reserve: chosen.r, gids: chosen.cover.slice() });
+      used.add(chosen.r.name);
+      chosen.cover.forEach((G) => need.delete(G));
+    }
+    return out;
+  }
+
+  // IMMEDIATE-TAKEOVER pairing: pick a healthy reserve to stand in for a SINGLE dropped campaign-plan agent A the
+  // INSTANT it fails (vs the end-of-pool _campaignStandins batch). The reserve must be a MEMBER of every group A
+  // targets, fresh-logged-in + past any rate-limit cool-down + within daily headroom (all via the caller's isHealthy),
+  // not a moderator, and not already jobbed this cycle. Returns { reserve, postId } or null (→ caller leaves it for
+  // the end-of-pool backstop). Pure given A + this._campaignPlan / _campaignNextIdx / _perAccountRotation / _data / _reserve.
+  _immediateStandin(A, isHealthy) {
+    if (!A || (A.postingOrder || '') !== 'campaign-plan') return null;
+    if (this._immediateCovered && this._immediateCovered.has(A.name)) return null;
+    // OWED-FIRST ([7][8] × drop/rest × stand-in): if A carries an UNFINISHED partial-delivery owed post, do NOT advance
+    // it to the next slice — the end-of-pool owed-standins path finishes that owed post to ONLY its un-reached groups.
+    // Advancing here would strand the owed groups AND (once the new post's obligation reconciles) silently drop them.
+    if (this._owed && this._owed[A.name] && this._owed[A.name].postId && ((this._owed[A.name].gids) || []).length) return null;
+    const plan = this._campaignPlan;
+    if (!plan || !plan.agentLists) return null;
+    if (((this._perAccountRotation || {})[A.name] || {}).lastPostedDate === this._localDayKey()) return null; // A already delivered today
+    const idx = this._campaignNextIdx(A.name);
+    if (idx.idx >= idx.len) return null; // A's slice already complete
+    const postId = (plan.agentLists[A.name] || [])[idx.idx];
+    if (!postId || !((this._data && this._data.posts) || []).some((p) => p.id === postId)) return null; // post gone from library
+    const covers = (r) => { const rg = r.assignedGroups || []; return (A.assignedGroups || []).length > 0 && (A.assignedGroups || []).every((g) => rg.includes(g)); };
+    const R = this._bestReserve((this._reserve || []).filter((r) => !r.isModerator && !this._jobbedOut(r.name) && covers(r) && isHealthy(r)), (A.assignedGroups || []).length);
+    return R ? { reserve: R, postId } : null;
+  }
+
+  // PARTIAL-DELIVERY pairing: for each OWED agent (delivered its post to some-but-not-all of its groups this cycle),
+  // find a healthy reserve that is a member of ALL its owed groups and assign it to cover ONLY those groups (gids).
+  // `cycleOwed` = { ownerName: { postId, gids[] } }; `exclude` = reserve names already taken (full-drop stand-ins).
+  // Returns { assigned: { reserveName: { postId, forAgent, gids } }, deferred: [{ owner, count }] }. Pure given inputs.
+  _owedStandins(cycleOwed, reserve, isHealthy, exclude = new Set()) {
+    const assigned = {}, deferred = [];
+    const used = new Set(exclude);
+    const resolveGids = (acc) => new Set((this._data.groups || []).filter((g) => (acc.assignedGroups || []).includes(g.id) || (acc.assignedGroups || []).includes(g.groupId)).map((g) => g.groupId || g.id));
+    for (const [owner, owed] of Object.entries(cycleOwed || {})) {
+      if (!owed || !(owed.gids || []).length) continue;
+      const R = this._bestReserve((reserve || []).filter((r) => !used.has(r.name) && !r.isModerator && isHealthy(r) && (() => { const rg = resolveGids(r); return owed.gids.every((G) => rg.has(G)); })()), 0);
+      if (R) { used.add(R.name); assigned[R.name] = { postId: owed.postId, forAgent: owner, gids: owed.gids.slice() }; }
+      else { // #1 no single reserve covers ALL owed groups → SPLIT them across multiple reserves
+        const split = this._splitCover(owed.gids, reserve, used, isHealthy);
+        for (const s of split) assigned[s.reserve.name] = { postId: owed.postId, forAgent: owner, gids: s.gids };
+        const coveredCount = split.reduce((a, s) => a + s.gids.length, 0);
+        if (coveredCount < owed.gids.length) deferred.push({ owner, count: owed.gids.length - coveredCount }); // groups with no member reserve
+      }
+    }
+    return { assigned, deferred };
+  }
+
+  // PERSISTENT OWED-LEDGER reconciliation — run ONCE at the end of each pool, AFTER all delivery this cycle (the
+  // primary pass AND any reserve takeover). For every daily-rotation / campaign-plan agent that TRIED to deliver a
+  // post this cycle (recorded in _cycleObligation with the groups it was responsible for), recompute its still-
+  // un-reached groups from the FINAL delivered set (_cycleDelivered). Any remainder is written to the persistent
+  // this._owed ledger so the SAME post is re-delivered to ONLY those groups next cycle/day (the owed pick-override);
+  // a fully-covered obligation CLEARS the entry so no delivered group is ever re-posted. Persists on any change.
+  // Invariants: (a) a group in _cycleDelivered is never owed (no double-post); (b) a responsible-but-un-reached
+  // group is always carried (no silent skip). [7][8]
+  // Delivery-ledger key SCOPE for the responsible agent. daily-rotation is PER-AGENT: two accounts each independently
+  // walk the SAME post library and can share an assigned group, so both legitimately post the SAME post P to a SHARED
+  // group G — its dedup/owed key MUST be scoped by the responsible agent, else A's delivery of P::G makes B skip G
+  // forever (a permanent silent under-delivery). Every other dedup mode (unique/sequence/campaign) is FLEET-WIDE (a
+  // post reaches each group ONCE across the whole fleet), so no agent scope. markDelivered/alreadyDelivered AND every
+  // owed-reconciliation filter route through this so they AGREE — a mismatch would re-owe a delivered group
+  // (double-post) or drop an un-reached one. A reserve stand-in passes the COVERED agent's name (it delivers on that
+  // agent's behalf), so its deliveries land under the same scope the covered daily-rotation agent's reconcile reads. [7][8]
+  _dkScope(agentName) {
+    try { const a = ((this._data && this._data.accounts) || []).find((x) => x.name === agentName); return (a && a.postingOrder === 'daily-rotation') ? (agentName + '::') : ''; }
+    catch { return ''; }
+  }
+
+  // Reconcile ONE agent's persistent owed entry from its obligation this cycle (expectedGids) minus what has ACTUALLY
+  // been delivered so far this cycle (_cycleDelivered). In-memory only — the caller persists. Returns true if it
+  // changed. CRASH-SAFETY: called INLINE right before each per-account rotation save (the one that advances the
+  // pointer), so this._owed is always written in lock-step with the pointer it depends on — a hard kill can never
+  // leave the pointer advanced past a post while the ledger still lists an already-delivered group (double-post) or
+  // omits an un-reached one (silent skip). No obligation for this agent → its owed is left untouched (a full drop
+  // that delivered nothing keeps any prior owed). [7][8]
+  _reconcileOwedFor(agent) {
+    if (!agent) return false;
+    this._owed = this._owed || {};
+    const ob = (this._cycleObligation || {})[agent];
+    if (!ob || !ob.postId) return false;
+    const _sc = this._dkScope(agent);
+    const still = (ob.expectedGids || []).filter((gid) => !this._cycleDelivered.has(_sc + ob.postId + '::' + gid));
+    const prev = this._owed[agent];
+    if (still.length) {
+      if (!prev || prev.postId !== ob.postId || (prev.gids || []).join(',') !== still.join(',')) { this._owed[agent] = { postId: ob.postId, gids: still }; return true; }
+      return false;
+    }
+    // CLEAR only the owed entry this obligation actually discharged. Without the postId guard, an obligation
+    // reconciled for post Q (e.g. a stand-in that advanced a rested agent to its NEXT slice) would silently DELETE a
+    // standing owed entry for a DIFFERENT earlier post P → those P groups are never delivered by anyone (invariant #2).
+    if (prev && prev.postId === ob.postId) { delete this._owed[agent]; return true; }
+    return false;
+  }
+
+  // End-of-pool sweep: reconcile EVERY obligated agent (belt-and-suspenders after the inline per-account reconciles —
+  // covers an agent whose own save was skipped, e.g. a stand-in that itself delivered nothing) and persist once.
+  _reconcileOwedLedger() {
+    let changed = false;
+    for (const agent of Object.keys(this._cycleObligation || {})) { if (this._reconcileOwedFor(agent)) changed = true; }
+    if (changed && !this._saveRotationState()) this.log('⚠️ Could not persist the owed-groups ledger (disk full/locked?) — a partial delivery may not carry across a restart. Free disk / fix data-folder permissions.');
+    return changed;
   }
 }
 
-module.exports = { Orchestrator, _test: { jitter } };
+module.exports = { Orchestrator };

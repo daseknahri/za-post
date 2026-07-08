@@ -13,8 +13,8 @@ const { execSync } = require('child_process');
 const ROOT = path.join(__dirname, '..');
 const DIST = path.join(ROOT, 'dist');
 const pkg = require(path.join(ROOT, 'package.json'));
-const APP_FOLDER = 'Za Post Comment Tool';
-const ZIP_NAME = `Za-Post-Comment-Tool-${pkg.version}-portable.zip`;
+const APP_FOLDER = pkg.build.productName; // derived from package.json (stamped by scripts/apply-brand.js) so it can't drift
+const ZIP_NAME = `${pkg.build.productName.replace(/\s+/g, '-')}-${pkg.version}-portable.zip`;
 const README_SRC = path.join(ROOT, 'build', 'READ-ME-FIRST.txt');
 
 function run(cmd) { console.log('\n> ' + cmd); execSync(cmd, { cwd: ROOT, stdio: 'inherit' }); }
@@ -74,16 +74,59 @@ function ensureWinCodeSign() {
   // 1.5) make electron-builder's winCodeSign cache usable without admin/Developer-Mode
   ensureWinCodeSign();
 
-  // 2) build the unpacked app: `dir` target = no installer, no signing
-  console.log('\n> electron-builder (dir target)');
+  // 2) build the unpacked app: `dir` target = no installer, no signing.
+  // BYTENODE=1 → ship V8 BYTECODE instead of readable JS for the main-process modules (anti-theft). We compile
+  // each module to .jsc UNDER ELECTRON (matching V8 ABI), then transiently swap each .js for a 2-line stub that
+  // loads its .jsc, build, and ALWAYS restore the source in `finally` (so the dev clone / source tree is never
+  // left modified, even on error). Off by default → the normal build is byte-for-byte unchanged.
   const builder = require('electron-builder');
-  await builder.build({ targets: builder.Platform.WINDOWS.createTarget('dir') });
+  const BYTENODE = process.env.BYTENODE === '1';
+  const swaps = []; const jscFiles = [];
+  try {
+    if (BYTENODE) {
+      console.log('\n> BYTENODE: compiling main-process modules to V8 bytecode (under Electron)…');
+      const electronPath = require('electron');
+      execSync(`"${electronPath}" scripts/compile-jsc.js`, { cwd: ROOT, stdio: 'inherit' });
+      const TARGETS = ['main.js', 'server.js', 'lib/store.js', 'lib/plan.js', 'lib/license.js', 'lib/secret.js', 'lib/chromium.js', 'lib/spintax.js', 'lib/imageVary.js', 'lib/proxy.js', 'automation/orchestrator.js', 'automation/worker.js'];
+      for (const rel of TARGETS) {
+        const jsPath = path.join(ROOT, rel);
+        const jscPath = jsPath.replace(/\.js$/, '.jsc');
+        if (!fs.existsSync(jscPath)) throw new Error(`bytenode: ${rel}.jsc was not produced (compile failed)`);
+        jscFiles.push(jscPath);
+        const base = path.basename(jsPath, '.js');
+        // main.js is the entry → just bootstrap bytenode + run its .jsc. Other modules re-export their .jsc.
+        // The stub keeps the SAME module path, so every existing require() resolves to it (no require rewrites).
+        const stub = rel === 'main.js'
+          ? `require('bytenode');\nrequire('./${base}.jsc');\n`
+          : `require('bytenode');\nmodule.exports = require('./${base}.jsc');\n`;
+        swaps.push({ file: jsPath, backup: fs.readFileSync(jsPath, 'utf8') });
+        fs.writeFileSync(jsPath, stub, 'utf8');
+      }
+      console.log(`> BYTENODE: ${TARGETS.length} modules → bytecode + stub loaders`);
+    }
+    console.log('\n> electron-builder (dir target)');
+    await builder.build({ targets: builder.Platform.WINDOWS.createTarget('dir') });
+  } finally {
+    // ALWAYS restore the original source + remove the transient .jsc (even if the build threw).
+    for (const s of swaps) { try { fs.writeFileSync(s.file, s.backup, 'utf8'); } catch (e) { console.error(`!! RESTORE FAILED: ${s.file} — restore it from git!`, e.message); } }
+    for (const j of jscFiles) { try { fs.rmSync(j, { force: true }); } catch {} }
+    if (BYTENODE && swaps.length) console.log('> BYTENODE: source .js restored, transient .jsc cleaned');
+  }
 
   const unpacked = path.join(DIST, 'win-unpacked');
   const chromeExe = path.join(unpacked, 'resources', 'chrome', 'chrome.exe');
   if (!fs.existsSync(chromeExe)) throw new Error('build incomplete: resources/chrome/chrome.exe missing in win-unpacked');
   const appExe = path.join(unpacked, `${APP_FOLDER}.exe`);
   if (!fs.existsSync(appExe)) throw new Error(`build incomplete: "${APP_FOLDER}.exe" missing in win-unpacked`);
+
+  // CLIENT license enforcement (opt-in): drop the marker main.js checks (process.resourcesPath/enforce-license.flag)
+  // into resources/ so this packaged build REQUIRES per-seat activation. Omit ENFORCE_LICENSE to ship an unlimited build.
+  if (process.env.ENFORCE_LICENSE === '1') {
+    fs.writeFileSync(path.join(unpacked, 'resources', 'enforce-license.flag'), 'client build — per-seat license enforced\r\n');
+    console.log('\n> ENFORCE_LICENSE=1 → wrote resources/enforce-license.flag (this build REQUIRES activation with a per-seat key)');
+  } else {
+    console.log('\n> (unlimited build — set ENFORCE_LICENSE=1 to require a per-seat key)');
+  }
 
   // 3) stage:  <staging>/Za Post Comment Tool/   +   <staging>/READ-ME-FIRST.txt
   const staging = path.join(DIST, '_portable-staging');
@@ -92,6 +135,23 @@ function ensureWinCodeSign() {
   fs.renameSync(unpacked, path.join(staging, APP_FOLDER));
   fs.copyFileSync(README_SRC, path.join(staging, 'READ-ME-FIRST.txt'));
   fs.copyFileSync(README_SRC, path.join(DIST, 'READ-ME-FIRST.txt')); // handy reference next to the zip
+
+  // start.bat launcher (sits next to the .exe): sets the remote-API token + enables the tunnel for that
+  // launch, so the recipient never has to touch Windows env vars — just double-click start.bat. The token is
+  // baked from ZAPOST_API_TOKEN at BUILD time (kept OUT of the repo); without it, a clearly-marked placeholder.
+  const apiToken = process.env.ZAPOST_API_TOKEN || 'PASTE-YOUR-TOKEN-HERE';
+  const enableTunnel = process.env.ENABLE_TUNNEL || '1';
+  const bat = [
+    '@echo off',
+    'REM ── Launches Za Post with the remote API enabled (token + tunnel set for THIS launch only). ──',
+    'REM Use this same token as the X-Access-Token header when POSTing from your external server.',
+    `set "ZAPOST_API_TOKEN=${apiToken}"`,
+    `set "ENABLE_TUNNEL=${enableTunnel}"`,
+    `start "" "%~dp0${APP_FOLDER}.exe"`,
+    '',
+  ].join('\r\n');
+  fs.writeFileSync(path.join(staging, APP_FOLDER, 'start.bat'), bat, 'utf8');
+  console.log(`\n> wrote ${APP_FOLDER}/start.bat (token ${apiToken === 'PASTE-YOUR-TOKEN-HERE' ? 'PLACEHOLDER — set ZAPOST_API_TOKEN before building' : 'baked from ZAPOST_API_TOKEN'}, ENABLE_TUNNEL=${enableTunnel})`);
 
   // 4) zip the staging CONTENTS via 7-Zip — STANDARD forward-slash zip entries (the .NET Framework
   // 4.x ZipFile API writes backslash separators that some extractors mishandle). cwd = staging so

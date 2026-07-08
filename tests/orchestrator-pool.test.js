@@ -31,7 +31,9 @@ test('E-N5: pool launches the next account as a slot frees (no batch barrier)', 
   store.save({
     posts: [{ id: 'p1', caption: 'x', comment: '', imagePaths: [] }],
     groups: [{ id: 'g1', name: 'G1', groupId: '111' }],
-    accounts: ['A', 'B', 'C'].map((n) => ({ name: n, enabled: true, assignedGroups: ['g1'], postingOrder: 'post-centric' })),
+    // Distinct per-account IPs so the pool MAY run them concurrently — the anti-link guard serializes only
+    // SAME-IP accounts (no-proxy accounts now share one 'real-ip' sentinel), which is covered by the ip-affinity test.
+    accounts: ['A', 'B', 'C'].map((n, i) => ({ name: n, enabled: true, assignedGroups: ['g1'], postingOrder: 'post-centric', proxy: `http://10.0.0.${i + 1}:8000:u:p` })),
     settings: { parallelAccounts: 2, accountDelay: 0, waitInterval: 0, groupDelay: 0, maxCycles: 1, staggerAccounts: false, varyImages: false, postsPerGroup: 0 },
     proxies: [], useProxies: false,
   });
