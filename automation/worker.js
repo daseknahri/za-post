@@ -825,13 +825,26 @@ function armPostIdCapture(page, gid) {
       let body = ''; try { body = await resp.text(); } catch { return; }
       if (!body || body.length > 3000000) return;
       const clean = body.replace(/\\\//g, '/');                  // FB escapes URL slashes as \/ in JSON
-      // Prefer a post URL under OUR group ONLY (exact gid — NOT a wildcard \d+ that could match a foreign/suggested
-      // group's permalink embedded ahead of ours in the response); else a clearly-labelled post-id field in the
-      // created story. Either way the id is only a CANDIDATE — the comment step re-verifies caption+author on the
-      // post's own page (forceContentVerify) before commenting, so even a mis-grab self-heals to the feed-scan.
-      let m = clean.match(new RegExp('/groups/' + gidStr + '/(?:posts|permalink)/(\\d{6,})'));
-      if (!m) m = clean.match(/"(?:post_id|top_level_post_id|story_fbid)"\s*:\s*"?(\d{8,})/);
-      if (m && m[1]) hit = { postId: m[1], url: 'https://www.facebook.com/groups/' + gidStr + '/posts/' + m[1] + '/' };
+      // ONLY a post URL under OUR EXACT group id. The removed `post_id`/`story_fbid` FIELD fallback was NOT
+      // group-scoped and caused a WRONG-GROUP capture → a double-comment: during a fast run a PREVIOUS group's
+      // create-story response can arrive LATE inside THIS group's capture window; the field regex would grab ITS
+      // id and we'd build `/groups/<thisGid>/posts/<otherGroupsId>` (resolves to the OTHER group's post). With the
+      // operator's IDENTICAL caption across groups, the comment step couldn't tell them apart → "2 comments on one
+      // post, 0 on the next". The gid-scoped URL match below can NEVER match another group's response (that response
+      // carries ITS OWN gid, not ours), so the captured id is always genuinely for THIS group. No URL match → no
+      // capture → the safe group-scoped feed-scan runs (correct even with identical captions — it's group-scoped).
+      // GLOBAL scan + AMBIGUITY-REJECT (recency safety). A create-story response can embed MORE THAN ONE same-group
+      // post URL (a pinned-post edge, a group-feed-context node, or out-of-order @defer stream chunks). A single
+      // first-match could then grab an OLDER same-group post's id — and because the operator posts an IDENTICAL
+      // caption + the SAME account to a group across MANY runs, the comment step can't tell that older post from the
+      // just-created one (caption AND author both match) → a double-comment on the OLD post, none on the new one.
+      // So collect ALL distinct same-group ids and capture ONLY when there's exactly ONE (unambiguously our new post).
+      // If several are present, capture NOTHING → _netPost stays null → the group-scoped feed-scan runs, which picks
+      // the TOPMOST (newest) our-caption post and REFUSES when it can't be sure — never a blind older-post comment.
+      const rx = new RegExp('/groups/' + gidStr + '/(?:posts|permalink)/(\\d{6,})', 'g');
+      const ids = new Set(); let mm;
+      while ((mm = rx.exec(clean))) ids.add(mm[1]);
+      if (ids.size === 1) { const id = [...ids][0]; hit = { postId: id, url: 'https://www.facebook.com/groups/' + gidStr + '/posts/' + id + '/' }; }
     } catch { /* never let a response probe throw into the publish path */ }
   };
   page.on('response', onResp);
@@ -1158,7 +1171,16 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         // (a captured link can be stale or redirect). Mismatch → demote to the id-checked feed fallback,
         // never a blind comment on the wrong post.
         const urlId = (page.url().match(/\/(?:posts|permalink)\/(\d+)/) || [])[1] || null;
-        if (expectedPostId && urlId && urlId !== expectedPostId) {
+        const urlGroup = (page.url().match(/\/groups\/([^\/?#]+)/) || [])[1] || null;
+        if (permalink && urlGroup && String(urlGroup) !== String(gid)) {
+          // GROUP guard (identical-caption safety, defense-in-depth behind the gid-scoped capture): the caption AND
+          // author are IDENTICAL across every group the operator posts to, so neither can tell our post in group A
+          // from our post in group B — the GROUP is the only disambiguator. If the captured/opened link resolved to
+          // a DIFFERENT group than the one we're commenting for, the post-id was wrong (points at another group's
+          // post) → NEVER comment here (that's the "2 comments on one post, 0 on the next" double-comment) → demote
+          // to THIS group's feed-scan, which finds OUR (newest) post in the CORRECT group by caption.
+          permalinkFailed = true; step(`Comment: the link resolved to a DIFFERENT group (${urlGroup} ≠ ${gid}) — captured post-id was wrong; using this group's feed instead (prevents a wrong-post/double comment)`);
+        } else if (expectedPostId && urlId && urlId !== expectedPostId) {
           permalinkFailed = true; step('Comment: post link did not resolve to OUR post (id mismatch) — falling back to the group feed');
         } else if (forceContentVerify && expectedPostId) {
           // NETWORK-CAPTURED id — its provenance is Facebook's publish response, NOT a caption-verified feed article,

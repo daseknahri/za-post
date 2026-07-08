@@ -2,6 +2,36 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.27] — 2026-07-08 — FIX a double-comment: network-captured link could point at the WRONG post (identical captions)
+
+The operator verified on Facebook and found **two comments on one post and none on the next** — a comment meant for
+post Y placed on post X. Root cause: the operator posts an **identical caption + the same account** to every group,
+many runs/day, so caption AND author are identical across all posts — the **group + recency** are the only
+disambiguators, and the network-capture comment path relied on neither strongly enough.
+
+Two distinct holes (both found via adversarial review), both fixed at the capture point:
+- **Cross-group (removed):** `armPostIdCapture` had a non-group-scoped `post_id`/`story_fbid` field fallback. During a
+  fast run, a *previous group's* create-story response can arrive late in *this* group's capture window; the field
+  grabbed its id → we built `/groups/<thisGid>/posts/<otherGroupsId>` → resolved to the other group's post. **Removed**
+  the field fallback — capture is now only from a `/groups/<OUR-exact-gid>/posts/<id>` URL, which another group's
+  response can never carry.
+- **Same-group, older post (fixed):** the URL regex took the *first* match with no recency check, so an older
+  same-group post URL embedded in the response (pinned-post edge / out-of-order `@defer` chunk) could be captured →
+  comment lands on the old post. **Now a global scan captures only when the response has exactly ONE distinct
+  same-group post id** (unambiguously the new post); if several, it captures nothing → the **group-scoped feed-scan**
+  runs (picks the newest matching post, refuses when unsure — never a blind older-post comment).
+- **Defense-in-depth:** a **group check** at comment time — if an opened link resolves to a different group than
+  intended, demote to that group's feed-scan.
+
+Verified: 4-vector adversarial hunt (cross-group race, same-group recency, tab-adoption, feed-scan ambiguity). The
+same-group-recency hole was CONFIRMED and is what this closes; the others cleared. 242 tests green.
+
+> **Operator note:** with identical captions, the safest targeting relies on **recency** (the newest matching post in
+> the correct group). The feed-scan picks the newest *only when the account's display name is set* (it groups by author
+> then takes the topmost); if the account shows "logged in as (unknown)", it will **refuse and route the comment to
+> rescue** rather than risk the wrong post. Setting each account's display name makes those comments land on the newest
+> post instead of deferring. (A tiny unique per-post caption marker would make targeting bulletproof, but that's your call.)
+
 ## [1.0.26] — 2026-07-08 — Trim the INSTANT inter-group / inter-comment pacing (operator-requested)
 
 Operator asked to cut the wait between groups. These gaps are **anti-spam velocity pacing** (not dead overhead — the
