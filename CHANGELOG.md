@@ -2,6 +2,24 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.19] — 2026-07-08 — Trim redundant steps from the posting path (INSTANT optimality)
+
+A focused audit for genuinely UNNECESSARY/redundant steps (not just slow waits) found the posting path already lean —
+only two safe removals, applied here. It correctly rejected removing the caption-accept `editableLen` re-read (a
+deliberate double-caption guard).
+
+### Changed
+- **INSTANT skips the redundant Post-button diagnostic scan.** A 3rd DOM scan of the enabled Post button (already gated
+  by the `waitForFunction` above and re-scanned by `clickPostButton`) ran before every publish purely to log a drift
+  breadcrumb — now skipped in instant mode (kept in slow modes for troubleshooting). It gates nothing.
+- **The image-first caption seed's verify result is reused when it already landed.** `enterCaptionOnce` ends by
+  returning a caption-landed check, which was discarded and immediately re-run on the same unmutated editor. When the
+  seed already reports landed, the loop reuses it (skipping a duplicate ~1.5s poll); a not-yet-landed seed still gets
+  the full patient re-read (its internal timeout differs), so a slow-rendering caption is never re-pasted early.
+
+242 tests green. Both changes are outcome-identical — no double-post/comment trap, wrong-post/caption guard, or
+anti-spam floor touched (the audit's unsafe candidate was rejected; a timeout mismatch on the second was caught and guarded).
+
 ## [1.0.18] — 2026-07-08 — Posting speedups for the single-IP setup (safe — no anti-spam change)
 
 With one IP the safe way to go faster is more groups/hour PER ACCOUNT, not more concurrency. A focused audit found

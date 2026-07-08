@@ -2717,11 +2717,15 @@ async function runAccount(o) {
             // its length-only fallback off a STRAY editable (an open Messenger draft, the background feed composer) →
             // falsely "landed" → the loop breaks without ever typing our caption → an image-only post publishes and
             // counts as success (silent caption drop). Idempotent: enterCaptionOnce clears-first, so it can't double.
-            if (_captionAfterImage) await enterCaptionOnce(settings.speedMode === 'instant' ? 250 : 400);
+            const _capSeed = _captionAfterImage ? await enterCaptionOnce(settings.speedMode === 'instant' ? 250 : 400) : null; // enterCaptionOnce ends by returning verifyCaptionLanded — capture it to skip a duplicate first poll below
             const _capDeadline = Date.now() + (isFastMode(settings) ? 9000 : 11000);
             let _capOk = false, _stale = 0;
             while (!_capOk && Date.now() < _capDeadline && !shouldStop()) {
-              const _v = await verifyCaptionLanded(page, post.caption, isFastMode(settings) ? 1500 : 2500); // patient read (slow renders lag)
+              // Reuse the seed's verify ONLY when it already reports landed=true — that's DEFINITIVE (the caption IS present on
+              // the same unmutated editor, so the loop's first patient read would land too), skipping a redundant ~1.5s poll.
+              // A NOT-landed seed is NOT reused (its internal timeout 1000/3000 ≠ this loop's 1500/2500) → fall through to the
+              // full patient verify so a slow-rendering caption still gets its longer read — no premature re-paste.
+              const _v = (_capSeed && _capSeed.landed) ? _capSeed : await verifyCaptionLanded(page, post.caption, isFastMode(settings) ? 1500 : 2500); // patient read (slow renders lag)
               if (_v.landed) { _capOk = true; break; }
               if ((await editableLen(page)) === 0) { await enterCaptionOnce(settings.speedMode === 'instant' ? 250 : 400); _stale = 0; } // truly empty → (re)paste
               else if (++_stale >= 2) { await enterCaptionOnce(settings.speedMode === 'instant' ? 250 : 400); _stale = 0; } // text present but NOT our caption after 2 patient checks → a persisted FB DRAFT (not our caption still rendering) → enterCaptionOnce CLEARS-first then re-enters OURS. Without this the editor keeps the draft, the final editableLen>0 guard passes, and we PUBLISH THE DRAFT (wrong caption). Re-pasting our own slow-rendering caption is idempotent, so a false trigger is harmless.
@@ -2763,8 +2767,10 @@ async function runAccount(o) {
           return false;
         }, { timeout: 8000, polling: 200 }, FB.postButton).catch(() => {}); // swallow timeout — clickPostButton will report 'not found' with diagnostics
         const dialogCountBefore = await withTimeout(page.evaluate(() => Array.from(document.querySelectorAll('div[role="dialog"]')).filter((d) => d.querySelector('[contenteditable="true"], input[type="file"], [role="textbox"]')).length), 8000, 1).catch(() => 1);
-        // Log what the Post-button scan sees (dialogs open, found label) — mirrors original's "🔍 Dialogs: N".
-        const postBtnInfo = await page.evaluate((labels) => {
+        // Diagnostic Post-button scan (dialogs open, found label + drift breadcrumb) — a REDUNDANT 3rd scan of what the
+        // waitForFunction gate above already gated and clickPostButton below re-scans; it gates nothing (only logs). SKIP
+        // it in INSTANT (fire-fast) — the `if (postBtnInfo)` guard below no-ops on null; slow modes keep the diagnostic.
+        const postBtnInfo = settings.speedMode === 'instant' ? null : await page.evaluate((labels) => {
           const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
           const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
           const scope = dialogs.length ? dialogs : [document];
