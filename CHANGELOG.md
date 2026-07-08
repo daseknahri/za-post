@@ -2,6 +2,37 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.22] — 2026-07-08 — Capture the post link from Facebook's publish response (skip the slow feed re-scan)
+
+The slowest, flakiest step of a comment-bearing post was **taking the post's URL**: reload the group, scroll,
+caption-match, then a hover + `sleep(700)` + re-read dance to force Facebook's now-usually-hidden permalink to
+render — and it *still* often came up empty (the code says so: *"FB's current DOM rarely exposes a numeric
+post-id"*). The professional fix: stop scraping the feed for the link and read it straight from Facebook's own
+**publish response** — the `create-story` GraphQL mutation returns the new post's id. Capture that and the whole
+verify-reload is unnecessary.
+
+### Added — opt-in, two-phase only, **default OFF**
+- **Setting `capturePostLinkFromNetwork`** ("🔗 Grab the post link from Facebook's response (faster, experimental)").
+  When on, `armPostIdCapture()` attaches a response listener right before the Post click, reads OUR post id from the
+  create-story mutation's response (a `/groups/<gid>/posts/<id>` URL for our exact group, or a `post_id`/`story_fbid`
+  field), and the two-phase flow uses it as the permalink — **skipping the feed reload/scroll/hover entirely**.
+- **Wrong-post-safe by construction.** The captured id is a *candidate* only. Phase 2 opens the link and
+  `forceContentVerify` requires a **positive caption OR author match on the post's own page** before commenting —
+  for both the `urlId===id` and the `urlId===null` (redirect) cases — else it demotes to the article-scoped,
+  caption-matched feed-scan fallback. A mis-parsed or foreign id can never blind-comment on the wrong post.
+- **Held detection preserved.** A silently-held post's link resolves to a non-public page → no comment box → the
+  feed-scan fallback finds it absent from the public feed → `notfound` → moderator queue, exactly as before.
+- **Off = zero change.** With the setting false, `forceContentVerify` is always false and the legacy cascade is
+  byte-identical; no listener is attached.
+
+### Verified
+Two adversarial-review rounds (find→refute→adjudicate, 5 vectors). Round 1 **confirmed a real wrong-post hole**:
+a bad captured id could redirect the permalink to the group root, nulling `urlId`, so the content-verify was
+skipped and the id-only branch could comment on the top feed post. Fixed by (a) tightening the capture regex to
+our exact group id (no `\d+` wildcard) and (b) making the network path *always* require a positive caption/author
+confirmation regardless of `urlId`. Round 2 confirmed the gap closed with the legitimate own-post path intact.
+242 tests green.
+
 ## [1.0.21] — 2026-07-08 — Question-every-step: trim the verify/publish/caption deadlines (fast/instant)
 
 A systematic "question every step" pass over the per-post flow (grounded in the test-log timings) confirmed the

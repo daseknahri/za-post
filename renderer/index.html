@@ -820,6 +820,13 @@
               </div>
               <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
                 <label class="checkbox-label flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-capture-link-from-network" class="w-5 h-5 rounded-md accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">🔗 Grab the post link from Facebook's response (faster, experimental)</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500 ml-8">Two-phase only. Instead of <b>reloading the group and scrolling to find the post</b> to read its link (slow, and Facebook often hides the link in the feed), read the link straight from Facebook's own <b>publish response</b> the moment the post is created — <b>no reload, no scroll</b>. Before commenting, the app still opens that link and <b>re-checks the post is yours</b> (caption + author), so a wrong link can never comment on the wrong post — it just falls back to the old feed search. Turn on and watch the log for "Captured the post's link from Facebook's publish response"; if you see it, it's working.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label class="checkbox-label flex items-center gap-3 cursor-pointer">
                   <input type="checkbox" id="setting-auto-start-daily" class="w-5 h-5 rounded-md accent-accent">
                   <span class="text-sm font-semibold text-gray-300">🕒 Auto-launch + post daily (Windows task)</span>
                 </label>

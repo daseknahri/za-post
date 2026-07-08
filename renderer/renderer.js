@@ -4151,6 +4151,7 @@ function loadSettings() {
   setValue('setting-cycles-per-day', S.cyclesPerDay !== undefined ? S.cyclesPerDay : 1);
   setValue('setting-tabs-per-browser', S.tabsPerBrowser !== undefined ? S.tabsPerBrowser : 1);
   setChecked('setting-post-then-comment', S.postThenComment === true); // two-phase: post all groups, then comment all
+  setChecked('setting-capture-link-from-network', S.capturePostLinkFromNetwork === true); // grab the post link from FB's publish response (two-phase, faster)
   setValue('setting-cycle-gap-min', (Number(S.cycleGapMin) > 0) ? S.cycleGapMin : ''); // "time between cycles" override (blank = use the speed preset's timing)
   setValue('setting-proxy-timezone', S.proxyTimezone || '');
   setValue('setting-proxy-locale', S.proxyLocale || '');
@@ -4315,6 +4316,7 @@ async function saveSettings() {
     cyclesPerDay: Math.max(1, Math.min(8, intOr('setting-cycles-per-day', 'cyclesPerDay', 1))), // cycles per run (engine clamps 1..8 too)
     tabsPerBrowser: Math.max(1, Math.min(4, intOr('setting-tabs-per-browser', 'tabsPerBrowser', 1))), // paced multi-tab: pre-load the next group(s) while posting (1 = classic; engine clamps 1..4 too)
     postThenComment: chk('setting-post-then-comment', 'postThenComment'), // two-phase: post every group first, then comment all (absorbs the post→comment wait; posts land before any comment)
+    capturePostLinkFromNetwork: chk('setting-capture-link-from-network', 'capturePostLinkFromNetwork'), // read OUR post's link from FB's publish response instead of feed-scanning for it (two-phase, faster; content-verified before commenting)
     // "Time between cycles" — an explicit override of the inter-cycle wait (minutes). 0/blank = use the speed preset's
     // timing. Kept SEPARATE from waitIntervalMin/Max so a speed preset and this control never clobber each other.
     cycleGapMin: (() => { const el = document.getElementById('setting-cycle-gap-min'); return (el && el.value !== '') ? Math.max(5, Math.min(720, parseInt(el.value, 10) || 0)) : 0; })(),

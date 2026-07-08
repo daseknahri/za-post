@@ -800,6 +800,44 @@ async function openComposer(page, log, name, settings = {}) {
   return false;
 }
 
+// Capture OUR just-published post's id/permalink from Facebook's OWN create-story GraphQL response — far
+// faster + more reliable than reloading the feed and scraping the (now usually id-less) [aria-posinset] DOM
+// with a hover-for-href dance. ARM this right before clicking Post; read .get() after the publish confirms;
+// always .dispose(). WRONG-POST-SAFE: the captured id is only a CANDIDATE — the comment step re-verifies the
+// post's caption+author on its own page before commenting (forceContentVerify), so a mis-parse self-heals to
+// the feed-scan fallback and can NEVER comment on the wrong post. Best-effort: if FB renames the mutation or
+// changes the response shape and nothing matches, .get() stays null → the feed-scan runs (no regression).
+function armPostIdCapture(page, gid) {
+  let hit = null; // { postId, url }
+  const gidStr = String(gid || '');
+  const onResp = async (resp) => {
+    try {
+      if (hit) return;
+      let req, u;
+      try { req = resp.request(); u = resp.url(); } catch { return; }
+      if (!/\/api\/graphql\/?/.test(u || '')) return;            // FB mutations POST to /api/graphql/
+      let pd = ''; try { pd = req.postData() || ''; } catch {}
+      // Only OUR create-post mutation's response (not a background feed/typeahead graphql call) so the parsed
+      // id is definitively ours. Match a broad set of known create-story friendly names; a miss just means
+      // no capture (feed-scan fallback), never a wrong capture.
+      const friendly = decodeURIComponent((pd.match(/fb_api_req_friendly_name=([^&]+)/) || [])[1] || '');
+      if (!/StoryCreate|CreateMutation|Composer.*Create|CreatePost|GroupsCometFeedStoryCreate|useComet.*Create|ComposerStore/i.test(friendly)) return;
+      let body = ''; try { body = await resp.text(); } catch { return; }
+      if (!body || body.length > 3000000) return;
+      const clean = body.replace(/\\\//g, '/');                  // FB escapes URL slashes as \/ in JSON
+      // Prefer a post URL under OUR group ONLY (exact gid — NOT a wildcard \d+ that could match a foreign/suggested
+      // group's permalink embedded ahead of ours in the response); else a clearly-labelled post-id field in the
+      // created story. Either way the id is only a CANDIDATE — the comment step re-verifies caption+author on the
+      // post's own page (forceContentVerify) before commenting, so even a mis-grab self-heals to the feed-scan.
+      let m = clean.match(new RegExp('/groups/' + gidStr + '/(?:posts|permalink)/(\\d{6,})'));
+      if (!m) m = clean.match(/"(?:post_id|top_level_post_id|story_fbid)"\s*:\s*"?(\d{8,})/);
+      if (m && m[1]) hit = { postId: m[1], url: 'https://www.facebook.com/groups/' + gidStr + '/posts/' + m[1] + '/' };
+    } catch { /* never let a response probe throw into the publish path */ }
+  };
+  page.on('response', onResp);
+  return { get: () => hit, dispose: () => { try { page.off('response', onResp); } catch {} } };
+}
+
 async function clickPostButton(page) {
   // Find the enabled submit button (prefer one inside an open dialog), return its coordinates, and
   // click with a REAL mouse event — synthetic .click() doesn't submit on web.facebook.com. Matches
@@ -1012,7 +1050,7 @@ function withTimeout(promise, ms, fallback) {
 // Add the "first comment" (the link) to the JUST-published post. Reloads the group
 // so the new post renders, finds the article containing our caption, and types into
 // ITS "Write a public comment…" box. Returns true on success.
-async function addFirstComment(page, gid, post, commentImg, step, permalink, settings = {}, expectedPostId = null, expectedAuthor = '', preNavigated = false) {
+async function addFirstComment(page, gid, post, commentImg, step, permalink, settings = {}, expectedPostId = null, expectedAuthor = '', preNavigated = false, forceContentVerify = false) {
   // WRONG-POST GUARD inputs: a real FB post id is a long digit string; reject a LOCAL library id (e.g.
   // "post-1718…") passed as expectedPostId so it can't poison the id check (and silently degrade to
   // caption-only). expectedAuthor = the poster's FB display name → used to confirm a same-caption article
@@ -1122,6 +1160,31 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         const urlId = (page.url().match(/\/(?:posts|permalink)\/(\d+)/) || [])[1] || null;
         if (expectedPostId && urlId && urlId !== expectedPostId) {
           permalinkFailed = true; step('Comment: post link did not resolve to OUR post (id mismatch) — falling back to the group feed');
+        } else if (forceContentVerify && expectedPostId) {
+          // NETWORK-CAPTURED id — provenance is Facebook's publish response, NOT a caption-verified feed article. So
+          // NOTHING about the id proves the page is OURS: a mis-parsed/foreign id builds a self-consistent link
+          // (urlId===expectedPostId but it's a STRANGER's post), AND a bad id can REDIRECT the page to the group root
+          // (nulling urlId). Therefore the ONLY thing that authorizes commenting here is a POSITIVE caption OR author
+          // match on the post's own page — checked for BOTH urlId===expectedPostId and urlId===null (closing the
+          // redirect gap the id-only branch below would otherwise leave open). Anything less demotes to the
+          // article-scoped, caption-matched feed-scan fallback → a network mis-grab can NEVER blind-comment.
+          const chk = await evalTimed(page, (arg) => {
+            const { s, author } = arg;
+            const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const a = document.querySelector('[aria-posinset], div[role="article"]');
+            if (!a) return { found: false };
+            const capOk = (s && s.length >= 12) ? norm(a.textContent).includes(norm(s)) : null;
+            const c = a.querySelector('h2 a, h3 a, h4 a, strong a, a strong, a[aria-label][href*="/user/"], a[aria-label][role="link"]');
+            const auth = norm(c ? (c.getAttribute('aria-label') || c.textContent) : '').slice(0, 60);
+            return { found: true, capOk, auth };
+          }, { s: snip.slice(0, 40), author: expAuthor }, 5000).catch(() => ({ found: false }));
+          const positiveCaption = chk.capOk === true;
+          const positiveAuthor = !!(expAuthor && chk.auth && chk.auth === expAuthor);
+          const authMismatch = !!(expAuthor && chk.auth && chk.auth !== expAuthor);
+          if (!chk.found || authMismatch || !(positiveCaption || positiveAuthor)) {
+            permalinkFailed = true;
+            step(`Comment: the captured link did not positively confirm OUR post (${!chk.found ? 'unreadable' : authMismatch ? 'author mismatch' : 'no caption/author match'}) — falling back to the group feed`);
+          }
         } else if (expectedPostId && !urlId) {
           const domId = await evalTimed(page, () => { const a = document.querySelector('[aria-posinset], div[role="article"]'); const l = a && a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; }, null, 5000).catch(() => null);
           if (domId && domId !== expectedPostId) { permalinkFailed = true; step('Comment: post link did not resolve to OUR post (id mismatch) — falling back to the group feed'); }
@@ -1179,7 +1242,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         // match wins (never an older duplicate), and when expectedPostId is known a same-caption article
         // whose id differs is REFUSED. A 40-char normalized snippet keeps the wider window strict.
         const _scanFeedRaw = () => evalTimed(page, (arg) => {
-          const { s, want, author } = arg;
+          const { s, want, author, idTrusted } = arg;
           const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
           const sn = (s && s.length >= 12) ? norm(s) : null;
           if (!sn && !want) return { clicked: false, reason: 'short' }; // nothing to match on
@@ -1200,11 +1263,15 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           }
           if (!cands.length) return { clicked: false, reason: 'nomatch' };
           // Pick OUR post safely WITHOUT over-blocking the normal case:
-          //  (1) an exact FB post-id match is definitive;
+          //  (1) an exact FB post-id match is definitive — but ONLY when the id is TRUSTED (a caption+author-verified
+          //      feed capture). A NETWORK-captured id (idTrusted=false) is unverified, so an id-match alone must NOT
+          //      authorize the pick (a foreign post's id embedded in our create-story response could match a real
+          //      article in our group); require caption corroboration (idHit && capHit) so a stranger's post is never
+          //      chosen. Short-caption network posts thus fall through to a safe nomatch → moderator, never a wrong-post.
           //  (2) else a SINGLE caption match is unambiguous → it's ours (don't let a flaky author read block it);
           //  (3) else MULTIPLE same-caption posts → the article authored by US (author disambiguates the bug case);
           //  (4) else REFUSE (idmismatch / ambiguous) — never guess between indistinguishable same-caption posts.
-          let pick = cands.find((m) => m.idHit);
+          let pick = idTrusted ? cands.find((m) => m.idHit) : cands.find((m) => m.idHit && m.capHit);
           if (!pick) {
             const idmis = cands.find((m) => m.capHit && want && m.id && m.id !== want);
             const caps = cands.filter((m) => m.capHit && !(want && m.id && m.id !== want)); // caption hits not contradicted by a differing id
@@ -1223,7 +1290,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           });
           if (b) { b.scrollIntoView({ block: 'center' }); const r = b.getBoundingClientRect(); const rect = (r.width && r.height) ? { x: r.x + r.width * (0.35 + Math.random() * 0.3), y: r.y + r.height * (0.35 + Math.random() * 0.3) } : null; return { clicked: true, rect, postId: pick.id, pos: pick.i, auth: pick.auth }; }
           return { clicked: false, reason: 'nobtn', postId: pick.id, pos: pick.i };
-        }, { s: snip.slice(0, 40), want: expectedPostId, author: expAuthor }, 12000).catch(() => ({ clicked: false, reason: 'err' }));
+        }, { s: snip.slice(0, 40), want: expectedPostId, author: expAuthor, idTrusted: !forceContentVerify }, 12000).catch(() => ({ clicked: false, reason: 'err' }));
         // scanFeed marks OUR article (data-zp-ctarget) in-page and returns the comment button's RECT; we click it
         // here with a REAL mouse (move + click) instead of an in-page el.click() (which would be isTrusted=false).
         const scanFeed = async () => {
@@ -2796,8 +2863,15 @@ async function runAccount(o) {
           if (postBtnInfo.found) step(`Post button found (label="${postBtnInfo.label}")`);
           else step(`⚠️ Post button NOT found (${postBtnInfo.dialogs} dialog(s)) — possible selector drift. Buttons seen: ${(postBtnInfo.seen || []).join(' | ') || '(none)'}. If this recurs, run scripts/inspect-fb.js.`);
         }
+        // Arm the publish-response capture RIGHT BEFORE the click (so we don't miss the create-story mutation's
+        // response) — only for a two-phase comment post (that's the sole consumer of the captured link) and only
+        // when the operator enabled it. See armPostIdCapture: the id is a candidate, re-verified before commenting.
+        let _netPost = null;
+        const _armNet = !!(settings.capturePostLinkFromNetwork && _twoPhase && ((post.comment && post.comment.trim()) || groupCommentImg));
+        const _netCapture = _armNet ? armPostIdCapture(page, gid) : null;
         const clicked = await clickPostButton(page);
         if (!clicked) {
+          if (_netCapture) _netCapture.dispose();
           // TWO IN A ROW = the composer opened but the submit button matched NO known label → this account's FB UI is
           // almost certainly in an UNSUPPORTED LANGUAGE (e.g. Arabic not in FB.postButton). A single miss can be a slow
           // render (the transient-retry path recovers it), but a genuine can't-find every group would SILENTLY deliver
@@ -2817,6 +2891,14 @@ async function runAccount(o) {
         consecNoPostBtn = 0;   // a successful click clears the "unsupported-language" streak
         step('Post button clicked');
         let publishResult = await waitForPublish(page, dialogCountBefore, 70000, shouldStop, settings.speedMode === 'instant'); // 70s CEILING kept (a slow/hidden/proxied window can take 35-45s+; too-short → false "timeout" → re-post → duplicate); instant only tightens the POLL granularity
+        if (_netCapture) {
+          // The create-story mutation's response usually landed by the time the composer closed; give it a brief
+          // grace (~1.8s max) only if it hasn't — normally get() is already set so this returns instantly.
+          for (let i = 0; i < 12 && !_netCapture.get(); i++) await sleep(150);
+          _netPost = _netCapture.get();
+          _netCapture.dispose();
+          if (_netPost) step(`🔗 Captured the post's link from Facebook's publish response (id=${_netPost.postId}) — the feed re-scan can be skipped`);
+        }
         if (publishResult === 'stopped') {
           // Stop hit DURING the publish wait — the Post button was ALREADY clicked (publishClicked), so the
           // post most likely went out. COUNT it so the orchestrator marks it dealt; a bare break would leave
@@ -2960,6 +3042,7 @@ async function runAccount(o) {
         // 'notfound' path, which routes it to the moderator queue.)
         let postPermalink = null;
         let expectedPostId = null; // OUR post's stable id — the trust anchor for commenting (CT-4)
+        let _idFromNetwork = false; // id came from FB's publish response (not a caption-verified feed match) → Phase 2 MUST content-verify before commenting
         // A comment that follows means addFirstComment will reload the group ONCE, find OUR post
         // (caption+author wrong-post guarded) and comment — so a standalone verify-reload here would be a
         // redundant SECOND reload of the same feed. Only no-comment posts need this reload as their sole check.
@@ -2969,7 +3052,18 @@ async function runAccount(o) {
         // post (no per-comment feed re-scan) AND lets it PRE-LOAD the next post's page while commenting the current.
         const _captureForTwoPhase = wantComment && _twoPhase;
         let feedConfirmed = wantComment && !_captureForTwoPhase; // a two-phase capture DOES do a real feed match below → it may set feedConfirmed true; otherwise unchanged.
-        if (!wantComment || _captureForTwoPhase) {
+        if (_captureForTwoPhase && _netPost && _netPost.postId) {
+          // FAST PATH — we already captured OUR post's link from Facebook's publish response, so the whole verify-
+          // reload (feed goto + scroll + caption-match + hover-for-href) is UNNECESSARY: skip it. Phase 2 navigates
+          // STRAIGHT to this permalink and re-verifies the post's caption+author on its own page before commenting
+          // (idFromNetwork → forceContentVerify), so a mis-parsed id self-heals to the feed-scan — the wrong-post
+          // guard is fully intact. A silent server-side hold is still caught at comment time (permalink 'notfound').
+          expectedPostId = _netPost.postId;
+          postPermalink = _netPost.url;
+          _idFromNetwork = true;
+          feedConfirmed = true; // FB confirmed the create + gave us the id — a genuine confirmed delivery
+          step(`Confirmed via the publish response (id=${expectedPostId}) — commenting via the direct link; skipped the feed re-scan`);
+        } else if (!wantComment || _captureForTwoPhase) {
         step(_captureForTwoPhase ? 'Verifying the post landed + capturing its link for the comment pass…' : 'Verifying the post landed (reloading the group)…');
         await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
         await page.waitForSelector('[aria-posinset], div[role="article"]', { timeout: 25000 }).catch(() => {});
@@ -3095,7 +3189,7 @@ async function runAccount(o) {
           // ran the verify-reload), so Phase 2 navigates STRAIGHT to this post (and pre-loads it) instead of re-scanning
           // the feed. If the capture came up empty (short caption / slow feed) they're null → Phase 2 falls back to the
           // feed-scan for this one post, exactly as before.
-          _deferredComments.push({ gid, groupName, post, groupCommentImg, postPermalink, expectedPostId, capSnip, basePostId: (basePost && basePost.id) || null });
+          _deferredComments.push({ gid, groupName, post, groupCommentImg, postPermalink, expectedPostId, capSnip, basePostId: (basePost && basePost.id) || null, idFromNetwork: _idFromNetwork });
           commentResult = 'deferred';
           step('Post published — comment DEFERRED to the post-then-comment pass (Phase 2)');
         } else if (wantComment) {
@@ -3325,7 +3419,7 @@ async function runAccount(o) {
               cstep(`Comment: retry ${cAttempt}/3 (waiting ${Math.round(gap / 1000)}s)`);
               await sleepInterruptible(gap, softStop, 500, isPaused, pauseHold);
             }
-            cres = await addFirstComment(page, dc.gid, dc.post, dc.groupCommentImg, cstep, dc.postPermalink, settings, dc.expectedPostId, account.fbDisplayName, _preNav && cAttempt === 1); // pre-loaded tab only on the FIRST attempt; a retry lets addFirstComment re-navigate to the permalink
+            cres = await addFirstComment(page, dc.gid, dc.post, dc.groupCommentImg, cstep, dc.postPermalink, settings, dc.expectedPostId, account.fbDisplayName, _preNav && cAttempt === 1, dc.idFromNetwork); // pre-loaded tab only on the FIRST attempt; a retry lets addFirstComment re-navigate to the permalink. idFromNetwork → content-verify the post on its page before commenting (network id is a candidate)
           }
           // 'blocked_*_landed' = the comment landed but FB then walled the account → treat as landed (do NOT route to
           // a reserve = no double-comment), while still stopping/cooling the account.

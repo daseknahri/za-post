@@ -7,9 +7,17 @@ Last updated: 2026-07-08. Read this first when continuing in a new session.
 > the *how it works*. **Engineering process: [`DEVELOPMENT.md`](DEVELOPMENT.md)** · **never-break rules:
 > [`INVARIANTS.md`](INVARIANTS.md)** · **decision log: [`docs/decisions/`](docs/decisions/).**
 
-## ⭐ STATUS 2026-07-08 — v1.0.21
+## ⭐ STATUS 2026-07-08 — v1.0.22
 
-Recent hardening (v1.0.7 → v1.0.21), all shipped:
+- **v1.0.22 — network post-link capture (opt-in, `capturePostLinkFromNetwork`, default OFF).** Two-phase posts can
+  read OUR post's permalink from Facebook's create-story GraphQL **response** instead of reloading+scrolling+hovering
+  the feed to scrape it (the old way was slow AND often failed — FB hides the feed permalink). Wrong-post-safe: the
+  captured id is a candidate; Phase 2 requires a positive caption/author match on the post's own page before
+  commenting (`forceContentVerify`), else falls back to the feed-scan. Two adversarial rounds; round 1 caught a real
+  wrong-post hole (redirect nulls `urlId` → content-verify skipped) — fixed (exact-gid capture + always-verify). The
+  owner tests it live: enable it and watch the log for "🔗 Captured the post's link from Facebook's publish response".
+
+Recent hardening (v1.0.7 → v1.0.22), all shipped:
 
 - **Owed-groups partial-delivery ledger** — when a run posts to only some of an account's groups (crash, rate-limit, pause), the undelivered groups are recorded and picked up next cycle instead of silently lost.
 - **Two-phase post-then-comment** — complete: the post is published first and confirmed, then the comment is attached in a second pass, so a comment failure no longer aborts or duplicates the post.
