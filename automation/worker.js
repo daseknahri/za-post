@@ -2021,6 +2021,7 @@ async function runAccount(o) {
   let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false, rlKind = null, consecPubTimeouts = 0, consecNoPostBtn = 0;
   const heldRecords = []; // MOD: posts FB held in the moderation queue this run (for the moderator phase)
   const commentQueue = []; // posts that went LIVE but whose link-comment couldn't be placed (for a healthy reserve account to rescue)
+  let droppedImage = false; // ≥1 intended local image was missing at resolve time → keep the library post (blocks auto-delete). Declared at FUNCTION scope (not inside the try below) so the final `return { …!droppedImage }` at the bottom can read it — a let-declaration inside the try threw "droppedImage is not defined" at the return on every clean completion.
   try {
     const hidden = settings.hideBrowser !== false; // default: hidden
     // ALWAYS headful — Facebook's composer (clipboard, typing focus, publish) misbehaves in true
@@ -2334,7 +2335,7 @@ async function runAccount(o) {
       if (p && !ok) log(`⚠️ [${name}] image file not found, dropping: ${p}`); // was SILENT for a MULTI-image post → it published fewer images than intended yet still reported fullyPosted → auto-delete could permanently lose the content
       return ok;
     });
-    let droppedImage = _srcImgPaths.length > resolvedImages.length; // ≥1 intended local image was missing → publish the survivors, but keep the library post (fullyPosted=false blocks auto-delete so the operator can fix the asset + re-run)
+    droppedImage = _srcImgPaths.length > resolvedImages.length; // ≥1 intended local image was missing → publish the survivors, but keep the library post (fullyPosted=false blocks auto-delete so the operator can fix the asset + re-run). NOTE: declared at function scope above (not `let` here) so the final return can read it.
     if (!resolvedImages.length && basePost.imageUrl) {
       const dl = await downloadImage(basePost.imageUrl, (m) => log(`[${name}] ${m}`));
       if (dl) { resolvedImages = [dl]; tempImages.push(dl); droppedImage = false; log(`⬇️ [${name}] image downloaded from URL`); } // the URL image fully satisfies the requirement (stale local paths + a working imageUrl) → the post is COMPLETE, clear droppedImage so auto-delete is allowed

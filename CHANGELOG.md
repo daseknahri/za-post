@@ -2,6 +2,23 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.24] — 2026-07-08 — Fix: `droppedImage is not defined` crash at the end of a clean run (live-monitor catch)
+
+Monitoring a live test run, an account **crashed at completion** with `droppedImage is not defined`, then retried.
+Root cause (introduced in v1.0.16's gap hunt, latent until now): `droppedImage` was `let`-declared **inside** the
+account's main `try` block (worker.js:2337) but read in the function's **final `return`** (worker.js:3500, after
+the `finally`) — out of scope → a `ReferenceError` on **every clean completion**. It stayed hidden because (a) the
+previously-running Electron instance held older in-memory code, and (b) the many early-exit returns (proxy/auth/etc.)
+don't reference it — only a *fully successful* run reaches the final return. The v1.0.20–1.0.23 speedups made clean
+completions the norm, surfacing it.
+
+- **Hoisted `let droppedImage = false;` to function scope** (worker.js:2024, beside `posted`/`heldRecords`/
+  `commentQueue`); line 2337 is now a plain assignment. In scope at every reference.
+
+Why it mattered beyond the crash: the thrown `ReferenceError` **discarded the run's return value** — `heldRecords`,
+`commentQueue`, and the `fullyPosted` deal-marking — so held posts / rescue comments could be dropped and a
+completed library post could be re-posted next cycle. 242 tests green. **Requires an app restart to take effect.**
+
 ## [1.0.23] — 2026-07-08 — Trim the comment-locate "nudge" loop (log-driven)
 
 Reading the owner's `automation.log` from a live run, the new dominant per-post cost (after the v1.0.20/1.0.21
