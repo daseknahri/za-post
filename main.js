@@ -1352,9 +1352,27 @@ async function checkStatus(accountName) {
 
     // Fix #3: capture FB display name
     const fbUserId = cUser.value;
+    // Robust display-name capture — MUST stay in sync with automation/worker.js (~2307). The old
+    // single [aria-label="Your profile"] read was English-only and usually empty, which is why the
+    // status check logged "logged in as (unknown)" and never seeded the wrong-post author guard
+    // (fbDisplayName). Read FB's authoritative CurrentUserInitialData.NAME first, with an accessible
+    // profile-link fallback; reject UI chrome that loose selectors used to grab.
     const fbName = await page.evaluate(() => {
-      const e = document.querySelector('[aria-label="Your profile"]');
-      return e ? (e.textContent || '').trim().slice(0, 40) : '';
+      const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const BAD = new Set(['share', 'home', 'menu', 'profile', 'profil', 'friends', 'amis', 'watch', 'video',
+        'marketplace', 'groups', 'groupes', 'notifications', 'messenger', 'settings', 'paramètres', 'see more',
+        'voir plus', 'like', 'comment', 'commenter', 'facebook', 'reels', 'pages', 'events']);
+      const ok = (n) => n && n.length >= 2 && n.length <= 80 && !BAD.has(n.toLowerCase()) && /[a-zA-ZÀ-ɏ؀-ۿ]/.test(n) && !/^https?:/.test(n);
+      try {
+        const html = document.documentElement.innerHTML;
+        const m = html.match(/CurrentUserInitialData"[\s\S]{0,400}?"NAME":"([^"]{2,80})"/) || html.match(/"USER":\{"[^}]*?"NAME":"([^"]{2,80})"/);
+        if (m) { let n = clean(m[1]); try { n = JSON.parse('"' + n + '"'); } catch {} if (ok(n)) return n.slice(0, 80); }
+      } catch {}
+      for (const s of ['a[href*="/me/"][aria-label]', 'a[aria-current="page"][aria-label]', '[role="navigation"] a[aria-label]']) {
+        const el = document.querySelector(s); const n = clean(el && el.getAttribute('aria-label'));
+        if (ok(n)) return n.slice(0, 80);
+      }
+      return '';
     }).catch(() => '');
     return { status: 'logged_in', message: `Active — c_user=${fbUserId}${fbName ? ' (' + fbName + ')' : ''}`, fbUserId, fbName };
   } catch (e) {
@@ -1379,6 +1397,11 @@ function setAccountStatus(name, status, message, result) {
     }
     if (result && result.fbUserId) a.fbUserId = result.fbUserId;
     if (result && result.fbName !== undefined) a.fbName = result.fbName;
+    // Seed the wrong-post author guard (fbDisplayName) from the status check ONLY when the operator hasn't
+    // set one and no prior run captured it — never override a manual UI value or an existing capture. This
+    // is what lets the author-aware guards (repost liveness, publish-timeout rescan, moderator, comment
+    // targeting) engage without a manual per-account step. Mirrors worker.js's capture-once semantics.
+    if (result && result.fbName && !(a.fbDisplayName && String(a.fbDisplayName).trim())) a.fbDisplayName = String(result.fbName).trim();
     if (result && result.status === 'logged_in') a.lastChecked = Date.now();
     // Opportunistically prune any assignedGroups that no longer exist in data.groups.
     const valid = new Set(data.groups.map((g) => g.id));

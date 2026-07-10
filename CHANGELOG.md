@@ -2,6 +2,20 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.28] — 2026-07-10 — FIX a wrong-post comment window + make the author guard actually populate (root cause)
+
+An adversarial audit of the Sacred invariants (double-post/double-comment traps) found the double-post/persistence/owed/moderator/pool traps all HOLD, but surfaced two real gaps in **comment targeting**, both rooted in the **author-match key being empty** ("logged in as (unknown)"). Fixed the one true code defect and the *root cause*, and deliberately did NOT take the tempting symptom-flips (each would trade a bounded strand/missed-post for an **unbounded double-post**).
+
+- **Wrong-own-post comment (INV-07) — fixed at `worker.js` captured-link verify.** In the network-captured-id branch (`forceContentVerify`), the post's own page was confirmed on **caption OR author**. But a mis-parsed id is drawn from *our own* create-story response, so its page author equals ours **even when the id points at a DIFFERENT (older) post of ours** with another caption — author-alone then confirmed the WRONG post. The feed-scan fallback on the same DOM already required the caption for an untrusted id; the permalink path now matches it: **caption is REQUIRED, author is read/logged but never a sole confirmer** (and, as before, a stale/unknown name never *rejects* our caption-confirmed post). Only bites once display names are set — so it was latent today and would have activated the moment the operator set them.
+
+- **Author guard never populated — fixed the capture + the field mismatch in `main.js`.** The wrong-post/strand guards (repost liveness `isContentLive`, the publish-timeout feed rescan, the moderator, and the above corroborator) all key off `account.fbDisplayName`. But the status check captured the name with a single English-only `[aria-label="Your profile"]` read (usually empty → "logged in as (unknown)") **and stored it into `fbName`, a different field the guards don't read**. Now the status check uses the same robust `CurrentUserInitialData.NAME` capture the posting run uses (multilingual, authoritative), and **seeds `fbDisplayName` when the operator hasn't set one** (never overriding a manual value or a prior capture). A plain "Check" now arms the author guards with no per-account manual step.
+
+- **Consequence — the two remaining audit items resolve at the source, no Sacred edit.** With `fbDisplayName` now reliably present: `isContentLive`'s author-aware fallback correctly treats a readable **stranger's** same-caption post as NOT-live (no strand / no mis-homed comment), and the publish-timeout rescan requires OUR author (no missed-post false-confirm on a stranger's caption). `repost.js`'s `if (!author) return true` and the timeout-rescan's short-caption gate stay **untouched** — flipping them would risk duplicating our own auto-released posts, the crown-jewel invariant.
+
+Verified: `node --check` on both files; full suite **242/242** green + **27/27** anti-spam (no behavior-lock regression). The comment-targeting logic lives in `page.evaluate` callbacks (DOM-only, not unit-testable) — validated by reasoning against `_scanFeedRaw`'s reference semantics and the existing suite. Live-FB re-verification of the captured-link path and the seeded author guard is still owed (see HANDOFF).
+
+> **Follow-up (not built):** a unique per-post caption *marker* would make targeting bulletproof even when two accounts share a display name — deferred because it injects content (an ADR-0001 detection trade-off) that the read-only display-name capture avoids entirely.
+
 ## [1.0.27] — 2026-07-08 — FIX a double-comment: network-captured link could point at the WRONG post (identical captions)
 
 The operator verified on Facebook and found **two comments on one post and none on the next** — a comment meant for

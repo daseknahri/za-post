@@ -1186,13 +1186,15 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           // NETWORK-CAPTURED id — its provenance is Facebook's publish response, NOT a caption-verified feed article,
           // so the id/URL alone doesn't prove the page is OURS. Confirm on the POST'S OWN PAGE by a POSITIVE CAPTION
           // match — the SAME single-article standard the feed-scan uses (see _scanFeedRaw: "caps.length === 1 → ours").
-          // The author is a positive CORROBORATOR only; a bare author mismatch does NOT reject a caption-confirmed post,
-          // because the account's configured display name is often stale/unknown (FB "logged in as (unknown)") — trusting
-          // it as a NEGATIVE was falsely rejecting our OWN posts and forcing a needless feed-scan on every comment.
-          // POLL: permalink pages render slowly on a real IP (a single early read misfires as a mismatch) — accept as
-          // soon as caption OR author matches; only after the deadline demote to the (wrong-post-guarded) feed-scan.
-          // Wrong-post safety holds: a foreign/mis-parsed id whose page does NOT carry our caption never confirms here
-          // (positiveCaption stays false → fall back for BOTH urlId===id and urlId===null), and the fallback is guarded.
+          // Author is neither a confirmer NOR a rejecter: a mis-parsed id is drawn from our OWN create-story response,
+          // so its page author equals expAuthor EVEN when the id points at a DIFFERENT (older) post of ours with another
+          // caption — author-alone would then confirm a WRONG post (the hole this closes). Hence CAPTION is REQUIRED;
+          // author is only read/logged. A stale/unknown display name (FB "logged in as (unknown)") must never REJECT our
+          // own caption-confirmed post, and a matching name must never OVERRIDE a caption miss.
+          // POLL: permalink pages render slowly on a real IP (a single early read misfires as a mismatch) — retry the
+          // caption read until the deadline, then demote to the (wrong-post-guarded) feed-scan. Wrong-post safety holds:
+          // a foreign/mis-parsed id whose page does NOT carry our caption never confirms here (capOk stays false → fall
+          // back for BOTH urlId===id and urlId===null), and the feed-scan fallback is itself guarded.
           let confirmed = false, sawArticle = false, lastAuth = '';
           const cvDeadline = Date.now() + 5000;
           do {
@@ -1208,9 +1210,8 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
             }, { s: snip.slice(0, 40) }, 3000).catch(() => ({ found: false }));
             if (chk.found) {
               sawArticle = true; if (chk.auth) lastAuth = chk.auth;
-              const positiveCaption = chk.capOk === true;
-              const positiveAuthor = !!(expAuthor && chk.auth && chk.auth === expAuthor);
-              if (positiveCaption || positiveAuthor) { confirmed = true; break; }
+              // Require the caption. Author is read (lastAuth) but is NOT sufficient to confirm — see the note above.
+              if (chk.capOk === true) { confirmed = true; break; }
             }
             if (Date.now() >= cvDeadline) break;
             await sleep(600);
@@ -1219,7 +1220,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
             permalinkFailed = true;
             step(`Comment: the captured link didn't confirm OUR post (${sawArticle ? `caption not matched; author read="${lastAuth || '?'}"` : 'page not rendered'}) — falling back to the group feed`);
           } else {
-            step('Comment: captured link confirmed OUR post (caption/author) — commenting directly');
+            step('Comment: captured link confirmed OUR post (caption) — commenting directly');
           }
         } else if (expectedPostId && !urlId) {
           const domId = await evalTimed(page, () => { const a = document.querySelector('[aria-posinset], div[role="article"]'); const l = a && a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; }, null, 5000).catch(() => null);
