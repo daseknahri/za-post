@@ -47,6 +47,16 @@ if (!groups.length) B('No groups defined.');
 // Logged in?
 const notIn = enabledPosters.filter((a) => !loggedIn(a));
 if (notIn.length) W(`${notIn.length} enabled poster(s) NOT logged in (will be skipped): ${nameList(notIn)}`);
+// Of the not-logged-in accounts, which can NEVER auto-recover: no saved cookies AND no stored credentials, so
+// Tier-2 (cookie inject) and Tier-3 (credential auto-login) both have nothing to use → permanently skipped, not just
+// "log in once". Check the cookies.json FILE presence (a plain-node script can't decrypt Electron-safeStorage cookies,
+// so readCookies would false-report empty — a raw file+size check is reliable). Credentials = both email + password set.
+const stuck = notIn.filter((a) => {
+  let hasCookieFile = false;
+  try { const cf = store.cookiesFile(a.name); hasCookieFile = fs.existsSync(cf) && fs.statSync(cf).size > 2; } catch {}
+  return !hasCookieFile && !(a.email && a.password);
+});
+if (stuck.length) W(`${stuck.length} not-logged-in account(s) have NEITHER saved cookies NOR stored credentials — they CANNOT auto-recover (permanently skipped until you log them in or add a password): ${nameList(stuck)}.`);
 
 // Groups assigned + valid (assignedGroups may hold group.id OR group.groupId — match either)
 const noGroups = enabledPosters.filter((a) => !(a.assignedGroups || []).length);
@@ -104,6 +114,22 @@ if (settings.enableWarmup) {
   if (noLoc.length) W(`${noLoc.length} PROXIED account(s) have NO locale (account.locale or the global proxyLocale) — their browser reports this machine's language (host is French here), mismatching the proxy IP: ${nameList(noLoc)}. Set proxyLocale (Settings) to your proxies' language.`);
 }
 if (!reserves.length) W('No reserve (standby) accounts — a dropped account has no auto-takeover.');
+// Per-GROUP reserve COVERAGE (campaign-plan failover): the orchestrator can only auto-cover a dropped agent's group
+// with a reserve that is a MEMBER of that group (via a single in-cluster stand-in or split-cover). A reserve pool that
+// exists but isn't assigned to a given group leaves a limit/logout there UNCOVERED until the account itself recovers —
+// the exact "owed groups, no reserve" gap the run surfaces mid-cycle (better to know before the run). Campaign-plan
+// only (unique/sequence/post-centric cover via the general undealt-post takeover, not group membership).
+{
+  const campaignAgents = enabledPosters.filter((a) => (a.postingOrder || '') === 'campaign-plan' && (a.assignedGroups || []).length);
+  const healthyReserves = reserves.filter((r) => r.enabled !== false && (r.assignedGroups || []).length);
+  if (campaignAgents.length && healthyReserves.length) {
+    const reserveGroups = new Set(); healthyReserves.forEach((r) => (r.assignedGroups || []).forEach((g) => reserveGroups.add(g)));
+    const activeGroups = new Set(); campaignAgents.forEach((a) => (a.assignedGroups || []).forEach((g) => activeGroups.add(g)));
+    const gname = (gid) => { const g = groups.find((x) => x.id === gid || x.groupId === gid); return (g && g.name) || gid; };
+    const uncovered = [...activeGroups].filter((g) => !reserveGroups.has(g));
+    if (uncovered.length) W(`${uncovered.length} active group(s) have NO reserve assigned — a limit/logout of the account posting there is NOT auto-covered until it recovers: ${uncovered.map(gname).join(', ')}. Assign a reserve to these groups (Accounts tab).`);
+  }
+}
 
 console.log('\n--- VERDICT ---');
 if (blocks.length) { console.log('🛑 NOT READY:'); blocks.forEach((m) => console.log('   • ' + m)); }

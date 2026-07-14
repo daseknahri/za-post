@@ -16,6 +16,14 @@ let proxyChain = null; try { proxyChain = require('proxy-chain'); } catch {}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+// R6 author-matching (pure, exported for tests). A crash-re-armed Phase-4 re-post is "live" if EITHER the ORIGINAL
+// poster OR the RESERVE reposter is present, so isContentLive matches ANY of OUR authors — never a stranger.
+// authorsList normalizes + 60-slices each expected author EXACTLY as authorOf slices the on-page author (so a >60-char
+// display name still matches). isOurAuthor is the per-article predicate the in-browser feed scan + permalink gate
+// replicate: an UNREADABLE author ('') is treated as possibly-ours (never risk a duplicate); a readable author is ours
+// iff it is in the set.
+const authorsList = (expectedAuthors) => (Array.isArray(expectedAuthors) ? expectedAuthors : [expectedAuthors]).map((a) => norm(a).slice(0, 60)).filter(Boolean);
+const isOurAuthor = (authors, articleAuthor) => !articleAuthor || authors.includes(articleAuthor);
 
 // Is `captionSnip` already LIVE in the group's public feed (FB auto-released the held original)?
 // Fail-SAFE: on any error/timeout returns false so a genuine hold still gets re-posted (a rare duplicate is
@@ -23,10 +31,10 @@ const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').rep
 // Returns 'live' (original is public — don't re-post), 'absent' (not public — safe to re-post),
 // 'no_proxy' (proxies are ON but this reserve has no usable proxy — bail, leave the held post for retry), or
 // 'session_expired' (the reserve is logged out — bail, leave the held post for retry).
-async function isContentLive(account, gid, captionSnip, settings, log, shouldStop, useProxies = false, proxies = [], permalink = null, expectedPostId = null, expectedAuthor = '') {
+async function isContentLive(account, gid, captionSnip, settings, log, shouldStop, useProxies = false, proxies = [], permalink = null, expectedPostId = null, expectedAuthors = []) {
   const snip = norm(captionSnip).slice(0, 40);
   const fbId = /^\d{8,}$/.test(String(expectedPostId || '')) ? String(expectedPostId) : null; // trust anchor for the permalink-direct check
-  const author = norm(expectedAuthor).slice(0, 60); // the ORIGINAL poster's display name — makes 'live' our-post-specific
+  const authors = authorsList(expectedAuthors); // R6: the ORIGINAL poster + (if a crash re-armed a re-post) the RESERVE reposter — 'live' if EITHER of OUR authors is present (see authorsList / isOurAuthor)
   if (snip.length < 12 && !permalink && !fbId) return 'absent'; // nothing to confirm with → allow the (cap-1-bounded) re-post
   const hidden = (settings.hideBrowser !== false);
   // Route the dedup presence-check through a proxy so we never read the group from the real IP: the account's
@@ -62,10 +70,13 @@ async function isContentLive(account, gid, captionSnip, settings, log, shouldSto
     await applyProxyGeo(page, account, settings, useProxies, proxies, log); // proxied presence-check must use the account's proxy clock/locale, not the host's
     page.on('dialog', async (d) => { try { if (d.type() === 'beforeunload') await d.accept(); else await d.dismiss(); } catch {} });
     // Stop-aware navigation helper: a CDP hang must not hold the caller for the full 90s after Stop.
-    const _goto = (url) => Promise.race([
-      page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 }),
-      new Promise((_, rej) => { const iv = setInterval(() => { if (shouldStop()) { clearInterval(iv); rej(new Error('stopped')); } }, 500); }),
-    ]).catch(() => {});
+    const _goto = (url) => {
+      let iv;
+      return Promise.race([
+        page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 }),
+        new Promise((_, rej) => { iv = setInterval(() => { if (shouldStop()) { clearInterval(iv); rej(new Error('stopped')); } }, 500); }),
+      ]).catch(() => {}).finally(() => clearInterval(iv)); // clear the stop-poll interval whichever side wins the race — goto usually wins, and the interval would otherwise run for the browser's whole lifetime (leak)
+    };
     // Session check: a logged-out reserve redirects to /login or shows the account picker — any presence verdict is
     // then meaningless. Surface it so the caller leaves the post for retry.
     const _gate = () => page.evaluate(() => {
@@ -82,7 +93,7 @@ async function isContentLive(account, gid, captionSnip, settings, log, shouldSto
       if (shouldStop()) return 'absent';
       if (await _gate()) return 'session_expired';
       await page.waitForSelector('[aria-posinset], div[role="article"]', { timeout: 15000 }).catch(() => {});
-      const pv = await page.evaluate(({ sn, fbId, author }) => {
+      const pv = await page.evaluate(({ sn, fbId, authors }) => {
         const n = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
         const unavail = /isn't available|isnt available|no longer available|content isn't|contenu.*introuvable|n'est pas disponible|nest pas disponible/i.test(document.body.innerText || '');
         const arts = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]'));
@@ -93,14 +104,18 @@ async function isContentLive(account, gid, captionSnip, settings, log, shouldSto
         const au = a ? authorOf(a) : '';
         // CONFIRM OUR post FIRST — a genuinely LIVE post can embed a since-deleted reshare rendering "…isn't available",
         // so we must NOT let the whole-page unavailable text short-circuit to 'absent' before checking our article.
-        if (author && au && au !== author) return 'inconclusive'; // different author on the page (e.g. FB redirected a held/removed post's link to the group feed) → DEFER to the author-aware feed scan; never a false 'absent'
+        if (authors.length && au && !authors.includes(au)) return 'inconclusive'; // the page's author is NOT one of OURS (e.g. FB redirected a held/removed post's link to the group feed) → DEFER to the author-aware feed scan; never a false 'absent'
         if (idOk || capOk) return 'live';                          // OUR post is public on its own page
         // OUR post is NOT confirmed on this page → 'absent' ONLY if the page ITSELF is unavailable (held/removed/private); else defer.
         return unavail ? 'absent' : 'inconclusive';
-      }, { sn: snip, fbId, author });
+      }, { sn: snip, fbId, authors });
       if (pv === 'live') return 'live';
-      if (pv === 'absent') return 'absent';
-      // inconclusive → fall through to the group-feed scan below
+      // R6: an 'absent' on the ORIGINAL poster's permalink is authoritative ONLY when there's no reserve reposter. When a
+      // reserve re-armed a re-post (authors.length > 1), the original permalink can be gone (held/removed) while the
+      // RESERVE's OWN live copy sits in the feed under a DIFFERENT permalink → fall through to the author-aware feed scan
+      // (which matches ANY of our authors) so we don't miss it and re-post a duplicate.
+      if (pv === 'absent' && authors.length <= 1) return 'absent';
+      // inconclusive, OR absent-with-a-reserve-author → fall through to the group-feed scan below
     }
 
     // FALLBACK (no permalink, or the permalink was inconclusive): group-feed scan — now AUTHOR-AWARE and DEEPER. A
@@ -112,15 +127,15 @@ async function isContentLive(account, gid, captionSnip, settings, log, shouldSto
     await page.waitForSelector('[aria-posinset], div[role="article"]', { timeout: 20000 }).catch(() => {});
     const _fast = isFastMode(applyPace(settings, account && account.pace)); // honor the reserve account's pace for the dedup-scan dwell
     for (let s = 0; s < 12 && !shouldStop(); s++) { await page.evaluate(() => window.scrollBy(0, 900)).catch(() => {}); await sleep(_fast ? 250 + Math.floor(Math.random() * 250) : 700 + Math.floor(Math.random() * 700)); } // DEEPER (12 scrolls, was 5): a ~90-min-old auto-released post sits far below the top in a busy group; missing it → a DUPLICATE re-post
-    const found = await page.evaluate(({ sn, author }) => {
+    const found = await page.evaluate(({ sn, authors }) => {
       const n = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
       const authorOf = (x) => { const c = x.querySelector('h2 a, h3 a, h4 a, strong a, a strong, a[aria-label][href*="/user/"], a[aria-label][role="link"]'); return n(c ? (c.getAttribute('aria-label') || c.textContent) : '').slice(0, 60); };
       const caps = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 60).filter((a) => n(a.textContent).includes(sn)); // scan up to 60 (was 25)
       if (!caps.length) return false;
-      if (!author) return true; // no author to check → any same-caption match = live (prior behaviour)
-      // OUR author, OR an unreadable author (could be ours → don't risk a dup). A readable STRANGER's post is NOT ours.
-      return caps.some((a) => { const au = authorOf(a); return !au || au === author; });
-    }, { sn: snip, author }).catch(() => false);
+      if (!authors.length) return true; // no author to check → any same-caption match = live (prior behaviour)
+      // ANY of OUR authors (original OR reserve), OR an unreadable author (could be ours → don't risk a dup). A readable STRANGER's post is NOT ours.
+      return caps.some((a) => { const au = authorOf(a); return !au || authors.includes(au); });
+    }, { sn: snip, authors }).catch(() => false);
     return found ? 'live' : 'absent';
   } catch { return 'absent'; } // best-effort: an error shouldn't permanently block delivery (cap-1 bounds any dup)
   finally {
@@ -140,7 +155,7 @@ async function runRepost(o) {
   const shouldStop = o.shouldStop || (() => false);
   const where = `[repost:${account.name}] [${groupName || gid}]`;
   log(`♻️ ${where} held post un-approvable — checking the public feed before re-posting (avoids duplicating an auto-released post)…`);
-  const presence = await isContentLive(account, gid, captionSnip, settings, log, shouldStop, !!o.useProxies, o.proxies || [], o.permalink || null, o.expectedPostId || null, o.expectedAuthor || '');
+  const presence = await isContentLive(account, gid, captionSnip, settings, log, shouldStop, !!o.useProxies, o.proxies || [], o.permalink || null, o.expectedPostId || null, o.expectedAuthors || []);
   if (presence === 'session_expired') {
     log(`♻️ ${where} this reserve is LOGGED OUT — not re-posting; leaving the held post for retry next cycle (re-login the account).`);
     return { posted: 0, heldRecords: [], flag: 'needs_login' };
@@ -191,4 +206,4 @@ async function runRepost(o) {
   return r || { posted: 0, heldRecords: [], commentQueue: [] };
 }
 
-module.exports = { runRepost, isContentLive };
+module.exports = { runRepost, isContentLive, authorsList, isOurAuthor };

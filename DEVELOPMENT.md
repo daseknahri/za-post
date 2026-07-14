@@ -24,8 +24,8 @@ Every change — a one-line fix included — goes through the same loop. Do not 
 3. **Adversarially verify — refute + reproduce.**
    - If the change touches a **sacred invariant** (the double-post / double-comment traps, crash/rotation safety), run a **multi-agent Workflow verify**: one agent tries to *refute* the fix (construct an input that still double-posts), another tries to *reproduce* the original bug against the patched code. It ships only if both fail to break it.
    - If the change is **contained** (no sacred invariant in the blast radius), **code-inspection verification** is enough — read the surrounding code and the call sites and argue why it's correct.
-4. **Run the tests.** `npm test` (240+ tests) **and** `npm run test:antispam`. Both green. See [§2](#2-testing).
-5. **Bump the version** in `package.json`. A hardening batch is a SemVer **patch** bump on the `1.0.x` line (currently **1.0.12** → 1.0.13). See [§4](#4-versioning).
+4. **Run the tests.** `npm test` (270 tests) **and** `npm run test:antispam`. Both green. See [§2](#2-testing).
+5. **Bump the version** in `package.json`. A hardening batch is a SemVer **patch** bump on the `1.0.x` line (currently **1.0.56** → 1.0.57). See [§4](#4-versioning).
 6. **Write a CHANGELOG entry** in plain language: *what changed* and, more importantly, *why it mattered*. Keep-a-Changelog style. See [§4](#4-versioning).
 7. **Package:** `ENFORCE_LICENSE=1 npm run pack:portable` → produces `dist/<product>-<ver>-portable.zip`. See [§3](#3-packaging).
 8. **Smoke-test the packaged zip** under an **isolated `--user-data-dir`** so it can never touch dev userData. See [§3](#3-packaging).
@@ -45,7 +45,7 @@ We do not merge on a hunch. A reliability fix is not "done" until it is *specifi
 ```
 npm test
 ```
-Runs `node --test "tests/**/*.test.js"` — 240+ tests. All must pass.
+Runs `node --test "tests/**/*.test.js"` — 270 tests. All must pass.
 
 **Anti-spam suite**
 ```
@@ -123,7 +123,7 @@ Ship **only the newest zip**. Delete older ones — they're superseded and buggy
 
 ## 4. Versioning & CHANGELOG
 
-- **SemVer.** Hardening batches are **patch** bumps on the **`1.0.x`** line. Current version: **1.0.12**.
+- **SemVer.** Hardening batches are **patch** bumps on the **`1.0.x`** line. Current version: **1.0.56**.
 - Every batch **bumps `package.json`** *and* **adds a matching `CHANGELOG.md` entry**.
 - CHANGELOG entries are **plain language, Keep-a-Changelog style**: *what changed* and *why it mattered*. Write for the person debugging a client six months from now, not for the compiler. "Fixed a race where a crash between publish-click and confirm could re-post — the retry now only fires on a pre-Enter 'failed' state" beats "hardened publish path".
 
@@ -242,7 +242,7 @@ The repo has accumulated a lot of docs across the build-out. Here's what each on
 
 ```bash
 # Tests (both must pass before packaging)
-npm test                              # node --test "tests/**/*.test.js" — 240+ tests
+npm test                              # node --test "tests/**/*.test.js" — 270 tests
 npm run test:antispam                 # scripts/test-antispam.js
 
 # Package an enforced client build
@@ -260,6 +260,6 @@ npx asar extract "<extracted>\resources\app.asar" C:\zpost\_asar-check
 
 - **Dev clone:** `C:\zpost\za-post` (userData `za-post-restored`) — work here.
 - **Production copy:** `C:\Za-Post-App` — **never touch.**
-- **Current version:** 1.0.12 (patch-bump the 1.0.x line for hardening batches).
+- **Current version:** 1.0.56 (patch-bump the 1.0.x line for hardening batches).
 - **License server must be live before shipping an enforced build.**
 - **Ship only the newest zip; delete the rest.**

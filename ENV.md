@@ -8,7 +8,7 @@ multi-instance, signed builds).
 
 | Variable / flag | Default | What it does |
 |---|---|---|
-| `ENABLE_LICENSE=1` | off | Turn on the license gate at startup. When off, the app runs unlimited (owner/dev). When on, it validates against the VPS server and enforces the key's tier limits. Can also be enabled via `settings.licenseEnabled`. |
+| `ENABLE_LICENSE=1` | off | Turn on the license gate at startup. When off, the app runs unlimited (owner/dev). When on, it validates against the configured license server and enforces access/expiry/device-lock/revocation (per-seat; no account/group caps); 7-day offline grace. Can also be enabled via `settings.licenseEnabled`. |
 | `ENABLE_TUNNEL=1` | off | Start the Cloudflare quick tunnel so the remote dashboard is reachable over the internet. Also enableable via `settings.enableTunnel`. The tunnel URL carries an access token — get it from the app UI (it is kept out of the logs). |
 | `--profile=<name>` / `ZA_PROFILE=<name>` | (default profile) | Run an isolated instance with its own `userData` dir (`za-post-restored-<name>`). Lets two account sets coexist on one machine. `--profile=base` is the second-instance convention. |
 | `CLOUDFLARED_BIN=<path>` | bundled | Override the path to the `cloudflared` binary if the bundled one doesn't work on your system. |
@@ -34,17 +34,15 @@ Run the server **behind an HTTPS reverse proxy** (Coolify/Traefik terminate TLS)
 
 | Variable | Default | What it does |
 |---|---|---|
+| `ENFORCE_LICENSE=1` | (off) | Build-time only. Writes `resources/enforce-license.flag` so the packaged build requires per-seat activation. Omit for an unlimited owner/dev build. |
 | `WIN_CODESIGN_VERSION` | auto-detected | Override the winCodeSign version the portable build seeds. Normally auto-detected from electron-builder; set this only if a version bump breaks the build (the script tells you when). |
 | `CSC_LINK` | (none) | Path/URL to a code-signing certificate (`.pfx`). When set, signed builds avoid the SmartScreen "Windows protected your PC" warning. |
 | `CSC_KEY_PASSWORD` | (none) | Password for the `CSC_LINK` certificate. |
 
 ## Tiers (placeholder business values — tune in `lib/license.js` `TIERS`)
 
-| Tier | maxAccounts | maxGroups |
-|---|---|---|
-| `trial` | 3 | 10 |
-| `standard` | 25 | 100 |
-| `pro` | 100 | 500 |
-| `owner` | ∞ | ∞ |
+> **All tiers are UNLIMITED on account/group count** (per-seat licensing; owner decision 2026-06-26).
+> The key does **not** cap how many accounts or groups you run — it controls only **ACCESS /
+> EXPIRY / DEVICE-LOCK / REVOCATION** (per-seat), with a **7-day offline grace** after the last good check.
 
 Generate a key for a tier: `node vps-server/gen-key.js "customer name" <days> <tier>`.

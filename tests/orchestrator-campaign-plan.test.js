@@ -133,3 +133,48 @@ test('campaign-plan: a deleted post in a slice is skipped (no stall)', () => {
   o._perAccountRotation = { A: { lastPostId: 'P1', lastPostedDate: '2000-01-01' } };
   assert.deepEqual(o._postsForAccount(A, 1).map((p) => p.id), ['P3'], 'skips the deleted P2 → P3');
 });
+
+// ── CP1: the plan roster is the STABLE full campaign fleet; completion is roster-aware. This closes the reserve-churn
+// ban-footgun (per-cycle reserve rotation changed the active set → batchId churn → pointer wipe → re-post every cycle). ──
+test('CP1: _campaignRoster = enabled, non-mod, non-standby campaign agents WITH groups (stable; ignores per-cycle churn)', () => {
+  const o = mk();
+  o._data = { accounts: [
+    agent('A', ['g1']), agent('B', ['g1']),
+    { ...agent('C', ['g1']), standby: true },       // standby → excluded (covers as a reserve, never churns the roster)
+    { ...agent('D', ['g1']), enabled: false },      // disabled → excluded
+    { ...agent('M', ['g1']), isModerator: true },   // moderator → excluded
+    agent('E', []),                                  // no groups → excluded (can't deliver a slice)
+  ] };
+  assert.deepEqual(o._campaignRoster().map((a) => a.name).sort(), ['A', 'B']);
+});
+
+test('CP1: _campaignAllFinished counts a RESERVE-held agent (in the plan roster, not in _active) → no premature reloop', () => {
+  const o = mk();
+  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], accounts: [], settings: {} };
+  o._campaignPlan = { agentLists: { A: ['P1', 'P2'], B: ['P1', 'P2'] } };
+  o._owed = {};
+  o._active = [agent('A', ['g1'])]; // B held in reserve this cycle → NOT in _active (the churn condition)
+  o._perAccountRotation = { A: { lastPostId: 'P2', lastPostedDate: o._localDayKey() }, B: { lastPostId: 'P1', lastPostedDate: o._localDayKey() } };
+  assert.equal(o._campaignAllFinished(), false, 'B still owes P2 → NOT finished, even though B is not active (prevents the premature reloop = whole-library re-post burst)');
+  assert.equal(o._campaignRemaining(), 1, 'exactly B\'s one remaining slice-post is counted');
+  o._perAccountRotation.B = { lastPostId: 'P2', lastPostedDate: o._localDayKey() }; // B finishes too
+  assert.equal(o._campaignAllFinished(), true, 'every agent in the plan roster finished → finished');
+});
+
+// ── CP2: warn (don't split) when same-cluster agents disagree on postFilter — splitting would over-deliver because
+// filters OVERLAP (all ⊇ with-comments) and the per-(post,group) ledger dedups only within a cycle. ──────────────────
+test('CP2: same-group campaign agents with DIFFERENT postFilter → one-time warning, still ONE cluster (no split)', () => {
+  const logs = [];
+  const o = new Orchestrator((channel, m) => { if (channel === 'automation-log') logs.push(m); }, {});
+  const mixed = [{ ...agent('A', ['g1']), postFilter: 'all' }, { ...agent('B', ['g1']), postFilter: 'with-comments' }];
+  const plan = o._computeCampaignPlan([{ id: 'P1', comment: 'x' }, { id: 'P2' }], mixed, 0);
+  assert.equal(plan.clusters.length, 1, 'still ONE cluster (sig unchanged — splitting would over-deliver via overlapping filters)');
+  assert.ok(logs.some((m) => /DIFFERENT post filters/i.test(m)), 'a warning fired about the mixed post filters');
+});
+
+test('CP2: uniform postFilter across a cluster → NO warning', () => {
+  const logs = [];
+  const o = new Orchestrator((channel, m) => { if (channel === 'automation-log') logs.push(m); }, {});
+  o._computeCampaignPlan([{ id: 'P1' }, { id: 'P2' }], [agent('A', ['g1']), agent('B', ['g1'])], 0);
+  assert.ok(!logs.some((m) => /DIFFERENT post filters/i.test(m)), 'no warning when filters agree');
+});

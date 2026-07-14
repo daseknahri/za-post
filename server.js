@@ -126,8 +126,8 @@ function startServer(port, injected) {
     const posts = (hooks.getData().posts || []).map((p) => ({
       caption: p.caption || '',
       comment: p.comment || '',
-      imagePath: (p.imagePaths && p.imagePaths[0]) || p.imagePath || '',
-      commentImagePath: p.commentImagePath || '',
+      imagePath: require('path').basename((p.imagePaths && p.imagePaths[0]) || p.imagePath || ''), // L2: basename only — the /images/<name> static route already serves by basename (consumer does .split(/[\/\\]/).pop()); the full on-disk path leaked the OS username + userData layout
+      commentImagePath: require('path').basename(p.commentImagePath || ''),
     }));
     res.json({ posts });
   });

@@ -45,6 +45,32 @@ test('clampSettings: tabsPerBrowser is clamped to 1..4 (0/garbage → 1, over-ma
   assert.deepEqual(Object.keys(store.clampSettings({ waitInterval: 30 })), ['waitInterval'], 'no tabsPerBrowser key emitted when absent');
 });
 
+test('clampSettings: skipInlineVerify coerces to a strict boolean (default-on v1.0.46)', () => {
+  // The worker gates the verify-later skip on `settings.skipInlineVerify === true` (strict).
+  assert.equal(store.clampSettings({ skipInlineVerify: 1 }).skipInlineVerify, true, 'truthy → true');
+  assert.equal(store.clampSettings({ skipInlineVerify: 0 }).skipInlineVerify, false, 'falsy → false');
+  assert.equal(store.DEFAULT_SETTINGS.skipInlineVerify, true, 'defaults ON (inline reload redundant with Phase-2 feed-scan)');
+  assert.deepEqual(Object.keys(store.clampSettings({ waitInterval: 30 })), ['waitInterval'], 'no skipInlineVerify key emitted when absent');
+});
+
+test('normalize: migrates a STALE skipInlineVerify=false (old opt-in default) to true, once, respecting a later deliberate toggle', () => {
+  // A persisted `false` is ALWAYS the old stale default (false WAS the default; opting IN meant true) → flip it on.
+  assert.equal(store.normalize({ settings: { skipInlineVerify: false } }).settings.skipInlineVerify, true, 'stale false → true');
+  // Absent → the new default (true).
+  assert.equal(store.normalize({ settings: {} }).settings.skipInlineVerify, true, 'absent → default true');
+  // Marked (already migrated) → a DELIBERATE false is preserved (not re-flipped).
+  assert.equal(store.normalize({ settings: { skipInlineVerify: false, sivMigrated: true } }).settings.skipInlineVerify, false, 'marked false → stays false');
+  // The migration stamps the marker so it is idempotent across loads.
+  assert.equal(store.normalize({ settings: { skipInlineVerify: false } }).settings.sivMigrated, true, 'marker stamped');
+});
+
+test('clampSettings: fastPublish coerces to a strict boolean (opt-in fast post-publish settle)', () => {
+  // The worker gates the reduced held-toast settle on `settings.fastPublish === true` (strict).
+  assert.equal(store.clampSettings({ fastPublish: 1 }).fastPublish, true, 'truthy → true');
+  assert.equal(store.clampSettings({ fastPublish: 0 }).fastPublish, false, 'falsy → false');
+  assert.equal(store.DEFAULT_SETTINGS.fastPublish, false, 'defaults OFF (byte-identical unless enabled)');
+});
+
 test('preserveAttentionStatus: keeps an ACTIVE rate-limit flag against a status check', () => {
   const future = Date.now() + 3600000;
   assert.equal(store.preserveAttentionStatus('rate_limited', future, 'logged_in'), true);

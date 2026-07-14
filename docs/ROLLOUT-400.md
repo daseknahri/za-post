@@ -1,6 +1,6 @@
 # 400-Account Client Rollout — Operator Runbook
 
-Everything the software needed for a 400-account deployment is done (v1.0.3). This is the exact order to roll it out.
+Everything the software needed for a 400-account deployment is done (v1.0.56). This is the exact order to roll it out.
 The one thing the code can't solve is **proxies** — fleet parallelism = number of distinct proxies (see step 6).
 
 ---
@@ -21,7 +21,7 @@ offline grace only applies *after* one successful activation). Before shipping, 
 ENFORCE_LICENSE=1 npm run pack:portable
 ```
 → `dist/Za-Post-Comment-Tool-<version>-portable.zip` (~335 MB, bundled Chromium, per-seat enforced). The version comes
-from `package.json` — today that is **1.0.2**. Ship *that* file; delete/ignore any older `1.0.0`/`1.0.1` zips still in `dist/`.
+from `package.json` — today that is **1.0.56**. Ship *that* file; delete/ignore any older-version zips still in `dist/`.
 *(Add `ZAPOST_API_TOKEN=<token>` before the command only if the client will push posts via the remote API.)*
 
 ## 2. Install on the client laptop

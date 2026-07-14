@@ -113,6 +113,46 @@ const ok = (name, cond, extra) => { if (cond) { passed++; console.log('PASS ' + 
   ok('persisted: capacct.daily.count == 2 (stopped AT the cap, no overshoot)', cap && cap.daily && cap.daily.count === 2, JSON.stringify(cap && cap.daily));
   ok('persisted: rlacct.rateLimitedUntil set in the future', rl && rl.rateLimitedUntil > Date.now(), String(rl && rl.rateLimitedUntil));
   ok('persisted: rlacct.rlStrikes incremented', rl && rl.rlStrikes >= 1, String(rl && rl.rlStrikes));
+
+  // ---- E) R2: attention-rest EXPONENTIAL BACKOFF ladder + clear-on-recovery -------------------------
+  // A logged-out/blocked account must BACK OFF per consecutive strike (not re-submit login on the shared IP
+  // every flat 3h forever) and RESET to the base window once it recovers. Drive _recordAccountOutcome directly
+  // because the rest window skips the account in the cycle loop, so the ladder can't be exercised end-to-end.
+  {
+    const S = { rateLimitCooldownHours: 4, enableWarmup: false };
+    const A = () => store.load().accounts.find((a) => a.name === 'okacct');
+    const logout = () => orch._recordAccountOutcome('okacct', { posted: 0, pendingApproval: 0, errors: 1, flag: 'needs_login', postedIds: [], dealtIds: [] }, S);
+    await logout(); const s1 = A(); const r1 = Number(s1.nextAttnRetry) - Date.now();
+    await logout(); const s2 = A(); const r2 = Number(s2.nextAttnRetry) - Date.now();
+    await logout(); const s3 = A(); const r3 = Number(s3.nextAttnRetry) - Date.now();
+    ok('R2: attnStrikes increments per consecutive attention flag', s1.attnStrikes === 1 && s2.attnStrikes === 2 && s3.attnStrikes === 3, `${s1.attnStrikes},${s2.attnStrikes},${s3.attnStrikes}`);
+    ok('R2: rest GROWS per strike (backoff, not flat)', r2 > r1 * 1.5 && r3 > r2 * 1.5, `${(r1 / 3.6e6).toFixed(1)}h,${(r2 / 3.6e6).toFixed(1)}h,${(r3 / 3.6e6).toFixed(1)}h`);
+    // clean delivery clears BOTH the rest timer and the strike ladder → next logout starts at the base window again
+    await orch._recordAccountOutcome('okacct', { posted: 1, pendingApproval: 0, errors: 0, flag: null, postedIds: ['p1'], dealtIds: ['p1'] }, S);
+    const s4 = A();
+    ok('R2: clean delivery clears nextAttnRetry AND attnStrikes', (Number(s4.nextAttnRetry) || 0) === 0 && (s4.attnStrikes || 0) === 0, `nar=${s4.nextAttnRetry} strikes=${s4.attnStrikes}`);
+    for (let i = 0; i < 6; i++) await logout();
+    const r6h = (Number(A().nextAttnRetry) - Date.now()) / 3.6e6;
+    ok('R2: backoff SATURATES at the 24h cap', r6h > 23 && r6h <= 24.5, `${r6h.toFixed(1)}h`);
+  }
+
+  // ---- F) per-IP AGGREGATE post gate (_ipPostGate) — OPT-IN, default OFF -------------------------------
+  // The fleet-wide reservation that bounds total posts/hr from the one shared IP: consecutive calls must space by the
+  // configured minimum; OFF (0) and a proxied fleet must be pure no-ops (0). Same shared-timestamp idiom as the launch throttle.
+  {
+    orch._data = orch._data || {};
+    orch._data.settings = orch._data.settings || {};
+    orch._data.useProxies = false;
+    orch._data.settings.realIpMinPostGapSec = 0; orch._lastRealIpPostAt = 0;
+    ok('#2: gate OFF (0) is a no-op', orch._ipPostGate() === 0 && orch._ipPostGate() === 0);
+    orch._data.settings.realIpMinPostGapSec = 30; orch._lastRealIpPostAt = 0;
+    const w1 = orch._ipPostGate(), w2 = orch._ipPostGate(), w3 = orch._ipPostGate(); // first immediate (stale ts), then +30s, +60s
+    ok('#2: gate ON spaces consecutive posts ~30s apart', w1 === 0 && w2 > 29000 && w2 <= 30000 && w3 > 59000 && w3 <= 60000, `${w1},${w2},${w3}`);
+    orch._data.useProxies = true; orch._lastRealIpPostAt = 0;
+    ok('#2: gate is a no-op for a proxied fleet (no shared-IP limit)', orch._ipPostGate() === 0);
+    orch._data.useProxies = false; orch._data.settings.realIpMinPostGapSec = 0; // restore
+  }
+
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
 
   console.log(`\n${passed}/${passed + failed} checks passed`);

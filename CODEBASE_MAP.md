@@ -15,7 +15,7 @@
 ## 2. Tech stack & dependencies
 
 **Runtime / platform**
-- **Electron 27+** desktop app, Windows-first (Windows-only features: PowerShell WMI orphan-Chromium cleanup, `SetWindowPos` background-window trick, off-screen `-32000` window pinning, desktop shortcut creation).
+- **Electron 35** desktop app, Windows-first (Windows-only features: PowerShell WMI orphan-Chromium cleanup, `SetWindowPos` background-window trick, off-screen `-32000` window pinning, desktop shortcut creation).
 - **Node.js** main process and Express server.
 
 **Core frameworks & key npm packages**
@@ -35,7 +35,7 @@
 **External services**
 - **Facebook** (the automation target — DOM-scraped, no API).
 - **Cloudflare** (`trycloudflare.com` quick tunnels).
-- **VPS license server** at `http://144.91.127.7:3509` (default; overridable).
+- **VPS license server** — the configured license server (`LICENSE_SERVER_URL`, see `lib/license.js`; overridable at runtime).
 - Connectivity probes to **google.com** and **facebook.com**.
 
 ---
@@ -91,6 +91,8 @@ The app is a single Electron process tree with three runtime planes — **UI**, 
 
 ## 4. Subsystem reference
 
+> ⚠️ Line numbers below are from the 2026-06-20 snapshot (main.js is now ~2073 lines) — grep the handler/function name rather than trusting a line number.
+
 ### 4.1 Electron main (`main.js`, `preload.js`)
 **Purpose:** Core orchestrator — window lifecycle, the full IPC surface, browser automation for *login & status* (not posting), data persistence, the license gate, remote-server/tunnel wiring, and crash/power resilience. It is the single writer that serializes mutations from IPC, the orchestrator, and the HTTP API.
 
@@ -101,7 +103,7 @@ The app is a single Electron process tree with three runtime planes — **UI**, 
 - Accounts: `create-account` (`551`), `toggle-account` (`564`), `delete-account` (`572`, removes profile dir), `set-account-credentials` (`582`), `rename-account` (`593`, moves profile dir), `import-cookies` (`608`), `check-account-status` (`634`), `login-account` (`642`), `close-login-browser` (`647`).
 - Automation: `start-automation` (`868`), `stop-automation` (`875`), `pause-automation` (`881`), `resume-automation` (`887`), `finish-automation` (`894`), `get-automation-status` (`901`).
 - Settings/misc: `save-settings` (`921`, calls `clampSettings`), `get-proxies`/`save-proxies`/`toggle-proxies` (`936–945`), `select-image` (`947`), `open-logs-folder` (`957`).
-- Licensing: `get-license-info` (`955`, **hardcoded permissive stub**), `validate-license-async` (`960`), `retry-license` (`976`), `get-server-url`/`update-server-url` (`984–987`), `get-remote-url` (`956`).
+- Licensing: `get-license-info` (`955`, **reflects the real validated tier/state** — Infinity surfaced as 9999 for the UI), `validate-license-async` (`960`), `retry-license` (`976`), `get-server-url`/`update-server-url` (`984–987`), `get-remote-url` (`956`).
 
 **Key functions:** `createWindow()` (`259`), `showLicenseWindow()`/`showRevokedWindow()` (`244–257`), `app.whenReady()` bootstrap (`273–397`), `checkStatus(accountName)` (`654`, headless `c_user`+checkpoint probe), `openLoginBrowser(accountName)` (`752`, visible login + live credential capture via `evaluateOnNewDocument`, 5s cookie flush), `setAccountStatus()` (`715`), `emit()/send()` (`167–184`, central broadcast + remote log mirror), `setRunActive()/isRunActive()` (`125–139`, atomic fsync+rename run-state flag), `killOrphanChromium()` (`51`, Windows WMI), `notifyAccountAttention()` (`188`, deduped desktop toast), `clampSettings()` (`909`), `clearInterruptedLoginStates()` (`731`).
 
@@ -156,7 +158,7 @@ The app is a single Electron process tree with three runtime planes — **UI**, 
 **Key files:** `license-server.js` (~71), `gen-key.js`, `revoke.js`, `Dockerfile`, `keys.example.json`, `README.md`, `DEPLOY-COOLIFY.md`.
 
 ### 4.8 Scripts (`scripts/`)
-**Purpose:** Build/migration, account prep, and diagnostics. Build: `bundle-chromium.js` (→ `chrome-bin`), `build-portable.js` (`npm run pack:portable`; pre-seeds winCodeSign cache, electron-builder dir target, 7-Zip → `dist/Za-Post-Comment-Tool-<ver>-portable.zip`), `migrate.js` (legacy King/Base import). Account prep: `prep-accounts.js`, `sync-memberships.js`, `check-membership.js` (Puppeteer group-membership detection, prune `assignedGroups`). Tests/diagnostics: `test-antispam.js` (27 checks), `test-fingerprint.js` (10 checks), `live-post.js` (one account→group→post end-to-end check), `diagnose-proxies.js` (proxy health CLI), `inspect-fb.js` (selector reconnaissance → `scripts/fb-recon/`). (One-off feature-verification probes — hidden-window/notification/comment-DOM diagnostics — were removed in the 2026-06-23 cleanup; recover from git history if needed.)
+**Purpose:** Build/migration, account prep, and diagnostics. Build: `bundle-chromium.js` (→ `chrome-bin`), `build-portable.js` (`npm run pack:portable`; pre-seeds winCodeSign cache, electron-builder dir target, 7-Zip → `dist/Za-Post-Comment-Tool-<ver>-portable.zip`), `migrate.js` (legacy King/Base import). Account prep: `prep-accounts.js`, `sync-memberships.js`, `check-membership.js` (Puppeteer group-membership detection, prune `assignedGroups`). Tests/diagnostics: `test-antispam.js` (34 checks), `test-fingerprint.js` (10 checks), `live-post.js` (one account→group→post end-to-end check), `diagnose-proxies.js` (proxy health CLI), `inspect-fb.js` (selector reconnaissance → `scripts/fb-recon/`). (One-off feature-verification probes — hidden-window/notification/comment-DOM diagnostics — were removed in the 2026-06-23 cleanup; recover from git history if needed.)
 
 ### 4.9 Documentation (`README.md`, `DOCS.md`, `HANDOFF.md`, `OPERATIONS.md`, `build/READ-ME-FIRST.txt`)
 Ground-truth product/architecture/operations reference. `DOCS.md` is the full technical reference (run lifecycle, posting modes, anti-spam 5-dimension audit); `HANDOFF.md` records the 2026-06-20 hardening session and verified end-to-end status; `OPERATIONS.md` is the daily workflow; `READ-ME-FIRST.txt` ships in the portable zip.
@@ -175,7 +177,7 @@ Ground-truth product/architecture/operations reference. `DOCS.md` is the full te
 
 ### Flow B — App launch & license check
 1. `app.whenReady()` (`main.js:273`): `store.init`, clear interrupted logins, data-corruption check, kill orphan Chromium, set up logging, create orchestrator, register power events, start Express server (+ optional tunnel if `ENABLE_TUNNEL`/`settings.enableTunnel`).
-2. **License gate (opt-in)** at `main.js:363`: `LICENSE_ON = ENABLE_LICENSE || settings.licenseEnabled`. If **off** → `createWindow()` directly (default). If **on** → `license.checkCached(userData, serverUrl)`: valid → main window; revoked → `showRevokedWindow()`; otherwise → `showLicenseWindow()`. Activation (`validate-license-async`) POSTs `{license, hwid}` to the VPS; on success caches to `userData/license.json`. Note: `get-license-info` (`main.js:955`) is a **separate hardcoded permissive stub** (`valid:true`, 9999 limits) used by the renderer for feature limits — it is *not* the gate.
+2. **License gate (opt-in)** at `main.js:363`: `LICENSE_ON = ENABLE_LICENSE || settings.licenseEnabled`. If **off** → `createWindow()` directly (default). If **on** → `license.checkCached(userData, serverUrl)`: valid → main window; revoked → `showRevokedWindow()`; otherwise → `showLicenseWindow()`. Activation (`validate-license-async`) POSTs `{license, hwid}` to the VPS; on success caches to `userData/license.json`. Note: `get-license-info` (`main.js:955`) **reflects the real validated tier/state** (`valid` per the cached license; Infinity limits surfaced as 9999 for the UI) used by the renderer for feature limits — it is *not* the boot gate.
 3. **Auto-resume** (`main.js:381`): if the previous session left `run-state.json.active` set **and** real work remains **and** `resumeOnStartup===true`, the orchestrator restarts on `did-finish-load` (guarded to fire once).
 
 ### Flow C — Content/image variation pipeline (anti-spam)
@@ -210,7 +212,7 @@ The licensing system is **opt-in** and spans the VPS server and the desktop clie
 
 **Key generation (VPS):** `vps-server/gen-key.js` creates a 16-hex key formatted `XXXX-XXXX-XXXX-XXXX` and writes a record into `keys.json`: `{ hwid:null, revoked:false, expires:null, note, createdAt }`. `OWNER_KEY` env var seeds an owner record on first boot if missing.
 
-**Validation (client → VPS):** `lib/license.validate(key, serverUrl)` POSTs `{ license, hwid }` to `<server>/api/validate` (default `http://144.91.127.7:3509`, 6s timeout). The server (`license-server.js:49`):
+**Validation (client → VPS):** `lib/license.validate(key, serverUrl)` POSTs `{ license, hwid }` to `<server>/api/validate` (the configured license server — `LICENSE_SERVER_URL`, see `lib/license.js`; 3s timeout). The server (`license-server.js:49`):
 - unknown key → `{valid:false, message:'Invalid license key'}`;
 - `revoked` → `{valid:false, revoked:true}`;
 - expired (`expires` ms < `Date.now()`) → `{valid:false, message:'License expired'}`;
@@ -220,13 +222,13 @@ The licensing system is **opt-in** and spans the VPS server and the desktop clie
 
 **Machine binding:** `hwid()` uses `node-machine-id.machineIdSync()` (fallback `os.hostname()`). Keys are first-activation-locked to one machine.
 
-**Offline fallback:** if the server is unreachable, `offlineValid(key)` checks SHA256(uppercased key) against `OFFLINE_ALLOW` (a single hardcoded owner-key hash `2d12582d…`). Only the owner key works offline; customer keys require server reachability.
+**Offline fallback:** if the server is unreachable, `offlineValid(key)` checks SHA256(uppercased key) against `OFFLINE_ALLOW` (an owner-machine offline-allow hash, in `lib/license.js`). Only the owner key works offline; customer keys require server reachability.
 
 **Caching:** `activate()` writes `userData/license.json` `{key, hwid, ts}`; `checkCached()` re-validates the cached key on each boot, rejects on hwid mismatch, and clears the cache when the server reports `revoked`.
 
 **Client gate & UI:** at boot (`main.js:363`) the gate runs only when `ENABLE_LICENSE`/`settings.licenseEnabled`. `validate-license-async` (renderer → main) drives activation; `license-validation-result` returns the verdict; success closes `license-window.html`, `revoked` shows `revoked.html` (WhatsApp contact + retry → `retry-license`). Server URL is configurable via `get-server-url`/`update-server-url` (`license-config.json`).
 
-**Revocation:** `revoke.js` sets `revoked=true/false` (and optionally `--unbind` clears hwid) in `keys.json`; the next client `validate`/`checkCached` returns `revoked` and the app shows the revoked window. **Important:** the in-app `get-license-info` IPC (`main.js:955`) is an unrelated permissive stub returning lifetime/9999 limits and does **not** reflect real license state.
+**Revocation:** `revoke.js` sets `revoked=true/false` (and optionally `--unbind` clears hwid) in `keys.json`; the next client `validate`/`checkCached` returns `revoked` and the app shows the revoked window. **Important:** the in-app `get-license-info` IPC (`main.js:955`) **reflects the real validated tier/state** (Infinity limits surfaced as 9999 for the UI); it is *not* the boot gate, but it does report real license state.
 
 **API contract:** `POST /api/validate {license,hwid} → {valid, revoked?, message}`; `GET /api/keys?admin=<ADMIN_TOKEN> → full key store`.
 
@@ -236,8 +238,8 @@ The licensing system is **opt-in** and spans the VPS server and the desktop clie
 
 | Sev | Area | File / location | Issue |
 |-----|------|-----------------|-------|
-| **High** | Security | `renderer.js` (license limits) | License limits (`maxGroups`/`maxAccounts`) are enforced **UI-only** from the permissive `get-license-info` stub; no backend re-validation — bypassable via direct IPC/HTTP. |
-| **High** | Security / licensing | `lib/license.js:8,30` | `OFFLINE_ALLOW` has one hardcoded owner-key hash; a slow-but-up server (6s timeout) causes offline fallback that can **bypass an active revocation**. No way to push revocations to offline clients. |
+| **High** | Security | `renderer.js` (license limits) | License limits (`maxGroups`/`maxAccounts`) are enforced **UI-only** from `get-license-info` (which reflects the real validated tier/state, Infinity surfaced as 9999); no backend re-validation — bypassable via direct IPC/HTTP. |
+| **High** | Security / licensing | `lib/license.js:8,30` | `OFFLINE_ALLOW` has one hardcoded owner-key hash; a slow-but-up server (3s timeout) causes offline fallback that can **bypass an active revocation**. No way to push revocations to offline clients. |
 | **High** | Fragility | `automation/worker.js` (rate-limit/selectors) | Rate-limit/verification/composer detection relies on **hardcoded English/Hungarian FB text + DOM selectors** (e.g. "try again later" disambiguation); FB UI/locale changes silently break detection or composing. First thing to verify on any live run. |
 | **High** | Reliability | `automation/worker.js` (image upload ~1191) | No retry on image `uploadFile` network failure (30s timeout); a stalled upload publishes the post **without its image**. |
 | **High** | UX limitation | `worker.js` / DOCS §13 | Captions type slowly in hidden mode (clipboard paste needs real window focus that off-screen windows lack); typing mitigates but doesn't fully solve. |
@@ -270,8 +272,8 @@ The licensing system is **opt-in** and spans the VPS server and the desktop clie
 
 ## 9. Open questions for the user
 
-1. **License enforcement model:** is the VPS gate intended to be the real enforcement (currently opt-in via `ENABLE_LICENSE`/`licenseEnabled`), and should the permissive `get-license-info` stub + UI-only limits be replaced with backend-validated limits? What license model is desired (machine-bound seat, subscription, per-account cap)?
-2. **VPS owner key & server:** what plaintext key corresponds to the single `OFFLINE_ALLOW` hash, is it intentionally the only offline-capable key, and is `144.91.127.7:3509` still the live production endpoint (with a fallback)? How is `keys.json` backed up, and is `ADMIN_TOKEN` rotated?
+1. **License enforcement model:** is the VPS gate intended to be the real enforcement (currently opt-in via `ENABLE_LICENSE`/`licenseEnabled`), and should the `get-license-info` values (now reflecting the real validated tier/state) + UI-only limits be replaced with backend-validated limits? What license model is desired (machine-bound seat, subscription, per-account cap)?
+2. **VPS owner key & server:** what plaintext key corresponds to the single `OFFLINE_ALLOW` hash, is it intentionally the only offline-capable key, and is the configured license server (`LICENSE_SERVER_URL`, see `lib/license.js`) still the live production endpoint (with a fallback)? How is `keys.json` backed up, and is `ADMIN_TOKEN` rotated?
 3. **Offline revocation:** since a slow server triggers offline fallback that can bypass revocation, is that acceptable, or should the client fail-closed on timeout for non-owner keys?
 4. **Facebook selector drift:** are there known FB localizations/A-B variants affecting the `write something|what's on your mind` selectors, and should fallback selectors + automated selector-drift detection (diffing `inspect-fb.js` output) be added?
 5. **Pending-approval posts:** should admin-rejected pending posts be auto-re-queued, and should first-comment delivery move to permalink-page-primary (vs feed-scan) so image-only posts get comments?
@@ -294,7 +296,7 @@ The licensing system is **opt-in** and spans the VPS server and the desktop clie
 - **Remote API:** `server.js` route table + the `hooks` it receives from `main.js`.
 
 **Validate the environment before changing anything:**
-- Run `node scripts/test-fingerprint.js` (10 checks) and `node scripts/test-antispam.js` (27 checks) — both should pass; they cover fingerprint, content/image/link variation, daily-cap, and cool-down persistence.
+- Run `node scripts/test-fingerprint.js` (10 checks) and `node scripts/test-antispam.js` (34 checks) — both should pass; they cover fingerprint, content/image/link variation, daily-cap, and cool-down persistence.
 - Run `node scripts/inspect-fb.js` for a logged-in account to capture current Facebook DOM (`scripts/fb-recon/`) and confirm composer/comment/post-button selectors still match `worker.js`. This is the canonical first step when posting breaks.
 - Do a controlled `node scripts/live-post.js` (one account → one group → one post) before any wider run; e2e is only verified at that minimal scale.
 

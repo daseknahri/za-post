@@ -6,12 +6,12 @@
 ## Current protection level (before this pass)
 - **License gate exists but is OFF by default.** `main.js` only enforces when `ENABLE_LICENSE=1` (env) or `settings.licenseEnabled=true`. The shipped `start.bat` does **not** set it → **every client today runs unlicensed/unlimited.**
 - **Source is fully readable.** The portable build packs `resources/app.asar`, but it's **plain, commented JS** — anyone can `asar extract app.asar` and read `main.js`, `lib/license.js`, `automation/*`, etc. Not minified, not obfuscated.
-- **Internal docs + tests were inside the asar** (AUDIT.md, SPEC files, 29 test files) — exposed the architecture. ✅ **Fixed this pass** (excluded from the build).
-- **Baked secrets:** the license server raw IP `http://144.91.127.7:3509` and the owner-key SHA-256 are in `lib/license.js` (and thus the asar). The FB credentials (DPAPI) and the API token (env, not baked) are correctly protected.
+- **Internal docs + tests were inside the asar** (AUDIT.md, SPEC files, 52 test files) — exposed the architecture. ✅ **Fixed this pass** (excluded from the build).
+- **Baked secrets:** a hardcoded license-server URL fallback (the configured license server — `LICENSE_SERVER_URL`, see `lib/license.js`) and the owner-key SHA-256 are in `lib/license.js` (and thus the asar). The FB credentials (DPAPI) and the API token (env, not baked) are correctly protected.
 
 ## ✅ Implemented (2026-06-24)
 - **Internal docs/tests excluded from the asar** (`package.json` build.files) — `*.md`, `tests/`, `docs/`, `devboot.*`. A thief who extracts the asar no longer gets specs/plans/test vectors.
-- **License enforcement wired** (`main.js`): `LICENSE_ON = app.isPackaged || ENABLE_LICENSE || settings.licenseEnabled`. → **every PACKAGED build always enforces** (a copied app can't run without a valid key); the **dev clone** (`electron .`, `app.isPackaged=false`) stays open; the **owner key bypasses fully offline**. License tests green.
+- **License enforcement wired** (`main.js`): `LICENSE_ON = ENABLE_LICENSE || settings.licenseEnabled || _enforceLicenseMarker()`, where the marker = the build is packaged **AND** `resources/enforce-license.flag` is present (opt-in via `ENFORCE_LICENSE=1` at build time). → a packaged build enforces **only when built with the enforce flag** (an ordinary packaged build does NOT always enforce); the **dev clone** (`electron .`) stays open; the **owner key bypasses fully offline**. License tests green.
 - **Server URL configurable** (`lib/license.js`): `DEFAULT_SERVER = process.env.LICENSE_SERVER_URL || '<ip fallback>'`. Set `LICENSE_SERVER_URL=https://license.yourdomain.com` at build time (start.bat) to hide the IP; the runtime License-screen override still wins.
 - **bytenode pipeline (flag-gated, zero risk to normal builds)**: `scripts/compile-jsc.js` compiles the 12 main-process modules to V8 bytecode **under Electron** (ABI-correct); `scripts/build-portable.js` with `BYTENODE=1` transiently swaps each `.js` for a 2-line stub loader, builds, and **always restores the source** in `finally`. No `require()` rewrites (stubs keep module paths). **Verified:** all 12 modules compile + a `.jsc` loads back as a working module under Electron. Renderer/preload are intentionally NOT compiled.
 
@@ -48,16 +48,16 @@ bytenode can't compile the renderer (it's loaded via `<script>` in `index.html`,
 The license system is fully built (per-seat tiers, HWID machine-binding, 7-day offline grace, revoke, periodic re-validation). Turning it on means **every client needs a key** validated against your VPS server.
 
 **Prerequisites before flipping it on:**
-- The license server (`vps-server/`, currently `144.91.127.7:3509`) must be **running and reachable** from client machines.
+- The license server (`vps-server/`, the configured license server — `LICENSE_SERVER_URL`, see `lib/license.js`) must be **running and reachable** from client machines.
 - Generate one key per client: `node vps-server/gen-key.js` (tier: trial/standard/pro). Revoke with `revoke.js`.
 - Your **owner key** bypasses everything (unlimited, offline) — keep it long + secret.
 
 **How to enable (pick one):**
 - **(A) Per build (simple):** add `set "ENABLE_LICENSE=1"` to the `start.bat` template in `scripts/build-portable.js`. ⚠️ Bypassable — a client who double-clicks the `.exe` directly skips it. Tell clients to launch via `start.bat` only.
-- **(B) Robust (recommended):** make the **packaged** build always enforce, so it can't be bypassed. In `main.js` change the gate to `const LICENSE_ON = app.isPackaged || ENABLE_LICENSE || settings.licenseEnabled;` — the dev clone (not packaged) stays open for testing; every shipped copy enforces; the owner key still bypasses. One-line change, but commit to it only when the server + keys are ready (otherwise shipped clients are blocked).
+- **(B) Robust (recommended) — ✅ SHIPPED:** the packaged build enforces via the enforce-marker, so it can't be bypassed: `const LICENSE_ON = ENABLE_LICENSE || settings.licenseEnabled || _enforceLicenseMarker()`, where the marker = packaged **AND** `resources/enforce-license.flag` present (opt-in via `ENFORCE_LICENSE=1` at build). The dev clone (not packaged) stays open for testing; a build made with `ENFORCE_LICENSE=1` enforces on every shipped copy; the owner key still bypasses. Build enforced copies only when the server + keys are ready (otherwise shipped clients are blocked).
 
-### 2. Hide the server IP behind a domain + HTTPS — **quick code, needs DNS**
-`lib/license.js:19` bakes `http://144.91.127.7:3509` (cleartext, raw IP). Put the server behind a subdomain + Cloudflare (free TLS), then change to `const DEFAULT_SERVER = 'https://license.yourdomain.com';`. Hides the real IP, encrypts validation traffic.
+### 2. Hide the server IP behind a domain + HTTPS — ✅ SHIPPED
+`lib/license.js` no longer bakes a raw IP as the only option: `DEFAULT_SERVER = process.env.LICENSE_SERVER_URL || <fallback>`. Setting `LICENSE_SERVER_URL=https://license.yourdomain.com` at build time points clients at a domain behind Cloudflare (free TLS) — hiding the real IP and encrypting validation traffic; the runtime License-screen override still wins. See the configured license server (`LICENSE_SERVER_URL`) in `lib/license.js`.
 
 ### 3. Obfuscate the code so it can't be read/copied — **the real "can't steal it" step (multi-hour)**
 Ranked by ROI:

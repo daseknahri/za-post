@@ -223,7 +223,7 @@ async function runModerator(o) {
               .map((e) => nm(e.textContent || ''))
               .filter((s) => s && s.length >= 2 && s.length <= 50 && !APPROVE.test(s) && !snips.some((sn) => sn && s.includes(sn.slice(0, 20)))); // DECLINE not applied to author names (a name may contain 'remove'/'hide'/etc.)
             if (ourNames && ourNames.length) {
-              const hit = cand.find((c) => ourNames.some((on) => c.includes(on) || on.includes(c)));
+              const hit = cand.find((c) => ourNames.some((on) => c.includes(on) || (on.includes(c) && c.length >= Math.max(5, Math.floor(on.length * 0.6))))); // S3: length-gate the reverse-substring direction so a short stranger token (e.g. "ali") can't pass the veto as our "ali baba store" → wrong-approve. A truncated real display-name still matches; a missed truly-ours card falls to Phase-4 (never worse for the wrong-approve guard).
               if (hit) { author = hit; authorOurs = true; }
               else if (cand.length) { author = cand[0]; authorOurs = false; } // a readable, non-matching name → veto
             } else if (cand.length) { author = cand[0]; }

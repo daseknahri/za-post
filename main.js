@@ -2,7 +2,9 @@
 // Electron main process for "Za Post Comment Tool" (restored, clean source).
 // Implements the full IPC contract the recovered renderer expects, persists data
 // via lib/store, runs automation via automation/orchestrator + worker, exposes a
-// remote dashboard via server.js, and uses a permissive LOCAL license (no server).
+// remote dashboard via server.js. Licensing is opt-in per-seat: gated by ENABLE_LICENSE /
+// settings.licenseEnabled / the packaged enforce-marker, it validates against the configured
+// license server (see lib/license.js); otherwise the app runs unlimited (owner/dev).
 
 const { app, BrowserWindow, ipcMain, dialog, shell, powerSaveBlocker } = require('electron');
 const path = require('path');
@@ -67,7 +69,9 @@ function migrateLegacyUserDataOnce(destRoot) {
     }
     if (!srcRoot) { try { fs.writeFileSync(marker, 'no-legacy'); } catch {} return; }
     console.log('[migrate] seeding fresh userData from prior build: ' + srcRoot);
-    fs.copyFileSync(path.join(srcRoot, 'data.json'), destData);
+    // Copy cookies + images FIRST and data.json LAST. destData's existence is the "already installed" signal
+    // (the early-return above), so if an I/O error interrupts the seed BEFORE data.json is written, the next boot
+    // RETRIES the full seed instead of skipping it and leaving the migrated fleet logged out (cookies never copied).
     const srcAcc = path.join(srcRoot, 'accounts');
     if (fs.existsSync(srcAcc)) {
       const destAcc = path.join(destRoot, 'accounts'); fs.mkdirSync(destAcc, { recursive: true });
@@ -81,6 +85,7 @@ function migrateLegacyUserDataOnce(destRoot) {
       for (const f of fs.readdirSync(srcImg)) { try { fs.copyFileSync(path.join(srcImg, f), path.join(destImg, f)); } catch {} }
     }
     for (const f of ['license.json', 'license-config.json']) { try { const s = path.join(srcRoot, f); if (fs.existsSync(s)) fs.copyFileSync(s, path.join(destRoot, f)); } catch {} }
+    fs.copyFileSync(path.join(srcRoot, 'data.json'), destData); // LAST: its existence IS the "install complete" signal — a seed that fails before this point safely retries on the next boot instead of wedging half-migrated
     try { fs.writeFileSync(marker, new Date().toISOString()); } catch {}
     console.log('[migrate] legacy data seeded OK');
   } catch (e) { try { console.error('[migrate] non-fatal:', e && e.message); } catch {} }
@@ -309,18 +314,21 @@ function persistTemp(tempPath, prefix) {
 function addPostFromRemote(fields) {
   const imgPath = persistTemp(fields.imagePath, 'post');
   const commentImagePath = persistTemp(fields.commentImagePath, 'comment');
+  // NO swallow + throwIfUnsaved: a hard save failure (ENOSPC) or a transient skipped-save must REJECT so server.js's
+  // route reports a truthful HTTP error the client can retry — not a false 200 that silently loses the post (matches
+  // addPostsBulkFromRemote). send('data-updated') stays on the success path only.
   return store.update((data) => {
     data.posts.push({
       id: 'post-' + Date.now(), caption: fields.caption || '', comment: fields.comment || '',
       imagePaths: imgPath ? [imgPath] : [], imageUrl: fields.imageUrl || '',
       commentImagePath: commentImagePath || null, commentImageUrl: fields.commentImageUrl || '',
     });
-  }).then(() => send('data-updated')).catch(() => {});
+  }, { throwIfUnsaved: true }).then(() => send('data-updated'));
 }
 function deletePostByIndex(index) {
   return store.update((data) => {
     if (index >= 0 && index < data.posts.length) data.posts.splice(index, 1);
-  }).then(() => send('data-updated')).catch(() => {});
+  }, { throwIfUnsaved: true }).then(() => send('data-updated'));
 }
 // Bulk-insert posts pushed from the client's external server (POST /api/posts/bulk). Mirrors the add-posts-bulk IPC
 // handler (trim caption, skip blanks) and honors replace=true (clear the library first). Returns { added, skipped } so
@@ -717,6 +725,7 @@ app.on('window-all-closed', () => {
   // fsync+rename) so the next launch won't auto-resume a run the user intentionally closed. A
   // crash/hard-kill leaves the flag set, which is the legitimate crash-resume case.
   try { setRunActive(false); } catch {}
+  try { store.flushProgress(); } catch {} // write any coalesced dashboard-ledger updates before quitting (deliberate close)
   for (const [, entry] of loginBrowsers) { try { entry.browser.close(); } catch {} }
   remote.stopServer();
   if (process.platform !== 'darwin') app.quit();
@@ -742,7 +751,7 @@ ipcMain.handle('save-data', async (_e, data) => {
       // isModerator, fbDisplayName, email, password) are kept from the renderer; runtime fields below are not.
       // chrome* are written CONTINUOUSLY by the Chrome-import bridge (session/health/group sync) independent of the
       // renderer, so a stale renderer save must NOT roll them back — treat them as runtime/bridge-owned like the rest.
-      const RUNTIME = ['status', 'lastMessage', 'daily', 'rateLimitedUntil', 'rlStrikes', 'nextAttnRetry', 'fbUserId', 'fbName', 'lastChecked', 'chromeCUser', 'chromeHealth', 'chromeSeen', 'chromeGroups'];
+      const RUNTIME = ['status', 'lastMessage', 'daily', 'rateLimitedUntil', 'rlStrikes', 'nextAttnRetry', 'attnStrikes', 'attnFlag', 'fbUserId', 'fbName', 'lastChecked', 'chromeCUser', 'chromeHealth', 'chromeSeen', 'chromeGroups'];
       const live = new Map((d.accounts || []).map((a) => [a.name, a]));
       for (const a of n.accounts) { const cur = live.get(a.name); if (cur) for (const k of RUNTIME) { if (cur[k] === undefined) delete a[k]; else a[k] = cur[k]; } }
       // NEVER drop an account that exists on disk but is missing from the renderer's (possibly stale) snapshot — the
@@ -800,7 +809,7 @@ ipcMain.handle('add-posts-bulk', async (_e, posts) => {
     const now = Date.now();
     await store.update((data) => {
       for (let i = 0; i < posts.length; i++) {
-        const p = posts[i];
+        const p = posts[i] || {}; // one null/garbage record must not throw out of the mutator and reject the whole batch (matches the /api/posts/bulk sibling)
         const caption = (p.caption || '').trim();
         if (!caption) { skipped++; continue; }
         data.posts.push({
@@ -970,11 +979,17 @@ function extractGroupId(input) {
 ipcMain.handle('create-account', async (_e, accountName, alias, opts) => {
   try {
     if (!accountName) return fail('Account name required');
+    if (!/^[a-zA-Z0-9_]+$/.test(String(accountName))) return fail('Account name can only contain letters, numbers, and underscores'); // main-process charset gate (never trust the renderer) — keeps account.name XSS-safe in the account-card inline handlers
     // A moderator is born flagged + disabled-as-poster so it can NEVER be selected into the posting pool,
     // even in the brief window before the renderer would set the flag (no race; no one-frame-as-poster).
     const isMod = !!(opts && opts.isModerator);
     const res = await store.update((data) => {
-      if (data.accounts.some((a) => a.name === accountName)) return fail('Account already exists');
+      // Dedup on the SANITIZED on-disk key (what profileDir/cookiesFile derive from), NOT the raw display name — else two
+      // names that fold to the SAME folder (e.g. "bb 24" vs "bb.24" → bb_24) would silently share one Chrome profile +
+      // cookie jar = wrong-identity posting. Matches the bulk-add path (add-accounts-bulk).
+      const _key = store.sanitizeName(accountName).toLowerCase();
+      if (!_key) return fail('Account name has no usable characters');
+      if (data.accounts.some((a) => store.sanitizeName(a.name).toLowerCase() === _key)) return fail('An account with that name already exists (same profile folder)');
       // Licensing: moderators are FREE — only posting accounts count against the per-seat limit. So skip the
       // check for moderators, and for posters count posters only (a designated moderator must not eat a seat).
       if (!isMod) { const over = overLimit('accounts', data.accounts.filter((a) => !a.isModerator).length); if (over) return over; }
@@ -1015,6 +1030,7 @@ ipcMain.handle('add-accounts-bulk', async (_e, accounts, opts) => {
       for (const raw of accounts) {
         const name = String((raw && raw.name) || '').trim();
         if (!name) { skipped++; continue; }               // no name → can't create a profile dir → skip
+        if (!/^[a-zA-Z0-9_]+$/.test(name)) { skipped++; continue; } // charset gate (matches create/rename) — a bad-charset name (quotes/angle-brackets) is skipped, not stored, so account.name stays XSS-safe in the card inline handlers
         const key = store.sanitizeName(name).toLowerCase();
         if (!key || existing.has(key)) { skipped++; continue; } // duplicate on the on-disk identity (existing OR earlier in this batch) → skip
         if (overLimit('accounts', (data.accounts || []).filter((a) => !a.isModerator).length)) { limited++; continue; }
@@ -1226,17 +1242,24 @@ ipcMain.handle('set-account-credentials', async (_e, accountName, email, passwor
 ipcMain.handle('get-account-credentials', (_e, accountName) => {
   const a = getData().accounts.find((x) => x.name === accountName);
   if (!a) return fail('Account not found');
-  return ok({ email: secret.decrypt(a.email || ''), hasPassword: !!a.password });
+  // Return the DECRYPTED password too (local-only IPC, same as the email) so the edit-account modal can SHOW it — the
+  // operator asked to see their own stored FB passwords. hasPassword stays for the "auto-login set" badge.
+  return ok({ email: secret.decrypt(a.email || ''), password: secret.decrypt(a.password || ''), hasPassword: !!a.password });
 });
 
 ipcMain.handle('rename-account', async (_e, oldName, newName) => {
   try {
     if (orchestrator && orchestrator.isRunning()) return fail('Stop automation before renaming an account');
     if (loginBrowsers.has(oldName)) return fail('Close the login browser for this account first');
+    if (!/^[a-zA-Z0-9_]+$/.test(String(newName || ''))) return fail('Account name can only contain letters, numbers, and underscores'); // main-process charset gate (never trust the renderer) — blocks a quote/angle-bracket in account.name that would XSS the account-card inline handlers
     const res = await store.update((data) => {
       const a = data.accounts.find((x) => x.name === oldName);
       if (!a) return { err: 'Account not found' };
-      if (data.accounts.some((x) => x.name === newName)) return { err: 'Name already in use' };
+      // Reject when the NEW name maps to ANOTHER account's on-disk key (sanitized folder), not just an exact raw match —
+      // else the rename's dir-move would collide with / overwrite a different account's Chrome profile + cookies.
+      const _nkey = store.sanitizeName(newName).toLowerCase();
+      if (!_nkey) return { err: 'New name has no usable characters' };
+      if (data.accounts.some((x) => x.name !== oldName && store.sanitizeName(x.name).toLowerCase() === _nkey)) return { err: 'That name maps to an existing account\'s profile folder' };
       try {
         const from = store.accountDir(oldName), to = path.join(store.paths.ACCOUNTS_DIR, store.sanitizeName(newName));
         if (fs.existsSync(from) && !fs.existsSync(to)) fs.renameSync(from, to);
@@ -1273,17 +1296,28 @@ ipcMain.handle('import-cookies', async (_e, accountName, cookies) => {
     const missing = ['c_user', 'xs'].filter((k) => !names.has(k));
     store.writeCookies(accountName, arr);
     console.log(`[import-cookies] ${accountName}: imported ${arr.length}, skipped ${skipped} junk entr${skipped === 1 ? 'y' : 'ies'}${missing.length ? `, MISSING critical cookie(s): ${missing.join(', ')}` : ''}`);
+    const warning = missing.length ? `Imported, but missing ${missing.join(' & ')} — Facebook will treat this account as logged out. Re-export cookies while logged in.`
+      : (!names.has('datr') ? `Imported, but missing "datr" (Facebook's device cookie) — the account logs in but looks like a NEW device, which means more checkpoints. Re-export the FULL cookie set (including datr).` : undefined);
+    // #1 (single-IP ban-hygiene): the post-import verification opens a NO-proxy real-IP FB browser (checkStatus) that
+    // ignores the pool's _realIpMax cap. While a run is active, import the cookies but DEFER the verification (mirrors the
+    // check-account-status + openLoginBrowser 1460 / check-account-memberships 1784 guards) so it can't add a concurrent session on the shared IP.
+    if (orchestrator && orchestrator.isRunning()) {
+      return ok({ status: 'imported', message: 'Cookies imported. Stop automation to verify the login (a status check opens a browser on your shared IP).', imported: arr.length, skipped, warning });
+    }
     setAccountStatus(accountName, 'checking', 'Verifying…');
     send('data-updated');
     const status = await checkStatus(accountName);
     setAccountStatus(accountName, status.status, status.message, status);
-    const warning = missing.length ? `Imported, but missing ${missing.join(' & ')} — Facebook will treat this account as logged out. Re-export cookies while logged in.`
-      : (!names.has('datr') ? `Imported, but missing "datr" (Facebook's device cookie) — the account logs in but looks like a NEW device, which means more checkpoints. Re-export the FULL cookie set (including datr).` : undefined);
     return ok({ status: status.status, message: status.message, imported: arr.length, skipped, warning });
   } catch (e) { return fail(e); }
 });
 
 ipcMain.handle('check-account-status', async (_e, accountName) => {
+  // #1 (single-IP ban-hygiene): checkStatus opens a NO-proxy real-IP FB browser (main.js ~1313) that ignores the pool's
+  // _realIpMax cap. Refuse while a run is active (mirrors openLoginBrowser 1460 / check-account-memberships 1784) so a
+  // manual "Check" can't become an extra concurrent session on the one shared IP on top of the posting fleet. The `busy`
+  // flag lets the renderer short-circuit rather than misread a non-'logged_in' status as logged-out and fire auto-login.
+  if (orchestrator && orchestrator.isRunning()) return { status: 'busy', message: 'Automation is running — stop it to check status.', busy: true };
   setAccountStatus(accountName, 'checking', 'Verifying…');
   send('data-updated');
   const res = await checkStatus(accountName);
@@ -1319,7 +1353,7 @@ async function checkStatus(accountName) {
     // A2: resilient injection — try batch first, fall back to one-by-one so one bad
     // cookie can't prevent ALL cookies from being set.
     if (cookies.length) {
-      const normalized = cookies.map(normalizeCookie);
+      const normalized = cookies.map(store.normalizeCookie); // C1: route through store's INV-25-compliant normalizer (forces secure:true for sameSite:None) — the removed local copy dropped xs/c_user on a minimal jar → false "not logged in" → a needless real-IP auto-login
       try {
         await page.setCookie(...normalized);
       } catch {
@@ -1377,7 +1411,7 @@ async function checkStatus(accountName) {
     return { status: 'logged_in', message: `Active — c_user=${fbUserId}${fbName ? ' (' + fbName + ')' : ''}`, fbUserId, fbName };
   } catch (e) {
     return { status: 'error', message: e.message };
-  } finally { if (browser) await browser.close().catch(() => {}); }
+  } finally { if (browser) { try { await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 8000))]); } catch {} try { const proc = browser.process && browser.process(); if (proc && !proc.killed) proc.kill('SIGKILL'); } catch {} } } // bounded close + SIGKILL (matches every other teardown) — a wedged probe Chromium can't hang the awaiting IPC forever or orphan the profile lock
 }
 
 // Fix #3: accept full result object to persist fbUserId, fbName, lastChecked.
@@ -1428,7 +1462,10 @@ function clearInterruptedLoginStates() {
     }
     changed = true;
   }
-  if (changed) store.save(data);
+  // getData() above is store.load(); if it couldn't READ an existing data.json (transient Defender/OneDrive lock at
+  // post-crash boot — exactly when this runs), `data` was rebuilt from .bak/blank. A bare save() here would then write
+  // that stale snapshot over the good-but-locked primary. update() has this guard built in; the bare save() does not.
+  if (changed && !store.primaryUnreadable()) store.save(data);
 }
 
 // Open a VISIBLE browser for manual login; persist cookies while open; notify on close.
@@ -1437,22 +1474,40 @@ async function openLoginBrowser(accountName, opts = {}) {
   // re-join a group / fix a held post AS this account), or 'autologin' (open /login + human-like credentialLogin fill;
   // on captcha/2FA/failure the visible window just stays open to finish manually). All modes share the SAME battle-
   // tested loginBrowsers map + cookie-save-on-close + status-verify, so session handling is identical + safe.
+  // Normalize the 'browse' target(s): a single opts.gotoUrl, OR opts.gotoUrls[] for the multi-group "Open groups" (one
+  // browser, one tab per assigned group — a profile can only be launched once). Empty in login/autologin modes.
+  const _browseUrls = (opts.mode === 'browse')
+    ? (Array.isArray(opts.gotoUrls) && opts.gotoUrls.length ? opts.gotoUrls.map(String) : (opts.gotoUrl ? [String(opts.gotoUrl)] : []))
+    : [];
   // Fix #6: already open guard
   if (loginBrowsers.has(accountName)) {
-    // A window is already open for this account (one profile/session at a time). If the operator asked for a specific
-    // group, navigate the EXISTING window there + bring it to front (so "open a group" still works); else just surface it.
+    // A window is already open for this account (one profile/session at a time). Navigate it to the requested group(s)
+    // — opening extra tabs for a multi-group request — + bring it to front; else just surface it.
     try {
       const _ent = loginBrowsers.get(accountName);
       const _p = _ent && _ent.browser && (await _ent.browser.pages())[0];
-      if (_p) { if (opts.mode === 'browse' && opts.gotoUrl) await _p.goto(String(opts.gotoUrl), { waitUntil: 'domcontentloaded' }).catch(() => {}); await _p.bringToFront().catch(() => {}); }
+      if (_p) {
+        if (_browseUrls.length) {
+          await _p.goto(_browseUrls[0], { waitUntil: 'domcontentloaded' }).catch(() => {});
+          for (const _u of _browseUrls.slice(1)) { try { const _np = await _ent.browser.newPage(); await _np.goto(_u, { waitUntil: 'domcontentloaded' }).catch(() => {}); } catch {} }
+        }
+        await _p.bringToFront().catch(() => {});
+      }
     } catch {}
-    emit('automation-log', `🔐 [${accountName}] browser already open — ${(opts.mode === 'browse' && opts.gotoUrl) ? 'navigated it to the group' : 'brought it to front'}`);
+    emit('automation-log', `🔐 [${accountName}] browser already open — ${_browseUrls.length ? (_browseUrls.length > 1 ? 'opened its groups in new tabs' : 'navigated it to the group') : 'brought it to front'}`);
     return;
   }
 
   // Fix #4: block login if automation is using this profile
   if (orchestrator && orchestrator.isRunning()) {
     emit('automation-log', `🔐 [${accountName}] cannot open login — automation is using this profile; stop automation first`);
+    return;
+  }
+
+  // Only open a browser for a CONFIGURED account. A remote POST /api/accounts/:name/login (or a mistyped name) for an
+  // unknown account would otherwise spawn a real Chrome + create a junk profile dir that maps to no account. Gate it here.
+  if (!(getData().accounts || []).some((a) => a.name === accountName)) {
+    emit('automation-log', `🔐 [${accountName}] no such account — not opening a browser`);
     return;
   }
 
@@ -1500,6 +1555,11 @@ async function openLoginBrowser(accountName, opts = {}) {
     // and the browser is on the REAL host IP — faking a proxy-region clock there is the incoherent context we want to AVOID.
     if (_proxyArg) { try { await applyProxyGeo(page, _acct, _d.settings || {}, _useProxies, _proxies, (m) => emit('automation-log', `🔐 [${accountName}] ${m}`)); } catch {} }
   } catch (e) {
+    // A throw AFTER launchStealth resolved (pages()/newPage()/authenticate/geo above) would otherwise ORPHAN this
+    // Chromium: the disconnected-close handler is wired via loginBrowsers.set() further down and hasn't run yet, so the
+    // process keeps holding the profile's userDataDir lock and blocks EVERY later launch on this account until an app
+    // restart. Bounded close + hard-kill (mirrors the posting/rescue/membership paths) before freeing the tunnel.
+    if (browser) { try { await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 8000))]); } catch {} try { const proc = browser.process && browser.process(); if (proc && !proc.killed) proc.kill('SIGKILL'); } catch {} }
     if (_anonLocal && proxyChain) { try { await Promise.race([proxyChain.closeAnonymizedProxy(_anonLocal, true).catch(() => {}), new Promise((r) => setTimeout(r, 8000))]); } catch {} } // free the tunnel a failed launch would otherwise leak
     throw e;
   }
@@ -1524,9 +1584,12 @@ async function openLoginBrowser(accountName, opts = {}) {
 
   // opts.gotoUrl (built + sanitized in the handler) lets 'browse' land on a specific FB group so the operator can confirm
   // membership / re-join AS this account, through its proxy. Gated on mode==='browse' so it can never redirect login/autologin.
-  const _navUrl = (opts.mode === 'browse' && opts.gotoUrl) ? String(opts.gotoUrl) : (opts.mode === 'browse' ? 'https://www.facebook.com/' : 'https://www.facebook.com/login');
+  const _navUrl = _browseUrls.length ? _browseUrls[0] : (opts.mode === 'browse' ? 'https://www.facebook.com/' : 'https://www.facebook.com/login');
   await page.goto(_navUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
-  emit('automation-log', `🔐 [${accountName}] navigated to ${page.url()} — ${opts.mode === 'browse' ? 'browse as this account (re-join a group / fix a held post), then close when done' : 'waiting for you to log in'}`);
+  // Multi-group "Open groups": open one ADDITIONAL tab per extra assigned group, then re-focus the first tab.
+  for (const _u of _browseUrls.slice(1)) { try { const _p2 = await browser.newPage(); await _p2.goto(_u, { waitUntil: 'domcontentloaded' }).catch(() => {}); } catch {} }
+  if (_browseUrls.length > 1) { try { await page.bringToFront(); } catch {} }
+  emit('automation-log', `🔐 [${accountName}] navigated to ${page.url()}${_browseUrls.length > 1 ? ` (+${_browseUrls.length - 1} more group tab${_browseUrls.length > 2 ? 's' : ''})` : ''} — ${opts.mode === 'browse' ? 'browse as this account (re-join a group / fix a held post), then close when done' : 'waiting for you to log in'}`);
   // AUTO-LOGIN mode (the Check button on a logged-out account WITH stored creds): fill the FB form human-like via the
   // worker's credentialLogin. On a captcha/2FA or ANY failure it just leaves the visible window open to finish by hand
   // (same end-state as manual login) — it never throws out of here.
@@ -1571,7 +1634,7 @@ async function openLoginBrowser(accountName, opts = {}) {
         const cUser = pageCookies.find((c) => c.name === 'c_user' && c.value);
         if (cUser) {
           sessionDetectedLogged = true;
-          emit('automation-log', `🔑 [${accountName}] session detected (c_user=${cUser.value}) — keep going / you can close when done`);
+          emit('automation-log', `🔑 [${accountName}] session detected (c_user=${String(cUser.value).slice(0, 4)}…) — keep going / you can close when done`); // L1: mask the FB UID (semi-public, but the log stream is reachable over the tunnel)
         }
       }
     } catch {}
@@ -1602,6 +1665,11 @@ async function openLoginBrowser(accountName, opts = {}) {
           } catch {}
         }
         emit('automation-log', `✅ [${accountName}] logged in as ${res.fbName || '(unknown)'} (c_user=${res.fbUserId || '?'})`);
+        // H2/H3: a GENUINE manual re-login un-benches the attention-rest ONLY for a logged-OUT (needs_login) bench —
+        // never for checkpoint/blocked/disabled (a logged_in cookie-probe does NOT prove FB lifted those, so clearing
+        // them would re-launch a still-blocked account into the shared IP = ban-axis). Keyed on the persisted REASON
+        // (attnFlag), not the churnable status field. Automation is stopped during openLoginBrowser → this write is race-free.
+        try { let _un = false; await store.update((dd) => { const a = (dd.accounts || []).find((x) => x.name === accountName); if (a && a.attnFlag === 'needs_login') { a.nextAttnRetry = 0; a.attnStrikes = 0; a.attnFlag = ''; _un = true; } }); if (_un) { send('data-updated'); emit('automation-log', `↩️ [${accountName}] re-login cleared its rest — it rejoins the next cycle`); } } catch {}
       } else {
         emit('automation-log', `❌ [${accountName}] not logged in: ${res.message}`);
       }
@@ -1758,6 +1826,27 @@ ipcMain.handle('open-account-browser', async (_e, accountName, groupId) => {
     return ok();
   } catch (e) { return fail(e); }
 });
+// Open ALL of THIS account's assigned groups AS the account (its own profile + proxy), each in its own TAB, in ONE
+// browser (a profile can only be launched once). URLs are built + sanitized HERE (single source of truth) so the
+// renderer can only ever reach facebook.com/groups/<id>. Capped so a huge assignment can't spawn dozens of tabs.
+ipcMain.handle('open-account-groups', async (_e, accountName) => {
+  try {
+    const _d = getData();
+    const acct = (_d.accounts || []).find((a) => a.name === accountName);
+    if (!acct) return fail(new Error('account not found'));
+    const MAX_TABS = 12;
+    const ids = (acct.assignedGroups || [])
+      .map((id) => (_d.groups || []).find((g) => g.id === id || g.groupId === id))
+      .filter((g) => g && (g.groupId || g.id))
+      .map((g) => String(g.groupId || g.id).trim().replace(/[^A-Za-z0-9._-]/g, '')) // digits OR a vanity slug only — strips slashes/protocol/query
+      .filter(Boolean);
+    const uniq = [...new Set(ids)];
+    if (!uniq.length) return fail(new Error('This account has no assigned groups with a saved Facebook id.'));
+    const urls = uniq.slice(0, MAX_TABS).map((gid) => `https://www.facebook.com/groups/${encodeURIComponent(gid)}`);
+    await openLoginBrowser(accountName, { mode: 'browse', gotoUrls: urls });
+    return { success: true, opened: urls.length, total: uniq.length };
+  } catch (e) { return fail(e); }
+});
 ipcMain.handle('auto-login-account', async (_e, accountName) => {
   try { await openLoginBrowser(accountName, { mode: 'autologin' }); return ok(); }
   catch (e) { return fail(e); }
@@ -1830,13 +1919,15 @@ ipcMain.handle('check-account-memberships', async (_e, accountName) => {
     }
   } catch (e) {
     membershipChecks.delete(accountName);
-    if (browser) { try { await browser.close().catch(() => {}); } catch {} }
+    try { if (browser) await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 8000))]); } catch {} // bounded close + hard-kill (mirrors the success path)
+    try { const proc = browser && browser.process && browser.process(); if (proc && !proc.killed) proc.kill('SIGKILL'); } catch {}
     if (_anonLocal && proxyChain) { try { await Promise.race([proxyChain.closeAnonymizedProxy(_anonLocal, true).catch(() => {}), new Promise((r) => setTimeout(r, 8000))]); } catch {} }
     return { success: false, error: 'Could not open the account browser: ' + ((e && e.message) || e) + (results.length ? ' (partial results returned)' : ''), results };
   }
-  if (browser) { try { await browser.close().catch(() => {}); } catch {} }
+  membershipChecks.delete(accountName); // delete BEFORE the close: a proxied-browser CLOSE_WAIT hang on browser.close() must not leak the membershipChecks entry, or isCheckOpen makes the orchestrator skip this account EVERY future cycle until an app restart
+  try { if (browser) await Promise.race([browser.close().catch(() => {}), new Promise((r) => setTimeout(r, 8000))]); } catch {} // bounded close (mirrors worker/rescue/repost/moderator)
+  try { const proc = browser && browser.process && browser.process(); if (proc && !proc.killed) proc.kill('SIGKILL'); } catch {} // hard-kill if the bounded close hung, else the Chromium orphans holding the profile
   if (_anonLocal && proxyChain) { try { await Promise.race([proxyChain.closeAnonymizedProxy(_anonLocal, true).catch(() => {}), new Promise((r) => setTimeout(r, 8000))]); } catch {} }
-  membershipChecks.delete(accountName);
   const memberN = results.filter((x) => x.status === 'member').length;
   emit('automation-log', `🔎 [${accountName}] membership check done — ${memberN}/${results.length} member`);
   return { success: true, results };
@@ -2027,23 +2118,6 @@ ipcMain.handle('update-server-url', (_e, url) => {
   try { fs.writeFileSync(licenseCfgPath(), JSON.stringify({ serverUrl: url })); return ok(); } catch (e) { return fail(e); }
 });
 
-// Shared cookie normalizer (kept identical to worker's).
-// A1: default domain to .facebook.com if missing; wrap in try so one bad cookie can't throw.
-function normalizeCookie(c) {
-  try {
-    const out = {
-      name: c.name,
-      value: String(c.value ?? ''),
-      domain: c.domain || '.facebook.com',
-      path: c.path || '/',
-    };
-    if (typeof c.expires === 'number' && c.expires > 0) out.expires = c.expires;
-    if (typeof c.httpOnly === 'boolean') out.httpOnly = c.httpOnly;
-    if (typeof c.secure === 'boolean') out.secure = c.secure;
-    const ss = String(c.sameSite || '').toLowerCase();
-    out.sameSite = ss === 'lax' ? 'Lax' : ss === 'strict' ? 'Strict' : 'None';
-    return out;
-  } catch {
-    return { name: String(c && c.name || '__bad__'), value: '', domain: '.facebook.com', path: '/' };
-  }
-}
+// Cookie normalizer lives in lib/store (store.normalizeCookie) — the INV-25-compliant single source
+// (forces secure:true for sameSite:'None', covered by tests/cookie-normalize.test.js). The former local
+// copy here diverged (no secure:true) and dropped xs/c_user on a minimal jar → removed (C1).

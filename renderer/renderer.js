@@ -93,11 +93,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       _duRunning = true;
       try {
         await loadData();
-        updateDashboard();
-        const isActive = (id) => { const el = document.getElementById(id); return el && el.classList.contains('active'); };
-        if (isActive('posts-view') && typeof renderPosts === 'function') renderPosts();
-        if (isActive('accounts-view') && typeof renderAccounts === 'function') renderAccounts();
-        if (isActive('groups-view') && typeof renderGroups === 'function') renderGroups();
+        preserveScroll(() => {
+          updateDashboard();
+          const isActive = (id) => { const el = document.getElementById(id); return el && el.classList.contains('active'); };
+          if (isActive('posts-view') && typeof renderPosts === 'function') renderPosts();
+          if (isActive('accounts-view') && typeof renderAccounts === 'function') renderAccounts();
+          if (isActive('groups-view') && typeof renderGroups === 'function') renderGroups();
+        });
       } finally { _duRunning = false; if (_duPending) { _duPending = false; _duTimer = setTimeout(() => { _duTimer = null; _doDataUpdate(); }, 400); } }
     };
     window.electronAPI.onDataUpdated(() => {
@@ -147,9 +149,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       const offlineEl = document.getElementById('offline-indicator');
       if (offlineEl) offlineEl.style.display = data.offline ? 'inline-block' : 'none';
       // Live per-account operations panel — show EVERY account's state (running/queued/done/…), not just the few in parallel.
-      if (Array.isArray(data.accounts)) renderLiveOps(data.accounts);
-      // Refresh the campaign-plan "done" overlay live during a run — throttled (the ledger updates as posts land).
-      planLiveRefresh();
+      // Wrapped in preserveScroll so the frequent live rebuilds don't yank the operator's scroll to the top.
+      preserveScroll(() => {
+        if (Array.isArray(data.accounts)) renderLiveOps(data.accounts);
+        // Refresh the campaign-plan "done" overlay live during a run — throttled (the ledger updates as posts land).
+        planLiveRefresh();
+      });
     });
   }
 
@@ -771,6 +776,20 @@ function handleQuickAction(action) {
 }
 
 // Dashboard
+// Preserve scroll across a re-render. A live run re-renders the active view + dashboard panels every ~400ms; replacing
+// innerHTML momentarily collapses the content and snaps the page (and scrollable panels) back to the TOP — which makes
+// scrolling during a run useless. Capture the window + panel scroll offsets by id (so re-created elements are re-found),
+// run the render, then restore them synchronously (same JS task → the browser only paints the final, restored state).
+function preserveScroll(render) {
+  const wy = window.scrollY || window.pageYOffset || 0;
+  const ids = ['live-ops-body', 'health-accounts', 'plan-scroll'];
+  const saved = {};
+  for (const id of ids) { const el = document.getElementById(id); if (el) saved[id] = el.scrollTop; }
+  try { render(); } finally {
+    for (const id of ids) { if (saved[id] != null) { const el = document.getElementById(id); if (el) { try { el.scrollTop = saved[id]; } catch {} } } }
+    if (wy && Math.abs((window.scrollY || 0) - wy) > 1) { try { window.scrollTo(0, wy); } catch {} }
+  }
+}
 function updateDashboard() {
   const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
   set('stat-posts', appData.posts.length);
@@ -789,24 +808,68 @@ function updateDashboard() {
   }
 
   renderHealth();
-  renderCampaignPlan();
+  renderAttention();
+  if (!isAutomationRunning) { try { renderLiveOps([]); } catch {} } // idle → show the schedule hint instead of stale rows (a live run drives this via progress events)
+  planLiveRefresh(); // THROTTLED (≤ every 8s): updateDashboard fires on every debounced data-update (~2×/s during a run);
+                     // calling renderCampaignPlan() directly here re-ran a getPlan IPC + full table rebuild each time (a stall).
+                     // planLiveRefresh renders immediately on the first call (init) then coalesces — same freshness, no churn.
+}
+
+// NEEDS ATTENTION — surface the things that need the OPERATOR right now (logged-out accounts, held posts, misconfig).
+// The #1 job of the dashboard for an unattended run. Shown as an amber card only when there's an ACTION to take; a calm
+// green line when all is well; rate-limit cooling is informational (auto-resumes) so it's a note, never an alarm.
+function renderAttention() {
+  const el = document.getElementById('dash-attention');
+  if (!el) return;
+  const active = (appData.accounts || []).filter((a) => !a.isModerator && a.enabled !== false);
+  const now = Date.now();
+  const needsLogin = active.filter((a) => a.status === 'not_logged_in' || a.status === 'error').length;
+  const needsVerify = active.filter((a) => a.status === 'checkpoint').length;
+  const cooling = active.filter((a) => a.status === 'rate_limited' || (Number(a.rateLimitedUntil) || 0) > now).length;
+  const noGroups = active.filter((a) => !(a.assignedGroups || []).length).length;
+  const held = (_planData && _planData.totals && Number(_planData.totals.held)) || 0;
+  const items = [];
+  if (needsLogin) items.push(['🔴', `${needsLogin} account${needsLogin > 1 ? 's are' : ' is'} logged out`, "switchView('accounts')", 'Re-login']);
+  if (needsVerify) items.push(['🔐', `${needsVerify} account${needsVerify > 1 ? 's need' : ' needs'} Facebook verification`, "switchView('accounts')", 'Verify']);
+  if (noGroups) items.push(['📋', `${noGroups} active account${noGroups > 1 ? 's have' : ' has'} no groups assigned — won't post`, "switchView('accounts')", 'Assign']);
+  if (held) items.push(['⏳', `${held} post${held > 1 ? 's' : ''} held for approval`, "switchView('groups')", 'Review']);
+  const coolNote = cooling ? `<div style="font-size:11.5px;color:#60a5fa;margin-top:${items.length ? '7px' : '0'};">🧊 ${cooling} account${cooling > 1 ? 's' : ''} cooling down after a rate-limit — auto-resumes, no action needed.</div>` : '';
+  if (!items.length) {
+    el.innerHTML = `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:rgba(52,211,153,0.06);border:1px solid rgba(52,211,153,0.2);border-radius:14px;padding:11px 16px;">
+        <span style="font-size:15px;">✅</span>
+        <span style="font-size:13px;color:#a7f3d0;">All ${active.length} active account${active.length === 1 ? '' : 's'} healthy — nothing needs you right now.</span>
+        <span style="flex:1;min-width:8px;"></span>${coolNote}
+      </div>`;
+    return;
+  }
+  const rows = items.map(([icon, text, action, cta]) => `<div style="display:flex;align-items:center;gap:11px;padding:7px 2px;">
+      <span style="font-size:15px;flex-shrink:0;">${icon}</span>
+      <span style="flex:1;font-size:13px;color:#f1f5f9;">${text}</span>
+      <button onclick="${action}" style="background:rgba(99,102,241,0.2);border:1px solid rgba(99,102,241,0.4);border-radius:7px;color:#c7d2fe;font-size:12px;font-weight:600;padding:4px 12px;cursor:pointer;white-space:nowrap;">${cta} →</button>
+    </div>`).join('');
+  el.innerHTML = `<div style="background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.28);border-radius:16px;padding:13px 18px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;"><span style="font-size:15px;">⚠️</span><h3 style="font-size:12px;font-weight:700;color:#fbbf24;text-transform:uppercase;letter-spacing:0.05em;margin:0;">Needs your attention</h3></div>
+      ${rows}${coolNote}
+    </div>`;
 }
 
 // Render account health card from appData.accounts
 function renderHealth() {
   // Moderators are not part of the posting fleet — keep them out of the health counts/chips.
   const accounts = (appData.accounts || []).filter(a => !a.isModerator);
-  let loggedIn = 0, needsLogin = 0, rateLimited = 0, other = 0;
+  let loggedIn = 0, needsLogin = 0, rateLimited = 0, checkpoint = 0, other = 0;
   for (const a of accounts) {
     if (a.status === 'logged_in') loggedIn++;
     else if (a.status === 'not_logged_in') needsLogin++;
     else if (a.status === 'rate_limited') rateLimited++;
+    else if (a.status === 'checkpoint') checkpoint++;
     else other++;
   }
   const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
   set('health-loggedin', loggedIn);
   set('health-needslogin', needsLogin);
   set('health-ratelimited', rateLimited);
+  set('health-checkpoint', checkpoint);
   set('health-other', other);
 
   const container = document.getElementById('health-accounts');
@@ -847,7 +910,10 @@ function renderLiveOps(accounts) {
   const summary = document.getElementById('live-ops-summary');
   if (!body) return;
   if (!accounts || !accounts.length) {
-    body.innerHTML = '<p class="text-xs text-gray-500 py-2">Idle — start a run to see every account working live.</p>';
+    const s = appData.settings || {};
+    const sched = (s.scheduleMode === 'daily' && s.dailyPostTime) ? ` Next daily run at <b style="color:#cbd5e1;">${escapeHtml(s.dailyPostTime)}</b>.`
+      : (s.scheduleMode === 'continuous' ? ' Continuous mode — it begins on ▶ Start and keeps cycling.' : '');
+    body.innerHTML = `<div style="display:flex;align-items:center;gap:8px;color:#64748b;font-size:12px;padding:8px 2px;"><span style="font-size:14px;">💤</span><span>Idle — start a run to watch every account work live in real time.${sched}</span></div>`;
     if (summary) summary.textContent = '';
     return;
   }
@@ -928,6 +994,10 @@ function drawCampaignPlan() {
     if (p.cycleDays) bits.push(`${p.cycleDays}-cycle plan`);
     if (t.posted) bits.push(`<span style="color:#34d399;">${t.posted} delivered</span>`);
     if (t.held) bits.push(`<span style="color:#fbbf24;">${t.held} held</span>`);
+    // Overall campaign progress (across ALL cycles, delivered vs planned group-posts) — the "am I on track" number.
+    const _allR = (p.days || []).flatMap((d) => d.rows || []);
+    const _ogT = _allR.reduce((s, r) => s + (r.groupsTotal || 0), 0), _ogD = _allR.reduce((s, r) => s + (r.groupsDone || 0), 0);
+    if (_ogT) bits.push(`<span style="color:${_ogD >= _ogT ? '#34d399' : '#818cf8'};font-weight:700;">${Math.round((_ogD / _ogT) * 100)}% of campaign done</span>`);
     bits.push(p.ongoing ? 'loops' : 'completes then stops');
     overall.innerHTML = bits.join(' · ');
   }
@@ -969,7 +1039,26 @@ function drawCampaignPlan() {
         <div style="height:6px;background:rgba(255,255,255,0.06);border-radius:99px;overflow:hidden;"><div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#6366f1,#34d399);border-radius:99px;transition:width .3s;"></div></div>
       </div>`);
 
+  // CYCLE STRIP: one pill per cycle (green=delivered, indigo=current, gray=upcoming; selected is wider) so the operator
+  // sees the WHOLE campaign arc at a glance and can jump to any cycle. Only when there's more than one cycle.
+  const pill = (d) => { const sel = d.offset === _planSelOffset; const c = d.when === 'past' ? '#34d399' : d.when === 'today' ? '#818cf8' : '#475569'; return `<button onclick="planGoto(${d.offset})" title="Cycle ${d.offset + 1} — ${escapeAttr(d.when)}" style="height:12px;width:${sel ? '28px' : '12px'};border-radius:6px;background:${c};border:${sel ? '2px solid #e0e7ff' : 'none'};padding:0;cursor:pointer;transition:width .15s;"></button>`; };
+  // Window the strip so a very long campaign (100s of cycles) renders at most ~60 pills, not 100s of DOM nodes.
+  const STRIP_CAP = 60;
+  let stripDays = p.days, headN = 0, tailN = 0;
+  if (p.days.length > STRIP_CAP) {
+    let si = p.days.findIndex((d) => d.offset === _planSelOffset); if (si < 0) si = p.todayIndex >= 0 ? p.todayIndex : 0;
+    const start = Math.max(0, Math.min(si - Math.floor(STRIP_CAP / 2), p.days.length - STRIP_CAP));
+    stripDays = p.days.slice(start, start + STRIP_CAP);
+    headN = start; tailN = p.days.length - (start + STRIP_CAP);
+  }
+  const jumpBtn = (n, off, label) => n > 0 ? `<button onclick="planGoto(${off})" title="Jump — ${n} more cycle${n === 1 ? '' : 's'}" style="height:14px;padding:0 6px;border-radius:6px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#94a3b8;font-size:9px;cursor:pointer;">${label}</button>` : '';
+  const cycleStrip = (p.days.length > 1) ? `<div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin:0 0 12px;">
+      ${jumpBtn(headN, p.days[0].offset, '‹ ' + headN)}
+      ${stripDays.map(pill).join('')}
+      ${jumpBtn(tailN, p.days[p.days.length - 1].offset, tailN + ' ›')}
+    </div>` : '';
   body.innerHTML = `
+    ${cycleStrip}
     <div style="display:flex;align-items:center;gap:8px;margin:2px 0 10px;">
       ${navBtn(-1, atStart, '◀')}
       <div style="flex:1;text-align:center;font-size:13px;color:#e2e8f0;font-weight:600;">${day.offset >= 0 ? `Cycle ${day.offset + 1}` : escapeHtml(day.label || 'Past')} &nbsp;<span style="font-size:11px;">${whenBadge}</span></div>
@@ -977,7 +1066,7 @@ function drawCampaignPlan() {
       <button onclick="planToday()" style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:8px;color:#cbd5e1;font-size:11px;padding:4px 10px;cursor:pointer;">Current</button>
     </div>
     ${summaryBar}
-    ${rows ? `<div style="max-height:34vh;overflow:auto;border:1px solid rgba(255,255,255,0.06);border-radius:10px;">
+    ${rows ? `<div id="plan-scroll" style="max-height:34vh;overflow:auto;border:1px solid rgba(255,255,255,0.06);border-radius:10px;">
       <table style="width:100%;border-collapse:collapse;">
         <thead><tr style="position:sticky;top:0;background:rgba(9,13,28,0.96);">
           <th style="padding:6px 8px;text-align:left;font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.04em;">Account</th>
@@ -999,16 +1088,26 @@ function planNav(dir) {
   drawCampaignPlan();
 }
 function planToday() { _planSelOffset = 0; drawCampaignPlan(); }
+function planGoto(o) { _planSelOffset = o; drawCampaignPlan(); } // jump to a specific cycle from the cycle strip
 // Throttled live refresh (called from frequent automation-progress events): re-fetch the plan at most every 8s.
 let _planLiveAt = 0;
 function planLiveRefresh() { const now = Date.now(); if (now - _planLiveAt < 8000) return; _planLiveAt = now; renderCampaignPlan(); }
 
 // Posts Management
+// Small localStorage helpers so view/sort preferences persist across reloads (the Electron renderer has localStorage).
+function lsGet(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : v; } catch { return d; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
 let postSearch = '';
+let postSetFilter = 'all'; // 'all' | '__none__' (untagged) | a post-set id — filters the posts grid by set
+let postView = lsGet('za_postView', 'compact'); // 'compact' (small thumbnails) | 'detailed'
 let selectedPostIds = new Set(); // Posts-page multi-select → bulk remove
 function setPostSearch(v, sel0, sel1) { postSearch = v || ''; renderPosts(); const el = document.getElementById('post-search'); if (el) { try { el.focus(); const p = (sel0 == null ? el.value.length : sel0); el.setSelectionRange(p, sel1 == null ? p : sel1); } catch {} } }
 
 // --- Posts multi-select ---------------------------------------------------
+function setPostSetFilter(v) { postSetFilter = v || 'all'; renderPosts(); }
+function setPostView(v) { postView = (v === 'detailed') ? 'detailed' : 'compact'; lsSet('za_postView', postView); renderPosts(); }
+// Click a post card body (not the edit/delete buttons or the checkbox) → toggle its selection for bulk actions.
+function postCardClick(ev, id) { if (ev.target.closest('button, a, input, select, textarea, label')) return; togglePostSelect(id); }
 function togglePostSelect(id, ev) { if (ev) ev.stopPropagation(); id = String(id); if (selectedPostIds.has(id)) selectedPostIds.delete(id); else selectedPostIds.add(id); renderPosts(); }
 // Select-all toggles over the CURRENTLY VISIBLE (filtered) posts only, so it does what the user sees.
 let _postsVisibleIds = []; // set by renderPosts to the ids of the filtered cards on screen
@@ -1053,7 +1152,13 @@ function renderPosts() {
   }
 
   const q = (postSearch || '').toLowerCase();
-  const fposts = q ? appData.posts.filter((p) => ((p.caption || '') + ' ' + (p.comment || '')).toLowerCase().includes(q)) : appData.posts;
+  const _sets0 = ((appData.settings || {}).postSets) || [];
+  // Post-set FILTER ('all' | '__none__' untagged | a set id). Reset a stale filter if that set was deleted.
+  if (postSetFilter !== 'all' && postSetFilter !== '__none__' && !_sets0.some((s) => s.id === postSetFilter)) postSetFilter = 'all';
+  let fposts = appData.posts;
+  if (postSetFilter === '__none__') fposts = fposts.filter((p) => !p.postSetId);
+  else if (postSetFilter !== 'all') fposts = fposts.filter((p) => p.postSetId === postSetFilter);
+  if (q) fposts = fposts.filter((p) => ((p.caption || '') + ' ' + (p.comment || '')).toLowerCase().includes(q));
 
   // Prune selection to posts that still exist (survives re-renders; drops deleted/imported-away ids).
   const existing = new Set(appData.posts.map((p) => String(p.id)));
@@ -1062,7 +1167,7 @@ function renderPosts() {
   const allVisibleSelected = _postsVisibleIds.length && _postsVisibleIds.every((i) => selectedPostIds.has(i));
   const selCount = selectedPostIds.size;
 
-  const searchRow = `<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;"><input id="post-search" value="${escapeHtml(postSearch)}" oninput="setPostSearch(this.value, this.selectionStart, this.selectionEnd)" placeholder="🔍 Search posts by caption or comment…" style="flex:1;min-width:170px;padding:7px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;font-size:13px;outline:none;">${q ? `<span style="font-size:11px;color:#64748b;white-space:nowrap;">showing ${fposts.length}/${appData.posts.length}</span>` : ''}</div>`;
+  const searchRow = `<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;"><input id="post-search" value="${escapeAttr(postSearch)}" oninput="setPostSearch(this.value, this.selectionStart, this.selectionEnd)" placeholder="🔍 Search posts by caption or comment…" style="flex:1;min-width:170px;padding:7px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;font-size:13px;outline:none;">${(q || postSetFilter !== 'all') ? `<span style="font-size:11px;color:#64748b;white-space:nowrap;">showing ${fposts.length}/${appData.posts.length}</span>` : ''}<button onclick="setPostView('${postView === 'compact' ? 'detailed' : 'compact'}')" title="Toggle card size — Compact (small thumbnails) vs Detailed" style="background:#1e293b;color:#cbd5e1;border:1px solid #6366f155;border-radius:8px;padding:7px 11px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;">${postView === 'compact' ? '▦ Compact' : '▤ Detailed'} ⇄</button></div>`;
   const selectRow = `<div style="margin-bottom:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#cbd5e1;cursor:pointer;user-select:none;">
         <input type="checkbox" ${allVisibleSelected ? 'checked' : ''} onclick="toggleSelectAllPosts()" style="width:16px;height:16px;cursor:pointer;accent-color:#6366f1;">
@@ -1073,24 +1178,33 @@ function renderPosts() {
       <button onclick="clearPostSelection()" title="Clear selection" style="padding:6px 12px;font-size:13px;color:#cbd5e1;background:#1e293b;border:1px solid #334155;border-radius:8px;cursor:pointer;">✕ Clear</button>` : ''}
     </div>`;
   // POST SETS bar: manage named sets + (when posts are selected) bulk-assign them to a set.
-  const sets = ((appData.settings || {}).postSets) || [];
+  const sets = _sets0;
+  const totalPosts = appData.posts.length;
+  const untaggedCnt = appData.posts.filter((p) => !p.postSetId).length;
+  const _pfChip = (label, val, title) => `<span onclick="setPostSetFilter('${escapeAttr(val)}')" title="${escapeAttr(title || label)}" style="cursor:pointer;font-size:12px;background:${postSetFilter === val ? '#6366f1' : '#1e293b'};color:${postSetFilter === val ? '#fff' : '#94a3b8'};border:1px solid #6366f155;border-radius:999px;padding:3px 11px;font-weight:600;">${label}</span>`;
   const setChips = sets.map((s) => {
     const cnt = appData.posts.filter((p) => p.postSetId === s.id).length;
-    return `<span style="display:inline-flex;align-items:center;gap:5px;font-size:12px;background:rgba(99,102,241,0.14);color:#c7d2fe;border:1px solid rgba(99,102,241,0.35);border-radius:999px;padding:3px 10px;">📦 ${escapeHtml(s.name)} <span style="color:#94a3b8;">(${cnt})</span><span onclick="deletePostSet('${escapeAttr(s.id)}')" title="Delete set (posts revert to default)" style="cursor:pointer;color:#f87171;font-weight:700;margin-left:2px;">✕</span></span>`;
+    const active = postSetFilter === s.id;
+    return `<span style="display:inline-flex;align-items:center;gap:6px;font-size:12px;background:${active ? '#6366f1' : 'rgba(99,102,241,0.14)'};color:${active ? '#fff' : '#c7d2fe'};border:1px solid rgba(99,102,241,0.35);border-radius:999px;padding:3px 6px 3px 11px;"><span onclick="setPostSetFilter('${escapeAttr(s.id)}')" title="Show only this set" style="cursor:pointer;">📦 ${escapeHtml(s.name)} <span style="opacity:0.75;">(${cnt})</span></span><span onclick="deletePostSet('${escapeAttr(s.id)}')" title="Delete set (its posts revert to the default library)" style="cursor:pointer;color:${active ? '#fecaca' : '#f87171'};font-weight:700;">✕</span></span>`;
   }).join('');
   const assignDropdown = selCount ? `<select onchange="if(this.value!==''){assignSelectedToSet(this.value==='__none__'?'':this.value);this.value='';}" style="font-size:12px;padding:5px 8px;background:#0f172a;border:1px solid #6366f1;border-radius:8px;color:#e5e7eb;cursor:pointer;">
       <option value="">📦 Assign ${selCount} selected to…</option>
       <option value="__none__">— default (all) —</option>
       ${sets.map((s) => `<option value="${escapeAttr(s.id)}">${escapeHtml(s.name)}</option>`).join('')}
     </select>` : '';
-  const postSetsBar = `<div style="margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 11px;background:rgba(30,41,59,0.5);border:1px solid #334155;border-radius:10px;">
-      <span style="font-size:12px;font-weight:700;color:#cbd5e1;" title="Tag posts into a set, then assign one set per batch in Quick Setup so each batch posts different content.">📦 Post sets:</span>
-      ${sets.length ? setChips : '<span style="font-size:12px;color:#64748b;">none yet — create sets to give each batch its own posts</span>'}
-      <input id="new-postset-name" placeholder="new set name" maxlength="40" onkeydown="if(event.key==='Enter'){addPostSetFromInput();}" style="font-size:12px;padding:5px 9px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;outline:none;width:120px;">
+  const postSetsBar = `<div style="margin-bottom:12px;display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:8px 11px;background:rgba(30,41,59,0.5);border:1px solid #334155;border-radius:10px;">
+      <span style="font-size:12px;font-weight:700;color:#cbd5e1;" title="Tag posts into a set, then assign one set per batch in Quick Setup so each batch posts different content. Click a chip to view just that set.">📦 Sets:</span>
+      ${_pfChip(`All (${totalPosts})`, 'all', 'Show all posts')}
+      ${setChips}
+      ${_pfChip(`Untagged (${untaggedCnt})`, '__none__', 'Show posts not in any set (the default library)')}
+      <span style="width:1px;height:18px;background:#334155;margin:0 3px;"></span>
+      <input id="new-postset-name" placeholder="new set name" maxlength="40" onkeydown="if(event.key==='Enter'){addPostSetFromInput();}" style="font-size:12px;padding:5px 9px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;outline:none;width:110px;">
       <button onclick="addPostSetFromInput()" style="font-size:12px;padding:5px 11px;font-weight:600;color:#fff;background:linear-gradient(135deg,#6366f1,#4f46e5);border:none;border-radius:8px;cursor:pointer;">+ Add set</button>
       ${assignDropdown}
     </div>`;
-  const postToolbar = searchRow + postSetsBar + selectRow;
+  const postToolbar = `<div style="grid-column:1 / -1;">${searchRow}${postSetsBar}${selectRow}</div>`;
+  document.body.classList.toggle('posts-compact', postView === 'compact'); // compact = CSS shrinks thumbnails + hides caption
+  container.style.gridTemplateColumns = postView === 'compact' ? 'repeat(auto-fill, minmax(130px, 1fr))' : ''; // compact = extra-small dense grid; detailed reverts to the Tailwind 3-col class
   container.innerHTML = postToolbar + (fposts.length ? fposts.map(post => {
     const pid = String(post.id);
     const selected = selectedPostIds.has(pid);
@@ -1108,7 +1222,7 @@ function renderPosts() {
           <img src="${escapeAttr(firstImage)}" alt="Post" class="post-image" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22300%22 height=%22200%22><rect fill=%22%23e5e7eb%22 width=%22300%22 height=%22200%22/><text x=%2250%%22 y=%2250%%22 font-family=%22Arial%22 font-size=%2218%22 fill=%22%236b7280%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22>Image</text></svg>'">
           ${countBadge}
         </div>`
-      : `<div style="background:linear-gradient(135deg,#1e293b,#334155);padding:24px 16px;display:flex;align-items:center;justify-content:center;min-height:100px;border-radius:12px 12px 0 0;">
+      : `<div class="post-textonly" style="background:linear-gradient(135deg,#1e293b,#334155);padding:24px 16px;display:flex;align-items:center;justify-content:center;min-height:100px;border-radius:12px 12px 0 0;">
           <span style="font-size:28px;">📝</span>
           <span style="color:#94a3b8;font-size:13px;margin-left:10px;font-weight:500;">Text Only</span>
         </div>`;
@@ -1118,7 +1232,7 @@ function renderPosts() {
     const setBadge = _setName ? `<span class="post-badge" style="background:rgba(99,102,241,0.18);color:#a5b4fc;">📦 ${escapeHtml(_setName)}</span>` : '';
 
     return `
-    <div class="post-card" style="position:relative;${selected ? 'outline:2px solid #6366f1;outline-offset:-2px;' : ''}">
+    <div class="post-card" onclick="postCardClick(event, '${pid}')" title="Tip: click the card to select it for a bulk action" style="cursor:pointer;position:relative;${selected ? 'outline:2px solid #6366f1;outline-offset:-2px;' : ''}">
       <label onclick="event.stopPropagation()" title="Select for bulk delete" style="position:absolute;top:6px;left:6px;z-index:3;background:rgba(15,23,42,0.78);border-radius:6px;padding:3px 4px;display:flex;cursor:pointer;">
         <input type="checkbox" ${selected ? 'checked' : ''} onclick="togglePostSelect('${pid}', event)" style="width:17px;height:17px;cursor:pointer;accent-color:#6366f1;margin:0;">
       </label>
@@ -1136,7 +1250,7 @@ function renderPosts() {
         </div>
       </div>
     </div>
-  `}).join('') : `<div class="empty-state" style="padding:24px;"><div class="icon">🔍</div><h3>No posts match</h3><p>Clear the search to see all posts.</p></div>`);
+  `}).join('') : `<div class="empty-state" style="padding:24px;grid-column:1 / -1;"><div class="icon">🔍</div><h3>No posts match</h3><p>Clear the search or pick <b>📦 All</b> to see every post.</p></div>`);
 }
 
 // ---- POST SETS (post-groups) -----------------------------------------------------------------------
@@ -1413,6 +1527,8 @@ function toggleSelectAllGroups() {
   renderGroups();
 }
 function clearGroupSelection() { selectedGroupIds.clear(); renderGroups(); }
+// Click a group card body (not a control) → toggle its selection for a bulk action.
+function groupCardClick(ev, id) { if (ev.target.closest('button, a, input, select, textarea, label')) return; toggleGroupSelect(id); }
 async function bulkDeleteGroups() {
   const ids = [...selectedGroupIds];
   if (!ids.length) return;
@@ -1477,7 +1593,7 @@ function renderGroups() {
   container.innerHTML = selectRow + appData.groups.map(group => {
     const selected = selectedGroupIds.has(String(group.id));
     return `
-    <div class="group-item" style="${selected ? 'outline:2px solid #6366f1;outline-offset:-2px;' : ''}">
+    <div class="group-item" onclick="groupCardClick(event, '${group.id}')" title="Tip: click the card to select it for a bulk action" style="cursor:pointer;${selected ? 'outline:2px solid #6366f1;outline-offset:-2px;' : ''}">
       <label onclick="event.stopPropagation()" title="Select for bulk delete" style="display:flex;align-items:center;margin-right:6px;cursor:pointer;">
         <input type="checkbox" ${selected ? 'checked' : ''} onclick="toggleGroupSelect('${group.id}', event)" style="width:17px;height:17px;cursor:pointer;accent-color:#6366f1;margin:0;">
       </label>
@@ -1488,7 +1604,7 @@ function renderGroups() {
       </div>
       <div class="group-actions">
         ${modSelect(group)}
-        <button class="icon-btn" onclick="openGroupPage('${escapeHtml(group.groupId)}','members')" title="Open this group's Members / admin tools (in your browser, as admin) — approve the member or allow them to post without review">👥</button>
+        <button class="icon-btn" onclick="openGroupPage(${escapeAttr(JSON.stringify(group.groupId))},'members')" title="Open this group's Members / admin tools (in your browser, as admin) — approve the member or allow them to post without review">👥</button>
         <button class="icon-btn" onclick="renameGroup('${group.id}')" title="Rename">✏️</button>
         <button class="icon-btn" onclick="deleteGroup('${group.id}')" title="Delete">🗑️</button>
       </div>
@@ -1635,15 +1751,25 @@ let accountSelectMode = false;
 const selectedAccounts = new Set();
 let accountFilter = '';
 let accountStatusFilter = 'all';
+let accountSort = lsGet('za_accountSort', 'status'); // 'status' (issues first) | 'name' | 'groups'
+let accountView = lsGet('za_accountView', 'compact'); // 'compact' (small, scan/select many) | 'detailed' (full controls)
 const expandedProxySections = new Set();
 const expandedFbNameSections = new Set();
 
 function setAccountFilter(v, sel0, sel1) { accountFilter = v || ''; renderAccounts(); const el = document.getElementById('acct-search'); if (el) { try { el.focus(); const p = (sel0 == null ? el.value.length : sel0); el.setSelectionRange(p, sel1 == null ? p : sel1); } catch {} } }
 function setAccountStatusFilter(v) { accountStatusFilter = v || 'all'; renderAccounts(); }
+function setAccountSort(v) { accountSort = v || 'status'; lsSet('za_accountSort', accountSort); renderAccounts(); }
 function toggleSelectMode() { accountSelectMode = !accountSelectMode; if (!accountSelectMode) selectedAccounts.clear(); renderAccounts(); }
 function toggleAccountSelect(name) { if (selectedAccounts.has(name)) selectedAccounts.delete(name); else selectedAccounts.add(name); renderAccounts(); }
 function selectAllFiltered(names) { (names || []).forEach((n) => selectedAccounts.add(n)); renderAccounts(); }
 function clearAccountSelection() { selectedAccounts.clear(); renderAccounts(); }
+function setAccountView(v) { accountView = (v === 'detailed') ? 'detailed' : 'compact'; lsSet('za_accountView', accountView); renderAccounts(); }
+// Click the card BODY (not a control) → toggle its selection, so the operator can quickly pick many accounts for a
+// bulk action. Ignore clicks on buttons / inputs / links / dropdown popovers (they do their own thing).
+function cardClickSelect(ev, name) {
+  if (ev.target.closest('button, a, input, select, textarea, label, .acct-group-menu, .acct-more-menu, .group-dropdown-menu')) return;
+  toggleAccountSelect(name);
+}
 
 // Stable per-account key for element IDs (account names can contain spaces / punctuation that
 // break querySelector + raw IDs — hash to a safe token instead).
@@ -1681,7 +1807,7 @@ function accountsToolbarHtml(posters, filtered, filteredNames, s) {
   const btn = (label, onclick, bg, fg) => `<button onclick="${onclick}" style="background:${bg};color:${fg};border:none;border-radius:7px;padding:6px 10px;font-size:12px;font-weight:600;cursor:pointer;">${label}</button>`;
   const filterOpts = ['all:All posts', 'with-comments:With comments', 'without-comments:Without comments'].map((o) => { const [v, l] = o.split(':'); return `<option value="${v}">${l}</option>`; }).join('');
   const selStyle = 'background:#0f172a;border:1px solid #334155;border-radius:7px;color:#cbd5e1;font-size:12px;padding:6px 8px;cursor:pointer;';
-  const bulkBar = accountSelectMode ? `
+  const bulkBar = (accountSelectMode || selectedAccounts.size) ? `
     <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;width:100%;background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.3);border-radius:10px;padding:8px 10px;margin-top:8px;">
       <span style="font-size:12px;color:#c7d2fe;font-weight:700;">${selectedAccounts.size} selected</span>
       ${btn(`Select all (${filteredNames.length})`, `selectAllFiltered(${escapeAttr(JSON.stringify(filteredNames))})`, '#334155', '#e5e7eb')}
@@ -1697,9 +1823,15 @@ function accountsToolbarHtml(posters, filtered, filteredNames, s) {
       ${btn('🔄 Check', "bulkAccountAction('check')", '#334155', '#e5e7eb')}
       ${btn('🗑️ Delete', "bulkAccountAction('delete')", '#b91c1c', '#fff')}
     </div>` : '';
-  return `<div style="margin-bottom:14px;">
+  return `<div style="margin-bottom:14px;grid-column:1 / -1;">
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-      <input id="acct-search" value="${escapeHtml(accountFilter)}" oninput="setAccountFilter(this.value, this.selectionStart, this.selectionEnd)" placeholder="🔍 Search accounts by name or alias…" style="flex:1;min-width:170px;padding:7px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;font-size:13px;outline:none;">
+      <input id="acct-search" value="${escapeAttr(accountFilter)}" oninput="setAccountFilter(this.value, this.selectionStart, this.selectionEnd)" placeholder="🔍 Search accounts by name or alias…" style="flex:1;min-width:150px;padding:7px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e5e7eb;font-size:13px;outline:none;">
+      <select onchange="setAccountSort(this.value)" title="Sort the account list" style="${selStyle}">
+        <option value="status" ${accountSort === 'status' ? 'selected' : ''}>⚠️ Issues first</option>
+        <option value="name" ${accountSort === 'name' ? 'selected' : ''}>🔤 Name A–Z</option>
+        <option value="groups" ${accountSort === 'groups' ? 'selected' : ''}>📋 Most groups</option>
+      </select>
+      <button onclick="setAccountView('${accountView === 'compact' ? 'detailed' : 'compact'}')" title="Toggle card size — Compact (small cards: scan & select many) vs Detailed (full per-account controls)" style="background:#1e293b;color:#cbd5e1;border:1px solid #6366f155;border-radius:8px;padding:7px 11px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;">${accountView === 'compact' ? '▦ Compact' : '▤ Detailed'} ⇄</button>
       <button onclick="toggleSelectMode()" style="background:${accountSelectMode ? '#6366f1' : '#1e293b'};color:${accountSelectMode ? '#fff' : '#cbd5e1'};border:1px solid #6366f155;border-radius:8px;padding:7px 12px;font-size:13px;font-weight:600;cursor:pointer;">${accountSelectMode ? '✓ Selecting' : '☑ Select'}</button>
       <button id="btn-quick-setup" onclick="openQuickSetup()" ${isAutomationRunning ? 'disabled' : ''} title="Guided setup for your monthly workflow: define group batches, split each batch's accounts into active posters + auto-reserves, pick a daily time — it configures Campaign Plan + all settings for you in one go." style="background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:8px;padding:7px 13px;font-size:13px;font-weight:700;cursor:${isAutomationRunning ? 'not-allowed' : 'pointer'};opacity:${isAutomationRunning ? '0.5' : '1'};box-shadow:0 2px 10px rgba(99,102,241,0.3);">⚡ Quick Setup</button>
     </div>
@@ -1847,6 +1979,22 @@ function renderAccounts() {
     if (accountStatusFilter === 'standby') return a.standby === true && a.enabled !== false;
     return true;
   });
+  // SORT the filtered accounts so the operator can navigate a large fleet. Default 'status' floats the accounts that
+  // NEED ACTION to the top (not-logged-in / error / checkpoint → rate-limited → active → standby → excluded), then by name.
+  const _dispName = (a) => String(a.alias || a.name || '').toLowerCase();
+  const _statusRank = (a) => {
+    if (a.enabled === false) return 4;                                   // excluded (parked) — bottom
+    if (a.standby === true) return 3;                                    // standby (backup) — fine
+    const rl = (Number(a.rateLimitedUntil) || 0) > Date.now() || a.status === 'rate_limited';
+    if (a.status === 'logged_in' && !rl) return 2;                       // active + logged in — fine
+    if (rl) return 1;                                                    // cooling down — semi-issue
+    return 0;                                                            // not logged in / error / checkpoint — needs action, TOP
+  };
+  filtered.sort((a, b) => {
+    if (accountSort === 'name') return _dispName(a).localeCompare(_dispName(b));
+    if (accountSort === 'groups') return ((b.assignedGroups || []).length - (a.assignedGroups || []).length) || _dispName(a).localeCompare(_dispName(b));
+    return (_statusRank(a) - _statusRank(b)) || _dispName(a).localeCompare(_dispName(b)); // 'status' (default)
+  });
   const filteredNames = filtered.map((a) => a.name);
   // VIRTUALIZE large fleets: rebuilding every card's innerHTML on every status tick (onDataUpdated fires on each
   // status write during a run) freezes the tab at hundreds of accounts. Cap the CARDS actually built to RENDER_CAP;
@@ -1897,7 +2045,7 @@ function renderAccounts() {
         : (account.status === 'checking') ? '🔍'
         : (account.status === 'logging_in') ? '🔐'
         : 'ℹ️';
-      statusMessageHtml = `<div title="${escapeHtml(account.lastMessage)}" style="color: ${msgColor}; font-size: 11px; margin-top: 4px; font-weight: 500;">${msgIcon} ${escapeHtml(msg)}</div>`;
+      statusMessageHtml = `<div class="acct-meta-2" title="${escapeHtml(account.lastMessage)}" style="color: ${msgColor}; font-size: 11px; margin-top: 4px; font-weight: 500;">${msgIcon} ${escapeHtml(msg)}</div>`;
     }
 
     // Show relative "checked X min ago" if lastChecked is set
@@ -1906,7 +2054,7 @@ function renderAccounts() {
       const diffMs = Date.now() - account.lastChecked;
       const diffMin = Math.round(diffMs / 60000);
       const checkedText = diffMin < 1 ? 'just now' : diffMin === 1 ? '1m ago' : `${diffMin}m ago`;
-      lastCheckedHtml = `<div style="color: #6b7280; font-size: 10px; margin-top: 2px;">checked ${escapeHtml(checkedText)}</div>`;
+      lastCheckedHtml = `<div class="acct-meta-2" style="color: #6b7280; font-size: 10px; margin-top: 2px;">checked ${escapeHtml(checkedText)}</div>`;
     }
 
     // LIVE from the Chrome helper (session sync / health beacon): the account's REAL state in your Chrome profile.
@@ -1925,7 +2073,7 @@ function renderAccounts() {
         : st === 'logged_out' ? { c: '#9ca3af', i: '⚪', t: 'Chrome: logged out' }
         : { c: '#9ca3af', i: '⚫', t: 'Chrome: seen' };
       const gTxt = (account.chromeGroups && account.chromeGroups.length) ? ` · ${account.chromeGroups.length} groups` : '';
-      chromeStatusHtml = `<div title="Live from your Chrome profile${stale ? ' (stale — Chrome not open recently)' : ''}" style="color:${meta.c};font-size:10px;margin-top:2px;">${meta.i} ${escapeHtml(meta.t)} · ${escapeHtml(seenTxt)}${escapeHtml(gTxt)}</div>`;
+      chromeStatusHtml = `<div class="acct-meta-2" title="Live from your Chrome profile${stale ? ' (stale — Chrome not open recently)' : ''}" style="color:${meta.c};font-size:10px;margin-top:2px;">${meta.i} ${escapeHtml(meta.t)} · ${escapeHtml(seenTxt)}${escapeHtml(gTxt)}</div>`;
     }
 
     // Display alias if exists
@@ -1948,7 +2096,7 @@ function renderAccounts() {
           <label class="group-checkbox-item" style="display: flex; align-items: center; padding: 8px 12px; cursor: pointer; border-bottom: 1px solid #374151; color: #e5e7eb;">
             <input type="checkbox" ${isChecked} onchange="toggleGroupAssignment('${account.name}', '${group.id}')" style="margin-right: 10px; accent-color: #3b82f6;">
             <span style="flex: 1; color: #ffffff;">${escapeHtml(group.name || 'Group ' + group.groupId)}</span>
-            <span style="color: #60a5fa; font-size: 11px;">${group.groupId}</span>
+            <span style="color: #60a5fa; font-size: 11px;">${escapeHtml(group.groupId)}</span>
           </label>
         `;
       }).join('');
@@ -1959,14 +2107,14 @@ function renderAccounts() {
     // toggle below; resting after a limit is automatic (rate-limit cooldown). Styled as a SQUARED chip so
     // it never reads as the rounded Primary/Standby pill next to it.
     const enabledPill = isEnabled
-      ? `<button onclick="toggleAccountEnabled('${account.name}')" title="Active in automation. Click to EXCLUDE — parks this account entirely: it won't post and won't be used as a reserve/backup. (To rest a tired account, leave it Active — limits are handled automatically.)" style="background:#0f172a;color:#94a3b8;border:1px solid #334155;border-radius:6px;padding:3px 9px;font-size:11px;font-weight:600;cursor:pointer;line-height:1.4;">⏻ Active</button>`
+      ? `<button class="acct-pill-default" onclick="toggleAccountEnabled('${account.name}')" title="Active in automation. Click to EXCLUDE — parks this account entirely: it won't post and won't be used as a reserve/backup. (To rest a tired account, leave it Active — limits are handled automatically.)" style="background:#0f172a;color:#94a3b8;border:1px solid #334155;border-radius:6px;padding:3px 9px;font-size:11px;font-weight:600;cursor:pointer;line-height:1.4;">⏻ Active</button>`
       : `<button onclick="toggleAccountEnabled('${account.name}')" title="Excluded from automation — won't post and won't be used as a reserve/backup. Click to make it Active again." style="background:rgba(220,38,38,0.18);color:#fca5a5;border:1px solid rgba(220,38,38,0.5);border-radius:6px;padding:3px 9px;font-size:11px;font-weight:700;cursor:pointer;line-height:1.4;">⛔ Excluded</button>`;
     // STANDBY (backup): an extra account for these groups that posts ONLY when needed (a working account drops,
     // a post stays held, or a comment needs placing). Off = a normal Primary poster.
     const isStandby = account.standby === true;
     const standbyPill = isStandby
       ? `<button onclick="toggleAccountStandby('${account.name}')" title="Standby (backup): idle until a working account in its groups drops, a post stays held, or a comment needs placing. Click to make it a normal Primary poster." style="background:#f59e0b;color:#1f2937;border:none;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:700;cursor:pointer;line-height:1.4;">🟡 Standby</button>`
-      : `<button onclick="toggleAccountStandby('${account.name}')" title="Primary poster. Click to make it a Standby (backup) account that only works when its groups need it." style="background:#1e293b;color:#94a3b8;border:1px solid #374151;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;line-height:1.4;">Primary</button>`;
+      : `<button class="acct-pill-default" onclick="toggleAccountStandby('${account.name}')" title="Primary poster. Click to make it a Standby (backup) account that only works when its groups need it." style="background:#1e293b;color:#94a3b8;border:1px solid #374151;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;line-height:1.4;">Primary</button>`;
 
     const isSelected = selectedAccounts.has(account.name);
     const proxyExpanded = expandedProxySections.has(account.name);
@@ -1978,18 +2126,22 @@ function renderAccounts() {
     const fbNameHasValue = !!(account.fbDisplayName || '').trim();
     const ak = acctKey(account.name);
     return `
-      <div class="account-card" data-account-name="${escapeHtml(account.name)}" style="${isEnabled ? '' : 'opacity:0.5;'}${isSelected ? 'outline:2px solid #6366f1;outline-offset:1px;' : ''}">
+      <div class="account-card" data-account-name="${escapeHtml(account.name)}" onclick="cardClickSelect(event, ${escapeAttr(JSON.stringify(account.name))})" title="Tip: click a blank part of the card to select it for a bulk action" style="position:relative;cursor:pointer;${isEnabled ? '' : 'opacity:0.5;'}${isSelected ? 'outline:2px solid #6366f1;outline-offset:1px;' : ''}">
+        ${isSelected ? '<div style="position:absolute;top:6px;right:6px;background:#6366f1;color:#fff;border-radius:50%;width:19px;height:19px;font-size:12px;line-height:1;display:flex;align-items:center;justify-content:center;z-index:2;box-shadow:0 1px 4px rgba(0,0,0,0.45);">✓</div>' : ''}
         <div class="account-header">
           ${accountSelectMode ? `<input type="checkbox" ${isSelected ? 'checked' : ''} onclick="toggleAccountSelect(${escapeAttr(JSON.stringify(account.name))})" title="Select for bulk action" style="width:18px;height:18px;margin-right:8px;accent-color:#6366f1;cursor:pointer;flex:0 0 auto;align-self:flex-start;margin-top:4px;">` : ''}
-          <div class="account-avatar">${displayName.charAt(0).toUpperCase()}</div>
+          <div class="account-avatar" title="${escapeAttr(statusText)}" style="outline:2px solid ${account.status === 'logged_in' ? '#22c55e' : account.status === 'rate_limited' ? '#f59e0b' : account.status === 'checkpoint' ? '#ef4444' : account.enabled === false ? '#6b7280' : account.standby ? '#f59e0b' : '#f87171'};outline-offset:1px;">${displayName.charAt(0).toUpperCase()}</div>
           <div class="account-info">
             <h3 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">${escapeHtml(displayName)} ${enabledPill} ${isEnabled ? standbyPill : ''}</h3>
-            ${subName ? `<div style="color: #9ca3af; font-size: 12px; margin-top: 2px;">${escapeHtml(subName)}</div>` : ''}
-            ${!isEnabled ? `<div style="color:#fca5a5;font-size:11px;font-weight:600;margin-top:2px;">⛔ Excluded — parked: won't post and won't be used as a backup</div>` : ''}
-            ${isEnabled && isStandby ? `<div style="color:#f59e0b;font-size:11px;font-weight:600;margin-top:2px;">🟡 Standby (backup) — idle until a working account in its groups needs help</div>` : ''}
-            <div class="account-status">
-              <span class="status-dot ${statusClass}" style="${account.status === 'error' ? 'background-color: #dc2626;' : account.status === 'checking' ? 'background-color: #f59e0b;' : account.status === 'logging_in' ? 'background-color: #3b82f6;' : account.status === 'rate_limited' ? 'background-color: #f59e0b;' : ''}"></span>
-              <span>${statusText}</span>
+            ${subName ? `<div class="acct-meta-2" style="color: #9ca3af; font-size: 12px; margin-top: 2px;">${escapeHtml(subName)}</div>` : ''}
+            ${!isEnabled ? `<div class="acct-meta-2" style="color:#fca5a5;font-size:11px;font-weight:600;margin-top:2px;">⛔ Excluded — parked: won't post and won't be used as a backup</div>` : ''}
+            ${isEnabled && isStandby ? `<div class="acct-meta-2" style="color:#f59e0b;font-size:11px;font-weight:600;margin-top:2px;">🟡 Standby (backup) — idle until a working account in its groups needs help</div>` : ''}
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <div class="account-status">
+                <span class="status-dot ${statusClass}" style="${account.status === 'error' ? 'background-color: #dc2626;' : account.status === 'checking' ? 'background-color: #f59e0b;' : account.status === 'logging_in' ? 'background-color: #3b82f6;' : account.status === 'rate_limited' ? 'background-color: #f59e0b;' : ''}"></span>
+                <span>${statusText}</span>
+              </div>
+              <span title="${assignedCount} assigned group${assignedCount === 1 ? '' : 's'}" style="font-size:11px;font-weight:600;color:${assignedCount > 0 ? '#94a3b8' : '#f59e0b'};">📋 ${assignedCount}</span>
             </div>
             ${statusMessageHtml}
             ${accountStatusBadges(account)}
@@ -2025,13 +2177,11 @@ function renderAccounts() {
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
             ${(() => { const ML = { 'campaign-plan': '🗓️ Campaign Plan', 'daily-rotation': '📅 Daily Rotation', 'post-centric': '🎯 Post to All', 'post-centric-unique': '🎯🔒 Unique', 'random': '🔀 Random', 'random-unique': '🔀🔒 Random', 'sequence': '📋 Sequence' }; const lbl = ML[account.postingOrder] || (account.postingOrder || '🗓️ Campaign Plan'); return `<span title="Posting method — set in Quick Setup" style="background:#1f2937;border:1px solid #374151;border-radius:6px;padding:4px 9px;color:#e5e7eb;font-size:12px;white-space:nowrap;">${lbl}</span>`; })()}
             <span style="font-size:11px;color:#94a3b8;margin-left:auto;">🐢 Speed</span>
-            <select onchange="updateAccountPace(${escapeAttr(JSON.stringify(account.name))}, this.value)" title="How fast/human THIS account posts (Inherit follows the global default)" style="padding:5px 8px;background:#1f2937;border:1px solid #374151;border-radius:6px;color:#e5e7eb;font-size:12px;cursor:pointer;">
-              <option value="" ${!account.pace ? 'selected' : ''}>⚙️ Inherit</option>
-              <option value="safe" ${account.pace === 'safe' ? 'selected' : ''}>🐢 Safe</option>
-              <option value="normal" ${account.pace === 'normal' ? 'selected' : ''}>⚖️ Normal</option>
+            <select onchange="updateAccountPace(${escapeAttr(JSON.stringify(account.name))}, this.value)" title="How fast/human THIS account posts (Inherit follows the fleet speed set in Settings)" style="padding:5px 8px;background:#1f2937;border:1px solid #374151;border-radius:6px;color:#e5e7eb;font-size:12px;cursor:pointer;">
+              <option value="" ${!account.pace ? 'selected' : ''}>⚙️ Inherit (fleet speed)</option>
+              <option value="safe" ${account.pace === 'safe' ? 'selected' : ''}>🛡️ Safe</option>
               <option value="fast" ${account.pace === 'fast' ? 'selected' : ''}>⚡ Fast</option>
-              <option value="turbo" ${account.pace === 'turbo' ? 'selected' : ''}>🚀 Turbo</option>
-              <option value="instant" ${account.pace === 'instant' ? 'selected' : ''}>⚡ Instant (max)</option>
+              <option value="max" ${account.pace === 'max' ? 'selected' : ''}>🚀 Max</option>
             </select>
           </div>
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px;">
@@ -2070,19 +2220,20 @@ function renderAccounts() {
         </div>
 
         <div class="account-actions" style="display: flex; gap: 6px;">
-          <button class="btn-primary" onclick="loginAccount('${account.name}')">
-            🔐 Login
+          <button class="btn-primary" onclick="loginAccount('${account.name}')" title="Open the login browser for this account">
+            🔐<span class="btn-label"> Login</span>
           </button>
           <button class="btn-secondary" onclick="checkAccountStatusCard('${account.name}')" title="Check this account's Facebook login status now" style="padding: 8px 12px; font-size: 13px;">
-            🔄 Check
+            🔄<span class="btn-label"> Check</span>
           </button>
           <button class="btn-secondary" onclick="openAccountBrowser('${account.name}')" title="Open Facebook (feed) in THIS account's own browser — through its proxy, as this account" style="padding: 8px 12px; font-size: 13px;">
-            🌐 Open
+            🌐<span class="btn-label"> Open</span>
           </button>
-          <div class="acct-group-picker" style="position: relative; display:inline-block;">
-            <button class="btn-secondary" onclick="toggleAccountGroupPicker('${account.name}')" title="Open one of THIS account's assigned groups in its own browser (through its proxy) — confirm membership / re-join as this account" style="padding: 8px 12px; font-size: 13px;">
-              👥 Group ▾
+          <div class="acct-group-picker" style="position: relative; display:inline-flex;">
+            <button class="btn-secondary" onclick="openAccountGroups('${account.name}')" title="Open ALL of this account's assigned groups — each in its own tab, in this account's own browser (through its proxy). One click." style="padding: 8px 11px; font-size: 13px; border-top-right-radius:0; border-bottom-right-radius:0;">
+              👥<span class="btn-label"> Open groups</span>
             </button>
+            <button class="btn-secondary" onclick="toggleAccountGroupPicker('${account.name}')" title="Open just ONE assigned group instead" style="padding:8px 7px; font-size:12px; border-left:1px solid rgba(15,23,42,0.6); border-top-left-radius:0; border-bottom-left-radius:0;">▾</button>
             <div id="acct-group-menu-${ak}" class="acct-group-menu" style="display:none; position:absolute; top:100%; left:0; background:#1f2937; border:1px solid #374151; border-radius:6px; min-width:220px; max-height:240px; overflow-y:auto; z-index:100; margin-top:4px; box-shadow:0 6px 18px rgba(0,0,0,0.4);">
               ${(() => {
                 const rows = (account.assignedGroups || []).map((gid) => (appData.groups || []).find((x) => x.id === gid)).filter((g) => g && (g.groupId || g.id));
@@ -2097,19 +2248,20 @@ function renderAccounts() {
               })()}
             </div>
           </div>
-          <button class="btn-secondary" onclick="openImportCookiesModal('${account.name}')" title="Import Cookies" style="padding: 8px 12px; font-size: 13px;">
-            🍪 Cookies
-          </button>
-          <button class="btn-secondary icon-btn" onclick="editAccount('${account.name}')" title="Edit Name/Alias" style="padding: 8px 12px; font-size: 13px;">
-            ✏️
-          </button>
-          <button class="btn-danger icon-btn" onclick="deleteAccount('${account.name}')" title="Delete">
-            🗑️
-          </button>
+          <div class="acct-more-picker" style="position:relative;display:inline-block;margin-left:auto;">
+            <button class="btn-secondary" onclick="toggleAccountMore('${account.name}')" title="More — import cookies, rename, delete" style="padding:8px 11px;font-size:15px;line-height:1;">⋯</button>
+            <div id="acct-more-menu-${ak}" class="acct-more-menu" style="display:none;position:absolute;top:100%;right:0;background:#1f2937;border:1px solid #374151;border-radius:8px;min-width:180px;z-index:100;margin-top:4px;box-shadow:0 8px 22px rgba(0,0,0,0.45);overflow:hidden;">
+              <button class="acct-more-row" onclick="closeCardMenus();openImportCookiesModal('${account.name}')" style="display:block;width:100%;text-align:left;background:transparent;border:none;border-radius:0;color:#e5e7eb;padding:9px 13px;cursor:pointer;font-size:12.5px;">🍪 Import cookies</button>
+              <button class="acct-more-row" onclick="closeCardMenus();editAccount('${account.name}')" style="display:block;width:100%;text-align:left;background:transparent;border:none;border-top:1px solid #374151;border-radius:0;color:#e5e7eb;padding:9px 13px;cursor:pointer;font-size:12.5px;">✏️ Rename / alias</button>
+              <button class="acct-more-row" onclick="closeCardMenus();deleteAccount('${account.name}')" style="display:block;width:100%;text-align:left;background:transparent;border:none;border-top:1px solid #374151;border-radius:0;color:#fca5a5;padding:9px 13px;cursor:pointer;font-size:12.5px;">🗑️ Delete account</button>
+            </div>
+          </div>
         </div>
       </div>
     `;
-  }).join('') + (_over ? `<div class="empty-state" style="padding:20px;grid-column:1 / -1;"><div class="icon">📋</div><h3>Showing ${RENDER_CAP} of ${filtered.length} accounts</h3><p>Use the search box or a status filter above to narrow the list. Start / Stop, bulk actions and select-all still apply to all ${filtered.length}.</p></div>` : '')) : `<div class="empty-state" style="padding:28px;"><div class="icon">🔍</div><h3>No accounts match</h3><p>Adjust the search or status filter above.</p></div>`;
+  }).join('') + (_over ? `<div class="empty-state" style="padding:20px;grid-column:1 / -1;"><div class="icon">📋</div><h3>Showing ${RENDER_CAP} of ${filtered.length} accounts</h3><p>Use the search box or a status filter above to narrow the list. Start / Stop, bulk actions and select-all still apply to all ${filtered.length}.</p></div>` : '')) : `<div class="empty-state" style="padding:28px;grid-column:1 / -1;"><div class="icon">🔍</div><h3>No accounts match</h3><p>Adjust the search or status filter above.</p></div>`;
+  document.body.classList.toggle('accounts-compact', accountView === 'compact'); // compact = CSS hides the heavy card sections
+  container.style.gridTemplateColumns = accountView === 'compact' ? 'repeat(4, minmax(0, 1fr))' : ''; // compact = 4 cards across; detailed reverts to the Tailwind 2-col class
   container.innerHTML = accountsToolbarHtml(posters, filtered, filteredNames, s) + cardsHtml;
 }
 
@@ -2151,6 +2303,7 @@ async function checkAccountStatusCard(name) {
   showNotification(`Checking ${name}…`, 'info');
   try {
     const result = await probeLogin(name);
+    if (result && result.busy) { showNotification(result.message || 'Automation is running — stop it to check status.', 'info'); return; } // #1: a check was refused mid-run (would add a session on the shared IP) — do NOT fall through to auto-login
     if (result && result.status === 'logged_in') { showNotification(`✅ ${name}: logged in`, 'success'); return; }
     // Logged out → if this account has stored credentials, let the agent auto-login (human-like). It opens a
     // visible window and fills the form; if it hits a captcha/2FA it stops and you finish in that same window.
@@ -2291,10 +2444,11 @@ function qsProxyCount(data) {
   return pool || perAcct;
 }
 
-// Speed preset to merge into settings from the QS speed selector (turbo/fast/normal/slow).
+// Speed preset to merge into settings from the QS speed selector (safe/fast/max). ALWAYS writes the tier's ranges,
+// so choosing a tier always resets the fleet timing to match the displayed tier (no stale ranges from a prior tier).
 function qsSpeedSettings() {
-  const s = qsState.speed || 'normal';
-  return (s !== 'normal' && typeof SPEED_PRESETS !== 'undefined' && SPEED_PRESETS[s]) ? { speedMode: s, ...SPEED_PRESETS[s] } : { speedMode: 'normal' };
+  const s = ['safe', 'fast', 'max'].includes(qsState.speed) ? qsState.speed : 'safe';
+  return (typeof SPEED_PRESETS !== 'undefined' && SPEED_PRESETS[s]) ? { speedMode: s, ...SPEED_PRESETS[s] } : { speedMode: s };
 }
 
 function openQuickSetup() {
@@ -2315,7 +2469,7 @@ function openQuickSetup() {
   qsState = { step: 1, time, method: 'daily-rotation', loadedDR: false, scheduleContinuous: false,
     moderationEnabled: !!s.moderationEnabled, moderationDryRun: (s.moderationDryRun === undefined ? true : !!s.moderationDryRun), // first-ever run defaults dry-run ON, but RESPECT a stored false (don't silently re-enable it every time the wizard opens)
     autoStartDaily: !!s.autoStartDaily, // 🕒 Windows clock-hook: auto-launch + post daily even if the app is closed
-    speed: s.speedMode || 'normal', // global speed selector (instant/turbo/fast/normal/slow), applied on finish
+    speed: s.speedMode || 'safe', // global fleet speed (safe/fast/max), applied on finish
     accountsPerBatch: Math.max(1, parseInt(s.accountsPerBatch, 10) || 1), // contiguous-block assignment knobs
     groupsPerBlock: Math.max(1, parseInt(s.groupsPerBlock, 10) || 4),
     // Advanced options (collapsed panel on the Review step) — all plain settings, applied via saveSettings.
@@ -2328,7 +2482,7 @@ function openQuickSetup() {
     resumeOnStartup: s.resumeOnStartup === true,
     enableTunnel: !!s.enableTunnel,
     launchOnStartup: !!s.launchOnStartup,
-    pace: {} }; // per-account pacing profile (safe|normal|fast), set on the Review step
+    pace: {} }; // per-account override tier (safe|fast|max), set on the Review step; absent = inherit the fleet speed
   // Seed each account's groups from its existing assignedGroups (filtered to current groups). No method
   // reconstruction, no auto-splitting — Quick Setup just reads + preserves what each account already has.
   qsState.drGroups = {};
@@ -2337,10 +2491,10 @@ function openQuickSetup() {
   // when an active account there drops. Loads from each account's current standby flag.
   qsState.drReserve = {};
   posters.forEach((a) => { qsState.drReserve[a.name] = a.standby === true; });
-  // Per-account pace profile. Keep the "unset" sentinel (undefined) distinct from an explicit 'normal' so an
-  // untouched account keeps INHERITING settings.defaultPace instead of being pinned. The dropdown shows 'Normal'
-  // for undefined (display-only); only an explicit pick is written back.
-  posters.forEach((a) => { qsState.pace[a.name] = QS_PACES.includes(a.pace) ? a.pace : undefined; }); // seed from stored pace (incl. turbo/instant) so re-opening QS preserves it
+  // Per-account override tier. Keep the "unset" sentinel (undefined = Inherit) distinct from an explicit tier so an
+  // untouched account keeps INHERITING the fleet speed instead of being pinned. The dropdown shows '⚙️ Inherit' for
+  // undefined; only an explicit pick is written back.
+  posters.forEach((a) => { qsState.pace[a.name] = QS_PACES.includes(a.pace) ? a.pace : undefined; }); // seed from stored pace (already migrated to safe/fast/max) so re-opening QS preserves it
   // Campaign Plan is the main method: a batch (agents sharing a group-set) SPLITS the library across its agents.
   // The WORK PATTERN (chosen on the Plan step) picks how that split runs; 'split' (the proven engine campaign-plan)
   // is the default. Each account's existing groups are preserved via drGroups (seeded from its assignedGroups).
@@ -2397,27 +2551,23 @@ function qsModeratorSectionHtml() {
     </div>`;
 }
 
-const QS_PACES = ['safe', 'normal', 'fast', 'turbo', 'instant'];
-function qsSetPace(name, val) { if (QS_PACES.includes(val)) qsState.pace[name] = val; qsRenderModal(); }
-// Bulk speed controls (Review step): set EVERY account (active + reserve) to one pace, or assign each a RANDOM
-// pace (varied speeds read more human across a fleet). Operates on the same rows the Review table shows.
-function qsSetAllPace(val) { if (!QS_PACES.includes(val)) return; for (const r of qsReviewAccounts()) qsState.pace[r.acct.name] = val; qsRenderModal(); }
-// Global speed for the WHOLE run (like the Settings-tab preset): sets every timing param at once on finish via
-// qsSpeedSettings. Instant is treated identically to the other tiers here. Per-account pace still overrides.
-function qsSetSpeed(val) { if (typeof SPEED_PRESETS !== 'undefined' && SPEED_PRESETS[val]) { qsState.speed = val; qsRenderModal(); } }
-// Randomize WITHIN a tempo band: clicking 🎲 reveals 4 bands; each gives every account a random pace from that
-// band's set (varied speeds read more human, but all in the tempo you picked).
-const QS_RANDOM_BANDS = {
-  superfast: { label: '🚀 Super fast', set: ['turbo', 'fast'] },
-  fast:      { label: '⚡ Fast', set: ['turbo', 'fast', 'normal'] },
-  normal:    { label: '⚖️ Normal', set: ['safe', 'normal', 'fast'] },
-  slow:      { label: '🐢 Slow', set: ['safe', 'normal'] },
-};
-function qsToggleRandomize() { qsState.randomizeOpen = !qsState.randomizeOpen; qsRenderModal(); }
-function qsRandomizePace(band) {
-  const set = (QS_RANDOM_BANDS[band] && QS_RANDOM_BANDS[band].set) || QS_PACES;
-  for (const r of qsReviewAccounts()) qsState.pace[r.acct.name] = set[Math.floor(Math.random() * set.length)];
-  qsState.randomizeOpen = false; qsRenderModal();
+const QS_PACES = ['safe', 'fast', 'max']; // the 3 per-account OVERRIDE tiers (Inherit = absent, handled separately)
+function qsSetPace(name, val) { if (val === '' || val === 'inherit') delete qsState.pace[name]; else if (QS_PACES.includes(val)) qsState.pace[name] = val; qsRenderModal(); }
+// Bulk pace controls (Review step): set EVERY account (active + reserve) to one tier, or assign each a RANDOM tier
+// (varied speeds read more human across a fleet). Operates on the same rows the Review table shows.
+// Global FLEET speed for the whole run (same 3 tiers as the Settings preset): fills every timing param on finish via
+// qsSpeedSettings. Per-account pace still overrides. safe/fast/max only.
+// Clicking a fleet speed sets it as the baseline AND clears every per-account override, so ALL agent rows immediately
+// show the new speed (then 🎲 Randomize can vary them around it). This is the operator's model: the button sets everyone.
+function qsSetSpeed(val) { if (typeof SPEED_PRESETS !== 'undefined' && SPEED_PRESETS[val]) { qsState.speed = val; qsState.pace = {}; qsRenderModal(); } }
+// Randomize per-account speeds AROUND the fleet baseline (ONE click, no bands to pick). The spread is derived from the
+// chosen fleet speed so it never pushes accounts wildly off it: safe→{safe,fast}, fast→{safe,fast,max}, max→{fast,max}.
+// Varied speeds across a fleet read more human than one identical cadence; the fleet baseline stays the center.
+function qsRandomizePace() {
+  const base = ['safe', 'fast', 'max'].includes(qsState.speed) ? qsState.speed : 'safe';
+  const spread = base === 'safe' ? ['safe', 'fast'] : base === 'max' ? ['fast', 'max'] : ['safe', 'fast', 'max'];
+  for (const r of qsReviewAccounts()) qsState.pace[r.acct.name] = spread[Math.floor(Math.random() * spread.length)];
+  qsRenderModal();
 }
 // Full per-account plan: which posts each ACTIVE agent publishes (its slice of the batch split, 1 per cycle, in
 // order). Mirrors the engine campaign split (agent j in a K-agent batch gets posts where idx%K===j).
@@ -2514,22 +2664,18 @@ function qsStepReviewHtml() {
   const activeRows = rows.filter((r) => r.role === 'active');
   const reserveRows = rows.filter((r) => r.role === 'reserve');
   const blockingActives = activeRows.filter((r) => issuesFor(r).length);
-  const paceSelect = (name) => { const v = qsState.pace[name] || 'normal'; const o = (val, label) => `<option value="${val}" ${v === val ? 'selected' : ''}>${label}</option>`; return `<select class="qs-select" data-acct="${escapeAttr(name)}" onchange="qsSetPace(this.getAttribute('data-acct'), this.value)" style="font-size:11px;padding:3px 6px;">${o('safe', '🐢 Safe')}${o('normal', '⚖️ Normal')}${o('fast', '⚡ Fast')}${o('turbo', '🚀 Turbo')}${o('instant', '⚡ Instant')}</select>`; };
-  const sBtn = (p) => `<button onclick="qsSetAllPace('${p}')" style="font-size:11px;padding:3px 9px;border-radius:7px;border:1px solid rgba(255,255,255,0.12);background:rgba(99,102,241,0.12);color:#c7d2fe;cursor:pointer;">${({ safe: '🐢 Safe', normal: '⚖️ Normal', fast: '⚡ Fast', turbo: '🚀 Turbo', instant: '⚡ Instant' })[p]}</button>`;
-  const rBtn = (k) => `<button onclick="qsRandomizePace('${k}')" style="font-size:11px;padding:3px 9px;border-radius:7px;border:1px solid rgba(52,211,153,0.4);background:rgba(16,185,129,0.16);color:#34d399;cursor:pointer;">${QS_RANDOM_BANDS[k].label}</button>`;
-  const paceBar = !rows.length ? '' : `<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;font-size:11px;color:#94a3b8;">
-      <span style="font-weight:700;color:#cbd5e1;">Set all:</span>${['safe', 'normal', 'fast', 'turbo', 'instant'].map(sBtn).join('')}
-      <span style="width:8px;display:inline-block;"></span>
-      ${qsState.randomizeOpen
-        ? `<span style="font-weight:700;color:#34d399;">🎲 Random within:</span>${Object.keys(QS_RANDOM_BANDS).map(rBtn).join('')}<button onclick="qsToggleRandomize()" title="cancel" style="font-size:11px;padding:3px 7px;border-radius:7px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:#94a3b8;cursor:pointer;">✕</button>`
-        : `<button onclick="qsToggleRandomize()" title="Give each account a random speed within a tempo band you choose" style="font-size:11px;padding:3px 9px;border-radius:7px;border:1px solid rgba(52,211,153,0.4);background:rgba(16,185,129,0.12);color:#34d399;cursor:pointer;">🎲 Randomize…</button>`}
-    </div>`;
-  // GLOBAL speed for the whole run (fills every timing param at once, exactly like the Settings-tab preset).
-  // Instant is a first-class tier here. Per-account pace (below) still overrides individual accounts.
-  const curSpeed = qsState.speed || 'normal';
-  const speedBtn = (v, label) => { const on = curSpeed === v; const danger = v === 'instant'; return `<button onclick="qsSetSpeed('${v}')" title="${danger ? 'MAX speed — everything pasted, 0–7s between actions (warmed accounts + proxies only)' : ''}" style="font-size:11px;padding:3px 11px;border-radius:7px;cursor:pointer;font-weight:${on ? '700' : '500'};border:1px solid ${on ? (danger ? '#ef4444' : '#6366f1') : 'rgba(255,255,255,0.12)'};background:${on ? (danger ? 'rgba(239,68,68,0.2)' : 'rgba(99,102,241,0.28)') : 'rgba(99,102,241,0.08)'};color:${danger ? '#fca5a5' : '#c7d2fe'};">${label}</button>`; };
+  // A row with no explicit override DISPLAYS the fleet speed (so every agent always shows a concrete tier — never a bare
+  // "Inherit"). Picking a tier here overrides just that agent; clicking a fleet-speed button resets everyone.
+  const paceSelect = (name) => { const v = qsState.pace[name] || (['safe', 'fast', 'max'].includes(qsState.speed) ? qsState.speed : 'safe'); const o = (val, label) => `<option value="${val}" ${v === val ? 'selected' : ''}>${label}</option>`; return `<select class="qs-select" data-acct="${escapeAttr(name)}" onchange="qsSetPace(this.getAttribute('data-acct'), this.value)" style="font-size:11px;padding:3px 6px;">${o('safe', '🛡️ Safe')}${o('fast', '⚡ Fast')}${o('max', '🚀 Max')}</select>`; };
+  // ONE speed control for the run: the fleet baseline (fills every timing param at once, like the Settings preset).
+  // Accounts inherit it unless individually overridden (the per-row dropdown) or varied via 🎲 Randomize. No separate
+  // "Set all" bar — "set everyone to X" IS just choosing the fleet speed X (they all inherit it).
+  const curSpeed = ['safe', 'fast', 'max'].includes(qsState.speed) ? qsState.speed : 'safe';
+  const speedBtn = (v, label) => { const on = curSpeed === v; const danger = v === 'max'; return `<button onclick="qsSetSpeed('${v}')" title="${danger ? 'MAX speed — everything pasted, smallest gaps (all-warmed fleet only; post the first item manually)' : ''}" style="font-size:11px;padding:3px 11px;border-radius:7px;cursor:pointer;font-weight:${on ? '700' : '500'};border:1px solid ${on ? (danger ? '#ef4444' : '#6366f1') : 'rgba(255,255,255,0.12)'};background:${on ? (danger ? 'rgba(239,68,68,0.2)' : 'rgba(99,102,241,0.28)') : 'rgba(99,102,241,0.08)'};color:${danger ? '#fca5a5' : '#c7d2fe'};">${label}</button>`; };
   const speedBar = !rows.length ? '' : `<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;font-size:11px;color:#94a3b8;">
-      <span style="font-weight:700;color:#cbd5e1;">⚡ Speed (whole run):</span>${speedBtn('slow', '🐢 Slow')}${speedBtn('normal', '⚖️ Normal')}${speedBtn('fast', '⚡ Fast')}${speedBtn('turbo', '🚀 Turbo')}${speedBtn('instant', '⚡ Instant')}
+      <span style="font-weight:700;color:#cbd5e1;">⚡ Speed (whole run):</span>${speedBtn('safe', '🛡️ Safe')}${speedBtn('fast', '⚡ Fast')}${speedBtn('max', '🚀 Max')}
+      <span style="width:12px;display:inline-block;"></span>
+      <button onclick="qsRandomizePace()" title="Vary each agent's speed around the fleet speed above — varied speeds read more human across a fleet" style="font-size:11px;padding:3px 9px;border-radius:7px;border:1px solid rgba(52,211,153,0.4);background:rgba(16,185,129,0.14);color:#34d399;cursor:pointer;">🎲 Randomize per agent</button>
     </div>`;
   const tableRows = rows.map((r) => {
     const a = r.acct, iss = issuesFor(r);
@@ -2584,7 +2730,7 @@ function qsStepReviewHtml() {
     : `<div style="border:1px solid rgba(16,185,129,0.4);background:rgba(16,185,129,0.08);border-radius:10px;padding:9px 12px;margin-top:10px;font-size:12px;color:#34d399;line-height:1.5;">✅ All ${activeRows.length} active account${activeRows.length === 1 ? '' : 's'} ready. This sets up <b>everything</b> — you won't need the Settings tab. <b>🚀 Save &amp; Start</b> saves and posts now; <b>✅ Apply</b> just saves the setup for your next campaign (start it later with ▶ Start).</div>`);
   // Simplified Review: the whole-content CYCLE plan + readiness + Save & Start. Speed, per-account pace,
   // auto-start and the advanced options now live on the Settings tab (off the launch screen).
-  return `${summary}${qsPlanHtml()}${fullPlan}${speedBar}${paceBar}${table}${paceLegend}${rollup}`;
+  return `${summary}${qsPlanHtml()}${fullPlan}${speedBar}${table}${paceLegend}${rollup}`;
 }
 
 // Global speed selector (turbo/fast/normal/slow) for the whole run — Turbo is the new "very fast" tier.
@@ -2936,7 +3082,7 @@ async function qsApplyAccountGroups(thenStart, order, extraSettings, summaryFn) 
     acc.postingOrder = order;
     if (!acc.postFilter) acc.postFilter = 'all'; // PRESERVE a per-account post filter (with/without comments) the operator set on the card; only default brand-new accounts
     acc.standby = !!qsState.drReserve[a.name]; // RESERVE → standby: waits + takes over in its groups when an active drops
-    acc.pace = qsState.pace[a.name]; // per-account timing profile (Review step); undefined = inherit settings.defaultPace
+    acc.pace = qsState.pace[a.name]; // per-account override tier (Review step); undefined = inherit the fleet speed
     const _sig = (qsState.drGroups[a.name] || []).slice().sort().join('|');
     const bp = batchProx[_sig]; // its batch's proxy
     if (bp) acc.proxy = bp; // share the batch IP (engine serializes same-IP). Only SET when the batch has a proxy — never WIPE a manually-set per-account proxy when no batch proxy is configured.
@@ -3041,14 +3187,15 @@ async function updatePostFilter(accountName, filterValue) {
 
 // Update posting order for an account
 
-// Update per-account PACE profile. '' (Inherit) DELETES the field so the account follows settings.defaultPace;
-// 'safe'|'normal'|'fast' store an explicit override (worker.applyPace scales that account's timing accordingly).
+// Update per-account PACE OVERRIDE. '' (Inherit) DELETES the field so the account follows the FLEET speed
+// (settings.speedMode); 'safe'|'fast'|'max' store an explicit override for THIS account (see lib/speed.js resolver —
+// the override SELECTS that tier's per-post timing; it does not multiply, and cycle cadence stays fleet-level).
 async function updateAccountPace(accountName, paceValue) {
-  const valid = ['safe', 'normal', 'fast', 'turbo', 'instant'].includes(paceValue);
+  const valid = ['safe', 'fast', 'max'].includes(paceValue);
   const account = await patchAccount(accountName, (a) => { if (valid) a.pace = paceValue; else delete a.pace; });
   if (!account) return;
-  const labels = { safe: '🐢 Safe (slower, most human)', normal: '⚖️ Normal (global tempo)', fast: '⚡ Fast (quick)', turbo: '🚀 Turbo (fastest, ¼ gaps)', instant: '⚡ Instant (max speed, 0–7s gaps)' };
-  showNotification(valid ? `Pace for ${accountName}: ${labels[paceValue]}` : `Pace for ${accountName}: inherit global default`, 'success');
+  const labels = { safe: '🛡️ Safe (full human)', fast: '⚡ Fast (paste, full gaps)', max: '🚀 Max (aggressive)' };
+  showNotification(valid ? `Pace for ${accountName}: ${labels[paceValue]}` : `Pace for ${accountName}: inherit the fleet speed`, 'success');
   try { renderAccounts(); } catch {}
 }
 
@@ -3324,6 +3471,12 @@ async function saveEditAccount() {
     showNotification('Account name cannot be empty', 'error');
     return;
   }
+  // Same charset as create (letters/numbers/underscore only) — the rename path previously skipped this, letting a name
+  // with quotes/angle-brackets through into the account-card inline onclick handlers (a stored-XSS vector). Enforced.
+  if (!/^[a-zA-Z0-9_]+$/.test(newName)) {
+    showNotification('Account name can only contain letters, numbers, and underscores', 'error');
+    return;
+  }
 
   // If name changed, use IPC to rename folder
   if (newName !== accountName) {
@@ -3531,12 +3684,43 @@ function openAccountBrowser(accountName) {
     .then((r) => { if (!(r && r.success)) showNotification(`Could not open ${accountName}: ` + ((r && r.error) || 'unknown'), 'error'); })
     .catch((e) => showNotification(`Could not open ${accountName}: ` + (e.message || e), 'error'));
 }
-// Toggle THIS account's group picker; close any other open picker first (one menu at a time).
+// Close every open account-card popover (group picker + the ⋯ overflow) — one menu at a time — and drop the z-index lift.
+function closeCardMenus() {
+  document.querySelectorAll('.acct-group-menu, .acct-more-menu').forEach((m) => { m.style.display = 'none'; });
+  document.querySelectorAll('.account-card.menu-open').forEach((c) => c.classList.remove('menu-open'));
+}
+// Open a popover AND lift its card above the neighbours. Each card is its own stacking context (backdrop-filter), so
+// without this the dropdown would be painted UNDER the next card in the grid (.menu-open sets a high z-index — see CSS).
+function _openCardMenu(menu) { if (!menu) return; menu.style.display = 'block'; const card = menu.closest('.account-card'); if (card) card.classList.add('menu-open'); }
+// Toggle THIS account's group picker; close any other open card popover first.
 function toggleAccountGroupPicker(accountName) {
   const menu = document.getElementById('acct-group-menu-' + acctKey(accountName));
   const open = menu && menu.style.display === 'block';
+  closeCardMenus();
+  if (menu && !open) _openCardMenu(menu);
+}
+// Toggle THIS account's ⋯ overflow menu (import cookies / rename / delete); close any other card popover first.
+function toggleAccountMore(accountName) {
+  const menu = document.getElementById('acct-more-menu-' + acctKey(accountName));
+  const open = menu && menu.style.display === 'block';
+  closeCardMenus();
+  if (menu && !open) _openCardMenu(menu);
+}
+// Close card popovers when clicking anywhere outside an open one (they otherwise linger until re-toggled).
+document.addEventListener('click', (e) => { try { if (!e.target.closest('.acct-group-picker, .acct-more-picker')) closeCardMenus(); } catch {} }, true);
+// Open ALL of THIS account's assigned groups at once — each in its own tab, in the account's own browser (one click).
+function openAccountGroups(accountName) {
   document.querySelectorAll('.acct-group-menu').forEach((m) => { m.style.display = 'none'; });
-  if (menu && !open) menu.style.display = 'block';
+  const acct = (appData.accounts || []).find((a) => a.name === accountName);
+  const n = ((acct && acct.assignedGroups) || []).length;
+  if (!n) { showNotification('No groups assigned to this account — assign some first (📋 Assigned Groups above).', 'error'); return; }
+  showNotification(`Opening ${n} group${n > 1 ? 's' : ''} as ${accountName}…`, 'info');
+  window.electronAPI.invoke('open-account-groups', accountName)
+    .then((r) => {
+      if (!(r && r.success)) { showNotification(`Could not open groups for ${accountName}: ` + ((r && r.error) || 'unknown'), 'error'); return; }
+      if (r.opened < r.total) showNotification(`Opened ${r.opened} of ${r.total} groups (capped at ${r.opened}) as ${accountName} — the rest can be opened via the ▾ list.`, 'info');
+    })
+    .catch((e) => showNotification(`Could not open groups for ${accountName}: ` + (e.message || e), 'error'));
 }
 // Open a specific assigned group AS this account (its own browser + proxy + geo, via open-account-browser + a group id).
 function openAccountGroup(accountName, fbGroupId) {
@@ -4147,6 +4331,8 @@ function loadSettings() {
   setValue('setting-daily-cap', S.dailyCap !== undefined ? S.dailyCap : 0);
   setValue('setting-reserve-accounts', S.reserveAccounts !== undefined ? S.reserveAccounts : 0);
   setValue('setting-reserve-max-jobs', S.reserveMaxJobsPerCycle !== undefined ? S.reserveMaxJobsPerCycle : 1);
+  setValue('setting-realip-max-concurrent', S.realIpMaxConcurrent !== undefined ? S.realIpMaxConcurrent : 3);
+  setValue('setting-realip-post-gap', S.realIpMinPostGapSec !== undefined ? S.realIpMinPostGapSec : 15);
   setValue('setting-daily-post-time', S.dailyPostTime || '09:00');
   setValue('setting-cycles-per-day', S.cyclesPerDay !== undefined ? S.cyclesPerDay : 1);
   setValue('setting-tabs-per-browser', S.tabsPerBrowser !== undefined ? S.tabsPerBrowser : 1);
@@ -4163,8 +4349,8 @@ function loadSettings() {
   setChecked('setting-enable-warmup', S.enableWarmup || false);
   setValue('setting-warmup-runs', S.warmupRuns !== undefined ? S.warmupRuns : 5);
   setValue('setting-cooldown-hours', S.rateLimitCooldownHours !== undefined ? S.rateLimitCooldownHours : 4);
-  { const el = document.getElementById('setting-default-pace'); if (el) el.value = ['safe', 'normal', 'fast', 'turbo', 'instant'].includes(S.defaultPace) ? S.defaultPace : 'normal'; }
-  try { highlightSpeed(S.speedMode || 'normal'); } catch {}
+  // (Removed: the "Default account pace" fleet-fallback dial — the fleet speed IS the baseline now; accounts Inherit it or override on the Accounts tab.)
+  try { highlightSpeed(S.speedMode || 'safe'); } catch {}
 }
 
 // Attach a hover "?" help badge to every Settings label explaining what the control does and how to
@@ -4214,20 +4400,14 @@ function injectSettingsHelp() {
 }
 
 // ---- One-click pacing presets (Fast / Normal / Slow) -------------------------------------------
-// Each preset fills EVERY timing range at once so the operator never tunes numbers by hand. Normal =
-// the verified defaults; Slow = safest (most human, lowest spam risk); Fast = quickest STILL-SAFE
-// pacing (group delay never goes below the engine's 120s floor). The operator can fine-tune after.
+// The 3 posting-speed tiers — the granular timing each fleet-baseline tier writes on one click.
+// ⚠️ KEEP IN SYNC WITH lib/speed.js TIER_TIMING (the backend's single source of truth; the resolver re-derives these
+// at runtime — this is the UI's copy for the one-click preset). safe = full human · fast = paste + full anti-spam
+// floors · max = aggressive (paste, smallest gaps; the worker clamps to rand(0,7000) regardless). See lib/speed.js.
 const SPEED_PRESETS = {
-  // INSTANT = max speed: everything PASTED + 0–7s between actions (the worker hard-clamps the gaps to rand(0,7000)
-  // with a ~1.5s/4s anti-spam floor regardless of these numbers). For warmed accounts on good proxies only — fast
-  // post→link is a spam tell.
-  instant: { waitIntervalMin: 0, waitIntervalMax: 3, accountDelayMin: 0, accountDelayMax: 0, groupDelayMin: 0, groupDelayMax: 7, commentDelayMin: 0, commentDelayMax: 7, pageScrollDwellSecMin: 0, pageScrollDwellSecMax: 0, prePublishDwellSecMin: 0, prePublishDwellSecMax: 0, commentDwellSecMin: 0, commentDwellSecMax: 0, composerOpenInitialDelayMs: 800 },
-  // TURBO = power-user / "super experienced user": instant typing + skipped reading dwells (speedMode triggers
-  // the fast path in the worker) + the smallest still-nonzero gaps (a real fast human, not a 0ms bot).
-  turbo:  { waitIntervalMin: 10,  waitIntervalMax: 20,  accountDelayMin: 0, accountDelayMax: 1, groupDelayMin: 20,  groupDelayMax: 45,  commentDelayMin: 8,   commentDelayMax: 20,  pageScrollDwellSecMin: 0, pageScrollDwellSecMax: 0,  prePublishDwellSecMin: 0, prePublishDwellSecMax: 1, commentDwellSecMin: 0, commentDwellSecMax: 1, composerOpenInitialDelayMs: 800 },
-  fast:   { waitIntervalMin: 45,  waitIntervalMax: 90,  accountDelayMin: 1, accountDelayMax: 2, groupDelayMin: 120, groupDelayMax: 180, commentDelayMin: 45,  commentDelayMax: 90,  pageScrollDwellSecMin: 2, pageScrollDwellSecMax: 6,  prePublishDwellSecMin: 1, prePublishDwellSecMax: 4,  commentDwellSecMin: 1, commentDwellSecMax: 3, composerOpenInitialDelayMs: 1000 },
-  normal: { waitIntervalMin: 90,  waitIntervalMax: 180, accountDelayMin: 1, accountDelayMax: 4, groupDelayMin: 120, groupDelayMax: 300, commentDelayMin: 60,  commentDelayMax: 180, pageScrollDwellSecMin: 3, pageScrollDwellSecMax: 15, prePublishDwellSecMin: 3, prePublishDwellSecMax: 8,  commentDwellSecMin: 1, commentDwellSecMax: 4, composerOpenInitialDelayMs: 1500 },
-  slow:   { waitIntervalMin: 180, waitIntervalMax: 360, accountDelayMin: 3, accountDelayMax: 8, groupDelayMin: 300, groupDelayMax: 600, commentDelayMin: 120, commentDelayMax: 300, pageScrollDwellSecMin: 8, pageScrollDwellSecMax: 25, prePublishDwellSecMin: 5, prePublishDwellSecMax: 12, commentDwellSecMin: 3, commentDwellSecMax: 8, composerOpenInitialDelayMs: 2500 },
+  safe: { waitIntervalMin: 90, waitIntervalMax: 180, accountDelayMin: 1, accountDelayMax: 4, groupDelayMin: 120, groupDelayMax: 300, commentDelayMin: 60, commentDelayMax: 180, pageScrollDwellSecMin: 3, pageScrollDwellSecMax: 15, prePublishDwellSecMin: 3, prePublishDwellSecMax: 8, commentDwellSecMin: 1, commentDwellSecMax: 4, composerOpenInitialDelayMs: 1500 },
+  fast: { waitIntervalMin: 45, waitIntervalMax: 90, accountDelayMin: 1, accountDelayMax: 2, groupDelayMin: 120, groupDelayMax: 180, commentDelayMin: 45, commentDelayMax: 90, pageScrollDwellSecMin: 2, pageScrollDwellSecMax: 6, prePublishDwellSecMin: 1, prePublishDwellSecMax: 4, commentDwellSecMin: 1, commentDwellSecMax: 3, composerOpenInitialDelayMs: 1000 },
+  max: { waitIntervalMin: 0, waitIntervalMax: 3, accountDelayMin: 0, accountDelayMax: 0, groupDelayMin: 0, groupDelayMax: 7, commentDelayMin: 0, commentDelayMax: 7, pageScrollDwellSecMin: 0, pageScrollDwellSecMax: 0, prePublishDwellSecMin: 0, prePublishDwellSecMax: 0, commentDwellSecMin: 0, commentDwellSecMax: 0, composerOpenInitialDelayMs: 800 },
 };
 function highlightSpeed(mode) {
   document.querySelectorAll('.speed-btn').forEach((b) => b.classList.toggle('active', b.dataset.speed === mode));
@@ -4246,7 +4426,7 @@ function wireSpeedButtons() {
     if (b.dataset.wired) return; b.dataset.wired = '1';
     b.addEventListener('click', () => applySpeedPreset(b.dataset.speed));
   });
-  highlightSpeed((appData && appData.settings && appData.settings.speedMode) || 'normal');
+  highlightSpeed((appData && appData.settings && appData.settings.speedMode) || 'safe');
 }
 async function autoDetectProxyGeo(btn) {
   const orig = btn && btn.textContent;
@@ -4311,18 +4491,19 @@ async function saveSettings() {
     dailyCap: intOr('setting-daily-cap', 'dailyCap', 0),
     reserveAccounts: intOr('setting-reserve-accounts', 'reserveAccounts', 0), // engine clamps 0..(posters-1); 0 = standby-only reserves
     reserveMaxJobsPerCycle: Math.max(1, Math.min(5, intOr('setting-reserve-max-jobs', 'reserveMaxJobsPerCycle', 1))), // #5: drops one reserve may cover per cycle
+    realIpMaxConcurrent: Math.max(1, Math.min(8, intOr('setting-realip-max-concurrent', 'realIpMaxConcurrent', 3))), // max concurrent browsers on one shared IP (speed vs ban); effective concurrency = min(parallelAccounts, this)
+    realIpMinPostGapSec: Math.max(0, Math.min(3600, intOr('setting-realip-post-gap', 'realIpMinPostGapSec', 15))), // #2: per-IP aggregate post spacing (default 15s; 0=off) — bounds total posts/hr from one shared IP
     scheduleMode: S0.scheduleMode || 'daily', // preserve the engine's actual mode (don't clobber 'continuous')
     dailyPostTime: valOr('setting-daily-post-time', 'dailyPostTime', '09:00') || '09:00',
-    cyclesPerDay: Math.max(1, Math.min(8, intOr('setting-cycles-per-day', 'cyclesPerDay', 1))), // cycles per run (engine clamps 1..8 too)
+    cyclesPerDay: Math.max(1, Math.min(20, intOr('setting-cycles-per-day', 'cyclesPerDay', 1))), // cycles per run (engine clamps 1..20 too)
     tabsPerBrowser: Math.max(1, Math.min(4, intOr('setting-tabs-per-browser', 'tabsPerBrowser', 1))), // paced multi-tab: pre-load the next group(s) while posting (1 = classic; engine clamps 1..4 too)
     postThenComment: chk('setting-post-then-comment', 'postThenComment'), // two-phase: post every group first, then comment all (absorbs the post→comment wait; posts land before any comment)
     capturePostLinkFromNetwork: chk('setting-capture-link-from-network', 'capturePostLinkFromNetwork'), // read OUR post's link from FB's publish response instead of feed-scanning for it (two-phase, faster; content-verified before commenting)
     // "Time between cycles" — an explicit override of the inter-cycle wait (minutes). 0/blank = use the speed preset's
     // timing. Kept SEPARATE from waitIntervalMin/Max so a speed preset and this control never clobber each other.
-    cycleGapMin: (() => { const el = document.getElementById('setting-cycle-gap-min'); return (el && el.value !== '') ? Math.max(5, Math.min(720, parseInt(el.value, 10) || 0)) : 0; })(),
+    cycleGapMin: (() => { const el = document.getElementById('setting-cycle-gap-min'); return (el && el.value !== '') ? Math.max(0.5, Math.min(720, parseFloat(el.value) || 0)) : 0; })(), // 0.5..720 min; 0.5 = 30s (sub-minute allowed — operator-controlled cadence)
     proxyTimezone: (valOr('setting-proxy-timezone', 'proxyTimezone', '') || '').trim(), // IANA tz for PROXIED accounts (applyProxyGeo); '' = no override
     proxyLocale: (valOr('setting-proxy-locale', 'proxyLocale', '') || '').trim(),       // BCP-47 locale for PROXIED accounts; '' = no override
-    defaultPace: (['safe', 'normal', 'fast', 'turbo', 'instant'].includes(valOr('setting-default-pace', 'defaultPace', 'normal')) ? valOr('setting-default-pace', 'defaultPace', 'normal') : 'normal'),
     repostEnabled: chk('setting-repost-enabled', 'repostEnabled'),
     repostGraceSec: intOr('setting-repost-grace-sec', 'repostGraceSec', 180),
     varyContent: chk('setting-vary-content', 'varyContent'),
