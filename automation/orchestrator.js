@@ -541,10 +541,23 @@ class Orchestrator {
   // daily-run inter-cycle gap and the continuous-mode "next cycle" wait.
   _interCycleMs(settings) {
     const g = Number(settings && settings.cycleGapMin) || 0;
-    // cycleGapMin (store-clamped ≥5min) + up to 30% jitter, else the speed preset's waitInterval range VERBATIM — which
-    // may be 0 (instant / back-to-back cycles). NO floor here: continuous + daily-N=1 must honor 0; only the multi-cycle
-    // DAILY gate applies its own ≥5min floor (where cycles must not fire faster than the per-account spacing).
+    // cycleGapMin (store-clamped ≥0.5min = 30s) + up to 30% jitter, else the speed preset's waitInterval range VERBATIM —
+    // which may be 0 (instant / back-to-back cycles). NO floor here: continuous + daily-N=1 must honor 0; only the
+    // multi-cycle DAILY gate applies its own ≥30s floor (where cycles must not fire faster than the per-account spacing).
     return (g > 0) ? Math.floor(g * 60000 * (1 + Math.random() * 0.3)) : rangeMs(settings, 'waitIntervalMin', 'waitIntervalMax', 90, 180, 60000, 1);
+  }
+
+  // The daily-schedule wait decision, extracted so the multi-cycle firing SEQUENCE is unit-testable. The v1.0.78
+  // infinite-re-wait bug lived here: a SUBSEQUENT cycle must arm an ABSOLUTE fire time (this._nextCycleAt) ONCE and
+  // count DOWN to it — re-deriving a fresh gap on every loop re-entry never reaches 0, so the cycle would wait forever
+  // and never fire. Returns ms to wait before the next cycle (0 = fire NOW); mutates this._nextCycleAt. Pure given
+  // (settings, N, doneToday, runNow, nowMs) + this.{_lastDailyRunDate, _nextCycleAt}.
+  _dailyCycleWaitMs(settings, N, doneToday, runNow, nowMs) {
+    if (doneToday >= N) { this._nextCycleAt = 0; return this._msUntilDailyFire(settings.dailyPostTime, this._localDayKey()); } // all N done today → rest until TOMORROW's fire time
+    if (doneToday === 0) { this._nextCycleAt = 0; return runNow ? 0 : this._msUntilDailyFire(settings.dailyPostTime, this._lastDailyRunDate); } // first cycle of the day → wait for dailyPostTime
+    if (runNow) { this._nextCycleAt = 0; return 0; } // "Save & Start" fires the next cycle immediately
+    if (!this._nextCycleAt) this._nextCycleAt = nowMs + Math.max(30 * 1000, this._interCycleMs(settings)); // subsequent cycle: arm the fire time ONCE (floored 30s; per-action anti-spam floors still pace each post within a cycle)
+    return Math.max(0, this._nextCycleAt - nowMs);
   }
 
   _postsForAccount(account, cycle, claim = false, claimedSet = this._claimed) {
@@ -1596,14 +1609,7 @@ class Orchestrator {
         if (this._dailyCycleDate !== today) { this._dailyCycleDate = today; this._dailyCycleCount = 0; this._nextCycleAt = 0; } // new local day → reset the day's cycle counter
         const doneToday = this._dailyCycleCount || 0;
         const runNow = this._runNow; this._runNow = false; // consume — "Save & Start" runs the NEXT cycle immediately
-        let waitMs;
-        if (doneToday >= N) { this._nextCycleAt = 0; waitMs = this._msUntilDailyFire(settings.dailyPostTime, today); } // all N done today → rest until TOMORROW's fire time
-        else if (doneToday === 0) { this._nextCycleAt = 0; waitMs = runNow ? 0 : this._msUntilDailyFire(settings.dailyPostTime, this._lastDailyRunDate); } // first cycle of the day → wait for dailyPostTime
-        else if (runNow) { this._nextCycleAt = 0; waitMs = 0; } // "Save & Start" fires the next cycle immediately
-        else { // subsequent cycle in a MULTI-cycle run → arm an ABSOLUTE fire time ONCE, then count DOWN to it across loop re-entries. (Re-deriving a fresh gap every re-entry never reaches 0 — the cycle would wait forever and never fire.)
-          if (!this._nextCycleAt) this._nextCycleAt = Date.now() + Math.max(30 * 1000, this._interCycleMs(settings)); // "time between cycles" (cycleGapMin override, else waitInterval), floored 30s so sub-minute gaps take effect; the per-action anti-spam floors still pace each post/comment within a cycle
-          waitMs = Math.max(0, this._nextCycleAt - Date.now());
-        }
+        const waitMs = this._dailyCycleWaitMs(settings, N, doneToday, runNow, Date.now()); // extracted for unit-testability — see _dailyCycleWaitMs (v1.0.78 infinite-re-wait guard)
         if (runNow && waitMs === 0 && doneToday === 0) this.log(`▶️ Running the first cycle now; the daily schedule (${settings.dailyPostTime}) applies from the next cycle.`);
         if (waitMs > 0) {
           // Overnight wait (all cycles done → waiting for TOMORROW) may sleep the laptop. Waiting for a TODAY cycle must stay awake.

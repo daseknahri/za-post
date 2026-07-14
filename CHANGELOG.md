@@ -2,6 +2,14 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.84] — 2026-07-14 — H4 shipped (standby checkpoint un-stick) + multi-cycle firing-loop test (operator-approved)
+
+Cleared the last two "known items" from the v1.0.83 wrap-up.
+
+- **H4 — standby stuck at checkpoint: NOW FIXED (was deferred).** Re-reading `checkStatus` (main.js:1340-1414) showed the deferral premise was a conflation: `checkStatus` launches a *real browser*, navigates FB, and returns `logged_in` **only if** the URL isn't `/login|checkpoint/` and `location.href` has no `/checkpoint/` (lines 1369/1384) — so an *active* `logged_in` genuinely means the checkpoint redirect is gone. (The "reads logged_in even when blocked" caveat is the *passive* cookie-beacon, which M2-02 still correctly distrusts.) Fix: in the login-browser `disconnected` handler, when the active `checkStatus` returns `logged_in`, force a stuck `checkpoint`/`needs_verification` status to `logged_in` past M2-02 and clear the attention-rest. **Adversarially reviewed (3 angles, all confirmed-safe):** keyed strictly on `checkpoint`/`needs_verification` (never touches `rate_limited`/`account_disabled`); worst case (a rare non-URL checkpoint slipping the URL check) is caught mid-run by the worker's *stricter* `checkVerification` on the first group and re-benched — bounded + self-correcting, no hammering; over-posting impossible (delivery governed by the dealt-set/journal/daily-cap independent of bench status). Only fires on the operator-driven login-browser path, never a passive probe.
+- **Multi-cycle firing-loop regression test.** Extracted the daily-gate wait decision into a testable `_dailyCycleWaitMs()` (behavior-preserving) and added `tests/orchestrator-firing-loop.test.js` (5 tests) that drive the full firing sequence — locking the v1.0.78 fix (a subsequent cycle arms an absolute fire time and counts DOWN to it, never re-arming a fresh gap forever). Also corrected two stale `≥5min`/`cycleGapMin ≥5min` comments (both are 30s now).
+- Verified: `node --check` · full suite **315/315** · antispam 34/34 · boot OK.
+
 ## [1.0.83] — 2026-07-14 — Deferred ban-safety sweep: 4 provably-safe fixes shipped, 1 kept deferred (operator-requested "final sweep")
 
 Cleared the deferred findings recorded at v1.0.73/76. Each was re-verified against current code by an independent reader and adversarially reviewed (skeptics tried to refute ban-safety); all four ship with `banAxisRegression: false`. Ban-safety rule held: never loosen an anti-spam floor, never over-post, never clear a real block.

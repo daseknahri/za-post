@@ -1665,11 +1665,26 @@ async function openLoginBrowser(accountName, opts = {}) {
           } catch {}
         }
         emit('automation-log', `✅ [${accountName}] logged in as ${res.fbName || '(unknown)'} (c_user=${res.fbUserId || '?'})`);
-        // H2/H3: a GENUINE manual re-login un-benches the attention-rest ONLY for a logged-OUT (needs_login) bench —
-        // never for checkpoint/blocked/disabled (a logged_in cookie-probe does NOT prove FB lifted those, so clearing
-        // them would re-launch a still-blocked account into the shared IP = ban-axis). Keyed on the persisted REASON
-        // (attnFlag), not the churnable status field. Automation is stopped during openLoginBrowser → this write is race-free.
-        try { let _un = false; await store.update((dd) => { const a = (dd.accounts || []).find((x) => x.name === accountName); if (a && a.attnFlag === 'needs_login') { a.nextAttnRetry = 0; a.attnStrikes = 0; a.attnFlag = ''; _un = true; } }); if (_un) { send('data-updated'); emit('automation-log', `↩️ [${accountName}] re-login cleared its rest — it rejoins the next cycle`); } } catch {}
+        // H2/H3 + H4: this branch means the ACTIVE checkStatus navigated FB and returned logged_in — i.e. it saw NO
+        // /login/ or /checkpoint/ URL (main.js:1369/1384). That un-benches the account for BOTH a logged-out
+        // (needs_login) bench AND a stuck checkpoint/needs_verification: the ACTIVE browser check verified the block is
+        // gone — unlike the PASSIVE cookie-beacon M2-02 rightly distrusts (that beacon reads logged_in even for a
+        // posting-blocked account; this active check does not). For a checkpoint we also force the status past M2-02
+        // (setAccountStatus above kept the protected 'checkpoint'). Worst case a rare NON-URL checkpoint slips the URL
+        // check → the worker's stricter checkVerification catches it on the FIRST group and re-benches (bounded +
+        // self-correcting). The write is SERIALIZED on store.update's write-chain; automation is normally stopped here
+        // (openLoginBrowser refuses while running), but even if the operator Starts during the multi-second checkStatus,
+        // any interleave is bounded by that same one-attempt-then-rebench path + the dealt-set/inflight double-post guards.
+        try {
+          let _cleared = '';
+          await store.update((dd) => {
+            const a = (dd.accounts || []).find((x) => x.name === accountName); if (!a) return;
+            const wasCheckpoint = a.status === 'checkpoint' || a.status === 'needs_verification'; // M2-02 kept this despite the logged_in write at :1654
+            if (wasCheckpoint) { a.status = 'logged_in'; a.lastMessage = res.message || 'Active re-login — checkpoint cleared'; } // H4: active checkStatus verified no /checkpoint/ URL
+            if (wasCheckpoint || a.attnFlag === 'needs_login') { a.nextAttnRetry = 0; a.attnStrikes = 0; a.attnFlag = ''; _cleared = wasCheckpoint ? 'checkpoint' : 'the rest'; }
+          });
+          if (_cleared) { send('data-updated'); emit('automation-log', `↩️ [${accountName}] active re-login cleared its ${_cleared} — it rejoins the next cycle`); }
+        } catch {}
       } else {
         emit('automation-log', `❌ [${accountName}] not logged in: ${res.message}`);
       }
