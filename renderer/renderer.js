@@ -2141,7 +2141,7 @@ function renderAccounts() {
                 <span class="status-dot ${statusClass}" style="${account.status === 'error' ? 'background-color: #dc2626;' : account.status === 'checking' ? 'background-color: #f59e0b;' : account.status === 'logging_in' ? 'background-color: #3b82f6;' : account.status === 'rate_limited' ? 'background-color: #f59e0b;' : ''}"></span>
                 <span>${statusText}</span>
               </div>
-              <span title="${assignedCount} assigned group${assignedCount === 1 ? '' : 's'}" style="font-size:11px;font-weight:600;color:${assignedCount > 0 ? '#94a3b8' : '#f59e0b'};">📋 ${assignedCount}</span>
+              <span data-groupchip="${account.name}" title="${assignedCount} assigned group${assignedCount === 1 ? '' : 's'}" style="font-size:11px;font-weight:600;color:${assignedCount > 0 ? '#94a3b8' : '#f59e0b'};">📋 ${assignedCount}</span>
             </div>
             ${statusMessageHtml}
             ${accountStatusBadges(account)}
@@ -2154,7 +2154,7 @@ function renderAccounts() {
         <div class="account-groups" style="margin: 7px 0; padding: 8px; background: #1e293b; border-radius: 8px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <span style="font-size: 12px; color: #94a3b8;">📋 Assigned Groups:</span>
-            <span style="font-size: 11px; color: ${assignedCount > 0 ? '#22c55e' : '#f59e0b'}; font-weight: 500;">${assignedText}</span>
+            <span data-grouptext="${account.name}" style="font-size: 11px; color: ${assignedCount > 0 ? '#22c55e' : '#f59e0b'}; font-weight: 500;">${assignedText}</span>
           </div>
           <div class="groups-dropdown" style="position: relative;">
             <button class="btn-secondary" onclick="toggleGroupDropdown('${account.name}')" style="width: 100%; text-align: left; display: flex; justify-content: space-between; align-items: center;">
@@ -2385,22 +2385,16 @@ async function toggleGroupAssignment(accountName, groupId) {
   if (res && res.success === false) { showNotification('Failed to save assignment: ' + res.error, 'error'); return; }
   appData = fresh;
 
-  // Update just the count display without re-rendering (keeps dropdown open)
+  // Update the count chip + text IN PLACE (keeps the picker open so several groups can be assigned in a row).
+  // BUGFIX: the v1.0.77 card redesign moved the count into a `📋 N` chip + an "N groups assigned" text, but this
+  // surgical update still queried the OLD `.account-groups > div > span:last-child` (which matched nothing) — so the
+  // assignment saved to disk but never showed until a full re-render. Now targets the account-keyed data attributes.
   const assignedCount = account.assignedGroups.length;
   const assignedText = assignedCount === 0 ? 'No groups assigned' : `${assignedCount} group${assignedCount > 1 ? 's' : ''} assigned`;
-
-  // Find and update the count display for this account
-  const accountCards = document.querySelectorAll('.account-card');
-  accountCards.forEach(card => {
-    const dropdownBtn = card.querySelector(`[onclick*="toggleGroupDropdown('${accountName}')"]`);
-    if (dropdownBtn) {
-      const countSpan = card.querySelector('.account-groups > div > span:last-child');
-      if (countSpan) {
-        countSpan.textContent = assignedText;
-        countSpan.style.color = assignedCount > 0 ? '#22c55e' : '#f59e0b';
-      }
-    }
-  });
+  const chip = document.querySelector(`[data-groupchip="${accountName}"]`);
+  if (chip) { chip.textContent = `📋 ${assignedCount}`; chip.style.color = assignedCount > 0 ? '#94a3b8' : '#f59e0b'; chip.title = `${assignedCount} assigned group${assignedCount === 1 ? '' : 's'}`; }
+  const txt = document.querySelector(`[data-grouptext="${accountName}"]`);
+  if (txt) { txt.textContent = assignedText; txt.style.color = assignedCount > 0 ? '#22c55e' : '#f59e0b'; }
  });
 }
 

@@ -2,6 +2,10 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.85] — 2026-07-14 — Fix: assigning a group to an account didn't update the UI until a restart (operator-reported)
+
+`toggleGroupAssignment` (renderer) saved the change to disk but its in-place UI update queried `.account-groups > div > span:last-child` — a selector from the pre-v1.0.77 card layout that no longer matches anything. So the `📋 N` chip and the "N groups assigned" text never refreshed until a full re-render/restart. Fix: tag the chip + text with `data-groupchip`/`data-grouptext` (account-keyed) and update those in place — so the count updates live and the picker stays open for assigning several groups in a row. Renderer-only; `node --check` + boot verified.
+
 ## [1.0.84] — 2026-07-14 — H4 shipped (standby checkpoint un-stick) + multi-cycle firing-loop test (operator-approved)
 
 Cleared the last two "known items" from the v1.0.83 wrap-up.
