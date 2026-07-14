@@ -1352,26 +1352,29 @@ async function checkStatus(accountName) {
     const cookies = store.readCookies(accountName);
     // A2: resilient injection — try batch first, fall back to one-by-one so one bad
     // cookie can't prevent ALL cookies from being set.
-    if (cookies.length) {
-      const normalized = cookies.map(store.normalizeCookie); // C1: route through store's INV-25-compliant normalizer (forces secure:true for sameSite:None) — the removed local copy dropped xs/c_user on a minimal jar → false "not logged in" → a needless real-IP auto-login
-      try {
-        await page.setCookie(...normalized);
-      } catch {
-        for (const ck of normalized) { try { await page.setCookie(ck); } catch {} }
+    const normalized = cookies.length ? cookies.map(store.normalizeCookie) : []; // C1: store's INV-25 normalizer (forces secure:true for sameSite:None) so a minimal jar's xs/c_user aren't silently dropped
+    const sourceHasCuser = normalized.some((c) => c.name === 'c_user' && c.value);
+    // HARDENING: an intermittent inject/navigate miss (a dropped setCookie, a slow nav, esp. right after a profile-folder
+    // move) can leave the page WITHOUT the session cookies, so a jar that DOES contain c_user occasionally reads a FALSE
+    // "not authenticated" and needlessly benches a healthy account. When the SOURCE jar has c_user but the page doesn't,
+    // retry the inject+navigate ONCE (clearing the half-seeded jar first). A real logout (source lacks c_user) or a real
+    // redirect to /login|checkpoint/ is authoritative → NO retry (it must stay conservative, never invent a session).
+    let cUser = null, redirected = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (normalized.length) {
+        try { await page.setCookie(...normalized); }
+        catch { for (const ck of normalized) { try { await page.setCookie(ck); } catch {} } } // A2: one-by-one fallback so one bad cookie can't block the rest
       }
+      await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForSelector('[role="navigation"], [data-pagelet="FeedUnit_0"], [aria-label="Your profile"]', { timeout: 12000 }).catch(() => {}); // real render wait
+      await new Promise((r) => setTimeout(r, 1500));
+      if (/login|checkpoint/.test(page.url())) { redirected = true; break; } // authoritative: a real login/checkpoint redirect
+      cUser = (await page.cookies()).find((c) => c.name === 'c_user' && c.value); // PRIMARY auth check
+      if (cUser || !sourceHasCuser) break; // authenticated, OR the jar genuinely has no session → no point retrying
+      try { const del = await page.cookies(); if (del.length) await page.deleteCookie(...del); } catch {} // transient miss → clear the half-seeded jar and re-seed on the next pass
     }
-    await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-    // Fix #2: real render wait instead of fixed 3s
-    await page.waitForSelector('[role="navigation"], [data-pagelet="FeedUnit_0"], [aria-label="Your profile"]', { timeout: 12000 }).catch(() => {});
-    await new Promise((r) => setTimeout(r, 1500));
-
-    if (/login|checkpoint/.test(page.url())) return { status: 'not_logged_in', message: 'Redirected to login/checkpoint' };
-
-    // Fix #1: gate on c_user cookie as PRIMARY auth check
-    const pageCookies = await page.cookies();
-    const cUser = pageCookies.find((c) => c.name === 'c_user' && c.value);
-    if (!cUser) return { status: 'not_logged_in', message: 'No c_user cookie — not authenticated' };
+    if (redirected) return { status: 'not_logged_in', message: 'Redirected to login/checkpoint' };
+    if (!cUser) return { status: 'not_logged_in', message: sourceHasCuser ? 'Session cookie present but did not apply after a retry — re-export cookies / re-login' : 'No c_user cookie — not authenticated' };
 
     // Still detect picker/checkpoint even when c_user present (stale session edge case)
     const probe = await page.evaluate(() => {
