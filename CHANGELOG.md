@@ -2,6 +2,16 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.93] — 2026-07-15 — Posting waste-audit batch A: light warming in Max/Fast + dead-code/log-noise cleanups
+
+From a 9-agent waste audit of the posting lifecycle (code + real log timing; every change floor-checked by a skeptic that rejects anything touching an anti-spam floor). Batch A — the highest-confidence warming win + pure cleanups. Anti-spam floors, single-IP pacing, and all double-post/held/cap guards untouched; full suite **320/320**, antispam 34/34, boot OK.
+
+- **#14 (WARM) — Max/Fast is no longer a warming no-op.** `humanDwell` early-returned in fast/max/turbo (the tiers production runs), so every established account went land→instant-composer with no browse — a durable spam-shape on the single IP. Now fast/max does a LIGHT pre-composer dwell (1–2 scrolls + a short read), operator-tunable via `fastDwellMsMin/Max` (Max=0 → off) with a ~20% skip so it isn't metronomic. It ADDS time before the composer and never feeds/shortens the inter-group gap. Normal/safe keep the full `pageScrollDwell`.
+- **#4 — deleted the redundant 3rd Post-button diagnostic scan** (`worker.js`) — it was `null` on every fast/instant/turbo post and only logged; set no DOM attribute, gated nothing. The enable-gate, `waitForPublish` keys, prePublishDwell, clickPostButton, and the post-button-not-found failure path are untouched.
+- **#5 — gated the composer-fail DOM diagnostic to the terminal (4th) attempt** — attempts 1–3 self-heal, so ~74/86 of these scans/day diagnosed a problem that had already resolved.
+- **#6 — removed a redundant second 1500 ms settle** between failed composer attempts (the next attempt's own settle covers it; failure path only).
+- **#1 / #3 — log-noise cuts (~1,070 lines/day):** the inter-cycle countdown now LOGS every 5 min on long waits (the 30 s UI progress emit is unchanged for liveness); "Opening composer (attempt 1/4)" now logs only on retries.
+
 ## [1.0.92] — 2026-07-15 — Core batch 2a: reconstruct the daily cap after a mid-cycle crash (#4)
 
 From the core-invariant audit. A hard kill BETWEEN a delivery and `_recordAccountOutcome` (which increments `acc.daily.count` — the cap) loses that cycle's count. The rotation-pointer crash-fold (#3, v1.0.91) covers `postsToday` but NOT the separate `acc.daily.count`, so on resume the account's remaining budget is too high and it can over-post past its daily cap (a Facebook spam signal) — in ALL posting modes. Fix (`orchestrator.js`): `_reconstructDailyCounts` runs once at run start (right after the inflight fold) and rebuilds today's count per account from the PER-DELIVERY run-report (`appendReport` writes each row synchronously *before* the account returns, so it captures crashed-cycle deliveries), deduped by `account|postId|groupId` (a commented post's two `posted` rows count once) and filtered to the LOCAL day. It takes `MAX(persisted, reconstructed)` — only ever RAISING the count, so it fails safe toward under-posting and never over-posts; a correct persisted count is preserved. +1 regression test. Full suite **320/320**.

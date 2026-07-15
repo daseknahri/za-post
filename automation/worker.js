@@ -247,8 +247,26 @@ async function warmLikePosts(page, max, shouldStop, log, name) {
 
 async function humanDwell(page, shouldStop = () => false, settings = {}) {
   try {
-    // humanizeMaster off / fast / turbo → skip the human-reading dwell entirely (deterministic + fast).
-    if (isFastMode(settings)) return;
+    // NORMAL/SAFE tiers → the full configurable pageScrollDwell browse below. FAST/MAX/TURBO (humanizeMaster off) is NO
+    // LONGER a no-op: a LIGHT warming dwell (1–2 scrolls + a short read) so an established account isn't a land→instant-
+    // composer bot shape on the single IP (the tell the code warns about at the humanDwell call site). This is WARMING,
+    // not pacing — it ADDS a little time BEFORE the composer and never feeds/shortens the inter-group anti-spam gap.
+    // Operator-tunable via fastDwellMsMin/Max (Max=0 → off), with an occasional skip so it isn't metronomic. (v1.0.93)
+    if (isFastMode(settings)) {
+      const _hi = Number.isFinite(settings.fastDwellMsMax) ? settings.fastDwellMsMax : 3000;
+      const _lo = Number.isFinite(settings.fastDwellMsMin) ? settings.fastDwellMsMin : 1200;
+      if (_hi <= 0 || Math.random() < 0.2) return; // disabled, or a ~20% skip so the warm dwell isn't a metronomic tell
+      const _budget = Math.max(400, _lo + Math.floor(Math.random() * Math.max(1, _hi - _lo)));
+      try { await moveMouseTo(page, 380 + Math.random() * 240, 280 + Math.random() * 160); } catch {}
+      const _sc = 1 + Math.floor(Math.random() * 2); // 1–2 light scrolls
+      const _per = Math.max(300, Math.floor(_budget / (_sc + 1)));
+      for (let s = 0; s < _sc && !shouldStop(); s++) {
+        try { await page.mouse.wheel({ deltaY: 180 + Math.random() * 260 }); } catch {}
+        await sleepInterruptible(jitter(_per, 0.3), shouldStop, 500);
+      }
+      if (!shouldStop()) { try { await page.mouse.wheel({ deltaY: -(120 + Math.random() * 160) }); } catch {} }
+      return;
+    }
     // T5: total browse time is a random draw from the configurable pageScrollDwell range (0/0 = skip).
     const _dm = (settings._behavior && Number.isFinite(settings._behavior.dwellMult)) ? settings._behavior.dwellMult : 1;
     const dwellMs = Math.round(rangeMs(settings, 'pageScrollDwellSecMin', 'pageScrollDwellSecMax', 3, 15, 0) * _dm); // × per-account reading pace
@@ -717,7 +735,7 @@ async function openComposer(page, log, name, settings = {}) {
   }, { timeout: 20000 }).catch(() => {}); // R2: feed-render gate (slow internet)
 
   for (let attempt = 1; attempt <= 4; attempt++) {
-    if (log) log(`Opening composer (attempt ${attempt}/4)`);
+    if (log && attempt > 1) log(`Reopening composer (attempt ${attempt}/4)`); // #3: attempt-1 is immediately followed by 'Composer opened' on success → the line was pure duplication (~800 noise lines/day); only retries carry information
     if (attempt > 1) await _backToFeedIfTabbed(); // if a prior attempt's click navigated to a group tab, return to the feed BEFORE re-scanning
     // The composer lives at the TOP of the feed — make sure we're there and nothing covers it.
     await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
@@ -776,7 +794,7 @@ async function openComposer(page, log, name, settings = {}) {
     else await openComposerByText(page).catch(() => false);
     const ok = await page.waitForSelector('div[role="dialog"] [contenteditable="true"], div[role="dialog"] [role="textbox"]', { timeout: attempt === 1 ? 6000 : 9000 }).then(() => true).catch(() => false); // R4: more patience on slow-net retries
     if (ok) { if (attempt > 1 && log) log(`Composer opened (attempt ${attempt})`); return true; }
-    if (log) {
+    if (log && attempt === 4) { // #5: gate the full-DOM diagnostic scan to the TERMINAL attempt only — attempts 1-3 self-heal (attempt-2/3 recover the bulk), so ~74/86 of these scans/day diagnosed a problem that had already resolved
       // R3: a read-only readiness probe so a not-yet-rendered feed isn't misdiagnosed as selector drift.
       const hint = await page.evaluate(() => {
         const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
@@ -793,7 +811,8 @@ async function openComposer(page, log, name, settings = {}) {
       }).catch(() => null);
       if (hint) log(`Composer not open yet (feed readiness: ${hint.articles} articles, focused=${hint.focused}, ${hint.composerHits} composer-text matches); visible buttons: ${hint.buttons.join(' | ') || '(none)'}`);
     }
-    await sleep(humanDelay(1500, settings, 'settle'));
+    // #6: removed a redundant second sleep(1500) here — the next attempt's own initial settle (line ~724) is the sole
+    // per-attempt hydration beat; the two fired back-to-back with only a loop-continue between them (failure path only).
   }
   // Distinguish "page never rendered" from genuine selector drift using the last readiness read.
   const ready = await page.evaluate(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length).catch(() => 0);
@@ -3279,27 +3298,11 @@ async function runAccount(o) {
         // diagnostics — the `if (postBtnInfo)` guard below no-ops on null. Human-paced tiers (normal/safe) keep it. On a
         // genuine miss in the speed tiers the clickPostButton failure path still fires (incl. the 2-in-a-row unsupported-
         // language flag); for the full enabled-buttons enumeration run scripts/inspect-fb.js or use normal/safe.
-        const postBtnInfo = isFastMode(settings) ? null : await page.evaluate((labels) => {
-          const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-          const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
-          const scope = dialogs.length ? dialogs : [document];
-          for (const root of scope) {
-            const btn = Array.from(root.querySelectorAll('[role="button"], button')).find((b) =>
-              b.getAttribute('aria-disabled') !== 'true' && !b.disabled && labels.includes(norm(b.getAttribute('aria-label') || b.textContent)));
-            if (btn) return { found: true, dialogs: dialogs.length, label: (btn.getAttribute('aria-label') || btn.textContent || '').trim() };
-          }
-          // None matched — collect the enabled button labels we DID see so drift is diagnosable.
-          const seen = [];
-          for (const root of scope) for (const b of root.querySelectorAll('[role="button"], button')) {
-            const l = (b.getAttribute('aria-label') || b.textContent || '').replace(/\s+/g, ' ').trim();
-            if (l && b.getAttribute('aria-disabled') !== 'true') seen.push(l);
-          }
-          return { found: false, dialogs: dialogs.length, seen: seen.slice(0, 10) };
-        }, FB.postButton).catch(() => null);
-        if (postBtnInfo) {
-          if (postBtnInfo.found) step(`Post button found (label="${postBtnInfo.label}")`);
-          else step(`⚠️ Post button NOT found (${postBtnInfo.dialogs} dialog(s)) — possible selector drift. Buttons seen: ${(postBtnInfo.seen || []).join(' | ') || '(none)'}. If this recurs, run scripts/inspect-fb.js.`);
-        }
+        // #4: removed a REDUNDANT 3rd Post-button diagnostic scan here (was `null` on every fast/instant/turbo post and
+        // only logged — set no DOM attribute, gated nothing). The load-bearing pieces are untouched and elsewhere: the
+        // enable-gate waitForFunction above, the data-zp-composer shell tag + waitForPublish keys, prePublishDwell,
+        // clickPostButton's mouse-move+click, and the independent post-button-not-found failure path (incl. the
+        // 2-in-a-row unsupported-language flag) below.
         // Arm the publish-response capture RIGHT BEFORE the click (so we don't miss the create-story mutation's
         // response) — for ANY comment-bearing post (single- OR two-phase; both consume the captured link now) when
         // the operator enabled it. See armPostIdCapture: the id is a candidate, re-verified before commenting.

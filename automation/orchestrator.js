@@ -3052,7 +3052,8 @@ class Orchestrator {
     const restMode = ms > 5 * 60 * 1000 && allowSleep;
     if (restMode) { try { this.emit('keep-awake', false); } catch {} this.log('😴 At rest until the next scheduled run — the laptop may sleep now; it resumes automatically (no posts lost).'); }
     let end = Date.now() + ms;
-    let lastLog = 0;
+    let lastLog = 0, lastEmit = 0;
+    const _logEveryMs = ms > 5 * 60 * 1000 ? 300000 : 30000; // #1: on a LONG wait (>5min) LOG the countdown only every 5min (was every 30s → ~270 noise lines/day); short waits keep 30s. The UI progress emit stays at 30s for liveness.
     const fmt = (sec) => { const m = Math.floor(sec / 60), s = sec % 60; return (m > 0 ? m + 'm ' : '') + s + 's'; };
     while (Date.now() < end && !this._shouldStop() && !this._finish) { // Finish wakes a long daily-schedule wait
       if (this._paused) {
@@ -3062,10 +3063,10 @@ class Orchestrator {
         if (this._shouldStop()) break;
         continue;
       }
-      if (lastLog === 0 || Date.now() - lastLog >= 30000) {
-        lastLog = Date.now();
+      if (lastEmit === 0 || Date.now() - lastEmit >= 30000) {
+        lastEmit = Date.now();
         const remaining = Math.ceil((end - Date.now()) / 1000);
-        this.log(`⏳ ${label} in ${fmt(remaining)}…`);
+        if (lastLog === 0 || Date.now() - lastLog >= _logEveryMs) { lastLog = Date.now(); this.log(`⏳ ${label} in ${fmt(remaining)}…`); } // #1: log throttled; emit below stays 30s
         if (this._progress) { this._progress.waitingLabel = label; this._progress.waitRemainingSec = remaining; this.emit('automation-progress', { ...this._progress }); }
       }
       await sleep(1000);
