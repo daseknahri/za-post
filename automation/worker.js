@@ -2816,6 +2816,7 @@ async function runAccount(o) {
     const _groupSeg = (u) => { const m = /\/groups\/([^/?#]+)/.exec(String(u || '')); return m ? m[1] : null; };
     for (let i = 0; i < targetGroups.length; i++) {
       let publishClicked = false; // E-P1: once true, NEVER retry this group (would risk a double-post)
+      let captionConfirmed = true; // C2: set false only when the image-attach survival loop exhausts WITHOUT confirming OUR caption landed. Consulted at the Post-button-not-found branch to reclassify a doomed-composer publish as a transient (fresh-composer) retry instead of a misleading 'post button not found'. Defaults true so text-only / no-caption / confirmed-caption paths are unaffected.
       let resolvedGroupSeg = null; // WRONG-GROUP guard: THIS group's resolved /groups/<seg> (numeric or vanity) captured on first nav; per-iteration so an i-- retry re-captures on the fresh nav
       if (aborted) { log(`⏹ [${name}] watchdog aborted this account — not touching the dead browser`); break; }
       if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
@@ -3081,13 +3082,30 @@ async function runAccount(o) {
         // never the old 3× repaste loop, never a slow retype after a paste. FAST/TURBO/INSTANT paste (Input.insertText
         // targets the focused editor, no OS clipboard → race-free across parallel accounts); NORMAL/SAFE human-TYPE
         // (a real person — anti-bot for cold accounts).
-        const enterCaptionOnce = async (settleMs) => {
+        const enterCaptionOnce = async (settleMs, stabilize) => {
           // (no leading focusEditable — clearEditable's OWN first step is focusEditable(page), which focuses + MARKS the
           // editor identically; the old back-to-back double-focus paid a full ~400ms settle + mouse-arc + click for nothing.)
           await clearEditable(page);  // GUARANTEE empty first → entry can never append to / double a persisted draft (its first step focuses + MARKS the exact editor data-zp-editor)
           await focusEditable(page);  // re-focus: clearEditable's execCommand('delete') can re-mount Lexical + drop focus (insertText targets the ACTIVE element)
           if (isFastMode(settings)) {
             await sleep(settleMs);
+            // G2 (image-first seed ONLY, opt-in via `stabilize`): the image attach + clearEditable both re-mount Lexical, so a
+            // blind fixed settle can insertText MID-re-mount → the caption lands in a stale editor → 'did not land' → the survival
+            // loop grinds ~9s then owes the group (≈30 'caption did not land' retries/day). After the floor settle above, wait
+            // (bounded) until the MARKED editor's rect is identical across two 150ms reads (settled + still present). STRICTLY
+            // ADDITIVE: never inserts earlier than the old fixed settle; if it never stabilizes we fall through and the survival
+            // loop below still catches it — so this can only improve first-try landing, never regress it. The other two callers
+            // pass no `stabilize` → byte-identical behavior.
+            if (stabilize) {
+              const _cap = Date.now() + (settings.speedMode === 'instant' ? 1800 : 2500);
+              let _lastRect = null, _stableReads = 0;
+              while (Date.now() < _cap && !shouldStop()) {
+                const _rect = await page.evaluate(() => { const el = document.querySelector('[data-zp-editor="1"]'); if (!el) return null; const b = el.getBoundingClientRect(); return Math.round(b.x) + ',' + Math.round(b.y) + ',' + Math.round(b.width) + ',' + Math.round(b.height); }).catch(() => null);
+                if (_rect && _rect === _lastRect) { if (++_stableReads >= 1) break; } else _stableReads = 0; // identical across two consecutive reads → settled
+                _lastRect = _rect;
+                await sleep(150);
+              }
+            }
             try { if (!cdpSession) throw new Error('no cdp session'); await cdpSession.send('Input.insertText', { text: String(post.caption) }); }
             catch { try { await page.evaluate((t) => { const el = document.querySelector('[data-zp-editor="1"]') || document.activeElement; if (el) { el.focus(); document.execCommand('insertText', false, t); } }, post.caption); } catch {} }
             await sleep(settings.speedMode === 'instant' ? 60 : 150); // let FB's React commit the inserted text before we read it (instant 60ms; fast/turbo 300→150ms = ONE verifyCaptionLanded poll-interval of headroom, then the reads-first-then-150ms-poll below with its UNCHANGED deadline absorbs a late commit — an under-committed early read just re-polls, never mis-verifies on the marked/prefix-match path)
@@ -3181,7 +3199,7 @@ async function runAccount(o) {
             // its length-only fallback off a STRAY editable (an open Messenger draft, the background feed composer) →
             // falsely "landed" → the loop breaks without ever typing our caption → an image-only post publishes and
             // counts as success (silent caption drop). Idempotent: enterCaptionOnce clears-first, so it can't double.
-            const _capSeed = _captionAfterImage ? await enterCaptionOnce(settings.speedMode === 'instant' ? 100 : 400) : null; // SPEED: instant 250→100 — this pre-insert settle stacks on the re-focus's own ~400ms tail, so 100ms is plenty; a rare under-settled insert is caught by the survival loop's empty-check re-paste below (never caption-less, never a draft). enterCaptionOnce ends by returning verifyCaptionLanded — capture it to skip a duplicate first poll below
+            const _capSeed = _captionAfterImage ? await enterCaptionOnce(settings.speedMode === 'instant' ? 100 : 400, true) : null; // G2: stabilize=true → wait for the re-mounted editor to settle before the seed insert (see enterCaptionOnce). SPEED: instant 250→100 — this pre-insert settle stacks on the re-focus's own ~400ms tail, so 100ms is plenty; a rare under-settled insert is caught by the survival loop's empty-check re-paste below (never caption-less, never a draft). enterCaptionOnce ends by returning verifyCaptionLanded — capture it to skip a duplicate first poll below
             const _capDeadline = Date.now() + (isFastMode(settings) ? 9000 : 11000);
             let _capOk = false, _stale = 0;
             while (!_capOk && Date.now() < _capDeadline && !shouldStop()) {
@@ -3195,7 +3213,8 @@ async function runAccount(o) {
               else if (++_stale >= 2) { await enterCaptionOnce(settings.speedMode === 'instant' ? 250 : 400); _stale = 0; } // text present but NOT our caption after 2 patient checks → a persisted FB DRAFT (not our caption still rendering) → enterCaptionOnce CLEARS-first then re-enters OURS. Without this the editor keeps the draft, the final editableLen>0 guard passes, and we PUBLISH THE DRAFT (wrong caption). Re-pasting our own slow-rendering caption is idempotent, so a false trigger is harmless.
               else await sleepInterruptible(settings.speedMode === 'instant' ? 300 : 400, shouldStop); // maybe still rendering → one more patient check before deciding it's a draft
             }
-            step(_capOk ? 'Caption present ✅' : 'Caption not confirmed after retries — will re-attempt the group');
+            captionConfirmed = _capOk; // C2: remember the outcome for the Post-button branch — a not-confirmed caption that still left text in the editor slips past the empty-editor guard below and would otherwise be misreported as 'post button not found'
+            step(_capOk ? 'Caption present ✅' : 'Caption not confirmed after retries'); // C2: dropped the '— will re-attempt the group' promise: a re-attempt now happens ONLY if the Post button is also not found (below), not unconditionally
           }
         }
 
@@ -3293,6 +3312,13 @@ async function runAccount(o) {
             return false; // no Post button at all (enabled OR disabled) → genuine drift/unsupported-language → fall through
           }, FB.postButton).catch(() => false);
           if (_postBtnStillDisabled) { step('Post button present but still DISABLED (image likely still uploading server-side) — re-attempting the group (nothing was clicked → no double-post)'); throw new Error('transient: post button still disabled'); }
+          // C2: the caption never CONFIRMED in the survival loop (editor was not provably empty, so the caption-less guard
+          // above didn't fire) AND now the Post button isn't found — a doomed publish on a bad composer, NOT a missing/
+          // unknown button. Route to the SAME bounded pre-publish retry (fresh composer; publishClicked still false → no
+          // double-post) instead of misreporting 'post button not found' and wrongly advancing the unsupported-language
+          // streak. Fires ONLY when the button is genuinely absent, so a still-publishable composer (caption actually fine,
+          // only the verify flaked) is never discarded. Bounded by groupRetries<3 like every other transient.
+          if (!captionConfirmed) { step('Caption never confirmed + Post button not found — re-attempting the group with a fresh composer (nothing was clicked → no double-post)'); throw new Error('transient: caption did not confirm — reopening a fresh composer'); }
           // TWO IN A ROW = the composer opened but the submit button matched NO known label → this account's FB UI is
           // almost certainly in an UNSUPPORTED LANGUAGE (e.g. Arabic not in FB.postButton). A single miss can be a slow
           // render (the transient-retry path recovers it), but a genuine can't-find every group would SILENTLY deliver
