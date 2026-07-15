@@ -2,6 +2,13 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.94] — 2026-07-15 — Posting waste-audit batch B: established-account daily warm pass + focus-poll reclaim
+
+Batch B from the posting waste audit — the primary warming reinvestment + the biggest floor-safe time reclaim. Anti-spam floors, single-IP pacing, and all guards untouched; full suite **320/320**, antispam 34/34, boot OK.
+
+- **#13 (WARM) — established accounts now get an ongoing daily warm pass.** The new-account warm-up stops after `warmupRuns`, so the whole long-running fleet went auth→composer every cycle with no browse — a durable spam-shape on the single IP. Established accounts (`priorRuns ≥ warmupRuns`, `enableWarmup` on) now do a LIGHT home-feed pass at most once/~20 h — keyed off a persisted `lastWarmTs` — home dwell + one genuine reaction, and ~half the time a dwell on one of its own groups. Best-effort, `shouldStop`-guarded; adds time BEFORE posting, never touches any anti-spam gap. Tunable via `establishedWarmHours` (0 → off). The primary sink for the time the speedups reclaim.
+- **#8 (SAFE-SPEEDUP) — `focusEditable`'s blind `sleep(400)` → a bounded focus poll.** Same 400 ms ceiling, ~120 ms residual floor; the click focuses synchronously so it usually returns in ~120–160 ms, keeping the full ceiling for a slow re-mount. Fires twice per caption (~13–15 min/day reclaimed fleet-wide) — reinvested into warming, not banked as speed. Never returns before 120 ms (the residual settle keeps first-try insert-miss + survival churn from rising).
+
 ## [1.0.93] — 2026-07-15 — Posting waste-audit batch A: light warming in Max/Fast + dead-code/log-noise cleanups
 
 From a 9-agent waste audit of the posting lifecycle (code + real log timing; every change floor-checked by a skeptic that rejects anything touching an anti-spam floor). Batch A — the highest-confidence warming win + pure cleanups. Anti-spam floors, single-IP pacing, and all double-post/held/cap guards untouched; full suite **320/320**, antispam 34/34, boot OK.

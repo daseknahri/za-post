@@ -1935,7 +1935,22 @@ async function focusEditable(page) {
       }
       return null;
     }).catch(() => null);
-    if (pt) { await moveMouseTo(page, pt.x, pt.y); await page.mouse.click(pt.x, pt.y, { delay: 30 + Math.floor(Math.random() * 70) }).catch(() => {}); await sleep(400); return true; }
+    if (pt) {
+      await moveMouseTo(page, pt.x, pt.y);
+      await page.mouse.click(pt.x, pt.y, { delay: 30 + Math.floor(Math.random() * 70) }).catch(() => {});
+      // #8: replaced a blind sleep(400) with a bounded focus-confirmation poll — SAME 400ms ceiling, ~120ms residual
+      // floor. The click focuses synchronously, so this usually returns in ~120-160ms; it keeps the full ceiling for a
+      // slow re-mount and never returns before 120ms (the residual settle keeps first-try insert-miss + the 9s survival
+      // churn from rising). Reclaimed time is REINVESTED into warming, never banked as posting speed. Fires twice/caption.
+      const _fEnd = Date.now() + 400;
+      await sleep(120);
+      while (Date.now() < _fEnd) {
+        const _ok = await page.evaluate(() => { const el = document.querySelector('[data-zp-editor="1"]'); return !!(el && document.activeElement === el); }).catch(() => false);
+        if (_ok) break;
+        await sleep(40);
+      }
+      return true;
+    }
   } catch {}
   return false;
 }
@@ -2679,6 +2694,34 @@ async function runAccount(o) {
           } catch {}
         }
       } catch (e) { log(`⚠️ [${name}] warm-up skipped (${e.message})`); }
+    }
+
+    // #13 ESTABLISHED-account ongoing warm pass (v1.0.93): the new-account warm-up above STOPS after warmupRuns, so a
+    // trusted-but-busy account (the whole long-running fleet) would then go straight auth→composer EVERY cycle with no
+    // browse — a durable spam-shape on the single Moroccan IP. Give established accounts a LIGHT home-feed pass at most
+    // once/~20h, keyed off a PERSISTED lastWarmTs (not per-run probability) so the human signal actually lands and stays
+    // bounded. This is the primary SINK for the wall-clock the waste-audit speedups reclaim. Best-effort + shouldStop-
+    // guarded; it ADDS time BEFORE posting and never counts toward / shortens any group/comment/cycle anti-spam gap.
+    if (settings.enableWarmup && priorRuns >= (Number.isFinite(settings.warmupRuns) ? settings.warmupRuns : 5) && !shouldStop()) {
+      let _lastWarm = 0;
+      try { const _me = store.load().accounts.find((a) => a.name === name); _lastWarm = Number(_me && _me.lastWarmTs) || 0; } catch {}
+      const _warmEveryMs = (Number.isFinite(settings.establishedWarmHours) ? settings.establishedWarmHours : 20) * 3600000;
+      if (_warmEveryMs > 0 && Date.now() - _lastWarm >= _warmEveryMs) {
+        log(`🌿 [${name}] daily warm pass — a light home-feed browse + reaction before posting (keeps a trusted account human-shaped on the single IP)`);
+        try {
+          await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await sleep(1500 + Math.floor(Math.random() * 1500));
+          await dismissPopups(page);
+          const warmSettings = { ...settings, humanizeMaster: true, speedMode: 'normal' }; // force the real browse past isFastMode (warming is trust behavior, not cosmetic pacing)
+          await humanDwell(page, shouldStop, warmSettings);
+          await warmLikePosts(page, 1, shouldStop, log, name); // one genuine reaction (real getBoundingClientRect + mouse click) = an engagement fingerprint, not just scrolling
+          if (!shouldStop() && targetGroups.length && Math.random() < 0.5) { // ~half the time, also dwell ONE of its own groups (builds engagement where it posts)
+            const _g = targetGroups[Math.floor(Math.random() * targetGroups.length)];
+            try { await page.goto(`https://www.facebook.com/groups/${_g.groupId || _g.id}`, { waitUntil: 'domcontentloaded', timeout: 30000 }); await sleep(1200 + Math.floor(Math.random() * 1200)); await dismissPopups(page); await humanDwell(page, shouldStop, warmSettings); } catch {}
+          }
+          try { await store.update((d) => { const a = d.accounts.find((x) => x.name === name); if (a) a.lastWarmTs = Date.now(); }); } catch {} // persist so it's at most once/~20h
+        } catch (e) { log(`⚠️ [${name}] daily warm pass skipped (${e.message})`); }
+      }
     }
 
     // Resolve images once: local files, or download remote URLs to temp.
