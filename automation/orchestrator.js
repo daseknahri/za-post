@@ -1465,6 +1465,46 @@ class Orchestrator {
     } catch (e) { try { this.log(`obligation-fold skipped: ${e.message}`); } catch {} }
   }
 
+  // #4 (mid-crash daily-cap under-count → over-post): a hard kill BETWEEN a delivery and _recordAccountOutcome (which
+  // increments acc.daily.count — the CAP) loses that cycle's count, so on resume the account's remaining budget is too
+  // high and it can over-post past its daily cap (a Facebook spam signal). The rotation-pointer fold (#3) covers
+  // postsToday but NOT the separate acc.daily.count. Reconstruct it from the PER-DELIVERY run-report (appendReport writes
+  // each row synchronously via fs.appendFileSync BEFORE the account returns, so it captures crashed-cycle deliveries):
+  // count TODAY's deliveries per account (deduped by account|postId|groupId so a commented post's two 'posted' rows count
+  // once) and take MAX(persisted, reconstructed). MAX only ever RAISES the count → fails safe toward UNDER-posting, never
+  // over; a correct persisted count is preserved. Runs once at run start, right after the inflight fold.
+  async _reconstructDailyCounts() {
+    try {
+      const fs = require('fs');
+      const today = store.todayKey();
+      const counts = {}, seen = new Set();
+      for (const f of [store.reportFile(), store.reportFile() + '.1']) {
+        let raw; try { raw = fs.readFileSync(f, 'utf8'); } catch { continue; }
+        for (const line of raw.split(/\n/)) {
+          if (!line) continue;
+          let r; try { r = JSON.parse(line); } catch { continue; }
+          if (!r || !r.account || r.account === '(run summary)') continue;
+          if (r.result !== 'posted' && r.result !== 'pending') continue;               // posted + held (pendingApproval) = what daily.count counts
+          if (!r.ts || store.todayKey(new Date(r.ts)) !== today) continue;             // LOCAL day, matching acc.daily's key
+          const key = r.account + '|' + (r.postId || '') + '|' + (r.groupId || '');     // dedup: count the DELIVERY once (two-phase writes two 'posted' rows)
+          if (seen.has(key)) continue;
+          seen.add(key);
+          counts[r.account] = (counts[r.account] || 0) + 1;
+        }
+      }
+      if (!Object.keys(counts).length) return;
+      let raised = 0;
+      await store.update((d) => {
+        for (const acc of (d.accounts || [])) {
+          const rec = counts[acc.name]; if (!rec) continue;
+          if (store.dailyRolledOver(acc.daily, today)) acc.daily = { date: today, count: 0 };
+          if (rec > (Number(acc.daily.count) || 0)) { acc.daily.count = rec; raised++; } // MAX: only raise, never lower
+        }
+      });
+      if (raised) this.log(`🧮 Daily-cap reconstruct: raised ${raised} account(s)' today-count from the per-delivery run-report (a mid-crash cycle had under-counted them) — prevents over-posting past the cap.`);
+    } catch {}
+  }
+
   _recoverInflightJournal(data) {
     try {
       const entries = store.loadInflight();
@@ -1630,6 +1670,7 @@ class Orchestrator {
     // group is re-posted and no un-reached group is silently skipped. Uses the getData() snapshot (this._data isn't bound
     // until the cycle loop below). Best-effort — it never throws into _loop.
     this._recoverInflightJournal(getData());
+    await this._reconstructDailyCounts(); // #4: rebuild the daily CAP count from the per-delivery run-report so a mid-crash cycle can't let an account over-post past its cap (fail-safe: only ever raises the count)
     // OBLIGATION crash-fold: recover held/comment obligations a hard-kill left in the journal (see _foldObligationJournal).
     await this._foldObligationJournal(getData());
     let cycle = 0;

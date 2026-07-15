@@ -2,6 +2,10 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.92] — 2026-07-15 — Core batch 2a: reconstruct the daily cap after a mid-cycle crash (#4)
+
+From the core-invariant audit. A hard kill BETWEEN a delivery and `_recordAccountOutcome` (which increments `acc.daily.count` — the cap) loses that cycle's count. The rotation-pointer crash-fold (#3, v1.0.91) covers `postsToday` but NOT the separate `acc.daily.count`, so on resume the account's remaining budget is too high and it can over-post past its daily cap (a Facebook spam signal) — in ALL posting modes. Fix (`orchestrator.js`): `_reconstructDailyCounts` runs once at run start (right after the inflight fold) and rebuilds today's count per account from the PER-DELIVERY run-report (`appendReport` writes each row synchronously *before* the account returns, so it captures crashed-cycle deliveries), deduped by `account|postId|groupId` (a commented post's two `posted` rows count once) and filtered to the LOCAL day. It takes `MAX(persisted, reconstructed)` — only ever RAISING the count, so it fails safe toward under-posting and never over-posts; a correct persisted count is preserved. +1 regression test. Full suite **320/320**.
+
 ## [1.0.91] — 2026-07-15 — Core-correctness batch 1: 4 verified fixes from the adversarial core-invariant audit
 
 An 8-agent adversarial audit tried to BREAK each core safety invariant (double-post, wrong-group, caption, held-post, accounting, crash-fold, bench, rotation); 18 holes found, 12 verified against the code. This ships the 4 highest-value, provably-safe, no-new-persisted-state fixes. All preserve the load-bearing guards; full suite **319/319** (+2), antispam 34/34, boot OK.
