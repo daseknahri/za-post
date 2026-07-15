@@ -392,6 +392,32 @@ class Orchestrator {
       if (n) this.log(`🧹 Reclaimed ${n} Chrome cache folder(s) between cycles (cookies/identity untouched) — keeps the disk from filling on a long run.`);
     } catch {}
   }
+  // E (observability): write a machine-readable status.json for an away operator polling remotely, and log a HEALTH line
+  // hourly, so a slowly-degrading run (accounts benching one by one, disk-halted, stuck with no recent post) is visible
+  // from afar instead of only on physical return. Read-only over EXISTING counters; driven by a 5-min timer, never the
+  // per-post critical path — a slow/failed status write can't perturb pacing or the single-IP loop.
+  _emitHealth() {
+    try {
+      const p = this._progress || {};
+      const benched = Object.entries(this._runFlags || {}).map(([name, flag]) => ({ name, flag }));
+      const now = Date.now();
+      const lastAgo = this._lastPostAt ? Math.round((now - this._lastPostAt) / 1000) : null;
+      const status = {
+        running: !!this.running, paused: !!this._paused, diskHalt: !!this._diskHalt, offline: !!p.offline,
+        cycle: p.cycle || 0, posted: p.posted || 0, errors: p.errors || 0, pending: p.pending || 0,
+        accountsDone: p.accountsDone || 0, accountsTotal: p.accountsTotal || 0,
+        benchedCount: benched.length, benched,
+        lastPostAgoSec: lastAgo, uptimeSec: this._runStartedAt ? Math.round((now - this._runStartedAt) / 1000) : 0,
+        ts: now,
+      };
+      try { store.writeStatus(status); } catch {}
+      if (!this._lastHealthLog || now - this._lastHealthLog >= 60 * 60 * 1000) {
+        this._lastHealthLog = now;
+        const ago = lastAgo == null ? 'never' : ((lastAgo < 90 ? lastAgo + 's' : Math.round(lastAgo / 60) + 'm') + ' ago');
+        this.log(`💓 HEALTH — cycle ${status.cycle} · ${status.posted} posted · ${status.errors} err · ${status.benchedCount} benched · last post ${ago}${status.paused ? ' · PAUSED' : ''}${status.diskHalt ? ' · DISK-LOW-PAUSE' : ''}${status.offline ? ' · OFFLINE' : ''}`);
+      }
+    } catch {}
+  }
   // State change (queued/running/done/error/...). Map updated now; emit is coalesced (see _emitLiveOps).
   _setAcctState(name, state, extra) {
     if (!this._acctLive) this._acctLive = {};
@@ -460,9 +486,13 @@ class Orchestrator {
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
     this._diskPreflight(getData); // warn BEFORE a long run if the drive can't hold the fleet's profiles (a full disk halts all accounts)
     this._startNetMonitor(); // watch connectivity for the whole run (auto-pause offline / auto-resume online)
+    this._runStartedAt = Date.now(); this._lastPostAt = 0; this._lastHealthLog = 0; // E: run-health tracking for an away operator
+    this._emitHealth(); // write an initial status.json immediately
+    this._healthTimer = setInterval(() => { try { this._emitHealth(); } catch {} }, 5 * 60 * 1000); // E: refresh status.json every 5 min (+ a HEALTH log line hourly)
     this._loop(getData).catch((e) => { this._crashed = true; this.log(`❌ Orchestrator crashed: ${e.message}`); }) // A1: tag a real loop crash so the terminal reason is 'crashed' (not 'completed') → run-active is KEPT set and the next launch's resume path recovers it, instead of the crash being silently mislabeled done
       .finally(() => {
         this._stopNetMonitor();
+        if (this._healthTimer) { try { clearInterval(this._healthTimer); } catch {} this._healthTimer = null; } // E: stop the health timer
         this.running = false;
         this._aborters.clear();
         this._progress.running = false;
@@ -472,6 +502,7 @@ class Orchestrator {
         this._emitSummary(reason);
         this.emit('automation-stopped', reason);
         this.log(`⏹ Automation ${reason}.`);
+        try { this._emitHealth(); } catch {} // E: final status.json write reflecting the terminal state (running:false)
       });
     // Concurrent moderator: a SECOND browser approves held "Spam potentiel" posts in the BACKGROUND while
     // the posting pool keeps running — the operator never has to stop. Self-gates on moderationEnabled.
@@ -2123,6 +2154,7 @@ class Orchestrator {
         if (res.flag === 'rate_limited') this._retryCount[account.name] = (this._retryCount[account.name] || 0) + 1;
         else if (res.progressed) this._retryCount[account.name] = 0;
         this._progress.accountsDone++; this._progress.posted += res.posted; this._progress.errors += res.errors; this._progress.pending += res.pendingApproval;
+        if (res.posted > 0) this._lastPostAt = Date.now(); // E: stamp last-delivery time so the health status shows "last post Nm ago" (a stalled fleet is then visible remotely)
         // Final live state for this account's row: rate-limited / needs-login / dropped flag / error / done.
         let _finalState = 'done';
         if (res.flag === 'rate_limited') _finalState = 'rate_limited';
