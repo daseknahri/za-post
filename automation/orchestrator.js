@@ -1516,7 +1516,14 @@ class Orchestrator {
             // it can NEVER fabricate a gap larger than reality → never posts before 20h-since-real-post (cross-midnight
             // straddle stays blocked). Legacy lines / missing t → Date.now() = today's conservative bench (no regression).
             const foldTs = (Number.isFinite(best.rec.t) && best.rec.t > 0 && best.rec.t <= Date.now()) ? best.rec.t : Date.now(); // defensive: only a plausible past timestamp is trusted; NaN/0/negative/future all fall back to Date.now() (conservative bench, never a floor bypass)
-            this._perAccountRotation[agent] = { lastPostId: p, lastPostedDate: d, lastPostedAt: foldTs, postsToday: 1, postsTodayDate: d, icommit: maxQ };
+            // #3 (cyclesPerDay>1 over-post fix): a survivor never clean-committed, so this recovered cycle is +1 ON TOP of
+            // the same-day cycles already persisted before the crash — NOT a reset to 1, which discarded them and let the
+            // agent post up to N-1 MORE past its daily cap on resume. min(N,…) is defensive; SET (not ++) stays idempotent
+            // (a later clean persist bumps icommit so the survivor is no longer a survivor). N=1 → priorToday 0 → 1 (byte-identical).
+            const _prevRot = this._perAccountRotation[agent] || {};
+            const _priorToday = (_prevRot.postsTodayDate === d) ? (Number(_prevRot.postsToday) || 0) : 0;
+            const _foldedPostsToday = Math.min(N, _priorToday + 1);
+            this._perAccountRotation[agent] = { lastPostId: p, lastPostedDate: d, lastPostedAt: foldTs, postsToday: _foldedPostsToday, postsTodayDate: d, icommit: maxQ };
             // HOLE 2 FIX: baseline the owed set on the PRE-EXISTING persisted _owed for THIS post (mirrors the clean path
             // ~1895-1896), NOT the full assigned set. If a PRIOR cleanly-committed cycle already delivered some of this
             // post's groups (so they're no longer journal survivors), recomputing owed from the full assigned set would
@@ -1528,8 +1535,9 @@ class Orchestrator {
             else if (this._owed[agent] && this._owed[agent].postId === p) delete this._owed[agent]; // full delivery of THIS post → nothing owed (guard the postId so a standing owed for a DIFFERENT post survives)
             // H-A2: an agent recovered as fully quota-satisfied for TODAY must NOT also spend the manual-Start one-shot
             // quota bypass (which would let it wrap past the pointer and re-post the NEXT post today). Pre-spend it so
-            // the normal _dailyQuotaBlocks cap gates it. postsToday is 1, so this fires exactly when N==1 (classic 1/day).
-            if (d === today && 1 >= N) this._manualBypassUsed.add(agent);
+            // the normal _dailyQuotaBlocks cap gates it. #3: gate on the FOLDED same-day count (≥N), not a hardcoded 1,
+            // so an N>1 agent that already used its full quota before the crash also pre-spends the bypass.
+            if (d === today && _foldedPostsToday >= N) this._manualBypassUsed.add(agent);
           } else {
             // unique / sequence: the FLEET-WIDE dealt-set is the supersession. Add a post to _dealt ONLY on a FULL
             // delivery (every assigned group reached); a PARTIAL stays UN-dealt so the resume re-picks + finishes it.
@@ -1550,7 +1558,7 @@ class Orchestrator {
                 this._clearInflightDelivered(p);                                 // full → no crash-durable guard needed (purge any prior partial keys)
                 if (rec.maxQ > fullMaxQ) fullMaxQ = rec.maxQ;                     // only FULL posts advance the watermark
               } else {
-                for (const g of rec.gids) this._inflightDelivered.add((rec.s || '') + p + '::' + g); // PARTIAL → durable delivered-guard (identical key format to worker markDelivered/alreadyDelivered: e.s + e.p + '::' + e.g)
+                for (const g of rec.gids) this._inflightDelivered.add(p + '::' + g); // PARTIAL → durable delivered-guard. #10: normalize to the ''-scope key (drop rec.s) — matches how the unique/sequence worker's alreadyDelivered looks it up (_dkScope returns '' for unique/sequence). No-op on the normal path (rec.s already ''); fixes ONLY the daily-rotation→unique operator-switch case, where a stale 'name::' scope made the key never match → re-post to already-delivered groups.
               }
             }
             if (fullMaxQ) this._inflightSeq[agent] = Math.max((this._inflightSeq[agent]) || 0, fullMaxQ);
@@ -2554,7 +2562,7 @@ class Orchestrator {
               this._reserve = (this._reserve || []).filter((a) => a.name !== reserve.name); // don't reuse this account for Phase-3 rescue this cycle
               // On a resolved re-post, advance the record OFF 'superseded' to terminal 'approved' so the Phase-1 dedup
               // (which blocks held/superseded/failed_held) doesn't permanently block a FUTURE re-hold of the same post.
-              const markResolved = () => { try { const msR = store.loadModeration(); const rR = (msR.held || []).find(recMatch); if (rR && rR.status === 'superseded') { rR.status = 'approved'; rR.approvedAt = Date.now(); store.saveModeration(msR); } } catch {} };
+              const markResolved = () => { try { const msR = store.loadModeration(); const rR = (msR.held || []).find(recMatch); if (rR && rR.status === 'superseded') { rR.status = 'approved'; rR.approvedAt = Date.now(); rR.repostAttempts = 1; store.saveModeration(msR); } } catch {} }; // #1: mark repostAttempts=1 on a SUCCESS/already-live terminal — the candidate filter (~2522 `!(repostAttempts>0)`) then PERMANENTLY excludes this record, so a later comment-rescue reopen→'failed' can't re-post an already-live held post (duplicate). No other reader of repostAttempts; Phase-1 re-hold dedup keys on status, so a fresh future hold is unaffected.
               this.log(`♻️ [${reserve.name}] re-posting held content to "${rec.groupName || rec.gid}" (original by ${rec.posterAccount} stayed in Spam potentiel)…`);
               this._setAcctState(reserve.name, 'running', { action: `♻️ re-posting held → ${rec.groupName || rec.gid}` }); // show the reserve working in Live Operations
               const result = await runRepost({
@@ -2707,7 +2715,7 @@ class Orchestrator {
                               // BOUNDED: after 3 re-opens the post is permanently un-placeable (FB keeps re-holding it) — stop
                               // re-approving it forever (the moderator only re-approves 'held'). Mark it terminally failed +
                               // surface it, instead of an unbounded re-home → re-approve → re-queue → notfound loop.
-                              approved.status = 'failed'; approved.heldFailedAt = Date.now(); approved.note = 'approved but its comment could never be placed after 3 re-opens — live WITHOUT its comment';
+                              approved.status = 'failed'; approved.heldFailedAt = Date.now(); approved.repostAttempts = 1; approved.note = 'approved but its comment could never be placed after 3 re-opens — live WITHOUT its comment'; // #1: this record was moderator-approved OUTSIDE markResolved (repostAttempts still 0); mark it 1 so the failed-status candidate filter (~2522) doesn't hand this ALREADY-LIVE post to Phase-4 re-post → duplicate
                               this.log(`❌ [${task.groupName || task.gid}] post repeatedly held after approval — giving up re-homing (live without its comment); place it manually.`);
                             } else {
                               approved.status = 'held'; approved.approvedAt = null; approved.note = 're-opened: approved but its comment could not be placed (still held in Spam potentiel)'; // keep the ORIGINAL heldAt so the 90-min STALE prune can still fire as a backstop

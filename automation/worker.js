@@ -2328,6 +2328,11 @@ async function runAccount(o) {
     try { const proc = browser && browser.process && browser.process(); if (proc) proc.kill(); } catch {}
   };
   let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false, rlKind = null, consecPubTimeouts = 0, consecNoPostBtn = 0, consecNoComposer = 0;
+  // #7 (d4 false-bench guard — shared probe): an account that has ALREADY delivered today (persisted daily count, updated
+  // after each prior cycle) is provably NOT blocked. Consulted at the THREE likely_blocked flag-sites to SUPPRESS a false
+  // "blocked" escalation caused by transient single-IP composer/feed/post-button misses. FAILS SAFE toward FB: returns
+  // false (→ still benches) when there is no positive same-day health signal. One helper so this ban-critical probe can't drift.
+  const deliveredToday = () => { try { const me = store.load().accounts.find((a) => a.name === name); return !!(me && store.dailyUsed(me.daily) > 0); } catch { return false; } };
   const heldRecords = []; // MOD: posts FB held in the moderation queue this run (for the moderator phase)
   const commentQueue = []; // posts that went LIVE but whose link-comment couldn't be placed (for a healthy reserve account to rescue)
   // v1.0.72 CRASH-DURABILITY: mirror each obligation into the durable journal AT CREATION (via the orchestrator callback),
@@ -3034,7 +3039,12 @@ async function runAccount(o) {
           // to English AND reserves cover its groups, instead of it silently erroring on every group and posting nothing.
           // STOP-direction only (publishClicked never fired, waitForPublish never ran) → structurally cannot double-post.
           if (why) consecNoComposer = 0;
-          else if (++consecNoComposer >= 2) { step('🛑 Composer would not open on 2 groups in a row — this account\'s Facebook is likely in a language the app doesn\'t recognize (set it to English) or Facebook changed the layout. Stopping it so reserves cover its groups.'); noRetry = true; flag = 'likely_blocked'; break; }
+          else if (++consecNoComposer >= 2) {
+            // #7: suppress the likely_blocked escalation when the account already delivered today — 2 composer misses in a
+            // row on an account that's been posting is a transient slow-IP/layout hiccup, NOT a block. Still stop this cycle.
+            if (deliveredToday()) { step('⚠️ Composer would not open on 2 groups in a row, but this account already delivered today — treating as transient (slow IP / FB layout hiccup), NOT blocked. Stopping it this cycle; it retries next.'); noRetry = true; break; }
+            step('🛑 Composer would not open on 2 groups in a row — this account\'s Facebook is likely in a language the app doesn\'t recognize (set it to English) or Facebook changed the layout. Stopping it so reserves cover its groups.'); noRetry = true; flag = 'likely_blocked'; break;
+          }
           continue;
         }
         consecNoComposer = 0; // composer opened → clear the unsupported-language streak (mirrors consecNoPostBtn's reset)
@@ -3325,6 +3335,14 @@ async function runAccount(o) {
           // ZERO posts with no reserve coverage (a plain skip isn't a drop flag). Flag it so (a) the operator is told to
           // set it to English, and (b) reserves cover its groups instead of the whole account posting nothing.
           if (++consecNoPostBtn >= 2) {
+            // #7: suppress the likely_blocked escalation when the account already delivered today (transient, not blocked).
+            // Keep errors++ + report so the flag-INDEPENDENT reserve-takeover (orchestrator res.errors>0) still covers these groups.
+            if (deliveredToday()) {
+              step('⚠️ Post button not found on 2 groups in a row, but this account already delivered today — treating as transient (slow IP / FB hiccup), NOT blocked. Stopping it this cycle; reserves still cover these groups.');
+              errors++; noRetry = true;
+              report(groupName, gid, 'error', 'post button not found (transient — account already delivered today, not benched)', '');
+              break;
+            }
             step('🛑 Post button not found on 2 groups in a row — this account\'s Facebook is likely in a language the app doesn\'t recognize (set it to English). Stopping it so reserves cover its groups.');
             errors++; noRetry = true; flag = 'likely_blocked';
             report(groupName, gid, 'error', 'post button not found (unsupported UI language? set the account to English)', '');
@@ -4039,7 +4057,15 @@ async function runAccount(o) {
       // problem. If we're OFFLINE, mark offline (the orchestrator HOLDS + re-runs next cycle, account untouched)
       // instead of 'likely_blocked' — which would wrongly drop it + trigger a needless reserve takeover / alert.
       if (typeof isOnline === 'function' && !(await isOnline())) offline = true;
-      else flag = 'likely_blocked';
+      else {
+        // D (false-bench guard — the d4 case): an account that has ALREADY delivered today is provably NOT blocked, so a
+        // single 0-posted cycle caused by transient single-IP composer/feed misses must NOT escalate to 'likely_blocked'
+        // (which drops the account, fires a "check this on Facebook" alert, and triggers a needless reserve takeover).
+        // FAILS SAFE toward FB: only suppress when there is POSITIVE evidence of health (it posted >0 today, read from the
+        // persisted daily count updated after each prior cycle); an account that has posted NOTHING today still benches.
+        if (deliveredToday()) log(`⚠️ [${name}] posted 0 this cycle (transient composer/feed misses) but it already delivered today — NOT flagging as blocked; it retries next cycle.`); // #7: shared probe (see deliveredToday helper)
+        else flag = 'likely_blocked';
+      }
     }
     // Persist refreshed cookies for next run — but ONLY if the session is still valid. If the run ended
     // on a logged-out/checkpoint wall (needs_login/needs_verification/account_disabled, or the jar lost

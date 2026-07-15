@@ -169,3 +169,45 @@ test('R5 fold H1: a CORRUPT t (non-numeric / 0 / negative / future) is rejected 
     assert.ok(lp >= before && lp <= Date.now() + 5, `corrupt t=${JSON.stringify(badT)} → foldTs falls back to ~now (benched, never a floor bypass)`);
   }
 });
+
+// ── #3 (cyclesPerDay>1 over-post): the fold must ADD the recovered cycle to the same-day count, not reset it to 1 ──────
+test('R5 fold #3: cyclesPerDay>1 folds postsToday = prior + 1 (never resets to 1 → no over-post past the daily cap)', () => {
+  const d = DAY();
+  const o = mk(
+    [{ q: 10, a: 'A', o: 'daily-rotation', s: 'A::', p: 'P2', g: 'g1', d }],
+    {
+      _data: { accounts: [acc('A', 'daily-rotation', ['g1', 'g2'])], groups: grps(['g1', 'g2']), posts: [{ id: 'P2' }], settings: { cyclesPerDay: 5 } },
+      _perAccountRotation: { A: { lastPostId: 'P1', lastPostedDate: d, postsToday: 3, postsTodayDate: d, icommit: 8 } }, // 3 cycles already committed today BEFORE the crash
+    },
+  );
+  o._recoverInflightJournal(o._data);
+  assert.strictEqual(o._perAccountRotation.A.postsToday, 4, 'folded = prior 3 + this recovered cycle = 4 (the old `postsToday:1` reset let it post up to N-1 MORE past the cap)');
+});
+
+test('R5 fold #3: folded postsToday clamps to N (saturation), N=1 stays 1, and a stale prior-day count does not carry', () => {
+  const d = DAY();
+  // saturation: prior already == N → clamp to N (not N+1)
+  const oSat = mk(
+    [{ q: 10, a: 'A', o: 'daily-rotation', s: 'A::', p: 'P2', g: 'g1', d }],
+    { _data: { accounts: [acc('A', 'daily-rotation', ['g1'])], groups: grps(['g1']), posts: [{ id: 'P2' }], settings: { cyclesPerDay: 3 } },
+      _perAccountRotation: { A: { lastPostId: 'P1', lastPostedDate: d, postsToday: 3, postsTodayDate: d, icommit: 8 } } },
+  );
+  oSat._recoverInflightJournal(oSat._data);
+  assert.strictEqual(oSat._perAccountRotation.A.postsToday, 3, 'clamped to N=3 (min), never 4');
+  // N=1 (default) → 1, byte-identical to the old behavior
+  const oN1 = mk(
+    [{ q: 10, a: 'A', o: 'daily-rotation', s: 'A::', p: 'P2', g: 'g1', d }],
+    { _data: { accounts: [acc('A', 'daily-rotation', ['g1'])], groups: grps(['g1']), posts: [{ id: 'P2' }], settings: {} },
+      _perAccountRotation: {} },
+  );
+  oN1._recoverInflightJournal(oN1._data);
+  assert.strictEqual(oN1._perAccountRotation.A.postsToday, 1, 'N=1, no prior record → 1 (unchanged)');
+  // stale prior-day count (postsTodayDate != today) must NOT carry into today's fold
+  const oStale = mk(
+    [{ q: 10, a: 'A', o: 'daily-rotation', s: 'A::', p: 'P2', g: 'g1', d }],
+    { _data: { accounts: [acc('A', 'daily-rotation', ['g1'])], groups: grps(['g1']), posts: [{ id: 'P2' }], settings: { cyclesPerDay: 5 } },
+      _perAccountRotation: { A: { lastPostId: 'P1', lastPostedDate: 'YESTERDAY', postsToday: 4, postsTodayDate: 'YESTERDAY', icommit: 8 } } },
+  );
+  oStale._recoverInflightJournal(oStale._data);
+  assert.strictEqual(oStale._perAccountRotation.A.postsToday, 1, "yesterday's count is ignored → today folds to 1");
+});
