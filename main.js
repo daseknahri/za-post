@@ -145,6 +145,15 @@ function killOrphanChromium() {
 // two original apps. Default profile keeps the package name (the King set).
 const PROFILE = (process.argv.find((a) => a.startsWith('--profile=')) || '').split('=')[1] || process.env.ZA_PROFILE;
 if (PROFILE) app.setName('za-post-restored-' + PROFILE);
+// Optional userData relocation (opt-in, inert unless set). Point ZA_USERDATA_DIR at another volume to move
+// ALL app data — account profiles, cookies, logs, uploads, license — off the default drive. Used when the
+// system drive is low on space (a single run's Chromium profile churn can be several GB). Must run BEFORE
+// whenReady/store.init so every app.getPath('userData') consumer sees the redirected location. On failure
+// (e.g. the target volume is missing) it silently keeps the default path — never blocks startup.
+if (process.env.ZA_USERDATA_DIR) {
+  try { fs.mkdirSync(process.env.ZA_USERDATA_DIR, { recursive: true }); app.setPath('userData', process.env.ZA_USERDATA_DIR); }
+  catch (e) { console.error('[userData] ZA_USERDATA_DIR redirect failed, using default:', e && e.message); }
+}
 // Required for Windows toast notifications (captcha/login alerts) to show with our identity —
 // without it, an unpackaged/portable run's notifications are silently dropped or mislabeled.
 try { app.setAppUserModelId('com.zapost.commenttool'); } catch {}
