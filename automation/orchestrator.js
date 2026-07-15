@@ -224,7 +224,7 @@ class Orchestrator {
   // Is this account posting RIGHT NOW (its profile browser is open)? Used to allow logging in any OTHER account
   // mid-run without a profile conflict — only the actively-posting account is off-limits.
   isAccountInFlight(name) { const l = this._acctLive && this._acctLive[name]; return !!(l && l.state === 'running'); }
-  async _waitWhilePaused() { while (this._paused && !this._stop) await sleep(500); }
+  async _waitWhilePaused() { while ((this._paused || this._diskHalt) && !this._stop) { if (this._diskHalt) this._evalDiskHalt(); await sleep(500); } } // B1: also HOLD while disk is critically low (a SEPARATE flag from operator-pause), re-evaluating each tick so it auto-resumes the instant space is freed
 
   async _waitForConnectivity() {
     let offlineLogged = false;
@@ -348,6 +348,24 @@ class Orchestrator {
       else if (nAcc >= 20 && free < need) { this._lastDiskWarn = now; this.log(`⚠️ DISK: ${freeGB} GB free may not hold ${nAcc} account profiles (~${Math.round(need / GB)} GB at ~200 MB each). If it fills mid-run, posting halts fleet-wide — add space or reduce accounts.`); }
     } catch {}
   }
+  // B1: HARD disk floor BELOW the advisory _diskPreflight warn tier. Sets a SEPARATE `_diskHalt` flag (never the
+  // operator's `_paused`) that gates every browser launch through _waitWhilePaused: auto-PAUSE the fleet under 1 GB so a
+  // filling drive can't hit ENOSPC and halt everything mid-post, auto-RESUME over 2 GB (hysteresis so it can't flap).
+  // Logs ONLY on a transition. Between-launch hold only — never aborts a live post (data stays consistent).
+  _evalDiskHalt() {
+    try {
+      const free = this._freeDiskBytes();
+      if (free == null) return;
+      const GB = 1024 * 1024 * 1024;
+      if (!this._diskHalt && free < 1 * GB) {
+        this._diskHalt = true;
+        this.log(`🛑 DISK CRITICAL: only ${(free / GB).toFixed(2)} GB free — auto-PAUSING all posting to prevent an ENOSPC halt (your data stays safe). Free some space; posting resumes automatically above 2 GB.`);
+      } else if (this._diskHalt && free > 2 * GB) {
+        this._diskHalt = false;
+        this.log(`✅ DISK recovered: ${(free / GB).toFixed(2)} GB free — resuming posting.`);
+      }
+    } catch {}
+  }
   // State change (queued/running/done/error/...). Map updated now; emit is coalesced (see _emitLiveOps).
   _setAcctState(name, state, extra) {
     if (!this._acctLive) this._acctLive = {};
@@ -394,7 +412,7 @@ class Orchestrator {
     this._manualRun = !!opts.manual;
     this._manualBypassUsed = new Set(); // per-account ONE-SHOT quota bypass for a manual Start (reset each Start) — see _dailyQuotaBlocks
     if (this._manualRun) { this._dailyCycleDate = this._localDayKey(); this._dailyCycleCount = 0; this._nextCycleAt = 0; }
-    this._stop = false; this._paused = false; this._finish = false; this._recordLossHalt = false; this.running = true; // _recordLossHalt reset so a Stop→Start AFTER fixing the disk/lock actually recovers (the sticky R2 halt would otherwise re-fire after the first account)
+    this._stop = false; this._paused = false; this._finish = false; this._recordLossHalt = false; this._crashed = false; this._diskHalt = false; this.running = true; // _recordLossHalt reset so a Stop→Start AFTER fixing the disk/lock actually recovers (the sticky R2 halt would otherwise re-fire after the first account). _crashed (A1) + _diskHalt (B1) reset per run.
     this._modLoop = false; // reset so a quick Stop→Start re-arms the concurrent moderator loop (a still-draining prior loop must not block the new one)
     this._runGen = (this._runGen || 0) + 1; // generation token: a moderator loop from a PRIOR Start self-terminates when this bumps — the _modLoop flag alone can't tear it down because start() flips running/_stop back before the old loop re-checks them (it would otherwise survive a quick Stop→Start that landed mid-approval, accumulating duplicate loops over a multi-day run)
     this._approving = false; // never start a run with a stuck approval guard
@@ -416,7 +434,7 @@ class Orchestrator {
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
     this._diskPreflight(getData); // warn BEFORE a long run if the drive can't hold the fleet's profiles (a full disk halts all accounts)
     this._startNetMonitor(); // watch connectivity for the whole run (auto-pause offline / auto-resume online)
-    this._loop(getData).catch((e) => this.log(`❌ Orchestrator crashed: ${e.message}`))
+    this._loop(getData).catch((e) => { this._crashed = true; this.log(`❌ Orchestrator crashed: ${e.message}`); }) // A1: tag a real loop crash so the terminal reason is 'crashed' (not 'completed') → run-active is KEPT set and the next launch's resume path recovers it, instead of the crash being silently mislabeled done
       .finally(() => {
         this._stopNetMonitor();
         this.running = false;
@@ -424,7 +442,7 @@ class Orchestrator {
         this._progress.running = false;
         this._progress.paused = false;
         this.emit('automation-progress', { ...this._progress });
-        const reason = this._stop ? 'stopped' : (this._finish ? 'finished' : 'completed');
+        const reason = this._crashed ? 'crashed' : (this._stop ? 'stopped' : (this._finish ? 'finished' : 'completed')); // A1: 'crashed' preserves run-active for auto-resume
         this._emitSummary(reason);
         this.emit('automation-stopped', reason);
         this.log(`⏹ Automation ${reason}.`);
@@ -2235,7 +2253,7 @@ class Orchestrator {
         return true;
       };
       while ((queue.length || inFlight.size) && !this._shouldStop()) {
-        await this._waitWhilePaused(); if (this._shouldStop()) break;
+        this._evalDiskHalt(); await this._waitWhilePaused(); if (this._shouldStop()) break; // B1: check disk before topping up the pool → a filling drive auto-pauses new launches (holds in _waitWhilePaused) instead of hitting ENOSPC mid-cycle
         while (inFlight.size < _livePoolTarget() && queue.length && !stopPool && !this._finish && !this._shouldStop()) { if (!launchNext()) break; } // live RAM-aware target: re-expands as memory frees so a low snapshot at cycle start can't serialize the whole cycle
         if (!inFlight.size) break; // nothing running and nothing launchable (finish / stop / drained / all IPs busy)
         await Promise.race([...inFlight]); // wake as soon as ONE slot frees, then top the pool back up

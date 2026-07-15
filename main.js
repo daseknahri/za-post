@@ -268,11 +268,14 @@ function emit(channel, payload) {
     remote.addLog(line);
     appendLogFile(line);
   }
-  // ANY terminal state clears the run-active flag — completed, finished, AND stopped
-  // (including internal stops like maxCycles / no-posts / all-logged-out). Otherwise the
-  // flag stays set and the next launch auto-resumes a run that already ended, forever.
+  // A NON-CRASH terminal state clears the run-active flag — completed, finished, AND stopped
+  // (including internal stops like maxCycles / no-posts / all-logged-out). Otherwise the flag stays set
+  // and the next launch auto-resumes a run that already ended, forever. A1 exception: reason 'crashed'
+  // is the ONE case we DON'T clear — the loop threw, so we KEEP run-active set → the next launch's resume
+  // path recovers it instead of the crash being silently mislabeled done. (A hard-kill mid-run never
+  // reaches this handler at all, so run-active also stays set there → resume — unchanged.)
   if (channel === 'automation-stopped') {
-    setRunActive(false);
+    if (payload !== 'crashed') setRunActive(false);
   }
   if (channel === 'account-attention') {
     notifyAccountAttention(payload);

@@ -2,6 +2,14 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.88] — 2026-07-15 — Unattended-survival hardening: honest crash tag (auto-resume unblocked) + hard disk auto-pause; CSV BOM
+
+P0 "days-unattended" survival fixes from the 2026-07-14 campaign-log hardening plan. All load-bearing guards preserved; `node --check` · full suite **315/315** · antispam 34/34 · boot OK.
+
+- **A1 — a real orchestrator-loop crash was mislabeled a clean "completed" and cleared run-active, so the resume path never fired (silent, unrecoverable run death).** `_loop().catch()` logged the crash, but `.finally()` computed `reason = _stop ? 'stopped' : _finish ? 'finished' : 'completed'` — a thrown loop collapses to `'completed'`, and main.js cleared run-active on every terminal reason. Fix: the catch sets `this._crashed = true`; the reason is now `_crashed ? 'crashed' : …`; main.js clears run-active on every reason EXCEPT `'crashed'`. A crash now KEEPS run-active set → the existing next-launch resume recovers it, and the log stops lying with "Automation completed." Clear semantics for completed/finished/stopped (incl. maxCycles / no-posts) are byte-identical.
+- **B1 — a filling disk was advisory-only; it would hit ENOSPC and halt the whole fleet mid-run (it did on 2026-07-14, forcing a manual C:→D: move).** Added a hard floor below the existing warn tier: a SEPARATE `_diskHalt` flag (never the operator's `_paused`) that `_waitWhilePaused` now honors, evaluated (`_evalDiskHalt`) before each pool top-up. Auto-PAUSE all posting under 1 GB free, auto-RESUME over 2 GB (hysteresis so it can't flap). Between-launch hold only — never aborts a live post. Converts the single most-likely hard failure into a self-healing pause.
+- **CSV BOM.** `run-report.csv` gets a UTF-8 BOM on header creation so Arabic/accented group names render in Excel/LibreOffice instead of mojibake (write-only file; no reader strips it).
+
 ## [1.0.87] — 2026-07-15 — Posting effectiveness: caption-drop reclassify + image-first Lexical seed stabilization; opt-in relocatable userData
 
 Two posting-effectiveness fixes from the 2026-07-14 campaign-log analysis (1438 posted / 34 errors; the error cluster was 13× "post button not found", 12× "composer did not open", ~30 "caption did not land"), plus an infrastructure opt-in for low-disk machines. All load-bearing guards preserved (single-IP serialized pacing, ~30s anti-spam floors, double-post / wrong-caption / caption-less guards untouched); `node --check` · full suite **315/315** · antispam 34/34.
