@@ -2,6 +2,10 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.89] — 2026-07-15 — Disk self-management: prune Chrome caches between cycles (complements the auto-pause)
+
+B2 from the hardening plan — the PROACTIVE half of disk safety (B1 in v1.0.88 was the reactive auto-pause). Chrome's HTTP/GPU/shader caches grow unbounded across a multi-day run (only the HTTP cache was capped); on a busy day the profile churn alone was several GB, which is what filled the drive and stalled a run. Fix (`orchestrator.js`): between cycles — when the pool + rescue + repost have all drained, before the inter-cycle wait — `_pruneProfileCaches` deletes ONLY ephemeral cache dirs (`Cache`, `Code Cache`, `GPUCache`, `ShaderCache`, `GrShaderCache`, `Dawn*`, `Crashpad`) at the profile root and its `Default` folder, for every non-moderator account. It NEVER touches Cookies/Network, Local Storage, IndexedDB, Service-Worker CacheStorage, or Preferences — and the durable login (`accounts/<name>/cookies.json`) lives outside `chrome-profile` entirely, so a session is never affected. Safe against a stray open browser (Windows locks in-use files → `rmSync` skips them) and skips the moderator (its background approval browser may be open). Runs before the next cycle's disk check so reclaimed space can avert a B1 pause. New regression tests (2) assert caches are pruned while every cookie/identity artifact survives, and that the moderator is never pruned. Full suite **317/317** · antispam 34/34.
+
 ## [1.0.88] — 2026-07-15 — Unattended-survival hardening: honest crash tag (auto-resume unblocked) + hard disk auto-pause; CSV BOM
 
 P0 "days-unattended" survival fixes from the 2026-07-14 campaign-log hardening plan. All load-bearing guards preserved; `node --check` · full suite **315/315** · antispam 34/34 · boot OK.

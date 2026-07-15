@@ -366,6 +366,32 @@ class Orchestrator {
       }
     } catch {}
   }
+  // B2: reclaim Chrome's UNBOUNDED cache growers BETWEEN cycles (called before the inter-cycle wait, when the pool +
+  // rescue + repost have all drained). Deletes ONLY ephemeral cache dirs — NEVER Cookies/Network, Local Storage,
+  // IndexedDB, Service-Worker CacheStorage, or Preferences (that would log the account out / lose identity; the durable
+  // login is the SEPARATE accounts/<name>/cookies.json regardless, never inside chrome-profile). Skips the moderator
+  // (its background approval browser may still be open). SAFE against a stray open browser: Windows locks in-use cache
+  // files so rmSync skips them. Best-effort; a locked/missing dir is silently ignored. Complements B1's auto-pause: this
+  // keeps the disk from filling in the first place so the pause rarely has to fire.
+  _pruneProfileCaches(getData) {
+    try {
+      const fs = require('fs'), path = require('path');
+      const data = (typeof getData === 'function' ? getData() : this._data) || {};
+      const CACHE_DIRS = ['Cache', 'Code Cache', 'GPUCache', 'ShaderCache', 'GrShaderCache', 'DawnCache', 'DawnGraphiteCache', 'DawnWebGPUCache', 'Crashpad'];
+      let n = 0;
+      for (const a of (data.accounts || [])) {
+        if (!a || a.isModerator || !a.name) continue;
+        let prof; try { prof = store.profileDir(a.name); } catch { continue; }
+        for (const base of [prof, path.join(prof, 'Default')]) { // cache dirs live at the profile root AND under its Default profile folder
+          for (const d of CACHE_DIRS) {
+            const p = path.join(base, d);
+            try { if (fs.existsSync(p)) { fs.rmSync(p, { recursive: true, force: true }); n++; } } catch {} // a locked (in-use) or missing dir is skipped — never corrupts a live browser
+          }
+        }
+      }
+      if (n) this.log(`🧹 Reclaimed ${n} Chrome cache folder(s) between cycles (cookies/identity untouched) — keeps the disk from filling on a long run.`);
+    } catch {}
+  }
   // State change (queued/running/done/error/...). Map updated now; emit is coalesced (see _emitLiveOps).
   _setAcctState(name, state, extra) {
     if (!this._acctLive) this._acctLive = {};
@@ -1630,6 +1656,7 @@ class Orchestrator {
         const waitMs = this._dailyCycleWaitMs(settings, N, doneToday, runNow, Date.now()); // extracted for unit-testability — see _dailyCycleWaitMs (v1.0.78 infinite-re-wait guard)
         if (runNow && waitMs === 0 && doneToday === 0) this.log(`▶️ Running the first cycle now; the daily schedule (${settings.dailyPostTime}) applies from the next cycle.`);
         if (waitMs > 0) {
+          this._pruneProfileCaches(getData); // B2: reclaim Chrome caches now that this cycle's browsers are closed — before the rest AND before the next cycle's disk check, so freed space can avert a pause
           // Overnight wait (all cycles done → waiting for TOMORROW) may sleep the laptop. Waiting for a TODAY cycle must stay awake.
           const overnight = (doneToday >= N);
           const hrs = Math.round(waitMs / 360000) / 10;
