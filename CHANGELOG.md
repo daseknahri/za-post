@@ -2,6 +2,10 @@
 
 Notable changes to za-post. Format loosely follows Keep a Changelog; versions follow SemVer.
 
+## [1.0.95] — 2026-07-15 — Core batch 2b: moderator won't wrong-approve a stranger's identical-caption post (#6)
+
+From the core-invariant audit (latent — behind `moderationEnabled`, currently off — but real). When a poster has no `fbDisplayName` (or the queue author is unreadable), the moderator's author check fails OPEN to caption-only, so it could approve a STRANGER's held post carrying byte-identical ad copy — landing our link-comment on their post. Fix (`moderator.js`): a stricter `authorConfirmedOurs` flag (true ONLY on a positive `ourNames` match, never the fail-open default), and before a caption-only approval, require the `captionSnip` to be UNIQUE across the scan — if 2+ cards share the same caption and none has a confirmed author, decline all (they stay `held` → recovered next pass / Phase-4). An author-confirmed card still approves normally even amid same-caption strangers; the change only ever NARROWS what the moderator clicks (never double/wrong-approves, never clears a real block). Full suite **320/320**.
+
 ## [1.0.94] — 2026-07-15 — Posting waste-audit batch B: established-account daily warm pass + focus-poll reclaim
 
 Batch B from the posting waste audit — the primary warming reinvestment + the biggest floor-safe time reclaim. Anti-spam floors, single-IP pacing, and all guards untouched; full suite **320/320**, antispam 34/34, boot OK.
