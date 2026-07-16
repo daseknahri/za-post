@@ -2409,7 +2409,13 @@ class Orchestrator {
         if (this._campaignTakeover && this._campaignTakeover[R.name]) return; // defensive: R is already covering another drop this cycle — never overwrite its stand-in (guards a future await between pick + the _jobbedThisCycle add)
         this._immediateCovered.add(A.name);
         this._campaignTakeover = this._campaignTakeover || {};
-        this._campaignTakeover[R.name] = { postId: pick.postId, forAgent: A.name }; // route A's exact slice to R (index-independent)
+        // gids: route A's EXACT slice — what this line already claimed to do but could not, since without them
+        // _onlyGroups is null and the worker targets the RESERVE'S OWN groups. covers()/the picker is a SUPERSET test,
+        // so a catch-all Standby's extra groups belong to ANOTHER campaign cluster holding the SAME library → its own
+        // agent delivers that postId too = a DOUBLE-POST, unguarded (campaign-plan has no durable per-(post,group)
+        // ledger, a stand-in's _uniqueSeqGuard is false, and the _unreached tally only looks at A's groups so the
+        // stray delivery is invisible). Always deliverable: R was chosen because it covers A's groups.
+        this._campaignTakeover[R.name] = { postId: pick.postId, forAgent: A.name, gids: [...this._groupIdsOf(A)] };
         this._reserve = (this._reserve || []).filter((x) => x.name !== R.name);     // don't also use R for the backstop / Phase-3 rescue
         this._active = (this._active || active).concat([R]);                        // APPEND-only (existing indices preserved)
         this._markJob(R.name);                                                      // R does a job this cycle (#5: up to reserveMaxJobsPerCycle)
@@ -3916,7 +3922,18 @@ class Orchestrator {
       // fully covered; any extra groups on the reserve also receive the post (acceptable). Standby of ANY order OK.
       const covers = (r) => { const rg = r.assignedGroups || []; return (A.assignedGroups || []).length > 0 && (A.assignedGroups || []).every((g) => rg.includes(g)); };
       const R = this._bestReserve((reserve || []).filter((r) => !used.has(r.name) && !r.isModerator && covers(r) && isHealthy(r)), (A.assignedGroups || []).length);
-      if (R) { used.add(R.name); out[R.name] = { postId, forAgent: A.name }; n++; }
+      // gids ARE REQUIRED — the split path below already passes them, and so do both _owedStandins paths; only this
+      // whole-set dispatch omitted them. Without gids _onlyGroups resolves to null (_stand is truthy but carries none,
+      // and _owedSelf is gated on !_stand), so the worker falls back to targetGroups = the RESERVE'S OWN full group
+      // set. covers() is a SUPERSET test (relaxed on purpose so a catch-all Standby is not rejected), so those extras
+      // are real: with each campaign cluster holding the WHOLE library, a reserve's extra groups belong to ANOTHER
+      // cluster whose own agent will deliver the SAME postId on its own schedule = a DOUBLE-POST. Campaign-plan has no
+      // durable per-(post,group) guard and a stand-in's _uniqueSeqGuard is false, so nothing would catch it — and the
+      // bookkeeping is blind (the _unreached tally is computed over A's groups, so the stray delivery lands in no
+      // ledger and raises no warning). Scoping to A's OWN groups is exactly what the comment already promises ("A's
+      // exact slice"), and is always deliverable because covers() proved R is a superset of them. This is the same
+      // hazard the parked-slice restore refuses (delivering a partition into a cluster whose members already have it).
+      if (R) { used.add(R.name); out[R.name] = { postId, forAgent: A.name, gids: [...this._groupIdsOf(A)] }; n++; }
       else { // #1 no single superset reserve → SPLIT A's groups across multiple in-group reserves (each delivers A's slice to ONLY its subset)
         for (const s of this._splitCover([...this._groupIdsOf(A)], reserve, used, isHealthy)) {
           if (n >= limit) break;
