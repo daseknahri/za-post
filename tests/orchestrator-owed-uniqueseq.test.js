@@ -65,18 +65,6 @@ async function runOneCycle(orch, until) {
 
 // ───────────────────────────── UNIT: the pick override ─────────────────────────────────────────────────────
 
-test('[b] unique owed: re-picks the SAME dealt post instead of dealing a new one', () => {
-  const o = new Orchestrator(() => {}, {});
-  const A = UQ('A', ['g1', 'g2', 'g3', 'g4', 'g5']);
-  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], groups: ['g1', 'g2', 'g3', 'g4', 'g5'].map((g) => ({ id: g })), settings: {}, accounts: [A] };
-  o._active = [A];
-  o._dealt = new Set(['P1']); // P1 was dealt on the partial cycle
-  o._owed = { A: { postId: 'P1', gids: ['g3', 'g4', 'g5'] } };
-  assert.deepEqual(o._postsForAccount(A, 1).map((p) => p.id), ['P1'], 'owed → re-pick the dealt P1, NOT the fresh P2');
-  o._owed = {};
-  assert.deepEqual(o._postsForAccount(A, 1).map((p) => p.id), ['P2'], 'owed cleared → normal deal resumes at P2');
-});
-
 test('[d] no owed → the unique deal is unchanged (override inert)', () => {
   const o = new Orchestrator(() => {}, {});
   const A = UQ('A', ['g1']);
@@ -84,65 +72,6 @@ test('[d] no owed → the unique deal is unchanged (override inert)', () => {
   o._active = [A];
   o._dealt = new Set(); // _loop normally seeds this from rotation.json
   assert.deepEqual(o._postsForAccount(A, 1).map((p) => p.id), ['P1'], 'first undealt post dealt exactly as before');
-});
-
-test('[a] unique owed: a group proven delivered by the crash-fold guard is pruned from the ledger, never re-picked', () => {
-  const o = new Orchestrator(() => {}, {});
-  const A = UQ('A', ['g1', 'g2', 'g3']);
-  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], groups: ['g1', 'g2', 'g3'].map((g) => ({ id: g })), settings: {}, accounts: [A] };
-  o._active = [A];
-  o._dealt = new Set(['P1']);
-  o._owed = { A: { postId: 'P1', gids: ['g2', 'g3'] } };
-  o._inflightDelivered = new Set(['P1::g2']); // the fold proved g2 landed before the crash
-  assert.deepEqual(o._postsForAccount(A, 1, true).map((p) => p.id), ['P1'], 'still owes g3 → re-picks P1');
-  assert.deepEqual(o._owed.A.gids, ['g3'], 'g2 pruned from the LEDGER — a reserve stand-in never consults the guard, so a listed g2 would be re-posted');
-});
-
-test('[a] unique owed: every owed group already delivered → obligation dropped, no re-pick of the dealt post', () => {
-  const o = new Orchestrator(() => {}, {});
-  const A = UQ('A', ['g1', 'g2']);
-  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], groups: ['g1', 'g2'].map((g) => ({ id: g })), settings: {}, accounts: [A] };
-  o._active = [A];
-  o._dealt = new Set(['P1']);
-  o._owed = { A: { postId: 'P1', gids: ['g2'] } };
-  o._inflightDelivered = new Set(['P1::g2']);
-  assert.deepEqual(o._postsForAccount(A, 1, true).map((p) => p.id), ['P2'], 'nothing genuinely owed → deal the next post');
-  assert.ok(!o._owed.A, 'fully-covered obligation dropped');
-});
-
-test('[c] unique owed: an un-assigned owed group is pruned (no undeliverable-owed livelock)', () => {
-  const o = new Orchestrator(() => {}, {});
-  const A = UQ('A', ['g1', 'g3']); // operator un-assigned g4
-  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], groups: [{ id: 'g1' }, { id: 'g3' }], settings: {}, accounts: [A] };
-  o._active = [A];
-  o._dealt = new Set(['P1']);
-  o._owed = { A: { postId: 'P1', gids: ['g3', 'g4'] } };
-  assert.deepEqual(o._postsForAccount(A, 1, true).map((p) => p.id), ['P1'], 'still owes the assigned g3 → re-picks P1');
-  assert.deepEqual(o._owed.A.gids, ['g3'], 'the un-assigned g4 is pruned');
-});
-
-test('[c] unique owed: a deleted owed post drops the stale obligation and deals normally', () => {
-  const o = new Orchestrator(() => {}, {});
-  const A = UQ('A', ['g1']);
-  o._data = { posts: [{ id: 'P2' }], groups: [{ id: 'g1' }], settings: {}, accounts: [A] };
-  o._active = [A];
-  o._dealt = new Set(['P1']);
-  o._owed = { A: { postId: 'P1', gids: ['g1'] } }; // P1 no longer in the library
-  assert.deepEqual(o._postsForAccount(A, 1, true).map((p) => p.id), ['P2'], 'owed post gone → deal normally');
-  assert.ok(!o._owed.A, 'stale obligation dropped (else _outstandingWork would count it forever)');
-});
-
-test('[a] Loop recycle: a cleared dealt-set disarms the owed entry so the recycled post goes to ALL groups', () => {
-  // A recycle re-delivers the whole library to every group. A leftover owed subset must not narrow that — and because
-  // _runAccount's _owedSelf keys off the ledger ALONE, the entry has to be DROPPED here, not merely skipped.
-  const o = new Orchestrator(() => {}, {});
-  const A = UQ('A', ['g1', 'g2', 'g3']);
-  o._data = { posts: [{ id: 'P1' }], groups: ['g1', 'g2', 'g3'].map((g) => ({ id: g })), settings: {}, accounts: [A] };
-  o._active = [A];
-  o._dealt = new Set(); // Loop-campaign recycle cleared it
-  o._owed = { A: { postId: 'P1', gids: ['g3'] } };
-  assert.deepEqual(o._postsForAccount(A, 1, true).map((p) => p.id), ['P1'], 'P1 re-dealt by the recycle');
-  assert.ok(!o._owed.A, 'stale owed dropped → _owedSelf cannot scope the recycled delivery down to [g3]');
 });
 
 // ───────────────────────────── UNIT: reconciliation + the guard-purge idempotency trap ─────────────────────
@@ -276,82 +205,6 @@ test('[a] crash-fold prunes the owed ledger against the groups it just proved de
 
 // ───────────────────────────── INTEGRATION: the finding's exact scenario ───────────────────────────────────
 
-test('[a][b][c] INTEGRATION: unique partial-delivers 2/5 with NO reserve → the 3 un-reached groups persist + are counted', async () => {
-  const tmp = mkTmp('int-partial'); store.init(tmp);
-  const calls = [];
-  runHandler = makeMock(calls, ({ postId, targetGids }) => (postId === 'P1' ? ['g1', 'g2'] : targetGids)); // deliver g1,g2 of {g1..g5}, then drop
-  store.save({
-    posts: [{ id: 'P1', caption: 'a', imagePaths: [] }, { id: 'P2', caption: 'b', imagePaths: [] }],
-    groups: ['g1', 'g2', 'g3', 'g4', 'g5'].map((g) => ({ id: g, name: g, groupId: g })),
-    accounts: [UQ('A', ['g1', 'g2', 'g3', 'g4', 'g5'])], // no reserve exists → the old code stranded the un-reached groups
-    settings: { parallelAccounts: 1, accountDelay: 0, waitInterval: 0, groupDelay: 0, maxCycles: 1, staggerAccounts: false, varyImages: false },
-    proxies: [], useProxies: false,
-  });
-  const orch = new Orchestrator(() => {}, {});
-  await runOneCycle(orch, () => (store.loadRotation().owedLedger || {}).A);
-  runHandler = null;
-
-  const owed = (store.loadRotation().owedLedger || {}).A;
-  assert.ok(owed, 'the partial is CARRIED — it used to vanish into the dealt-set with no trace');
-  assert.equal(owed.postId, 'P1');
-  assert.deepEqual(owed.gids.slice().sort(), ['g3', 'g4', 'g5'], 'exactly the 3 un-reached groups');
-  assert.ok(store.loadRotation().dealt.includes('P1'), 'P1 stays dealt (no other account re-deals it) — the owed ledger is what recovers it');
-  for (const g of ['g1', 'g2']) assert.equal(calls.filter((c) => c.gid === g).length, 1, `${g} delivered exactly once`);
-  fs.rmSync(tmp, { recursive: true, force: true });
-});
-
-test('[a][b] INTEGRATION: next cycle re-picks the owed post to ONLY the 3 un-reached groups (g1,g2 NOT re-posted)', async () => {
-  const tmp = mkTmp('int-discharge'); store.init(tmp);
-  const calls = [];
-  runHandler = makeMock(calls, ({ targetGids }) => targetGids); // deliver whatever it is asked to
-  // Pre-seed the exact post-partial state: P1 dealt, g1+g2 delivered, g3..g5 owed.
-  store.saveRotation({
-    dealt: ['P1'], roundOffset: 0, staggerRotation: 0, lastDailyRunDate: null, campaignPlan: null,
-    perAccountRotation: {}, owedLedger: { A: { postId: 'P1', gids: ['g3', 'g4', 'g5'] } }, inflightSeq: {},
-  });
-  store.save({
-    posts: [{ id: 'P1', caption: 'a', imagePaths: [] }, { id: 'P2', caption: 'b', imagePaths: [] }],
-    groups: ['g1', 'g2', 'g3', 'g4', 'g5'].map((g) => ({ id: g, name: g, groupId: g })),
-    accounts: [UQ('A', ['g1', 'g2', 'g3', 'g4', 'g5'])],
-    settings: { parallelAccounts: 1, accountDelay: 0, waitInterval: 0, groupDelay: 0, maxCycles: 1, staggerAccounts: false, varyImages: false },
-    proxies: [], useProxies: false,
-  });
-  const orch = new Orchestrator(() => {}, {});
-  await runOneCycle(orch, () => !(store.loadRotation().owedLedger || {}).A);
-  runHandler = null;
-
-  // (a) THE ban-risk invariant: the 2 already-delivered groups are never touched again
-  assert.equal(calls.filter((c) => c.gid === 'g1').length, 0, 'g1 NOT re-posted');
-  assert.equal(calls.filter((c) => c.gid === 'g2').length, 0, 'g2 NOT re-posted');
-  // (b) the un-reached groups get the SAME post
-  assert.deepEqual(calls.filter((c) => c.postId === 'P1').map((c) => c.gid).sort(), ['g3', 'g4', 'g5'], 'P1 finished to exactly g3,g4,g5');
-  assert.ok(calls.filter((c) => c.postId === 'P1').every((c) => c.onlyGroups && c.onlyGroups.slice().sort().join() === 'g3,g4,g5'), 'the worker was scoped via onlyGroups=[g3,g4,g5]');
-  assert.ok(!(store.loadRotation().owedLedger || {}).A, 'ledger cleared once fully covered');
-  fs.rmSync(tmp, { recursive: true, force: true });
-});
-
-test('[a][b] INTEGRATION: a reserve finishing a unique partial lands ONLY the un-reached groups', async () => {
-  const tmp = mkTmp('int-reserve'); store.init(tmp);
-  const calls = [];
-  // A delivers g1,g2 of {g1..g4} then drops. Reserve R (in g3,g4) finishes only g3 and drops at g4 → g4 must CARRY.
-  runHandler = makeMock(calls, ({ name }) => (name === 'A' ? ['g1', 'g2'] : ['g3']));
-  store.save({
-    posts: [{ id: 'P1', caption: 'a', imagePaths: [] }, { id: 'P2', caption: 'b', imagePaths: [] }],
-    groups: ['g1', 'g2', 'g3', 'g4'].map((g) => ({ id: g, name: g, groupId: g })),
-    accounts: [UQ('A', ['g1', 'g2', 'g3', 'g4']), { ...UQ('R', ['g3', 'g4']), standby: true }],
-    settings: { parallelAccounts: 2, accountDelay: 0, waitInterval: 0, groupDelay: 0, maxCycles: 1, staggerAccounts: false, varyImages: false },
-    proxies: [], useProxies: false,
-  });
-  const orch = new Orchestrator(() => {}, {});
-  await runOneCycle(orch, () => { const o = (store.loadRotation().owedLedger || {}).A; return o && o.gids && o.gids.length === 1; });
-  runHandler = null;
-
-  const owed = (store.loadRotation().owedLedger || {}).A;
-  assert.deepEqual(owed.gids.slice().sort(), ['g4'], 'g4 (reached by nobody) still carries — the reserve covering g3 does not mask it');
-  for (const g of ['g1', 'g2', 'g3']) assert.equal(calls.filter((c) => c.gid === g).length, 1, `${g} delivered exactly once across A + R (no double-post)`);
-  fs.rmSync(tmp, { recursive: true, force: true });
-});
-
 // ---------------------------------------------------------------------------------------------------------------
 // [a] REGRESSION — the reserve-cover obligation gate (the ban-risk axis).
 //
@@ -395,4 +248,64 @@ test('[a] stand-in obligation: an unknown/absent mode is never admitted (no obli
   for (const m of ['', null, undefined, 'post-centric', 'random']) {
     assert.equal(standinObligationAdmits(m, true), false, `mode ${JSON.stringify(m)} must not record an obligation`);
   }
+});
+
+// ===============================================================================================================
+// LEDGER COHERENCE — the [9] re-delivery was REMOVED; these lock in WHY, so it is not re-added blind.
+//
+// [9] (v1.0.110) gave unique/sequence a persistent owed ledger + a pick-override. An adversarial audit returned
+// FIVE recurring double-posts: a delivered (post,group) re-posted EVERY cycle on the ONE shared IP. Root cause
+// PRE-DATES [9]: the ledger's CONSUMERS are mode-agnostic while the producer of its discharge record is not, so an
+// entry whose owner cannot discharge it is IMMORTAL and gets re-dispatched to a reserve forever.
+//
+// The fix is two-sided:
+//   (1) do NOT create an entry a mode cannot discharge (the obligation gate is pointer-modes-only again), and
+//   (2) do NOT CONSUME an entry whose owner cannot discharge it (_owedDischargeable gates every consumer), and
+//       drop-and-log it instead — self-healing across an operator mode-flip.
+// Trade: a strand (recoverable, ~1.1% measured) over a double-post (a ban ends the fleet).
+// ===============================================================================================================
+
+const mkO = () => new Orchestrator(() => {}, {});
+
+test('[a] REMOVED: a unique agent with an owed entry does NOT re-pick the dealt post (no re-delivery surface)', () => {
+  const o = mkO();
+  o._data = { accounts: [UQ('A', ['g1', 'g2', 'g3'])], groups: [{ id: 'g1', groupId: 'g1' }, { id: 'g2', groupId: 'g2' }, { id: 'g3', groupId: 'g3' }], posts: [{ id: 'P1' }, { id: 'P2' }], settings: {} };
+  o._dealt = new Set(['P1']);            // P1 partial-delivered then dealt
+  o._owed = { A: { postId: 'P1', gids: ['g2', 'g3'] } }; // a legacy/stale entry
+  const picks = o._postsForAccount(o._data.accounts[0], 0, false).map((p) => p.id);
+  assert.deepEqual(picks, ['P2'], 'the dealt P1 is NOT re-picked — it deals the next undealt post; the owed override is gone');
+});
+
+test('[a] _owedDischargeable: only the pointer modes (which HAVE a pick-override) may consume an entry', () => {
+  const o = mkO();
+  o._data = { accounts: [
+    { name: 'DR', postingOrder: 'daily-rotation' }, { name: 'CP', postingOrder: 'campaign-plan' },
+    { name: 'UQ', postingOrder: 'unique' }, { name: 'SQ', postingOrder: 'sequence' },
+    { name: 'PC', postingOrder: 'post-centric' }, { name: 'NM', postingOrder: '' },
+  ], groups: [], posts: [], settings: {} };
+  for (const n of ['DR', 'CP']) assert.equal(o._owedDischargeable(n), true, `${n} has an owed pick-override → may be consumed`);
+  for (const n of ['UQ', 'SQ', 'PC', 'NM']) assert.equal(o._owedDischargeable(n), false, `${n} has NO pick-override → consuming its entry would re-post the same gids every cycle`);
+  assert.equal(o._owedDischargeable('ghost'), false, 'an owner no longer in the library is never dischargeable');
+});
+
+
+test('[a] owedDischargeableMode: the ONE predicate BOTH the producer and the consumers gate on', () => {
+  const { owedDischargeableMode } = require('../automation/orchestrator');
+  // The producer (_cycleObligation gate) and every consumer (_hasPersistentOwed / synthesis / _owedSelf) call this.
+  // If they ever disagree again, an entry becomes immortal and a reserve re-posts its gids every cycle.
+  for (const m of ['daily-rotation', 'campaign-plan']) assert.equal(owedDischargeableMode(m), true, `${m} HAS an owed pick-override -> may both produce and consume`);
+  for (const m of ['unique', 'unique-random', 'sequence', 'post-centric', 'random', '', null, undefined]) {
+    assert.equal(owedDischargeableMode(m), false, `${JSON.stringify(m)} has NO owed pick-override -> must never produce or consume an entry`);
+  }
+});
+
+test('[a] pointer-mode carry-over is UNCHANGED by the revert (regression guard for [7][8])', () => {
+  const o = mkO();
+  o._cycleObligation = { DR: { postId: 'P1', expectedGids: ['g1', 'g2'] } };
+  o._cycleDelivered = new Set();
+  o._owed = {};
+  o._data = { accounts: [{ name: 'DR', postingOrder: 'daily-rotation' }], groups: [], posts: [{ id: 'P1' }], settings: {} };
+  o._cycleDelivered.add(o._dkScope('DR') + 'P1::g1');
+  o._reconcileOwedFor('DR');
+  assert.deepEqual(o._owed.DR.gids, ['g2'], 'daily-rotation still carries its un-reached groups — only the unique/sequence extension was reverted');
 });

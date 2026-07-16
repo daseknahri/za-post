@@ -61,4 +61,5 @@ ADRs are append-only: to change a decision, write a new ADR and mark the old one
 | [0018](ADR-0018-persistent-rotating-tab-pool.md) | Persistent rotating tab pool for multi-tab posting (reuse tabs by re-navigation instead of newPage/close churn) | Accepted |
 | [0019](ADR-0019-campaign-plan-frozen-within-round.md) | Campaign Plan frozen within a round — a mid-round edit defers to the next round, never a live re-partition | Accepted |
 | [0020](ADR-0020-interchangeable-account-pool-weighted-shared-posting.md) | Interchangeable account pool — weighted shared-pool posting (evolve unique/sequence, not campaign-plan slices) | Proposed |
-| [0021](ADR-0021-owed-ledger-extended-to-unique-sequence.md) | The owed ledger covers unique/sequence too — the fleet-wide dealt-set is a pointer, so a PARTIAL must stay recoverable (amends 0008) | Accepted |
+| [0021](ADR-0021-owed-ledger-extended-to-unique-sequence.md) | The owed ledger covers unique/sequence too — the fleet-wide dealt-set is a pointer, so a PARTIAL must stay recoverable (amends 0008) | ❌ Rejected (reverted v1.0.112 — caused 5 recurring double-posts; see 0022) |
+| [0022](ADR-0022-owed-ledger-coherence.md) | Owed-ledger coherence — ONE predicate gates both the producer and every consumer, so an entry nothing can discharge is never created or consumed (supersedes 0021) | Accepted |

@@ -1,9 +1,45 @@
 # ADR-0021: The persistent owed ledger covers unique/sequence too — the fleet-wide dealt-set is a pointer, and a PARTIAL must stay recoverable
 
-- **Status:** Accepted (implemented in v1.0.110)
+- **Status:** ❌ **REJECTED / REVERTED in v1.0.112** (was: Accepted, implemented in v1.0.110 — live for ~1 hour, never shipped)
 - **Date:** 2026-07-16
 - **Deciders:** owner + engineering
 - **Amends:** ADR-0008 (owed ledger, previously scoped to the per-agent-pointer modes)
+- **Superseded by:** ADR-0022 (owed-ledger coherence: one predicate gates both producer and consumers)
+
+> ## ⚠️ REVERTED — read this before re-attempting
+>
+> This design was implemented (v1.0.110), then **reverted in v1.0.112**. The reasoning below about the *problem* is
+> sound and worth keeping. The **solution is not** — and re-attempting it naively will get the fleet banned.
+>
+> **What happened.** An adversarial audit of the implementation returned **11 confirmed findings, 7 HIGH — five of them
+> recurring double-posts** on the one shared IP: a delivered `(post,group)` re-posted **every cycle, forever**. One HIGH
+> was found and patched first (v1.0.111); the *next* audit found five more, two of which **bypassed that patch**. The
+> defect rate went UP after patching, not down.
+>
+> **Why the whole suite stayed green (the trap).** The crash-fold reconciles `this._owed` from the journal on **every
+> process start**, so a stale ledger entry is silently cleared on restart. Any test — or reviewer — modelling "the next
+> cycle" as a **new process** sees the bug self-heal. Duplicates only accumulate in a **healthy days-unattended run**:
+> the fold runs once, then cycles continue in the same process with stale state. **Crashes self-heal; health
+> accumulates** — i.e. the failure targets precisely the product's purpose. 18 tests + 370/370 green missed all of it.
+>
+> **The root cause is architectural and PRE-DATES this ADR.** The ledger's **consumers** (`_hasPersistentOwed`, the
+> persistent-owed synthesis, `_owedStandins`, `_owedSelf`) were **mode-agnostic**, while the **producer** of its
+> discharge record (the `_cycleObligation` gate) was **mode-restricted**. An entry whose owner cannot discharge it is
+> therefore **immortal**: nothing prunes it, no obligation is recorded, `_reconcileOwedFor` early-returns on `!ob`, and
+> the synthesis re-dispatches the identical gids to a reserve every cycle — while a stand-in has `_uniqueSeqGuard=false`,
+> so only the per-cycle `_cycleDelivered` guards it. Extending the ledger to unique/sequence did not create this hole; it
+> **multiplied its blast radius** from "a pointer agent whose mode was flipped" to "every unique agent on a unique fleet".
+> See ADR-0022 for the coherence fix, which is retained.
+>
+> **Why the problem is not worth this risk.** Measured on the owner's own finished campaign: **17 of 1491 pairs (1.1%)**
+> permanently lost, all in the shared-IP throttle tail — and the **same-cycle** reserve cover (`_cycleOwed`, unchanged
+> and dry-verified) already recovers most partials. This ADR only added **cross-cycle** carry: a fraction of 1.1%. The
+> asymmetry decides it — **a strand costs ~1%; a ban costs the entire fleet.** The real lever for that tail is
+> **proxies** (87% of the campaign's errors were shared-IP throttle), not cross-cycle re-delivery.
+>
+> **If you re-attempt this, you MUST have:** (a) live validation on real accounts, (b) a test that runs **N cycles in ONE
+> process with no fold in between**, and (c) a coherent ledger lifecycle (ADR-0022) — never a mode-agnostic consumer.
+> Today the trade is taken deliberately: a unique/sequence partial **strands** (recoverable) rather than risking a ban.
 
 ## Context
 ADR-0008 introduced `this._owed` so a **partial** delivery — an account that posted to some but not all of its groups before dropping — finishes the un-reached groups later, targeting only those groups. It was wired for **daily-rotation** and **campaign-plan** only: `_cycleObligation` (the persistent carry-over) was gated to those two modes, because the carry-over is discharged by an *owed pick-override* that re-picks the SAME post next cycle, and only the per-agent-pointer modes had one.
