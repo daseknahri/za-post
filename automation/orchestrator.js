@@ -333,6 +333,82 @@ class Orchestrator {
     } catch { return null; }
   }
   // Warn if free space looks insufficient. Called once at Start and periodically per cycle (throttled ~15min).
+  // PROXY PREFLIGHT — prove each configured proxy actually works BEFORE a long run, instead of discovering it as 26
+  // silently-skipped accounts (proxies fail CLOSED: a dead/malformed proxy means the account does not post at all,
+  // which is correct but looks identical to "the fleet died"). Advisory only: it never blocks a run and never changes
+  // routing — a warning here is something the operator can fix in a minute; a wrong "fix" could put an account on the
+  // bare IP, which is the one thing the fail-closed design exists to prevent.
+  //
+  // Three things it can tell you that nothing else can:
+  //   1. MALFORMED  → this account will silently never post.
+  //   2. DEAD/AUTH  → same, but it looked fine in the UI.
+  //   3. NOT ACTUALLY PROXYING → the exit IP equals this machine's own IP. That is the WORST case: you believe the
+  //      account is isolated while it is posting from your real IP, correlating it to the whole fleet.
+  // It also reports how many accounts share each exit IP, because that — not the proxy count — is what Facebook links
+  // on. N accounts behind ONE proxy is the same linkage as N accounts on one bare IP; the anti-link gate then
+  // serializes them on that host too, so throughput does not improve either. Better to know that up front.
+  async _proxyPreflight(getData) {
+    try {
+      if (!axios) return;
+      const data = getData() || {};
+      const accounts = (data.accounts || []).filter((a) => a && !a.isModerator && a.enabled !== false);
+      const pool = (data.proxies || []).filter((p) => String(p || '').trim());
+      const usePool = !!data.useProxies;
+      // Resolve each account to the proxy it will ACTUALLY use — mirroring the worker/rescue precedence exactly
+      // (own proxy wins; else a stable hash pick from the pool; else none).
+      const pick = (name, own) => {
+        const s = String(own || '').trim();
+        if (s) return s;
+        if (!usePool || !pool.length) return '';
+        let h = 0; for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+        return pool[h % pool.length];
+      };
+      const byProxy = new Map(); // proxy string -> [account names]
+      let bare = 0;
+      for (const a of accounts) {
+        const p = pick(a.name, a.proxy);
+        if (!p) { bare++; continue; }
+        if (!byProxy.has(p)) byProxy.set(p, []);
+        byProxy.get(p).push(a.name);
+      }
+      if (!byProxy.size) {
+        if (usePool) this.log('🚫 Proxies are ON but NO account resolves to a proxy — every account will be SKIPPED (fail-closed: it will never post from your real IP). Add proxies, or turn the toggle off.');
+        return; // no proxies configured → the existing shared-IP warning already covers it
+      }
+      const { parseProxy } = require('./worker');
+      // This machine's own egress IP — the reference for "is this proxy actually proxying?".
+      let realIp = null;
+      try { const r = await axios.get('https://api.ipify.org?format=json', { timeout: 8000 }); realIp = (r.data && r.data.ip) || null; } catch {}
+      this.log(`🌐 Proxy preflight: testing ${byProxy.size} proxy endpoint(s) for ${accounts.length - bare} account(s)…`);
+      const exits = new Map(); // exit ip -> [account names]
+      for (const [pstr, names] of byProxy) {
+        const who = names.length > 3 ? `${names.slice(0, 3).join(', ')} +${names.length - 3}` : names.join(', ');
+        const pp = parseProxy(pstr);
+        if (!pp) { this.log(`🚫 [${who}] proxy string is MALFORMED — ${names.length} account(s) will be SKIPPED every cycle (they will never post). Expected e.g. http://user:pass@host:port`); continue; }
+        // Live test only for HTTP-family proxies (what residential/ISP providers actually serve, per parseProxy's own
+        // note). A SOCKS endpoint is parse-checked only — reporting a false "dead" for a working socks5 would be worse
+        // than staying quiet.
+        if (pp.scheme !== 'http') { this.log(`ℹ️ [${who}] ${pp.scheme}:// proxy — format OK (live exit-IP test is HTTP-only; not verified here)`); continue; }
+        let ip = null, err = null;
+        try {
+          const r = await axios.get('https://api.ipify.org?format=json', { timeout: 12000, proxy: { protocol: 'http', host: pp.host, port: Number(pp.server.split(':').pop()), ...(pp.username ? { auth: { username: pp.username, password: pp.password || '' } } : {}) } });
+          ip = (r.data && r.data.ip) || null;
+        } catch (e) { err = (e && e.message) || String(e); }
+        if (!ip) { this.log(`🚫 [${who}] proxy ${pp.host} is NOT reachable (${err || 'no response'}) — ${names.length} account(s) will be SKIPPED every cycle until it works. Check the credentials/endpoint with your provider.`); continue; }
+        if (realIp && ip === realIp) { this.log(`🛑 [${who}] proxy ${pp.host} is NOT actually proxying — its exit IP (${ip}) is THIS MACHINE'S own IP. Those accounts are posting from your real IP and are correlated to the whole fleet. Fix or remove this proxy.`); continue; }
+        if (!exits.has(ip)) exits.set(ip, []);
+        exits.get(ip).push(...names);
+        this.log(`✅ [${who}] proxy OK — exit IP ${ip}${realIp ? '' : ' (could not read this machine\'s own IP to compare)'}`);
+      }
+      // The number that actually matters: accounts per EXIT IP. Facebook links on the IP, not on the proxy count.
+      for (const [ip, names] of exits) {
+        if (names.length > 1) this.log(`⚠️ ${names.length} accounts share exit IP ${ip} (${names.slice(0, 6).join(', ')}${names.length > 6 ? ' …' : ''}) — Facebook links accounts that share an IP exactly as it does on a bare IP, and the anti-link gate serializes them on that host, so this does NOT increase throughput. One proxy per account is what buys isolation AND parallelism.`);
+      }
+      if (bare > 0 && usePool) this.log(`🚫 ${bare} enabled account(s) resolve to NO proxy while proxies are ON — they will be SKIPPED every cycle (fail-closed). Give them a proxy or disable them.`);
+      else if (bare > 0) this.log(`ℹ️ ${bare} account(s) have no proxy and will post from this machine's IP${realIp ? ` (${realIp})` : ''} — they are correlated to each other.`);
+    } catch (e) { try { this.log(`⚠️ Proxy preflight skipped (${(e && e.message) || e}) — proxies still fail closed at launch, so nothing can leak to your real IP.`); } catch {} }
+  }
+
   _diskPreflight(getData) {
     try {
       const free = this._freeDiskBytes();
@@ -486,6 +562,9 @@ class Orchestrator {
     this.emit('automation-progress', { ...this._progress });
     this.log(`▶️ Automation started — ${new Date().toLocaleString()}`);
     this._diskPreflight(getData); // warn BEFORE a long run if the drive can't hold the fleet's profiles (a full disk halts all accounts)
+    // Advisory + NON-blocking (each endpoint costs a real network round-trip; a large fleet must not wait on it). It
+    // only logs — proxies still fail closed at launch, so a bad one can never leak to the real IP while this runs.
+    this._proxyPreflight(getData).catch(() => {});
     this._startNetMonitor(); // watch connectivity for the whole run (auto-pause offline / auto-resume online)
     this._runStartedAt = Date.now(); this._lastPostAt = 0; this._lastHealthLog = 0; // E: run-health tracking for an away operator
     this._emitHealth(); // write an initial status.json immediately
