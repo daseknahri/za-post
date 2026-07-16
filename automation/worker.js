@@ -975,6 +975,41 @@ function commentFailureDecision(consecCommentFails, commentedToday, threshold = 
   return commentedToday ? 'transient' : 'block';
 }
 
+// Classify a comment outcome for the BREAKER. This is deliberately NOT _commentLanded — do not merge them.
+//
+// The two predicates answer DIFFERENT questions and disagree on purpose:
+//   • _commentLanded asks "was Enter PRESSED?" → it drives RESCUE routing, where the ban-axis invariant is "never
+//     re-queue something that may already be under the post" (a double-comment). It must therefore treat 'unconfirmed'
+//     and 'not_visible' as landed. That is correct, and must stay exactly as it is.
+//   • THIS asks "did a comment actually become VISIBLE (i.e. produce value)?" — the breaker's whole purpose.
+// v1.0.118 reused _commentLanded here, which made the breaker blind to precisely the class it exists for:
+// addFirstComment returns 'not_visible' when the box emptied but a re-scan PROVED our text is not under the post — the
+// shadow-suppression signature (its own log says "sent but NOT visible — verify this group manually"). As a "success"
+// that RESET the streak and latched commentedToday=true forever, so the breaker could never fire again, and any later
+// genuine streak downgraded from 'block' (rest) to 'transient' (no rest).
+//
+// 'unknown' is load-bearing, and 'unconfirmed' MUST map to it:
+//   - counting it as a LOSS would rest every account instantly in instant/max speed mode, where the confirm re-scan is
+//     skipped by design so nearly every outcome is 'unconfirmed' — a catastrophic false positive;
+//   - counting it as a WIN would blind the breaker there, exactly as v1.0.118 did.
+// 'unknown' neither increments NOR resets, so it is honest (we genuinely do not know) AND real losses still accumulate
+// ACROSS it — a not_visible / unconfirmed / not_visible / unconfirmed / not_visible run still reaches 3 and trips.
+// Returns 'landed' | 'lost' | 'unknown'. Pure → unit-tested.
+function commentOutcomeClass(cres) {
+  switch (cres) {
+    case 'posted':                  // re-scan CONFIRMED it visible
+    case 'already_present':         // our link is already under the post — the value exists
+    case 'blocked_account_landed':  // it landed, THEN FB walled the account (the wall stops it separately)
+    case 'blocked_comment_landed':
+      return 'landed';
+    case 'none':                    // no comment wanted — never an attempt
+    case 'unconfirmed':             // Enter pressed, delivery not auto-verified (instant mode skips the re-scan)
+      return 'unknown';
+    default:                        // not_visible / failed / error / timeout / skipped / unplaced / blocked_*
+      return 'lost';
+  }
+}
+
 // #3 (time-waste): how many composer-open attempts to make. FULL (4) on a fresh/healthy account — a slow / hidden /
 // proxied feed legitimately needs the retries. But once FB is already pushing this account back (pushback>0), the feed
 // usually won't render at all, so 4 attempts just idle ~30s before the skip — cut to 2 so the account reaches its
@@ -4007,13 +4042,14 @@ async function runAccount(o) {
           // 'blocked_*_landed' = the comment DID land but FB then walled the account — treat as LANDED (never
           // re-queue = never double-comment) while still cooling/stopping the account below.
           const _commentLanded = (cres === 'posted' || cres === 'unconfirmed' || cres === 'not_visible' || cres === 'none' || cres === 'blocked_account_landed' || cres === 'blocked_comment_landed');
-          // Feed the comment-side breaker (see commentFailureDecision). 'none' means no comment was wanted — never an
-          // attempt, so it neither counts nor resets. Everything else IS an attempt: landing resets the streak (and arms
-          // the transient signal), not landing extends it. The blocked_* outcomes already stop the account below, so
-          // this only ever fires for the SILENT failure modes that previously let it keep posting link-less.
-          if (cres !== 'none') {
-            if (_commentLanded) { consecCommentFails = 0; anyCommentLanded = true; }
-            else consecCommentFails++;
+          // Feed the comment-side breaker. Uses commentOutcomeClass, NOT _commentLanded — see that helper for why the
+          // two must stay separate (_commentLanded means "Enter was pressed", which deliberately includes the
+          // provably-not-visible case; the breaker needs "a comment actually became VISIBLE"). 'unknown' neither
+          // increments nor resets, so real losses still accumulate across an unverifiable outcome.
+          {
+            const _cls = commentOutcomeClass(cres);
+            if (_cls === 'landed') { consecCommentFails = 0; anyCommentLanded = true; }
+            else if (_cls === 'lost') consecCommentFails++;
           }
           if (cres === 'failed') step(`Comment: could not place the comment after ${cAttemptsActual} attempt(s) — left uncommented`);
           else if (cres === 'skipped') step('Comment: skipped (could not safely identify our post)');
@@ -4204,7 +4240,14 @@ async function runAccount(o) {
           }
           // 'blocked_*_landed' = the comment landed but FB then walled the account → treat as landed (do NOT route to
           // a reserve = no double-comment), while still stopping/cooling the account.
-          const landed = (cres === 'posted' || cres === 'unconfirmed' || cres === 'not_visible' || cres === 'none' || cres === 'blocked_account_landed' || cres === 'blocked_comment_landed');
+          const landed = (cres === 'posted' || cres === 'unconfirmed' || cres === 'not_visible' || cres === 'none' || cres === 'blocked_account_landed' || cres === 'blocked_comment_landed'); // ROUTING predicate ("was Enter pressed?") — deliberately generous so a maybe-placed comment is never re-queued (a double-comment). Do NOT use it for the breaker; that is commentOutcomeClass.
+          // Feed the comment-side breaker from Phase 2 as well. Without this the breaker was DEAD CODE in two-phase
+          // mode — it is written only from the inline branch, which two-phase never takes — so the operator's exact
+          // report ("keeps posting, never comments") reproduced here in its WORST form: the post pass publishes to
+          // EVERY group before the first comment is even attempted, so a suppressed account emits its whole batch
+          // link-less, every cycle. And because runAccount then returned {posted:N, flag:null}, the orchestrator scored
+          // it a CLEAN delivery and CLEARED rateLimitedUntil / rlStrikes / attnStrikes — actively rewarding it.
+          { const _c2 = commentOutcomeClass(cres); if (_c2 === 'landed') { consecCommentFails = 0; anyCommentLanded = true; } else if (_c2 === 'lost') consecCommentFails++; }
           if (cres === 'blocked_account') { flag = 'rate_limited'; rlKind = 'account'; noRetry = true; cstep('🛑 Facebook blocked this account during the comment pass — stopping it; the rest route to reserves'); routeToRescue(dc, 'blocked_account'); report(dc.groupName, dc.gid, 'posted', 'account temporarily blocked', cres); d++; break; }
           if (cres === 'blocked_account_landed') { flag = 'rate_limited'; rlKind = 'account'; noRetry = true; cstep('🛑 Comment landed, then Facebook blocked this account — stopping it; the rest route to reserves (this comment NOT re-queued)'); report(dc.groupName, dc.gid, 'posted', 'account temporarily blocked', cres); d++; break; }
           if (cres === 'blocked_comment') { flag = 'rate_limited'; rlKind = 'comment'; noRetry = true; cstep('🛑 Commenting rate-limited — stopping this account (pace too high); the rest route to reserves'); routeToRescue(dc, 'blocked_comment'); report(dc.groupName, dc.gid, 'posted', 'comment rate-limited', cres); d++; break; }
@@ -4220,9 +4263,24 @@ async function runAccount(o) {
             report(dc.groupName, dc.gid, 'pending', 'held in Spam potentiel — awaiting moderator approval', 'skipped');
             continue;
           }
-          if (!landed) { routeToRescue(dc, cres); cstep('Comment: 📌 queued for rescue by a healthy account — this post will NOT be left without its link'); report(dc.groupName, dc.gid, 'posted', '', cres); continue; }
-          cstep('Comment: placed');
-          report(dc.groupName, dc.gid, 'posted', '', cres); // update the group's comment status from 'deferred' to its real outcome (mirrors the inline path's final report)
+          if (!landed) { routeToRescue(dc, cres); cstep('Comment: 📌 queued for rescue by a healthy account — this post will NOT be left without its link'); report(dc.groupName, dc.gid, 'posted', '', cres); }
+          else { cstep('Comment: placed'); report(dc.groupName, dc.gid, 'posted', '', cres); } // update the group's comment status from 'deferred' to its real outcome (mirrors the inline path's final report)
+          // ACT on the streak. The posting loop has already closed by the time Phase 2 runs, so its loop-top check can
+          // never fire from here — the earliest this can stop the account is the NEXT cycle, and that only happens if we
+          // set a flag: otherwise runAccount returns {posted:N, flag:null}, which the orchestrator scores as a CLEAN
+          // delivery and uses to CLEAR rateLimitedUntil / rlStrikes / attnStrikes. So a comment-suppressed account did
+          // not merely go unpunished — it had its rest ladder wiped every cycle. Stop the pass and rest it instead: the
+          // remaining deferred comments route to rescue (below), which is strictly better than a dead account
+          // hand-placing them. Same transient/block split as the inline twin.
+          {
+            const _cfd2 = commentFailureDecision(consecCommentFails, anyCommentLanded);
+            if (_cfd2) {
+              noRetry = true;
+              if (_cfd2 === 'block') { flag = 'rate_limited'; rlKind = 'comment'; cstep('🛑 3 comment failures in a row and NOT ONE comment has landed this run — Facebook is suppressing this account\'s comments. Stopping the comment pass and resting it; the remaining comments route to rescue. Without this it would post its whole batch link-less again next cycle.'); }
+              else cstep('⚠️ 3 comment failures in a row, but this account DID land one earlier this run — treating as transient (FB hiccup). Stopping the comment pass this cycle; the remaining comments route to rescue.');
+              d++; break;
+            }
+          }
         }
         // Anything left unprocessed (Stop or a block broke the pass early) → rescue so no post is left without its link.
         for (; d < _deferredComments.length; d++) routeToRescue(_deferredComments[d], 'comment_pass_interrupted');
@@ -4298,7 +4356,7 @@ const normalizeCookie = store.normalizeCookie;
 module.exports = {
   runAccount, parseProxy, normalizeCookie, addFirstComment, killChromiumForProfile, sweepOrphanTemps,
   // exported for diagnostics — use the EXACT worker logic
-  clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish, publishWaitCeilingMs, mixedPushbackDecision, commentFailureDecision, composerOpenAttempts, watchdogTickDecision, credentialLogin, moveMouseTo, behaviorFor,
+  clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish, publishWaitCeilingMs, mixedPushbackDecision, commentFailureDecision, commentOutcomeClass, composerOpenAttempts, watchdogTickDecision, credentialLogin, moveMouseTo, behaviorFor,
   // exported for tests (no runtime effect)
   jitter, rand, rangeMs, withFloor, ANTI_SPAM_MIN_GROUP_MS, ANTI_SPAM_MIN_COMMENT_MS, antiSpamFloors, postLinkFloorOwed, humanDelay, isFastMode, applyPace, varyLinks, retryAsync, downloadImage, isSafeImageUrl, proxyFormatHint, classifyProxyError, proxyErrorHint, classifyGroupError,
   FB, isRateLimitText, isCheckpointText, isPendingText, isPostButtonLabel, isCommentBoxLabel,

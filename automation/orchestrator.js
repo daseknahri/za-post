@@ -914,9 +914,19 @@ class Orchestrator {
     const _onlyGroups = (_stand && Array.isArray(_stand.gids)) ? _stand.gids
       : (_owedSelf ? _owedSelf.gids : null);
     try {
+    // DAILY-CAP BUDGET — must be CONSUMED across the loop, not handed out whole to every post. maxThisRun is the
+    // account's REMAINING budget for the cycle (cap − usedToday), computed once by the caller. It used to be passed
+    // verbatim into every runAccount call below, and the worker enforces it against a counter it RE-INITIALISES on each
+    // entry — so with several posts per cycle each post got the FULL cap and the account posted cap × posts. The daily
+    // count is recorded honestly afterwards, so the overshoot was only caught on the NEXT cycle, after the burst had
+    // already landed on the shared IP. Only reachable in the BROADCAST modes (post-centric/random) with
+    // postsPerGroup = 0 ("all") or > 1; the single-post modes (campaign-plan / daily-rotation / unique / sequence) and
+    // the default postsPerGroup = 1 are byte-identical either way. Tightening only.
+    let _budget = maxThisRun;
     postsLoop:
     for (const post of posts) {
       if (this._shouldStop()) break;
+      if (Number.isFinite(_budget) && _budget <= 0) { this.log(`📵 [${account.name}] daily cap reached for this cycle — not starting another post (${posts.length} were planned).`); break; }
       // Per-account crash isolation + restart (approximates the old supervisor that
       // could relaunch a crashed account worker independently).
       const MAX = 2;
@@ -928,7 +938,7 @@ class Orchestrator {
             // else the fleet baseline) per-post timing — NO multiplier / compounding. Only the WORKER gets this resolved
             // copy; orchestrator-level gaps (cycle/stagger) keep reading the unscaled data.settings, so a per-account pace
             // never changes pool cadence. Canonical tiers are safe|fast|max (legacy migrated at load). See lib/speed.js.
-            account, maxThisRun, post, groups: data.groups, settings: applyPace(data.settings, account.pace),
+            account, maxThisRun: _budget, post, groups: data.groups, settings: applyPace(data.settings, account.pace), // _budget (not maxThisRun): the REMAINING cycle budget, consumed after each post — see the declaration
             useProxies: !!data.useProxies, proxies: data.proxies || [], assignedProxy: (this._proxyForAccount ? this._proxyForAccount(account) : null), // cycle-pinned pool proxy the anti-link gate serialized on — worker must use the SAME one
             log: (m) => { this.log(m); this._setAcctAction(account.name, m); }, // mirror each worker step into the live dashboard panel
             shouldStop: () => this._shouldStop(),
@@ -954,6 +964,10 @@ class Orchestrator {
           });
           if (r && r.offline) accountOffline = true;
           posted += (r && r.posted) || 0; pendingApproval += (r && r.pendingApproval) || 0; errors += (r && r.errors) || 0;
+          // Consume the cycle budget with what this post ACTUALLY delivered — counting held/pending exactly as
+          // _recordAccountOutcome does (a held post DID reach FB), so the in-cycle guard and the persisted daily count
+          // can never disagree. Infinity (cap off) stays Infinity.
+          if (Number.isFinite(_budget)) _budget -= ((r && r.posted) || 0) + ((r && r.pendingApproval) || 0);
           // A post is "dealt" (rotation advances, not re-posted next cycle) if it published OR went
           // pending in ANY group — we never re-post to avoid duplicates. But it is only auto-DELETABLE
           // when it FULLY published to EVERY targeted group with no errors (r.fullyPosted); a partial
