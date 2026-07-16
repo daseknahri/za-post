@@ -1978,10 +1978,22 @@ class Orchestrator {
           const planPosts = (this._data.posts || []); // full library — _computeCampaignPlan applies EACH cluster's own postFilter (+ post-set) so clusters with different filters aren't all gated by the first agent's
           const fresh = this._computeCampaignPlan(planPosts, planAgents, this._roundOffset || 0);
           this._reconcileCampaignPlan(fresh, planAgents, planPosts.length); // #2: build once, then FREEZE — never re-partition/wipe pointers mid-round
-        } else if (this._campaignPlan) {
-          this._campaignPlan = null; // no campaign-plan agents this cycle
-          this._pendingPlanBatchId = null;
         }
+        // [FREEZE FIX] An EMPTY roster means "no campaign work THIS cycle" — NOT "the round is over". This used to null
+        // this._campaignPlan + this._pendingPlanBatchId, destroying round-scoped state on a TRANSIENT condition (an
+        // operator flipping a poster off campaign-plan, assigning-groups-none, or standby/disable on a mixed fleet all
+        // empty _campaignRoster() while the pool still runs). The next non-empty cycle then hit the first-plan branch and
+        // installed a plan freshly computed from the CURRENT library — exactly the mid-round REPARTITION the freeze
+        // exists to forbid ("the whole library re-posts to the shared IP (a re-burst = the ban-risk axis)"). Worse,
+        // _perAccountRotation SURVIVES, so _campaignNextIdx does list.indexOf(lastPostId)+1 against the NEW slice: a
+        // lastPostId that moved to another agent's slice (or was deleted) yields -1 → idx 0 → the agent RESTARTS its
+        // slice and re-posts already-live pairs. Campaign-plan has no durable delivered-guard by design
+        // (_uniqueSeqGuard is false for it) and _cycleDelivered resets each cycle, so nothing catches it. The 📝 edit
+        // notice was lost too (the rebuilt plan compares against its own batchId), so the operator got zero signal.
+        // No disk write happened either, so a CRASH self-healed via the load path while a HEALTHY run did not — the
+        // blind spot exactly. Keep both fields: the plan is cleared only at a genuine round boundary (the reloop, which
+        // resets pointers atomically) or on Stop→Start. Returning agents are in liveNames, so _reconcileCampaignPlan
+        // does not prune their slices, and a library edit correctly raises the held-for-next-round notice.
       }
       // Shared-IP warning (once per run): many accounts from ONE IP is a top coordinated-spam signal.
       if (!this._proxyWarned && active.length > 1) {
@@ -2953,7 +2965,17 @@ class Orchestrator {
                               approved.status = 'failed'; approved.heldFailedAt = Date.now(); approved.repostAttempts = 1; approved.note = 'approved but its comment could never be placed after 3 re-opens — live WITHOUT its comment'; // #1: this record was moderator-approved OUTSIDE markResolved (repostAttempts still 0); mark it 1 so the failed-status candidate filter (~2522) doesn't hand this ALREADY-LIVE post to Phase-4 re-post → duplicate
                               this.log(`❌ [${task.groupName || task.gid}] post repeatedly held after approval — giving up re-homing (live without its comment); place it manually.`);
                             } else {
-                              approved.status = 'held'; approved.approvedAt = null; approved.note = 're-opened: approved but its comment could not be placed (still held in Spam potentiel)'; // keep the ORIGINAL heldAt so the 90-min STALE prune can still fire as a backstop
+                              // repostAttempts=1 for the SAME reason the >3 sibling sets it: this record was
+                              // moderator-approved OUTSIDE markResolved, so its repostAttempts is still 0 while the post
+                              // is ALREADY LIVE. We keep the ORIGINAL heldAt (so the 90-min stale prune still backstops)
+                              // — but that prune flips 'held' → 'failed' WITHOUT touching repostAttempts, and the Phase-4
+                              // candidate filter selects failed records with !(repostAttempts>0). So a re-opened record
+                              // whose original heldAt is already >90min old gets reaped straight into Phase-4 and the
+                              // LIVE post is re-posted = duplicate. Marking it 1 makes the post permanently ineligible
+                              // for Phase-4 re-post, which is correct in every direction: it is live. Nothing else reads
+                              // repostAttempts (Phase-1 re-hold dedup keys on status), so the re-open → re-approve →
+                              // re-queue flow is unaffected.
+                              approved.status = 'held'; approved.approvedAt = null; approved.repostAttempts = 1; approved.note = 're-opened: approved but its comment could not be placed (still held in Spam potentiel)'; // keep the ORIGINAL heldAt so the 90-min STALE prune can still fire as a backstop
                               this.log(`🔁 [${task.groupName || task.gid}] approved post's comment couldn't be placed — re-opened for the moderator to release again (${approved.reopenCount}/3)`);
                             }
                             return;
@@ -3063,7 +3085,19 @@ class Orchestrator {
         this._roundOffset = (this._roundOffset || 0) + 1;
         const planAgents = this._campaignRoster(); // CP1: reloop over the STABLE roster too, so the new round's batchId matches the in-cycle plan build (line ~1694) and the reserve rotation can't desync them
         { const _dk = this._localDayKey(); const _N = Math.max(1, Math.min(20, parseInt(settings.cyclesPerDay, 10) || 1));
-          for (const a of planAgents) (this._perAccountRotation || (this._perAccountRotation = {}))[a.name] = { lastPostId: null, lastPostedDate: _dk, postsToday: _N, postsTodayDate: _dk }; } // reset slice; mark today's quota FULL so a new round paces to next day (matches "resumes next day")
+          // MERGE, never REPLACE. A wholesale replace dropped two fields the round reset has no business clearing:
+          //   • lastPostedAt — the ONLY bench _dailyQuotaBlocks' ~20h anti-straddle floor measures elapsed-since-post
+          //     against. Dropping it made the floor unevaluable for EVERY campaign agent at once, so a new round could
+          //     post sooner than the floor permits, fleet-wide, on the one shared IP (an anti-spam guard, silently off).
+          //   • icommit — the R5 clean-commit watermark. Zeroing it makes this run's ALREADY-SUPERSEDED journal lines
+          //     look like survivors to the next crash-fold (survivor test is q > watermark), so the fold reconstructs a
+          //     pointer/owed state from deliveries that were already committed.
+          // Only the SLICE is round-scoped: reset lastPostId and mark today's quota full so the round paces to the next
+          // day ("resumes next day"). Everything else carries.
+          for (const a of planAgents) {
+            const _prev = (this._perAccountRotation || {})[a.name] || {};
+            (this._perAccountRotation || (this._perAccountRotation = {}))[a.name] = { ..._prev, lastPostId: null, lastPostedDate: _dk, postsToday: _N, postsTodayDate: _dk };
+          } }
         const planPosts = (this._data.posts || []); // full library — per-cluster postFilter applied inside _computeCampaignPlan
         this._campaignPlan = this._computeCampaignPlan(planPosts, planAgents, this._roundOffset);
         this._pendingPlanBatchId = null; // #2: the new round IS the recompute — any edit held during the last round is now applied, so clear the pending marker
@@ -3368,6 +3402,19 @@ class Orchestrator {
   _emitCompletionReport(reason, out) {
     const data = this._data || {};
     const stats = this._runStats || {};
+    // A PARKED slice is undelivered work that every completion consumer is (deliberately) blind to — they read
+    // agentLists only, which is what keeps a departed agent's un-advanceable pointer from wedging the run. So the
+    // completion path must SURFACE it, or "🎉 complete" would claim 100% while a parked agent's posts were never
+    // delivered. Report it; never auto-redistribute (that is the re-burst/ban direction — it resolves at the next round
+    // or when the operator re-enables the agent, which restores the slice exactly where it left off).
+    try {
+      const _parked = (this._campaignPlan && this._campaignPlan.parkedLists) || {};
+      const _names = Object.keys(_parked).filter((n) => ((_parked[n]) || []).length);
+      if (_names.length) {
+        const _pairs = _names.reduce((s, n) => s + (_parked[n] || []).length, 0);
+        this.log(`⚠️ NOT fully delivered: ${_pairs} post(s) across ${_names.length} parked agent(s) [${_names.join(', ')}] were never delivered — those accounts left the campaign (disabled / standby / groups cleared / method changed) and their slice is parked. Re-enable them to finish it, or start a new round to redistribute. This report covers only the ACTIVE roster.`);
+      }
+    } catch {}
     let posted = 0, pending = 0, errors = 0;
     for (const k of Object.keys(stats)) { posted += stats[k].posted || 0; pending += stats[k].pending || 0; errors += stats[k].errors || 0; }
     const now = Date.now();
@@ -3516,8 +3563,36 @@ class Orchestrator {
     }
     // Plan exists → FREEZE. Roster shrink: prune departed agents so a stuck pointer can't wedge completion.
     const liveNames = new Set(planAgents.map((a) => a.name));
+    // PARK, don't DELETE. The prune stops a departed agent's un-advanceable pointer from wedging completion — but it
+    // used to `delete` the slice with no log and NOTHING ever re-added it (the only builder is the first-plan branch
+    // above, and the freeze means `fresh` is used only for the batchId compare). Every reason _campaignRoster() drops an
+    // agent (disabled, standby, postingOrder changed, groups cleared) is a one-click Accounts-tab flip an operator
+    // routinely UNDOES — e.g. disable to fix a login, re-enable. After that round-trip the agent had NO slice
+    // (_postsForAccount → [], _campaignNextIdx → {idx:0,len:0}), its posts were delivered by nobody (cluster-mates hold
+    // disjoint partitions and the freeze blocks redistribution), and because every completion consumer keys off
+    // agentLists those posts became INVISIBLE → out.total===0 → "🎉 Campaign complete — every post published" while they
+    // were never delivered. Parking keeps the no-wedge property (consumers still read agentLists only) AND makes the
+    // prune reversible + auditable.
+    const _plan = this._campaignPlan;
+    _plan.parkedLists = _plan.parkedLists || {};
     let prunedAgents = false;
-    for (const n of Object.keys(this._campaignPlan.agentLists || {})) if (!liveNames.has(n)) { delete this._campaignPlan.agentLists[n]; prunedAgents = true; }
+    for (const n of Object.keys(_plan.agentLists || {})) {
+      if (liveNames.has(n)) continue;
+      _plan.parkedLists[n] = _plan.agentLists[n];            // park the slice so a returning agent gets it back
+      delete _plan.agentLists[n];
+      prunedAgents = true;
+      this.log(`⏸️ [${n}] left the campaign (disabled / standby / groups cleared / method changed) — its remaining slice is PARKED, not lost. Re-enable it to resume that slice; until then those posts are undelivered and the campaign is NOT complete.`);
+    }
+    // RESTORE a parked slice the moment its agent comes back — but only while the plan it belongs to is still the SAME
+    // round (batchId match). A different batchId means the library/roster changed, so the parked slice's post ids may no
+    // longer be that agent's partition; the next round's recompute assigns it properly instead.
+    for (const n of Object.keys(_plan.parkedLists || {})) {
+      if (!liveNames.has(n) || _plan.agentLists[n]) continue;
+      _plan.agentLists[n] = _plan.parkedLists[n];
+      delete _plan.parkedLists[n];
+      prunedAgents = true;
+      this.log(`▶️ [${n}] rejoined the campaign — its parked slice is restored (it resumes where it left off; already-delivered posts are not re-posted).`);
+    }
     if (prunedAgents) this._saveRotationState();
     // Edit notice: any other batchId change is held for the next round; tell the operator once per distinct edit.
     if (this._campaignPlan.batchId !== fresh.batchId && this._pendingPlanBatchId !== fresh.batchId) {

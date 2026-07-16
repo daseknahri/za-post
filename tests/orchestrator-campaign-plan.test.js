@@ -263,3 +263,38 @@ test('#1b: with only campaign agents and NONE active this cycle, hasFinite still
   assert.ok(out.undealt >= 1, 'roster campaign-remaining is counted');
   assert.equal(out.hasFinite, true, 'hasFinite comes from the roster → completion cannot falsely fire');
 });
+
+// [#7] ROSTER-SHRINK PRUNE MUST BE REVERSIBLE. The prune stops a departed agent's un-advanceable pointer from wedging
+// completion — but deleting the slice made a routine disable→re-enable (fix a login, turn it back on) void that agent's
+// posts FOREVER: nothing re-added the slice, cluster-mates hold disjoint partitions, and the freeze blocks
+// redistribution. Every completion consumer reads agentLists, so those posts went INVISIBLE and the run reported
+// "🎉 complete — every post published" with them never delivered. Park + restore, and surface a parked slice.
+test('[#7] a departed agent\'s slice is PARKED (not deleted) and RESTORED when it returns — same round', () => {
+  const o = mk();
+  const A = { name: 'A', postingOrder: 'campaign-plan', enabled: true, assignedGroups: ['g1'], standby: false };
+  const B = { name: 'B', postingOrder: 'campaign-plan', enabled: true, assignedGroups: ['g1'], standby: false };
+  o._saveRotationState = () => true;
+  o._campaignPlan = { batchId: 'b1', agentLists: { A: ['P1', 'P3'], B: ['P2', 'P4'] }, clusters: [], roundOffset: 0 };
+  const fresh = { batchId: 'b1', agentLists: {}, clusters: [] };
+
+  o._reconcileCampaignPlan(fresh, [A], 4);          // B left (operator disabled it)
+  assert.ok(!o._campaignPlan.agentLists.B, 'B is pruned from agentLists so its stuck pointer cannot wedge completion');
+  assert.deepEqual(o._campaignPlan.parkedLists.B, ['P2', 'P4'], 'B\'s slice is PARKED, not destroyed — else its posts are delivered by nobody and completion falsely reports 100%');
+  assert.deepEqual(o._campaignPlan.agentLists.A, ['P1', 'P3'], 'a surviving agent\'s slice is untouched (no re-partition → no re-burst)');
+
+  o._reconcileCampaignPlan(fresh, [A, B], 4);       // operator re-enables B
+  assert.deepEqual(o._campaignPlan.agentLists.B, ['P2', 'P4'], 'B rejoined → its parked slice is restored, resuming where it left off');
+  assert.ok(!o._campaignPlan.parkedLists.B, 'and it is no longer parked');
+});
+
+test('[#7] a parked slice is NOT restored across a round/library change (batchId differs → next round assigns it)', () => {
+  const o = mk();
+  const B = { name: 'B', postingOrder: 'campaign-plan', enabled: true, assignedGroups: ['g1'], standby: false };
+  o._saveRotationState = () => true;
+  o._campaignPlan = { batchId: 'b1', agentLists: {}, parkedLists: { B: ['P2', 'P4'] }, clusters: [], roundOffset: 0 };
+  // Same-round restore is keyed on the PLAN's own batchId, which the freeze never mutates mid-round; a library edit
+  // only sets _pendingPlanBatchId. So a returning agent restores here, and the next ROUND recomputes partitions afresh.
+  o._reconcileCampaignPlan({ batchId: 'b2-edited', agentLists: {}, clusters: [] }, [B], 4);
+  assert.deepEqual(o._campaignPlan.agentLists.B, ['P2', 'P4'], 'B returns within the SAME frozen round → slice restored (the pending edit is still deferred to the next round)');
+  assert.equal(o._pendingPlanBatchId, 'b2-edited', 'and the library edit is still held for the next round');
+});
