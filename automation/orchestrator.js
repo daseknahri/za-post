@@ -2863,9 +2863,18 @@ class Orchestrator {
           }
           await Promise.allSettled([...inFlight]);
         } else {
-          this._active = active; // no takeover → restore the unmodified active set
           if (active.some((a) => (a.postingOrder || '') === 'daily-rotation')) this.log('ℹ️ A daily-rotation agent dropped this cycle — a FULL drop retries the same post next cycle/day (its pointer only advanced on a successful post); a PARTIAL delivery carries its un-reached groups in the owed ledger, so nothing is permanently skipped.');
         }
+        // RESTORE — UNCONDITIONALLY, and only now. _active is widened to active.concat(...) for the probe + the
+        // takeover pool (_postsForAccount returns [] for an account not in _active), so it must be widened for exactly
+        // that long and no longer. The takeover branch used to fall through with NO restore (only the no-takeover
+        // branch restored), so promoted reserves stayed in _active for the whole tail of the cycle — the next write is
+        // on the NEXT cycle. Mirrors the immediate-takeover cleanup, which is unconditional for this same reason.
+        // What that broke: _waitPosters() reads this._active, so a promoted reserve — healthy, already finished, with
+        // nothing left to do — reported a wake of 0 ("it could act now"). ONE zero vetoes the unified wait (which
+        // requires EVERY poster to be blocked), so a fleet that was genuinely all capped/cooling fell through to the
+        // stall-breaker and the run STOPPED overnight — the exact failure the unified wait exists to prevent.
+        this._active = active;
         // Campaign agents that dropped with NO healthy in-cluster reserve to cover them: surface the deferral.
         const _covered = new Set(Object.values(this._campaignTakeover || {}).map((t) => t.forAgent));
         for (const a of active) {
@@ -3027,7 +3036,16 @@ class Orchestrator {
                 // Count this delivery against the reserve's daily cap (it went through runRepost→runAccount,
                 // NOT the pool, so the pool's _recordAccountOutcome never ran) — keeps the cap accurate so
                 // it isn't re-picked past its limit next cycle.
-                try { await this._recordAccountOutcome(reserve.name, { posted: result.posted || 0, pendingApproval: result.pendingApproval || 0, errors: result.errors || 0, flag: null, postedIds: [], dealtIds: [] }, settings); } catch {}
+                // Forward the worker's REAL outcome — NOT a literal null. `posted >= 1` together with
+                // flag === 'rate_limited' is a first-class worker shape, not an edge case: the wall-stop path does
+                // posted++/markDelivered and THEN sets flag/rlKind in the same iteration (and the *_landed outcomes do
+                // the same). Hardcoding flag:null meant the rate-limit ladder never ran for a reserve FB blocked AFTER
+                // its post landed — and worse, the 'recovered' branch fired instead (posted>0 && !flag), zeroing
+                // rateLimitedUntil AND rlStrikes, clearing nextAttnRetry/attnStrikes, and forcing status back to
+                // logged_in. So Phase-4 didn't merely fail to rest a walled reserve: it WIPED its ladder, then the
+                // picker handed it more work next cycle. commentLost/commentLanded are forwarded too, or the persisted
+                // comment-health breaker is blind on this path.
+                try { await this._recordAccountOutcome(reserve.name, { posted: result.posted || 0, pendingApproval: result.pendingApproval || 0, errors: result.errors || 0, flag: result.flag || null, rlKind: result.rlKind || null, targetCount: result.targetCount || 1, commentLost: result.commentLost || 0, commentLanded: !!result.commentLanded, postedIds: [], dealtIds: [] }, settings); } catch {}
                 // Count the LIVE re-post in the run totals: it went via runRepost (NOT the pool), so the pool's posted
                 // counters never saw it → the run summary + completion report were UNDER-counting real deliveries. Gated
                 // on the confirmed delivery above (result.posted>=1) → pure reporting, no re-dispatch / double-post.
@@ -3046,7 +3064,7 @@ class Orchestrator {
                 // posted>=1 branch recorded an outcome, so a reserve whose re-posts kept getting held did unlimited
                 // FB-visible work per day while its cap read zero — the picker's `dailyUsed < cap` gate could never
                 // stop it. pendingApproval (not posted) is what runRepost reports for a held delivery.
-                try { await this._recordAccountOutcome(reserve.name, { posted: 0, pendingApproval: (result.pendingApproval || (result.heldRecords || []).length || 1), errors: result.errors || 0, flag: null, postedIds: [], dealtIds: [] }, settings); } catch {}
+                try { await this._recordAccountOutcome(reserve.name, { posted: 0, pendingApproval: (result.pendingApproval || (result.heldRecords || []).length || 1), errors: result.errors || 0, flag: result.flag || null, rlKind: result.rlKind || null, targetCount: result.targetCount || 1, commentLost: result.commentLost || 0, commentLanded: !!result.commentLanded, postedIds: [], dealtIds: [] }, settings); } catch {} // forward the real outcome (see the success branch): a held re-post can carry a wall too
                 this.log(`⚠️ [${reserve.name}] replacement re-post to "${rec.groupName || rec.gid}" was ALSO held → reported undeliverable (2 accounts held = group-level spam gate). Warm/replace accounts for this group.`);
               } else {
                 // Session/infra/transient failure (logged out, profile lock, crash, no composer) — NOT a
@@ -4178,6 +4196,11 @@ class Orchestrator {
   _waitPosters() {
     return (this._active || []).filter((a) => {
       if (a.enabled === false || a.isModerator) return false;
+      // Standby: idle BY DESIGN, exactly like an empty-slice campaign agent — it can never be the reason the fleet is
+      // or is not blocked, so it must not get a vote on the wait. Normally standby accounts are partitioned out of
+      // _active anyway; this matters when a standby has been PROMOTED into _active as a takeover reserve, where a
+      // healthy-but-finished reserve reporting "I could act now" would veto a hold the whole fleet needs.
+      if (a.standby === true) return false;
       if ((a.postingOrder || '') === 'campaign-plan' && this._campaignNextIdx(a.name).len === 0) return false;
       return true;
     });
