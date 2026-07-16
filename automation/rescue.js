@@ -28,7 +28,7 @@ async function runRescue(o) {
   const waitIfPaused = o.waitIfPaused || (async () => {});
   const hidden = o.hidden !== false; // default hidden, mirrors the worker
   const name = account.name;
-  const out = { placed: 0, failed: 0, blocked: false, needsLogin: false };
+  const out = { placed: 0, failed: 0, blocked: false, needsLogin: false, rlKind: null }; // rlKind: WHICH wall — 'account' (FB blocked the whole account: the serious one) vs 'comment' (commenting only). Collapsing them into `blocked` alone made the orchestrator rest an ACCOUNT-level block on the MILD comment ladder and re-launch it into the same wall — ban-escalation.
   // Rescue had NO consecutive-failure breaker. A rescuer whose comments never land (silently dropped / no comment box /
   // shadow-suppressed — i.e. anything short of an explicitly DETECTED wall) walked its ENTIRE task list, burning one of
   // every orphan post's 3 attempts per cycle. Three such cycles and every one of those posts is TERMINALLY failed —
@@ -128,11 +128,11 @@ async function runRescue(o) {
         } else if (res === 'blocked_account_landed' || res === 'blocked_comment_landed') {
           // The rescuer's comment LANDED, but Facebook then walled the rescuer on the next action. Mark THIS task
           // DONE (never re-attempt a landed comment = no double-comment) AND stop the rescuer.
-          out.placed++; await record(t, 'done'); out.blocked = true;
+          out.placed++; await record(t, 'done'); out.blocked = true; out.rlKind = (res === 'blocked_account_landed') ? 'account' : 'comment'; // carry the KIND: an ACCOUNT-level block is the serious one (mult 3) and must not rest on the mild COMMENT ladder
           log(`💬 [rescue:${name}] ✅ placed, then this rescuer hit a rate-limit — stopping it; remaining comments stay pending for next cycle`);
           break;
         } else if (res === 'blocked_account' || res === 'blocked_comment') {
-          out.blocked = true; await record(t, 'blocked');
+          out.blocked = true; out.rlKind = (res === 'blocked_account') ? 'account' : 'comment'; await record(t, 'blocked');
           log(`💬 [rescue:${name}] ⛔ this rescuer hit a rate-limit — stopping it; remaining comments stay pending for next cycle`);
           break; // never keep hammering with a blocked rescuer
         } else if (res === 'blocked_login' || res === 'blocked_checkpoint') {
@@ -156,7 +156,7 @@ async function runRescue(o) {
           // gets them — which is the entire point: one broken account must not terminally fail everyone else's posts.
           const _cfd = commentFailureDecision(consecFails, anyLanded);
           if (_cfd) {
-            if (_cfd === 'block') { out.blocked = true; log(`💬 [rescue:${name}] 🛑 3 comment failures in a row and NOT ONE landed — this rescuer cannot place comments (Facebook is suppressing it). Stopping it and resting it; the remaining ${tasks.length - i - 1} comment(s) keep their attempts and go to a healthy account next cycle.`); }
+            if (_cfd === 'block') { out.blocked = true; out.rlKind = 'comment'; log(`💬 [rescue:${name}] 🛑 3 comment failures in a row and NOT ONE landed — this rescuer cannot place comments (Facebook is suppressing it). Stopping it and resting it; the remaining ${tasks.length - i - 1} comment(s) keep their attempts and go to a healthy account next cycle.`); }
             else log(`💬 [rescue:${name}] ⚠️ 3 comment failures in a row, but it DID land one earlier — treating as transient. Stopping this rescuer; the remaining ${tasks.length - i - 1} comment(s) keep their attempts and retry next cycle.`);
             break;
           }

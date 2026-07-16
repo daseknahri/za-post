@@ -2091,7 +2091,13 @@ class Orchestrator {
         for (const a of rotated) {
           if (reserveSet.size >= reserveN) break;
           if (reserveSet.has(a.name)) continue;
-          if (allPosters.filter((x) => !reserveSet.has(x.name)).length <= 1) break; // keep ≥1 posting
+          // HEALTH GATE — Pass 1 has one; Pass 2 did not, and the two disagreed in both directions. A reserve exists to
+          // COVER a dropped agent, so reserving a dead account (logged out / cooling / capped) buys nothing: it eats a
+          // reserve slot, then cannot cover anything when a drop happens. And the floor below counted ALL non-reserved
+          // posters rather than HEALTHY ones (Pass 1 counts healthy), so a fleet of mostly-dead accounts could reserve
+          // away the last account that could actually post — the fleet then delivers nothing while looking fully staffed.
+          if (!healthy(a)) continue;
+          if (allPosters.filter((x) => healthy(x) && !reserveSet.has(x.name)).length <= 1) break; // keep ≥1 HEALTHY poster (matches Pass 1's floor)
           reserveSet.add(a.name);
         }
         reserve = allPosters.filter((a) => reserveSet.has(a.name));
@@ -3259,7 +3265,7 @@ class Orchestrator {
                 // A rescuer that hit a rate-limit/block wall (incl. a comment that LANDED then walled → blocked_*_landed)
                 // must REST too — else it's re-picked as a rescuer next cycle and immediately re-walled (reserve burn).
                 // Mirror the poster path with a short COMMENT-level cooldown so it's excluded until it settles.
-                else if (rres && rres.blocked) { try { await this._recordAccountOutcome(account.name, { posted: 0, pendingApproval: 0, errors: 0, flag: 'rate_limited', rlKind: 'comment', postedIds: [], dealtIds: [] }, settings); } catch {} }
+                else if (rres && rres.blocked) { try { await this._recordAccountOutcome(account.name, { posted: 0, pendingApproval: 0, errors: 0, flag: 'rate_limited', rlKind: (rres.rlKind || 'comment'), postedIds: [], dealtIds: [] }, settings); } catch {} } // rlKind from the rescuer: an FB ACCOUNT-level block must rest on the account ladder (mult 3), not the mild comment one
                 this._setAcctState(account.name, (rres && (rres.blocked || rres.needsLogin)) ? 'error' : 'done', { action: `✓ rescued ${tasks.length} comment${tasks.length === 1 ? '' : 's'}` }); // final rescuer state in Live Operations
                 // Space consecutive RESCUERS so a batch of orphan link-comments — FB's strongest single spam signal —
                 // doesn't fan out as a coordinated burst from multiple accounts on the ONE shared IP. The within-
