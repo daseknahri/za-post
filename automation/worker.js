@@ -1584,7 +1584,12 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
             else if (caps.length > 1 && author) { const ours = caps.filter((m) => m.auth && m.auth === author); if (ours.length === 1) pick = ours[0]; }
             if (!pick) {
               if (idmis && !caps.length) return { clicked: false, reason: 'idmismatch', postId: idmis.id, pos: idmis.i };
-              return { clicked: false, reason: 'ambiguous', count: caps.length || cands.length };
+              // Carry WHAT WE SAW. "author not matched" alone is undiagnosable: the operator cannot tell a genuine
+              // stranger's post (the guard working) from a STALE fbDisplayName on their own account (the guard firing
+              // on every post, forever). Observed live: one account refused 56/56 comments while every other account
+              // matched fine — its stored name simply no longer matched what Facebook renders. Reporting the seen vs
+              // expected author turns an unexplained silence into a one-line fix.
+              return { clicked: false, reason: 'ambiguous', count: caps.length || cands.length, seenAuth: (caps[0] && caps[0].auth) || (cands[0] && cands[0].auth) || '', wantAuth: author || '' };
             }
           }
           const a = pick.a;
@@ -1662,7 +1667,20 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           }
         }
         if (res.reason === 'idmismatch') { step(`Comment: a same-caption post in feed is NOT ours (found id=${res.postId}, expected=${expectedPostId}) — NOT commenting (avoids a wrong-post)`); return 'skipped'; }
-        if (res.reason === 'ambiguous') { step(`Comment: ${res.count} same-caption post(s) in the feed and can't confirm which is OURS (no post-id, author not matched) — NOT commenting (avoids landing the link on another account's/stranger's post)`); return 'skipped'; }
+        if (res.reason === 'ambiguous') {
+          // Name the mismatch. A READABLE author that simply differs from this account's stored fbDisplayName is almost
+          // always a STALE NAME (renamed on Facebook, or mis-captured at import) — not a stranger's post — and it makes
+          // EVERY comment for that account refuse, forever, while its posts keep going out link-less. That is an
+          // instant operator fix, but only if we say what we saw. (An unreadable author stays generic: it really is
+          // ambiguous.)
+          const _seen = (res.seenAuth || '').trim(), _want = (res.wantAuth || '').trim();
+          if (_seen && _want && _seen !== _want) {
+            step(`Comment: found our caption, but the post's author reads "${_seen}" while this account expects "${_want}" — NOT commenting (a wrong-post would land your link on someone else). If "${_seen}" IS this account, its saved display name is STALE: fix fbDisplayName (or re-import it from Chrome) and its comments will work again.`);
+          } else {
+            step(`Comment: ${res.count} same-caption post(s) in the feed and can't confirm which is OURS (no post-id, author not readable) — NOT commenting (avoids landing the link on another account's/stranger's post)`);
+          }
+          return 'skipped';
+        }
         // We matched OUR article (scanFeed marked it via data-zp-ctarget) — either it clicked the
         // "comment" button, or the box was already open (reason 'nobtn'). EITHER WAY take the box that
         // lives INSIDE our marked article; never an unscoped feed box (which could be a different post).
