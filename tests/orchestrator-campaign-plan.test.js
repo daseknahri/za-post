@@ -178,3 +178,88 @@ test('CP2: uniform postFilter across a cluster → NO warning', () => {
   o._computeCampaignPlan([{ id: 'P1' }, { id: 'P2' }], [agent('A', ['g1']), agent('B', ['g1'])], 0);
   assert.ok(!logs.some((m) => /DIFFERENT post filters/i.test(m)), 'no warning when filters agree');
 });
+
+// ── #2 (defer-to-next-round): a mid-round campaign edit must NOT re-partition slices or wipe pointers — recomputing
+// mid-round restarts every agent at slice[0], re-posting the whole library to the shared IP (a re-burst = the ban-risk
+// axis). _reconcileCampaignPlan builds the plan once, then FREEZES it; the edit is applied at the next round boundary. ──
+test('#2: _reconcileCampaignPlan builds the plan on the FIRST call', () => {
+  const o = mk();
+  o._saveRotationState = () => true; // isolate from disk
+  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], accounts: [], settings: {} };
+  const agents = [agent('A', ['g1']), agent('B', ['g1'])];
+  const fresh = o._computeCampaignPlan(o._data.posts, agents, 0);
+  assert.equal(o._campaignPlan, null, 'no plan yet');
+  o._reconcileCampaignPlan(fresh, agents, 2);
+  assert.equal(o._campaignPlan, fresh, 'the first call installs the freshly-computed plan');
+  assert.equal(o._pendingPlanBatchId, null, 'nothing pending after a clean first build');
+});
+
+test('#2: a mid-round EDIT is frozen — the active plan is not recomputed and pointers are preserved (no re-burst)', () => {
+  const o = mk();
+  o._saveRotationState = () => true;
+  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], accounts: [], settings: {} };
+  const agents = [agent('A', ['g1']), agent('B', ['g1'])];
+  const original = o._computeCampaignPlan(o._data.posts, agents, 0); // A=[P1] B=[P2]
+  o._reconcileCampaignPlan(original, agents, 2);
+  // both agents have delivered their slice — their pointers are set
+  o._perAccountRotation = { A: { lastPostId: 'P1', lastPostedDate: '2000-01-01' }, B: { lastPostId: 'P2', lastPostedDate: '2000-01-01' } };
+  // operator adds a post mid-round → a DIFFERENT batchId (a genuine edit)
+  const edited = o._computeCampaignPlan([{ id: 'P1' }, { id: 'P2' }, { id: 'P3' }], agents, 0);
+  assert.notEqual(edited.batchId, original.batchId, 'the edit changed the batchId');
+  o._reconcileCampaignPlan(edited, agents, 3);
+  assert.equal(o._campaignPlan, original, 'the ACTIVE plan is unchanged (frozen) — NOT replaced by the edited one');
+  assert.deepEqual(o._perAccountRotation.A, { lastPostId: 'P1', lastPostedDate: '2000-01-01' }, 'A\'s pointer preserved (no wipe → no re-post of P1)');
+  assert.deepEqual(o._perAccountRotation.B, { lastPostId: 'P2', lastPostedDate: '2000-01-01' }, 'B\'s pointer preserved');
+  assert.equal(o._pendingPlanBatchId, edited.batchId, 'the edit is recorded as pending for the next round');
+});
+
+test('#2: an agent REMOVED from the roster mid-round is pruned from the frozen plan (completion can\'t wedge)', () => {
+  const o = mk();
+  o._saveRotationState = () => true;
+  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], accounts: [], settings: {} };
+  const A = agent('A', ['g1']), B = agent('B', ['g1']);
+  o._reconcileCampaignPlan(o._computeCampaignPlan(o._data.posts, [A, B], 0), [A, B], 2); // A=[P1] B=[P2]
+  assert.ok(o._campaignPlan.agentLists.B, 'B starts in the plan');
+  // operator turns B OFF → _campaignRoster() shrinks to [A]; reconcile is called with the shrunk roster
+  const freshWithoutB = o._computeCampaignPlan(o._data.posts, [A], 0);
+  o._reconcileCampaignPlan(freshWithoutB, [A], 2);
+  assert.ok(!o._campaignPlan.agentLists.B, 'B\'s slice is pruned — its un-advanceable pointer can no longer wedge the loop/completion');
+  assert.deepEqual(o._campaignPlan.agentLists.A, ['P1'], 'the SURVIVING agent A\'s slice is untouched (frozen; no re-partition, no re-burst)');
+});
+
+test('#2: a still-rostered agent (benched / reserve-held) is NOT pruned — CP1 no-premature-reloop preserved', () => {
+  const o = mk();
+  o._saveRotationState = () => true;
+  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], accounts: [], settings: {} };
+  const A = agent('A', ['g1']), B = agent('B', ['g1']);
+  o._reconcileCampaignPlan(o._computeCampaignPlan(o._data.posts, [A, B], 0), [A, B], 2);
+  // B is merely benched/held this cycle but STILL enabled in the roster → reconcile still receives [A, B]
+  o._reconcileCampaignPlan(o._computeCampaignPlan(o._data.posts, [A, B], 0), [A, B], 2);
+  assert.ok(o._campaignPlan.agentLists.B, 'B stays in the plan (still rostered) → still counted for completion, no premature reloop');
+});
+
+// ── #1: _outstandingWork must tally campaign-remaining over the PLAN ROSTER, not the per-cycle `active` set — else a
+// cycle that reserves ALL campaign agents collapses undealt to 0 and completionMode declares a FALSE 100% and stops
+// with campaign posts still owed (the CP1 active-vs-roster anti-pattern). Asserts `undealt` (not `total`, which reads
+// pending/held off disk) so the campaign accounting is isolated. ──
+test('#1: campaign-remaining is counted from the roster even when NO campaign agent is active this cycle (no false 100%)', () => {
+  const o = mk();
+  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], accounts: [], settings: {} };
+  o._campaignPlan = { agentLists: { A: ['P1', 'P2'], B: ['P1', 'P2'] } }; // A owes P2, B owes P1+P2 → 3 remaining across the roster
+  o._perAccountRotation = { A: { lastPostId: 'P1', lastPostedDate: '2000-01-01' }, B: {} };
+  o._owed = {}; o._dealt = new Set(['P1', 'P2']); // the ONLY active agent is a FINISHED unique agent (all its posts dealt)
+  const finishedUnique = { name: 'U', postingOrder: 'unique', assignedGroups: ['g1'], postFilter: 'all' };
+  const out = o._outstandingWork([finishedUnique]); // active set has ZERO campaign agents (both reserved this cycle)
+  assert.equal(out.undealt, 3, 'the 3 owed campaign slice-posts are counted from agentLists, not the empty active set (bug → 0)');
+  assert.equal(out.hasFinite, true, 'hasFinite stays true so completion waits for the owed campaign work');
+});
+
+test('#1b: with only campaign agents and NONE active this cycle, hasFinite still comes from the roster', () => {
+  const o = mk();
+  o._data = { posts: [{ id: 'P1' }], accounts: [], settings: {} };
+  o._campaignPlan = { agentLists: { A: ['P1'] } };
+  o._perAccountRotation = {}; o._owed = {}; o._dealt = new Set();
+  const out = o._outstandingWork([]); // no active agents at all
+  assert.ok(out.undealt >= 1, 'roster campaign-remaining is counted');
+  assert.equal(out.hasFinite, true, 'hasFinite comes from the roster → completion cannot falsely fire');
+});

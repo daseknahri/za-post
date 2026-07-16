@@ -207,6 +207,8 @@ const REMOTE_TOKEN = require('crypto').randomBytes(16).toString('hex');
 // RUN_STATE_FILE is assigned in whenReady (after app paths are available).
 // Declared here so setRunActive / isRunActive are accessible throughout the file.
 let RUN_STATE_FILE = null;
+let CRASH_COUNT_FILE = null; // #6: persisted crash-relaunch streak — bounds the auto-relaunch so a deterministic crash can't fast-loop the shared IP
+let _healthyResetTimer = null; // #6: fires once a run has been up long enough to be 'healthy' → resets the streak
 
 /** Persist active=true/false atomically so a hard kill leaves the flag intact. */
 let _psbId = null;
@@ -220,6 +222,17 @@ function setRunActive(active) {
     finally { fs.closeSync(fd); }
     fs.renameSync(tmp, RUN_STATE_FILE);
   } catch {}
+  // #2 (no-admin auto-relaunch): mirror the flag as a bare presence file NEXT TO THE EXE (= the launcher .bat's %~dp0)
+  // so the relaunch-on-crash wrapper can tell a CRASH (flag still present when the process died) from a clean quit (flag
+  // removed) WITHOUT resolving userData. Packaged build only; best-effort — a read-only dir just disables auto-relaunch,
+  // never breaks the run. A1 keeps run-active set on a crash, so a dead process is relaunched → resumes from disk.
+  try {
+    if (app.isPackaged) {
+      const _mk = path.join(path.dirname(app.getPath('exe')), 'run-active.flag');
+      if (active) fs.writeFileSync(_mk, String(Date.now()));
+      else if (fs.existsSync(_mk)) fs.rmSync(_mk, { force: true });
+    }
+  } catch {}
   // RDP/unattended: while a run is active, block system + display sleep. The hidden off-screen Chromium
   // windows stop painting if the display sleeps, so this keeps automation reliable on a laptop left running
   // (and 'prevent-display-sleep' also prevents system suspend). Released the moment the run stops.
@@ -231,6 +244,45 @@ function setRunActive(active) {
 /** Returns true if the previous session left active=true (interrupted / shutdown). */
 function isRunActive() {
   try { return !!JSON.parse(fs.readFileSync(RUN_STATE_FILE, 'utf8')).active; } catch { return false; }
+}
+// #6: the orchestrator's in-process crash-breaker (crashRestartDecision) gives up after 3 rapid _loop crashes and returns
+// reason 'crashed', but the Electron process stays ALIVE (window + timers keep the event loop) — so start.bat's `start
+// /wait` never unblocks and the daily --autostart second instance only focuses the window; the loop sits DEAD with
+// run-active + powerSaveBlocker stuck. Hand off to a FRESH process (app.relaunch reloads durable state from disk and,
+// with resumeOnStartup, resumes), BOUNDED by a persisted streak (reset once a run has been healthy for 10 min) so a
+// deterministic crash cannot fast-loop the shared IP — mirrors start.bat's own _fails cap and works even if not launched
+// via start.bat. app.exit() is a hard exit, so window-all-closed's run-active clear does NOT fire → the flag stays set.
+function _crashRelaunchCount() { try { return Number(JSON.parse(fs.readFileSync(CRASH_COUNT_FILE, 'utf8')).n) || 0; } catch { return 0; } }
+function _setCrashRelaunchCount(n) { try { fs.writeFileSync(CRASH_COUNT_FILE, JSON.stringify({ n: Number(n) || 0, ts: Date.now() })); } catch {} }
+function _markHealthy() { // #6/review-fix: a run reached healthy uptime — reset the self-relaunch streak AND drop a marker start.bat reads to reset ITS _fails, so isolated crashes days apart don't slowly retire either watchdog.
+  try { _setCrashRelaunchCount(0); } catch {}
+  try { if (app.isPackaged) fs.writeFileSync(path.join(path.dirname(app.getPath('exe')), '.healthy'), String(Date.now())); } catch {}
+}
+// #6 (healthy-uptime fix): (re)arm the 10-min 'healthy' timer. Called on automation-started AND on each in-process
+// crash-restart (automation-restarted), so it measures CRASH-FREE uptime — _markHealthy fires only after 10 continuous
+// minutes with no restart, never on cumulative wall-clock while the loop is thrashing (which reset both watchdog caps).
+function _armHealthyReset() {
+  if (_healthyResetTimer) { try { clearTimeout(_healthyResetTimer); } catch {} }
+  _healthyResetTimer = setTimeout(() => { _markHealthy(); _healthyResetTimer = null; }, 10 * 60 * 1000);
+}
+function _crashedGiveUp() {
+  try {
+    // #6 (healthy-uptime fix): drop any .healthy marker written moments before this give-up (belt-and-suspenders with the
+    // restart-reset timer above) so start.bat can't consume a stale marker to reset ITS _fails while we're crash-looping.
+    try { if (app.isPackaged) { const _h = path.join(path.dirname(app.getPath('exe')), '.healthy'); if (fs.existsSync(_h)) fs.rmSync(_h, { force: true }); } } catch {}
+    // #6/review-fix: under the start.bat watchdog, IT owns the SINGLE relaunch path (run-active.flag) with its own cap —
+    // do NOT also app.relaunch here. Two relaunchers RACE: our detached fresh process wins the single-instance lock, so the
+    // watchdog's own relaunch then LOSES the lock and quits in ~1s WITHOUT clearing the flag, burning the watchdog's _fails
+    // every ~30s until it retires entirely while a healthy process runs — and a later HARD kill (the very case the watchdog
+    // exists for) then goes unrecovered. So just EXIT; the watchdog relaunches a fresh process that resumes from disk.
+    if (process.env.ZAPOST_WATCHDOG === '1') { try { appendLogFile('[crash] in-process breaker gave up — exiting so the start.bat watchdog relaunches a fresh process (it owns the single relaunch + cap).'); } catch {} setTimeout(() => { try { app.exit(0); } catch {} }, 3000); return; }
+    // Not under the watchdog (dev / a direct .exe launch): self-relaunch, bounded by a persisted streak (reset by _markHealthy).
+    const n = _crashRelaunchCount() + 1;
+    _setCrashRelaunchCount(n);
+    if (n > 3) { try { appendLogFile(`[crash] the in-process breaker gave up ${n} times in a row — NOT relaunching (deterministic crash). Fix the app, then Start again.`); } catch {} return; }
+    try { appendLogFile(`[crash] in-process crash-breaker gave up — relaunching a fresh process in 8s (attempt ${n}/3; resumes from disk).`); } catch {}
+    setTimeout(() => { try { app.relaunch(); app.exit(0); } catch (e) { try { appendLogFile('[crash] relaunch failed: ' + (e && e.message)); } catch {} } }, 8000);
+  } catch (e) { try { appendLogFile('[crash] give-up handler error: ' + (e && e.message)); } catch {} }
 }
 
 let mainWindow = null;
@@ -244,7 +296,11 @@ async function applyTunnelState(enabled) {
   if (enabled && !tunnelActive) {
     tunnelActive = true;
     emit('automation-log', '🌐 Starting remote-access tunnel...');
-    try { remote.startTunnel(REMOTE_PORT, (u) => { tunnelUrl = u ? `${u}/?token=${REMOTE_TOKEN}` : u; send('remote-url-update', tunnelUrl); if (u) emit('automation-log', `🔐 Remote dashboard ready — open it from the app (the access-token URL is kept OUT of the logs). Base: ${u}`); }); }
+    try { remote.startTunnel(REMOTE_PORT, (u) => { tunnelUrl = u ? `${u}/?token=${REMOTE_TOKEN}` : u; send('remote-url-update', tunnelUrl); if (u) emit('automation-log', `🔐 Remote dashboard ready — open it from the app (the access-token URL is kept OUT of the logs). Base: ${u}`); },
+      () => { // #10: the tunnel child died — reset state so a re-enable can revive it, and SELF-HEAL after 60s if still enabled (unattended). A tunnel relaunch is cloudflared, not FB, so the 60s cadence carries no ban-safety cost.
+        tunnelActive = false; tunnelUrl = ''; try { send('remote-url-update', ''); } catch {}
+        setTimeout(() => { try { if (!tunnelActive && store.load().settings && store.load().settings.enableTunnel) applyTunnelState(true); } catch {} }, 60000);
+      }); }
     catch (e) { tunnelActive = false; emit('automation-log', '🌐 Tunnel failed: ' + e.message); }
   } else if (!enabled && tunnelActive) {
     tunnelActive = false; tunnelUrl = '';
@@ -274,8 +330,27 @@ function emit(channel, payload) {
   // is the ONE case we DON'T clear — the loop threw, so we KEEP run-active set → the next launch's resume
   // path recovers it instead of the crash being silently mislabeled done. (A hard-kill mid-run never
   // reaches this handler at all, so run-active also stays set there → resume — unchanged.)
+  if (channel === 'automation-started') {
+    // #6: arm the 'healthy' reset — a run that stays up 10 min clears the crash-relaunch streak, so isolated crashes
+    // days apart never accumulate toward the give-up cap (only RAPID consecutive crash-relaunches do).
+    _armHealthyReset();
+  }
+  if (channel === 'automation-crashed') {
+    // #6 (healthy-uptime fix): a cycle threw and a restart is pending (backoff about to start). CLEAR the healthy timer
+    // NOW so a stale pre-crash timer can't fire _markHealthy during the backoff — a crash landing in the last backoff
+    // window before 10 min would otherwise reset the relaunch caps mid-crash-sequence (→ unbounded relaunch). It is
+    // re-armed on 'automation-restarted' when the loop actually re-enters, so crash-free uptime restarts there.
+    if (_healthyResetTimer) { try { clearTimeout(_healthyResetTimer); } catch {} _healthyResetTimer = null; }
+  }
+  if (channel === 'automation-restarted') {
+    // #6 (healthy-uptime fix): the orchestrator restarted _loop IN-PROCESS after a cycle crash. Re-arm the timer from NOW
+    // so the 'healthy' signal means crash-free uptime — it can't fire mid-thrash on cumulative wall-clock-since-start.
+    _armHealthyReset();
+  }
   if (channel === 'automation-stopped') {
-    if (payload !== 'crashed') setRunActive(false);
+    if (_healthyResetTimer) { try { clearTimeout(_healthyResetTimer); } catch {} _healthyResetTimer = null; }
+    if (payload !== 'crashed') { setRunActive(false); try { _setCrashRelaunchCount(0); } catch {} } // #6: a clean end (completed/finished/stopped) means the crash streak is over — reset it so a short clean run can't leave the counter elevated
+    else _crashedGiveUp(); // #6: the in-process breaker gave up → hand off to a fresh process (bounded) instead of sitting dead behind a live window
   }
   if (channel === 'account-attention') {
     notifyAccountAttention(payload);
@@ -545,6 +620,7 @@ app.whenReady().then(async () => {
 
   // ---- run-state file (shutdown/crash resilience) ---------------------------
   RUN_STATE_FILE = path.join(app.getPath('userData'), 'run-state.json');
+  CRASH_COUNT_FILE = path.join(app.getPath('userData'), 'crash-relaunch.json'); // #6
 
   // ---- Windows login-item (opt-in launchOnStartup) -------------------------
   try { app.setLoginItemSettings({ openAtLogin: !!(store.load().settings.launchOnStartup) }); } catch {}
@@ -683,6 +759,11 @@ app.whenReady().then(async () => {
   const _rd = store.load();
   const _hasWork = (_rd.posts || []).length > 0 && (_rd.accounts || []).some((a) => a.enabled !== false && !a.isModerator && (a.assignedGroups || []).length > 0);
   if (wasInterrupted && !_hasWork) { try { setRunActive(false); } catch {} }
+  // #7: run was interrupted (crash) but resume is DISABLED — don't leave run-active sticky. Sticky it would (a) suppress
+  // the --autostart daily hook forever (that hook is guarded on !wasInterrupted) AND (b) never auto-resume (resume is
+  // gated on resumeOnStartup===true), so daily posting silently stops until a manual Start. Abandon the interrupted run
+  // so today's schedule / a manual Start can proceed.
+  if (wasInterrupted && _hasWork && _rd.settings.resumeOnStartup !== true) { try { setRunActive(false); } catch {} }
   if (wasInterrupted && _hasWork && _rd.settings.resumeOnStartup === true && mainWindow) {
     let resumeFired = false; // guard: fire exactly once
     mainWindow.webContents.once('did-finish-load', () => {
@@ -713,7 +794,7 @@ app.whenReady().then(async () => {
   // tomorrow — missing today. Guards: only on the flagged launch, only when NOT resuming an interrupted run (that path
   // owns it), only in daily mode with the toggle on + work present, and only if not already running. A manual launch (no
   // flag) never auto-posts; a task launch while the app is already open quits on the single-instance lock (no double-post).
-  if (process.argv.includes('--autostart') && !wasInterrupted && _hasWork && _rd.settings && _rd.settings.autoStartDaily === true && _rd.settings.scheduleMode === 'daily' && mainWindow && !orchestrator.isRunning()) {
+  if (process.argv.includes('--autostart') && !(wasInterrupted && _rd.settings.resumeOnStartup === true) && _hasWork && _rd.settings && _rd.settings.autoStartDaily === true && _rd.settings.scheduleMode === 'daily' && mainWindow && !orchestrator.isRunning()) { // #7: fire even when interrupted IF resume is disabled (the resume block won't own it) — else the daily hook is suppressed forever
     let autoFired = false;
     const _fireAuto = () => { if (autoFired || orchestrator.isRunning()) return; autoFired = true; emit('automation-log', '⏰ Daily auto-start (scheduled task) — running today\'s campaign now...'); orchestrator.start(getData, { runNow: true }); setRunActive(true); };
     mainWindow.webContents.once('did-finish-load', _fireAuto);
@@ -1535,7 +1616,7 @@ async function openLoginBrowser(accountName, opts = {}) {
   const _d = getData();
   const _acct = (_d.accounts || []).find((a) => a.name === accountName) || { name: accountName };
   const _useProxies = !!_d.useProxies, _proxies = _d.proxies || [];
-  let _proxyArg = '', _anonLocal = null, _proxyAuth = null;
+  let _proxyArg = '', _anonLocal = null, _proxyAuth = null, _proxyMisconfigured = false;
   try {
     const { parseProxy } = require('./automation/worker');
     let pstr = (_acct.proxy && String(_acct.proxy).trim()) || '';
@@ -1545,9 +1626,13 @@ async function openLoginBrowser(accountName, opts = {}) {
       if (pp) {
         if (pp.username && proxyChain) { _anonLocal = await proxyChain.anonymizeProxy(pp.upstream).catch(() => null); if (_anonLocal) _proxyArg = `--proxy-server=${_anonLocal}`; else { _proxyArg = `--proxy-server=${pp.server}`; _proxyAuth = pp; } }
         else { _proxyArg = `--proxy-server=${pp.server}`; if (pp.username) _proxyAuth = pp; }
-      }
+      } else _proxyMisconfigured = true; // #A: configured but UNPARSEABLE (schemeless / bad port / unknown scheme) — do NOT fall through to the real IP
     }
   } catch (e) { emit('automation-log', `🔐 [${accountName}] proxy setup skipped: ${(e && e.message) || e}`); }
+  // #A (proxies fail-closed): a configured-but-unparseable proxy must NOT open a FB session on the real shared host IP —
+  // that correlates the account to the fleet IP (the exact multi-IP account link the proxy exists to prevent). The worker
+  // fails closed on this input (proxy_invalid); this login/auto-login launch site must too.
+  if (_proxyMisconfigured) { emit('automation-log', `🚫 [${accountName}] its proxy is SET but unparseable — NOT opening a browser on your real IP (that would link the account to your fleet IP). Fix the proxy format in the Accounts tab (it needs a scheme: http://host:port or http://user:pass@host:port).`); return { success: false, error: 'Proxy configured but unparseable — fix it in the Accounts tab (needs an http:// or socks5:// scheme).' }; }
   emit('automation-log', _proxyArg ? `🔐 [${accountName}] browser routed through the account's proxy (same IP as posting — avoids an "unusual location" captcha)` : `🔐 [${accountName}] no proxy for this account — browser uses the real host IP`);
   const _vp = viewportFor(accountName);
   // F1: free the proxy-chain tunnel if the LAUNCH (or page setup) throws — otherwise it is ONLY freed in the disconnected
@@ -1902,16 +1987,19 @@ ipcMain.handle('check-account-memberships', async (_e, accountName) => {
   // Route through the account's OWN proxy + geo, exactly like the posting/login browser — otherwise the group reads from a
   // different IP than it posts from, which both skews the result and risks an "unusual location" flag. Same pool pick as the worker.
   const _useProxies = !!_d.useProxies, _proxies = _d.proxies || [];
-  let _proxyArg = '', _anonLocal = null, _proxyAuth = null;
+  let _proxyArg = '', _anonLocal = null, _proxyAuth = null, _proxyMisconfigured = false;
   try {
     const { parseProxy } = require('./automation/worker');
     let pstr = (acct.proxy && String(acct.proxy).trim()) || '';
     if (!pstr && _useProxies && _proxies.length) { let h = 0; for (let i = 0; i < accountName.length; i++) h = (h * 31 + accountName.charCodeAt(i)) >>> 0; pstr = _proxies[h % _proxies.length]; }
-    if (pstr) { const pp = parseProxy(pstr); if (pp) { if (pp.username && proxyChain) { _anonLocal = await proxyChain.anonymizeProxy(pp.upstream).catch(() => null); if (_anonLocal) _proxyArg = `--proxy-server=${_anonLocal}`; else { _proxyArg = `--proxy-server=${pp.server}`; _proxyAuth = pp; } } else { _proxyArg = `--proxy-server=${pp.server}`; if (pp.username) _proxyAuth = pp; } } }
+    if (pstr) { const pp = parseProxy(pstr); if (pp) { if (pp.username && proxyChain) { _anonLocal = await proxyChain.anonymizeProxy(pp.upstream).catch(() => null); if (_anonLocal) _proxyArg = `--proxy-server=${_anonLocal}`; else { _proxyArg = `--proxy-server=${pp.server}`; _proxyAuth = pp; } } else { _proxyArg = `--proxy-server=${pp.server}`; if (pp.username) _proxyAuth = pp; } } else _proxyMisconfigured = true; }
   } catch {}
   const _vp = viewportFor(accountName);
   try { store.sanitizeProfile(accountName, false); } catch {} // headless probe: clear saved tabs / off-screen bounds so it doesn't restore 40 old tabs
   let browser = null; const results = [];
+  // #A (proxies fail-closed): a configured-but-unparseable proxy must NOT open FB group pages on the real shared host IP —
+  // that correlates the account to the fleet IP (the exact multi-IP link the proxy prevents). Skip the check (worker + login already fail closed here).
+  if (_proxyMisconfigured) { try { membershipChecks.delete(accountName); } catch {} emit('automation-log', `🚫 [${accountName}] its proxy is SET but unparseable — skipping the membership check (opening it would use your real IP and link the account). Fix the proxy format in the Accounts tab.`); return results; }
   try {
     browser = await launchStealth({ headless: true, userDataDir: store.profileDir(accountName), defaultViewport: { width: _vp.width, height: _vp.height }, args: [...(_proxyArg ? [_proxyArg] : [])] });
     const _pgs = await browser.pages(); const page = _pgs[0] || (await browser.newPage());

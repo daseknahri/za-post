@@ -123,6 +123,15 @@ async function runRescue(o) {
           out.blocked = true; await record(t, 'blocked');
           log(`💬 [rescue:${name}] ⛔ this rescuer hit a rate-limit — stopping it; remaining comments stay pending for next cycle`);
           break; // never keep hammering with a blocked rescuer
+        } else if (res === 'blocked_login' || res === 'blocked_checkpoint') {
+          // The rescuer's SESSION died mid-run (logged out / checkpoint) — the failure is the rescuer's, NOT the post's.
+          // Do NOT record() (that would burn one of this post's 3 attempts on the dead session); leave the comment
+          // 'pending' with attempts UNCHANGED. Flag needsLogin so the orchestrator _markLoggedOut's the account (2880)
+          // and STOP immediately — driving a logged-out browser through the remaining tasks just consumes attempts and
+          // never flags the logout. Mirrors the poster path, which classifies a login wall as needs_login and stops.
+          out.needsLogin = true;
+          log(`💬 [rescue:${name}] 🔒 rescuer is logged out / checkpointed — stopping it and flagging for re-login; remaining comments stay pending`);
+          break;
         } else {
           out.failed++; await record(t, res);
           log(`💬 [rescue:${name}] ⚠️ could not place the comment on a "${label}" post (${res})`);

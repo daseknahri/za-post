@@ -84,7 +84,7 @@ const ok = (name, cond, extra) => { if (cond) { passed++; console.log('PASS ' + 
     settings: {
       // Use the RANGE keys the loop actually reads (the legacy singular keys are inert) with explicit 0 so
       // the cycles run back-to-back and the run completes within the test window.
-      parallelAccounts: 1, maxCycles: 3, staggerAccounts: false, dailyCap: 2, varyImages: false, varyContent: true,
+      parallelAccounts: 1, maxCycles: 3, staggerAccounts: false, dailyCap: 2, realIpMinPostGapSec: 0, varyImages: false, varyContent: true, // realIpMinPostGapSec:0 keeps this integration run fast: #12/#15 now enforce the per-IP launch floor even when staggerAccounts is off, and the real-IP gate has its OWN dedicated checks below
       waitIntervalMin: 0, waitIntervalMax: 0, accountDelayMin: 0, accountDelayMax: 0, groupDelayMin: 0, groupDelayMax: 0,
     },
     proxies: [], useProxies: false,

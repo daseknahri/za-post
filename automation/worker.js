@@ -12,16 +12,34 @@ let proxyChain; try { proxyChain = require('proxy-chain'); } catch {}
 
 const store = require('../lib/store');
 
-// One-time sweep of orphaned comment-image temps (zpv-*) in the OS temp dir. A temp handed off to the rescue/moderator
-// queue is intentionally kept past runAccount's cleanup so its consumer can upload it; if that consumer never runs
-// (crash/abort between persist and the rescue phase), the file would leak. Reclaim any older than 24h at module load.
-try {
-  const _tmp = os.tmpdir(), _cut = Date.now() - 24 * 3600 * 1000;
-  for (const f of fs.readdirSync(_tmp)) {
-    if (!/^(zpv-|za-img-)/.test(f)) continue; // zpv- = varied images; za-img- = downloaded (URL) images that were handed off un-varied
-    try { const p = path.join(_tmp, f); if (fs.statSync(p).mtimeMs < _cut) fs.unlinkSync(p); } catch {}
-  }
-} catch {}
+// Sweep orphaned comment-image temps (zpv-* varied / za-img-* downloaded) from the OS temp dir. A temp handed off to the
+// rescue/moderator queue is intentionally kept past runAccount's cleanup so its consumer can upload it; if that consumer
+// never runs (crash/abort between persist and the rescue phase) — or its record's queue entry has since been resolved —
+// the file leaks. Reclaim any older than 24h. #14: but NEVER delete one still referenced by a PERSISTED held/pending
+// record (a routine >24h-unapproved moderation image), or its later approval / Phase-4 re-home uploadFile → ENOENT drops
+// the comment. #11: callable periodically (the orchestrator calls it between cycles) so a days-long run that never
+// restarts still reclaims CONSUMED temps, not only at module load — bounding the leak instead of growing it unbounded.
+function sweepOrphanTemps() {
+  try {
+    const referenced = new Set();
+    try { for (const h of (store.loadModeration().held || [])) { if (h && h.commentImg) referenced.add(path.normalize(String(h.commentImg))); } } catch {}
+    try { for (const c of (store.loadComments().pending || [])) { if (c && c.commentImg) referenced.add(path.normalize(String(c.commentImg))); } } catch {}
+    // #6/journal-fix: also protect a temp referenced ONLY by the crash-obligation journal (pcu-obligations.jsonl), which
+    // the module-load sweep runs BEFORE _foldObligationJournal folds into held/pending. A comment obligation that survived
+    // a hard-kill is, at sweep time, referenced only here — dropping its >24h temp would make the later fold restore a
+    // pending comment whose commentImg points at a deleted file (rescue uploadFile → ENOENT: an image-only comment fails,
+    // a text+image comment silently loses its image). Keeping a temp longer is inert for ban-safety.
+    try { for (const o of (store.loadObligations() || [])) { if (o && o.commentImg) referenced.add(path.normalize(String(o.commentImg))); } } catch {}
+    const _tmp = os.tmpdir(), _cut = Date.now() - 24 * 3600 * 1000;
+    for (const f of fs.readdirSync(_tmp)) {
+      if (!/^(zpv-|za-img-)/.test(f)) continue;
+      const p = path.join(_tmp, f);
+      if (referenced.has(path.normalize(p))) continue; // #14: still referenced by a persisted queue → keep regardless of age
+      try { if (fs.statSync(p).mtimeMs < _cut) fs.unlinkSync(p); } catch {} // #11 safety margin: only >24h (a temp in active handoff is younger, so this can't race an in-flight upload)
+    }
+  } catch {}
+}
+sweepOrphanTemps(); // startup reclamation
 const { chromiumPath } = require('../lib/chromium');
 const spintax = require('../lib/spintax');
 const imageVary = require('../lib/imageVary');
@@ -351,6 +369,7 @@ async function retryAsync(fn, opts = {}) {
   const baseDelayMs = Number.isFinite(opts.baseDelayMs) ? opts.baseDelayMs : 1500;
   const label = opts.label || 'operation';
   const onAttempt = typeof opts.onAttempt === 'function' ? opts.onAttempt : null;
+  const shouldRetry = typeof opts.shouldRetry === 'function' ? opts.shouldRetry : null; // #17: return false to STOP retrying a permanent error (e.g. HTTP 4xx) instead of burning the whole retry+backoff budget on a hopeless outcome
   let lastErr;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     let timer;
@@ -365,6 +384,7 @@ async function retryAsync(fn, opts = {}) {
       clearTimeout(timer);
       lastErr = e;
       if (onAttempt) { try { onAttempt(attempt, attempts, e); } catch {} }
+      if (shouldRetry && !shouldRetry(e)) break; // #17: a permanent failure — stop now rather than retry+backoff a hopeless outcome
       if (attempt < attempts) await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt - 1)));
     }
   }
@@ -409,7 +429,7 @@ async function downloadImage(url, log) {
     },
     maxContentLength: 15 * 1024 * 1024,    // cap the download so a giant/streaming URL can't exhaust memory
     maxBodyLength: 15 * 1024 * 1024,
-  }), { attempts: 3, timeoutMs: 35000, baseDelayMs: 1500, label: 'image download' });
+  }), { attempts: 3, timeoutMs: 35000, baseDelayMs: 1500, label: 'image download', shouldRetry: (e) => { const s = e && e.response && e.response.status; if (!Number.isFinite(s)) return true; if (s === 408 || s === 429) return true; return !(s >= 400 && s < 500); } }); // #17: a permanent 4xx (404/410/403…) can never become 200 — don't spend 3 attempts + 4.5s backoff on it every cycle; still retry transient (timeout, 408, 429, 5xx, network)
   if (!r.ok) { const st = r.error && r.error.response && r.error.response.status; note(`request failed after retries${st ? ` (HTTP ${st})` : ''}: ${r.error && r.error.message}`); return null; }
   // Reject non-image responses (an HTML error page / unexpected content type isn't an image).
   const ct = String((r.result.headers && (r.result.headers['content-type'] || r.result.headers['Content-Type'])) || '').toLowerCase();
@@ -696,7 +716,7 @@ async function openComposerByText(page) {
 // (the text lives in a placeholder span), so target the SHORT-text placeholder, walk
 // up to its clickable [role=button], real-mouse-click it, and WAIT for the composer
 // dialog's editable to actually appear. Retries — returns true only when it opened.
-async function openComposer(page, log, name, settings = {}) {
+async function openComposer(page, log, name, settings = {}, maxAttempts = 4) {
   // R1: a focused search/"type ahead" box (the "Exit typeahead" seen in failures) steals keyboard
   // focus and obscures the composer trigger — blur it + Escape. R2: scroll to top, clear popups, and
   // WAIT for the feed to actually render (an article or the "Write something" placeholder) ONCE before
@@ -734,8 +754,8 @@ async function openComposer(page, log, name, settings = {}) {
     return Array.from(document.querySelectorAll('[role="button"], span, div')).some((e) => /write something|what'?s on your mind|irj valamit|mi jar a fejedben|quoi de neuf|écrivez quelque chose|ecrivez quelque chose|créer une publication|creer une publication|que estas pensando|was machst du/i.test(e.textContent || ''));
   }, { timeout: 20000 }).catch(() => {}); // R2: feed-render gate (slow internet)
 
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    if (log && attempt > 1) log(`Reopening composer (attempt ${attempt}/4)`); // #3: attempt-1 is immediately followed by 'Composer opened' on success → the line was pure duplication (~800 noise lines/day); only retries carry information
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (log && attempt > 1) log(`Reopening composer (attempt ${attempt}/${maxAttempts})`); // attempt-1 is immediately followed by 'Composer opened' on success → the line was pure duplication (~800 noise lines/day); only retries carry information. maxAttempts shrinks to 2 once FB is already pushing this account back (see composerOpenAttempts)
     if (attempt > 1) await _backToFeedIfTabbed(); // if a prior attempt's click navigated to a group tab, return to the feed BEFORE re-scanning
     // The composer lives at the TOP of the feed — make sure we're there and nothing covers it.
     await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
@@ -817,8 +837,8 @@ async function openComposer(page, log, name, settings = {}) {
   // Distinguish "page never rendered" from genuine selector drift using the last readiness read.
   const ready = await page.evaluate(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length).catch(() => 0);
   if (log) {
-    if (!ready) log('⚠️ Composer never opened after 4 attempts and the group FEED never rendered — likely a slow/blocked network or this account can\'t view this group. Not selector drift.');
-    else log('⚠️ SELECTOR DRIFT? The feed rendered but the "Write something" trigger was not found after 4 attempts — Facebook may have changed it or the page is in an unexpected locale/state. Run scripts/inspect-fb.js to capture the current DOM.');
+    if (!ready) log(`⚠️ Composer never opened after ${maxAttempts} attempt(s) and the group FEED never rendered — likely a slow/blocked network or this account can't view this group. Not selector drift.`);
+    else log(`⚠️ SELECTOR DRIFT? The feed rendered but the "Write something" trigger was not found after ${maxAttempts} attempt(s) — Facebook may have changed it or the page is in an unexpected locale/state. Run scripts/inspect-fb.js to capture the current DOM.`);
   }
   return false;
 }
@@ -905,6 +925,53 @@ async function clickPostButton(page) {
     return true;
   }
   return false;
+}
+
+// #time-waste: how long to wait for FB to confirm a publish before falling back to the (double-post-safe) rescan.
+// The FIRST post of a run — and any post after a CONFIRMED publish (consecPubTimeouts reset to 0) — gets the FULL
+// ceiling: a slow / hidden / proxied window can take 35-45s+, and a too-short wait would be a FALSE "timeout" that the
+// owed/reserve path could re-post = a DUPLICATE (the one ban-risk axis). But once FB has SILENTLY dropped a publish
+// this run (consecPubTimeouts>0 ⇒ its create-story backend didn't acknowledge the prior post), the account is very
+// likely throttled and a full 70s wait is mostly idle time — return the shorter "throttle" ceiling so we reach the
+// 2-in-a-row backoff fast instead of stalling ~70s per post. This does NOT weaken double-post safety: on a timeout the
+// H3 network-capture confirm (~3s), the dialog-close poll (~12s) and the author-matched feed rescan ALL still run —
+// ≈15s of landing-coverage AFTER the ceiling — so 35s still covers the documented 35-45s slow-publish window; a post
+// that actually landed is caught and never re-posted.
+function publishWaitCeilingMs(consecPubTimeouts, fullMs = 70000, throttleMs = 35000) {
+  return (Number(consecPubTimeouts) || 0) >= 1 ? throttleMs : fullMs;
+}
+
+// #hardening: the unified MIXED-failure backoff decision. `consecPushback` counts consecutive FB-pushback failures of
+// ANY type (silent publish-timeout / composer-won't-open / post-button-missing) and resets on a confirmed or held
+// publish. The per-type "2 in a row" counters miss a throttle that makes an account fail DIFFERENT ways each group, so
+// this catches that mix. Below `threshold` → null (keep going). At/above it, FB is pushing the account back: return
+// 'transient' if it already delivered today (a slow-IP/layout hiccup — stop this cycle, no rest) else 'block' (a
+// rate-limit rest so a reserve / the next cycle covers). Pure + exported so the contract is unit-tested.
+function mixedPushbackDecision(consecPushback, deliveredToday, threshold = 3) {
+  if ((Number(consecPushback) || 0) < threshold) return null;
+  return deliveredToday ? 'transient' : 'block';
+}
+
+// #3 (time-waste): how many composer-open attempts to make. FULL (4) on a fresh/healthy account — a slow / hidden /
+// proxied feed legitimately needs the retries. But once FB is already pushing this account back (pushback>0), the feed
+// usually won't render at all, so 4 attempts just idle ~30s before the skip — cut to 2 so the account reaches its
+// backoff fast instead of hammering an unloadable group. The FIRST attempt is always made. This is a READ-ONLY
+// pre-publish path (nothing is clicked/submitted), so fewer attempts can NEVER cause a double-post.
+function composerOpenAttempts(pushback, fullAttempts = 4, throttledAttempts = 2) {
+  return (Number(pushback) || 0) >= 1 ? throttledAttempts : fullAttempts;
+}
+
+// #5 (hardening): the per-account watchdog tick decision on a budget-elapse. A DEAD browser → abort. A LIVE browser that
+// ADVANCED a group this window → extend (reset the no-progress streak — it's just slow, not stuck). A live browser that
+// made ZERO group progress → extend ONCE (grace: a rare laptop sleep-resume fires the wall-clock timer with no fault,
+// though powerSaveBlocker blocks sleep during a run) then ABORT on the SECOND consecutive no-progress window — a
+// responsive-but-STUCK browser (persistent interstitial / hung SPA) that would otherwise re-extend the full budget
+// FOREVER and stall the cycle drain. Pure → unit-tested. Returns { action:'extend'|'abort', noProgressTicks }.
+function watchdogTickDecision(alive, progressed, noProgressTicks, graceWindows = 1) {
+  if (!alive) return { action: 'abort', noProgressTicks: Number(noProgressTicks) || 0 };
+  if (progressed) return { action: 'extend', noProgressTicks: 0 };
+  const n = (Number(noProgressTicks) || 0) + 1;
+  return n > graceWindows ? { action: 'abort', noProgressTicks: n } : { action: 'extend', noProgressTicks: n };
 }
 
 // Confirm the post actually published: the composer dialog closes OR the enabled
@@ -2308,7 +2375,7 @@ async function runAccount(o) {
   catch (e) { log(`⚠️ [${name}] profile prep failed (${e.message}) — skipping account`); return { posted: 0, errors: 1, pendingApproval: 0, noRetry: false, flag: null, postedIds: [] }; }
   // Proxy: Chrome can't do authenticated SOCKS5 directly, so we wrap the upstream
   // through proxy-chain (a local anonymized HTTP proxy) when credentials are present.
-  let proxyAuth = null, anonLocal = null, watchdog = null;
+  let proxyAuth = null, anonLocal = null, watchdog = null, progressedSinceArm = false, noProgressTicks = 0; // #5: progressedSinceArm = a new group started since the watchdog armed → the account is advancing, not stuck
   const tempImages = []; // downloaded remote images to clean up at the end
   {
     // Per-account STABLE proxy: an account's OWN assigned proxy is ALWAYS honored — even when the global
@@ -2361,7 +2428,7 @@ async function runAccount(o) {
     try { await Promise.race([browser.close().catch(() => {}), sleep(10000)]); } catch {}
     try { const proc = browser && browser.process && browser.process(); if (proc) proc.kill(); } catch {}
   };
-  let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false, rlKind = null, consecPubTimeouts = 0, consecNoPostBtn = 0, consecNoComposer = 0;
+  let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false, rlKind = null, consecPubTimeouts = 0, consecNoPostBtn = 0, consecNoComposer = 0, consecPushback = 0;
   // #7 (d4 false-bench guard — shared probe): an account that has ALREADY delivered today (persisted daily count, updated
   // after each prior cycle) is provably NOT blocked. Consulted at the THREE likely_blocked flag-sites to SUPPRESS a false
   // "blocked" escalation caused by transient single-IP composer/feed/post-button misses. FAILS SAFE toward FB: returns
@@ -2494,8 +2561,12 @@ async function runAccount(o) {
             alive = true;
           }
         } catch { alive = false; }
-        if (alive) { _log(`⏰ [${name}] budget elapsed but browser is alive (likely resumed from sleep) — extending`); armWatchdog(); return; }
-        _log(`⏰ [${name}] time budget exceeded and browser unresponsive — aborting account`);
+        const _wd = watchdogTickDecision(alive, progressedSinceArm, noProgressTicks); // #5: extend while advancing / one grace window; abort a live-but-stuck browser after 2 no-progress windows
+        noProgressTicks = _wd.noProgressTicks;
+        if (_wd.action === 'extend') { progressedSinceArm = false; _log(alive && noProgressTicks === 0 ? `⏰ [${name}] budget elapsed but browser is alive + still advancing groups — extending` : `⏰ [${name}] budget elapsed, browser alive but no group progress this window — extending once (grace for a possible sleep-resume)`); armWatchdog(); return; }
+        _log(alive
+          ? `⏰ [${name}] browser alive but made ZERO group progress across ${noProgressTicks} full budget windows — treating as STUCK, aborting account (a reserve covers its groups)`
+          : `⏰ [${name}] time budget exceeded and browser unresponsive — aborting account`);
         aborted = true;
         await closeBrowserOnce();
         watchdog = null;
@@ -2903,6 +2974,7 @@ async function runAccount(o) {
       // rate-limited off a generic transient error — abandoning the rest of its groups. Removed: the
       // real block checks already run per-group AFTER the group loads, below.)
       const g = targetGroups[i];
+      progressedSinceArm = true; // #5: advancing to a new group = real progress (the prior group finished) → the watchdog won't treat a slow-but-moving account as stuck
       const gid = g.groupId || g.id;
       const groupName = g.name || gid;
       const step = createStepLogger(log, name, groupName);
@@ -2910,6 +2982,19 @@ async function runAccount(o) {
       // here before it fell over, and we're the reserve covering its un-reached groups), SKIP — never re-post a group.
       // Placed before any navigation so a skip costs nothing. Only ever fires in deal-once modes / stand-ins.
       if (alreadyDelivered(gid)) { _dropPrefetch(i); step('↩️ this post already reached this group this cycle — skipping (no double-post)'); report(groupName, gid, 'skipped', 'already delivered this cycle', ''); continue; }
+      // #hardening (mixed-failure backoff): the per-type "2 in a row" counters (composer / post-button / publish-timeout)
+      // each MISS the case where FB throttles an account into failing DIFFERENT ways across its groups (a timeout, then a
+      // composer that won't open, then a missing post-button) — no single counter reaches 2, so the account flails every
+      // remaining group (wasted time + a botty rapid-fail pattern). consecPushback counts ANY of those pushback failures
+      // and RESETS on a confirmed/held publish; ≥3 in a row (any mix) ⇒ FB is pushing this account back → stop hammering
+      // its REMAINING groups and back it off (a reserve / the next cycle covers). Checked HERE (loop top) so it only fires
+      // when there ARE remaining groups to protect — a flail on the last group just ends the cycle (retries next). Purely
+      // ADDITIVE: a same-type 2-in-a-row always breaks first, so same-type behaviour is byte-identical.
+      {
+        const _mpb = mixedPushbackDecision(consecPushback, deliveredToday());
+        if (_mpb === 'transient') { step('⚠️ 3 posting failures in a row (mixed timeout / composer / post-button), but this account already delivered today — treating as transient (slow IP / FB hiccup), NOT blocked. Stopping it this cycle; it retries next.'); noRetry = true; break; }
+        if (_mpb === 'block') { step('🛑 3 posting failures in a row (mixed timeout / composer / post-button) — Facebook is pushing this account back; stopping it so a reserve / the next cycle covers its remaining groups.'); noRetry = true; flag = 'rate_limited'; rlKind = 'post'; break; }
+      }
       // Per-group content variation: expand {a|b|c} spintax so THIS group gets a different caption
       // and comment than the others, and give any link in the comment a unique tracking param. This
       // is the #1 fix for "identical content to many groups" — FB's strongest content-spam signal.
@@ -3049,7 +3134,7 @@ async function runAccount(o) {
 
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
-        const opened = await openComposer(page, step, name, settings);
+        const opened = await openComposer(page, step, name, settings, composerOpenAttempts(consecPushback)); // #3: fewer composer attempts once FB is already pushing this account back (consecPushback>0) → reach backoff fast, don't idle on an unloadable group
         if (!opened) {
           // An account-level block can be WHY the composer won't open — confirm it and skip the
           // WHOLE account immediately rather than trying every remaining group.
@@ -3106,7 +3191,7 @@ async function runAccount(o) {
             // row on an account that's been posting is a transient slow-IP/layout hiccup, NOT a block. Still stop this cycle.
             if (deliveredToday()) { step('⚠️ Composer would not open on 2 groups in a row, but this account already delivered today — treating as transient (slow IP / FB layout hiccup), NOT blocked. Stopping it this cycle; it retries next.'); noRetry = true; break; }
             step('🛑 Composer would not open on 2 groups in a row — this account\'s Facebook is likely in a language the app doesn\'t recognize (set it to English) or Facebook changed the layout. Stopping it so reserves cover its groups.'); noRetry = true; flag = 'likely_blocked'; break;
-          }
+          } else consecPushback++; // #hardening: a composer miss with NO per-group cause (why===null) is FB pushback → feed the unified mixed-failure backoff (loop top)
           continue;
         }
         consecNoComposer = 0; // composer opened → clear the unsupported-language streak (mirrors consecNoPostBtn's reset)
@@ -3394,6 +3479,7 @@ async function runAccount(o) {
             report(groupName, gid, 'error', 'post button not found (unsupported UI language? set the account to English)', '');
             break;
           }
+          consecPushback++; // #hardening: a post-button miss (below the per-type 2-in-a-row) is FB pushback → feed the unified mixed-failure backoff (loop top)
           step('Post button not found; skipping group'); errors++; report(groupName, gid, 'error', 'post button not found', ''); continue;
         }
         // E-P1: set ONLY after the click actually fired (clickPostButton returns true post-mouse-click). If it
@@ -3401,7 +3487,8 @@ async function runAccount(o) {
         publishClicked = true; // from here this group must NOT be retried (would double-post)
         consecNoPostBtn = 0;   // a successful click clears the "unsupported-language" streak
         step('Post button clicked');
-        let publishResult = await waitForPublish(page, dialogCountBefore, 70000, shouldStop, settings.speedMode === 'instant'); // 70s CEILING kept (a slow/hidden/proxied window can take 35-45s+; too-short → false "timeout" → re-post → duplicate); instant only tightens the POLL granularity
+        const _pubCeiling = publishWaitCeilingMs(consecPubTimeouts); // #time-waste: full 70s on a fresh/healthy account; 35s once FB is silently dropping this account's publishes (consecPubTimeouts>0) so we reach the throttle backoff fast instead of idling ~70s/post — the timeout-path double-post guards (H3 capture + dialog poll + author-matched rescan) still run. See publishWaitCeilingMs.
+        let publishResult = await waitForPublish(page, dialogCountBefore, _pubCeiling, shouldStop, settings.speedMode === 'instant'); // instant only tightens the POLL granularity
         // FINDING-1 DOUBLE-SAFETY: a fast rate/block WALL caught while the composer was still open does NOT prove the post
         // didn't commit server-side (FB can ACCEPT the post AND show a "posting too fast" banner). So route the rate-limit
         // sentinels through the SAME landing-confirmation the 'timeout' path uses (create-story id warm-up + feed-rescan):
@@ -3520,11 +3607,14 @@ async function runAccount(o) {
             // toward the account-stop streak. (We do NOT flip it to 'published' — the body could be a reject; we only avoid
             // a false account-stop on a slow-but-successful publish.) _netCapture is still armed here (disposed at finalize).
             const _sawCreate = !!(_netCapture && (() => { try { return _netCapture.stats().sawCreate; } catch { return false; } })());
-            if (!_sawCreate && ++consecPubTimeouts >= 2) { step('🛑 2 posts in a row went unconfirmed — likely a silent Facebook throttle after a burst. Backing this account off now (its reserve / next cycle continues).'); noRetry = true; flag = 'rate_limited'; rlKind = 'post'; break; }
+            if (!_sawCreate) {
+              consecPushback++; // #hardening: a silent-throttle timeout is FB pushback → feed the unified mixed-failure backoff (loop top)
+              if (++consecPubTimeouts >= 2) { step('🛑 2 posts in a row went unconfirmed — likely a silent Facebook throttle after a burst. Backing this account off now (its reserve / next cycle continues).'); noRetry = true; flag = 'rate_limited'; rlKind = 'post'; break; }
+            }
           } else { consecPubTimeouts = 0; }
           continue;
         }
-        consecPubTimeouts = 0; // a confirmed publish breaks any unconfirmed-publish streak
+        consecPubTimeouts = 0; consecPushback = 0; // a confirmed publish breaks any unconfirmed-publish streak (per-type AND the unified mixed-failure streak)
         // FUNCTIONAL WAIT: after publish, FB needs time to commit the post server-side and for the
         // pending-approval toast to appear in the DOM before pendingNoticeForOurPost reads it.
         // The old 600ms turbo/instant settle ran AFTER pendingNoticeForOurPost (wrong order) — a
@@ -3778,7 +3868,7 @@ async function runAccount(o) {
         if (pendingAtPublish && !feedConfirmed && !_ambiguousPresent && !_wallStop) { // hold ONLY on CONFIRMED-absent (and NOT when a rate/block wall was flagged → let _wallStop fall through to the stop-account handler below, belt-and-suspenders for a practically-impossible held+walled co-occurrence). Rest of note: (id-not-in-feed, or caption-not-found): NOT when a same-caption post is present-but-ambiguous (that defers to the comment step's floored/id picker, which REFUSES rather than guessing). A comment post held here keeps its comment (heldRecords) for post-approval — we must NOT let a confirmed-absent comment post reach addFirstComment, whose lone-caption match could be an OLD duplicate (the verified wrong-post).
           step('Post HELD for admin approval (pending notice + NOT found public in the feed) — routing to the moderator queue.');
           pendingApproval++; markDelivered(gid); // the post reached the group (held for review) — don't let a reserve re-post it
-          consecPubTimeouts = 0; // a HELD post is a CONFIRMED publish (FB accepted it, just gated) — must NOT count toward the silent-throttle streak
+          consecPubTimeouts = 0; consecPushback = 0; // a HELD post is a CONFIRMED publish (FB accepted it, just gated) — must NOT count toward the silent-throttle OR the unified mixed-failure streak
           // P-0 (double-post fix, operator-approved): persist the gid-scoped create-story URL (if FB exposed it for this
           // held post) so Phase-4's permalink-direct liveness check (repost.js) can reach the post even after FB AUTO-
           // RELEASES it deep in the feed — instead of the 60-article feed scan missing it and re-posting a DUPLICATE.
@@ -3790,7 +3880,7 @@ async function runAccount(o) {
           report(groupName, gid, 'pending', 'awaiting admin approval (confirmed absent from feed)', 'skipped');
           if (i < targetGroups.length - 1) {
             const _cfgGap = settings.speedMode === 'instant' ? rand(100, 1000) : withFloor(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).group);
-            const _d = Math.max(_cfgGap, (typeof ipPostGate === 'function') ? ipPostGate() : 0); // #2 OPT-IN per-IP aggregate cap: effective gap = max(configured, fleet-wide per-IP minimum) — 0/no-op when off or proxied
+            const _d = Math.max(_cfgGap, (typeof ipPostGate === 'function') ? ipPostGate(_cfgGap) : 0); // #2/#13 OPT-IN per-IP aggregate cap: reserve on the PROJECTED post instant (now+_cfgGap) so the shared per-IP clock reflects when THIS post lands, not the boundary — the returned wait is ≥ _cfgGap when active, else 0 (off/proxied)
             await sleepInterruptible(_d, softStop, 1000, isPaused, pauseHold);
           }
           continue;
@@ -3960,7 +4050,7 @@ async function runAccount(o) {
       // so the cadence is never metronomic (a fixed gap is itself a bot signal).
       if (i < targetGroups.length - 1) {
         const _cfgGap = settings.speedMode === 'instant' ? rand(100, 1000) : withFloor(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).group); // T2: randomized inter-group gap. INSTANT 0.1–1s (operator-requested, was 0.5–1.8s; the next group already pre-loads during this gap, so it's pure anti-spam pacing — kept a ~100ms floor + jitter so it's never a literal-0 metronomic bot tell on a single IP. ⚠️ faster = more detectable; dial back up if blocks appear)
-        const d = Math.max(_cfgGap, (typeof ipPostGate === 'function') ? ipPostGate() : 0); // #2 OPT-IN per-IP aggregate cap: effective gap = max(configured, fleet-wide per-IP minimum) — 0/no-op when off or proxied
+        const d = Math.max(_cfgGap, (typeof ipPostGate === 'function') ? ipPostGate(_cfgGap) : 0); // #2/#13 OPT-IN per-IP aggregate cap: reserve on the PROJECTED post instant (now+_cfgGap) so the shared per-IP clock reflects when THIS post lands, not the boundary — the returned wait is ≥ _cfgGap when active, else 0 (off/proxied)
         if (d > 0) {
           step(`Wait ${d >= 60000 ? Math.round(d / 60000) + 'min' : Math.round(d / 1000) + 's'} before next group`);
           await sleepInterruptible(d, softStop, 1000, isPaused, pauseHold);
@@ -4161,9 +4251,9 @@ async function runAccount(o) {
 const normalizeCookie = store.normalizeCookie;
 
 module.exports = {
-  runAccount, parseProxy, normalizeCookie, addFirstComment, killChromiumForProfile,
+  runAccount, parseProxy, normalizeCookie, addFirstComment, killChromiumForProfile, sweepOrphanTemps,
   // exported for diagnostics — use the EXACT worker logic
-  clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish, credentialLogin, moveMouseTo, behaviorFor,
+  clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish, publishWaitCeilingMs, mixedPushbackDecision, composerOpenAttempts, watchdogTickDecision, credentialLogin, moveMouseTo, behaviorFor,
   // exported for tests (no runtime effect)
   jitter, rand, rangeMs, withFloor, ANTI_SPAM_MIN_GROUP_MS, ANTI_SPAM_MIN_COMMENT_MS, antiSpamFloors, postLinkFloorOwed, humanDelay, isFastMode, applyPace, varyLinks, retryAsync, downloadImage, isSafeImageUrl, proxyFormatHint, classifyProxyError, proxyErrorHint, classifyGroupError,
   FB, isRateLimitText, isCheckpointText, isPendingText, isPostButtonLabel, isCommentBoxLabel,

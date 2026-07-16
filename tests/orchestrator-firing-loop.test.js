@@ -11,6 +11,14 @@ const { Orchestrator } = require('../automation/orchestrator');
 const mk = () => { const o = new Orchestrator(() => {}, {}); o._lastDailyRunDate = o._localDayKey(); o._nextCycleAt = 0; return o; };
 const NOW0 = 1700000000000; // fixed base ms (deterministic; no Date.now in the assertions)
 
+// The EXACT "rest until tomorrow" target: ms timestamp of the day AFTER baseMs's LOCAL day at HH:MM local.
+// Mirrors _msUntilDailyFire's tomorrow branch, so the assertion is exact AND timezone/DST-independent (it does
+// not assume any particular wall-clock time-of-day — the old `> 20h` bound only held at certain run times).
+function nextDayFireMs(baseMs, hh, mm) {
+  const d = new Date(baseMs);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, hh, mm, 0, 0).getTime();
+}
+
 // Drive the loop exactly like _mainLoop: compute waitMs; if 0 → FIRE (doneToday++, clear _nextCycleAt); else advance
 // simulated time by the wait and re-enter. A guard trips if it can't converge (the v1.0.78 symptom).
 function drive(o, settings, N) {
@@ -57,7 +65,7 @@ test('firing loop: runNow (Save & Start) fires the first cycle immediately', () 
 test('firing loop: after the last cycle (doneToday>=N) it rests until tomorrow + disarms the gap', () => {
   const o = mk();
   const w = o._dailyCycleWaitMs({ dailyPostTime: '05:23', cyclesPerDay: 3 }, 3, 3, false, NOW0);
-  assert.ok(w > 20 * 3600000, 'doneToday=3>=N → waits ~until tomorrow (a large positive ms), not the 30s gap');
+  assert.equal(NOW0 + w, nextDayFireMs(NOW0, 5, 23), 'doneToday>=N → rests until EXACTLY tomorrow 05:23 local (not the 30s inter-cycle gap)');
   assert.equal(o._nextCycleAt, 0, 'the subsequent-cycle fire time is disarmed once the day is done');
 });
 
@@ -68,5 +76,5 @@ test('firing loop: cyclesPerDay=1 fires once then rests (byte-identical classic 
   assert.equal(o._dailyCycleWaitMs(settings, 1, 0, true, NOW0), 0, 'runNow first cycle fires');
   // after firing, doneToday=1 >= N=1 → rest
   const w = o._dailyCycleWaitMs(settings, 1, 1, false, NOW0);
-  assert.ok(w > 20 * 3600000, 'N=1: one cycle then rest until tomorrow (no subsequent-cycle path)');
+  assert.equal(NOW0 + w, nextDayFireMs(NOW0, 5, 23), 'N=1: one cycle then rest until EXACTLY tomorrow 05:23 local (no subsequent-cycle path)');
 });

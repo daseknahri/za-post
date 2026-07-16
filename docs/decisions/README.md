@@ -27,7 +27,7 @@ Options rejected and why.
 
 ## Adding a new ADR
 
-1. Pick the **next number**: take the highest existing id and add one (the next is `0019`).
+1. Pick the **next number**: take the highest existing id and add one (the next is `0022`).
 2. Copy `ADR-template.md` to `ADR-<id>-<slug>.md`, choosing a short kebab-case slug that names the decision.
 3. Fill in the sections. Set the initial **status**:
    - **Proposed** — under consideration, not yet committed.
@@ -59,3 +59,6 @@ ADRs are append-only: to change a decision, write a new ADR and mark the old one
 | [0016](ADR-0016-portable-zip-delivery-enforce-marker-migration.md) | Portable-zip delivery with a separate userData folder, build-time enforce marker, and non-overwriting first-run migration | Accepted |
 | [0017](ADR-0017-robustness-over-security-priority.md) | Robustness-over-security as the guiding priority for remaining work | Accepted |
 | [0018](ADR-0018-persistent-rotating-tab-pool.md) | Persistent rotating tab pool for multi-tab posting (reuse tabs by re-navigation instead of newPage/close churn) | Accepted |
+| [0019](ADR-0019-campaign-plan-frozen-within-round.md) | Campaign Plan frozen within a round — a mid-round edit defers to the next round, never a live re-partition | Accepted |
+| [0020](ADR-0020-interchangeable-account-pool-weighted-shared-posting.md) | Interchangeable account pool — weighted shared-pool posting (evolve unique/sequence, not campaign-plan slices) | Proposed |
+| [0021](ADR-0021-owed-ledger-extended-to-unique-sequence.md) | The owed ledger covers unique/sequence too — the fleet-wide dealt-set is a pointer, so a PARTIAL must stay recoverable (amends 0008) | Accepted |

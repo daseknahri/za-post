@@ -26,7 +26,7 @@
 const path = require('path');
 const os = require('os');
 const store = require('../lib/store');
-const { runAccount, applyPace, parseProxy } = require('./worker');
+const { runAccount, applyPace, parseProxy, sweepOrphanTemps } = require('./worker');
 const { normalizeSpeedMode } = require('../lib/speed'); // to recognize the 'max' tier in the orchestrator's own fleet-level pacing (fleet settings.speedMode is the USER tier safe/fast/max)
 const { ProxyHealthManager } = require('../lib/proxy');
 
@@ -150,6 +150,7 @@ class Orchestrator {
     this._staggerRotation = 0;
     this._perAccountRotation = {};
     this._campaignPlan = null;
+    this._pendingPlanBatchId = null; // #2: no plan → no deferred edit pending
     this._lastDailyRunDate = null;
     this._nextCycleAt = 0; // absolute fire time (ms) for the NEXT subsequent daily cycle in a multi-cycle run; 0 = not armed
     this._owed = {}; // Start Fresh clears the partial-delivery owed ledger too (a new run starts every post at #1 to ALL groups)
@@ -224,7 +225,7 @@ class Orchestrator {
   // Is this account posting RIGHT NOW (its profile browser is open)? Used to allow logging in any OTHER account
   // mid-run without a profile conflict — only the actively-posting account is off-limits.
   isAccountInFlight(name) { const l = this._acctLive && this._acctLive[name]; return !!(l && l.state === 'running'); }
-  async _waitWhilePaused() { while ((this._paused || this._diskHalt) && !this._stop) { if (this._diskHalt) this._evalDiskHalt(); await sleep(500); } } // B1: also HOLD while disk is critically low (a SEPARATE flag from operator-pause), re-evaluating each tick so it auto-resumes the instant space is freed
+  async _waitWhilePaused() { while ((this._paused || this._diskHalt) && !this._stop && !this._finish) { if (this._diskHalt) this._evalDiskHalt(); await sleep(500); } } // B1: also HOLD while disk is critically low (a SEPARATE flag from operator-pause), re-evaluating each tick so it auto-resumes the instant space is freed. Honor _finish too (like _waitForConnectivity): finish() can't clear _diskHalt (only _evalDiskHalt does, >2GB), so without this a Finish during a <1GB disk-halt would PARK the pool forever at "Finishing…" — only a hard Stop escaped. Draining is safe: the launch guards (!this._finish) already block new work on a full disk.
 
   async _waitForConnectivity() {
     let offlineLogged = false;
@@ -489,7 +490,39 @@ class Orchestrator {
     this._runStartedAt = Date.now(); this._lastPostAt = 0; this._lastHealthLog = 0; // E: run-health tracking for an away operator
     this._emitHealth(); // write an initial status.json immediately
     this._healthTimer = setInterval(() => { try { this._emitHealth(); } catch {} }, 5 * 60 * 1000); // E: refresh status.json every 5 min (+ a HEALTH log line hourly)
-    this._loop(getData).catch((e) => { this._crashed = true; this.log(`❌ Orchestrator crashed: ${e.message}`); }) // A1: tag a real loop crash so the terminal reason is 'crashed' (not 'completed') → run-active is KEPT set and the next launch's resume path recovers it, instead of the crash being silently mislabeled done
+    // #1 (stall breaker): a throw ANYWHERE in the ~1440-line cycle body used to unwind the WHOLE run — a night crash then
+    // sat DEAD until a human relaunched (A1 only recovers on the next LAUNCH). Auto-restart the loop IN-PROCESS instead:
+    // re-entering _loop reloads durable state from disk + re-folds the crash journal (a relaunch, minus the human) so no
+    // progress is lost. crashRestartDecision runs the breaker — only RAPID consecutive crashes count (max 3) with a growing
+    // backoff so a deterministic crash-loop can't hammer the shared IP; only then is it tagged 'crashed' (A1 keeps run-active
+    // for the next launch to resume). A clean return (Stop / Finish / Completed / give-up) exits normally.
+    (async () => {
+      let restarts = 0;
+      for (;;) {
+        const startedAt = Date.now();
+        try { await this._loop(getData); return; } // clean end
+        catch (e) {
+          const d = crashRestartDecision(restarts, Date.now() - startedAt);
+          restarts = d.restarts;
+          if (this._shouldStop()) { this.log(`⏹ Orchestrator error during stop: ${e && e.message}`); return; } // Stop wins → reason 'stopped', not 'crashed'
+          if (!d.restart) { this._crashed = true; this.log(`❌ Orchestrator crashed: ${e && e.message} (${restarts} rapid crashes in a row) — stopping; the next launch will resume from disk.`); return; } // A1: 'crashed' keeps run-active
+          this.log(`⚠️ Orchestrator cycle crashed: ${e && e.message} — auto-restarting the loop in ${Math.round(d.backoffMs / 1000)}s (attempt ${restarts}/3; durable state reloaded from disk, no progress lost).`);
+          // #6 (healthy-uptime fix): CLEAR the healthy timer at the crash MOMENT — BEFORE the backoff — so a stale
+          // pre-crash timer can't fire _markHealthy during the backoff. A cycle crashing in [healthyMs-backoff, healthyMs)
+          // (e.g. ~9m40s with a 30s backoff) would otherwise let the T=0 timer cross 10 min mid-backoff and reset BOTH
+          // relaunch caps during an active crash sequence → unbounded relaunch. Re-armed by 'automation-restarted' below.
+          this.emit('automation-crashed');
+          try { await this._interruptibleSleep(d.backoffMs); } catch {}
+          if (this._shouldStop()) return;
+          // #6 (healthy-uptime fix): an in-process restart re-enters _loop WITHOUT re-emitting 'automation-started', so the
+          // main-process 'healthy' timer kept measuring wall-clock-since-START, not crash-free uptime — during a
+          // deterministic thrash where each doomed cycle outlives 10 min it fired _markHealthy and reset BOTH watchdog caps
+          // → unbounded relaunch on the shared IP. Signal each restart so main.js re-arms the timer from NOW (it then fires
+          // only after 10 CONTINUOUS crash-free minutes).
+          this.emit('automation-restarted');
+        }
+      }
+    })()
       .finally(() => {
         this._stopNetMonitor();
         if (this._healthTimer) { try { clearInterval(this._healthTimer); } catch {} this._healthTimer = null; } // E: stop the health timer
@@ -628,8 +661,8 @@ class Orchestrator {
   // and never fire. Returns ms to wait before the next cycle (0 = fire NOW); mutates this._nextCycleAt. Pure given
   // (settings, N, doneToday, runNow, nowMs) + this.{_lastDailyRunDate, _nextCycleAt}.
   _dailyCycleWaitMs(settings, N, doneToday, runNow, nowMs) {
-    if (doneToday >= N) { this._nextCycleAt = 0; return this._msUntilDailyFire(settings.dailyPostTime, this._localDayKey()); } // all N done today → rest until TOMORROW's fire time
-    if (doneToday === 0) { this._nextCycleAt = 0; return runNow ? 0 : this._msUntilDailyFire(settings.dailyPostTime, this._lastDailyRunDate); } // first cycle of the day → wait for dailyPostTime
+    if (doneToday >= N) { this._nextCycleAt = 0; return this._msUntilDailyFire(settings.dailyPostTime, this._localDayKey(new Date(nowMs)), nowMs); } // all N done today → rest until TOMORROW's fire time (nowMs threaded so the "did we run today?" day-key + the wait are computed at the SAME instant → deterministic)
+    if (doneToday === 0) { this._nextCycleAt = 0; return runNow ? 0 : this._msUntilDailyFire(settings.dailyPostTime, this._lastDailyRunDate, nowMs); } // first cycle of the day → wait for dailyPostTime
     if (runNow) { this._nextCycleAt = 0; return 0; } // "Save & Start" fires the next cycle immediately
     if (!this._nextCycleAt) this._nextCycleAt = nowMs + Math.max(30 * 1000, this._interCycleMs(settings)); // subsequent cycle: arm the fire time ONCE (floored 30s; per-action anti-spam floors still pace each post within a cycle)
     return Math.max(0, this._nextCycleAt - nowMs);
@@ -721,6 +754,30 @@ class Orchestrator {
     }
 
     // UNIQUE / SEQUENCE -> deal each post exactly ONCE across the active accounts, round-robin.
+    // PERSISTENT OWED (partial-delivery carry-over, [7][8][9]): a unique/sequence account that delivered its post to
+    // SOME but not all of its groups still had that post added to the FLEET-WIDE dealt-set — so NO account (itself
+    // included) could ever re-pick it, the un-reached groups stranded PERMANENTLY once no same-cycle reserve covered
+    // them, and _outstandingWork reported a false 100%. Mirror the daily-rotation/campaign-plan owed pick-override:
+    // re-pick the SAME post FIRST; _runAccount's _owedSelf → onlyGroups scopes the delivery to ONLY the still-owed
+    // groups, so a delivered group is never re-posted. NO claim: the post is already dealt, so it is invisible to every
+    // other account's `remaining` — there is no deal-once race to arbitrate.
+    // _inflightDelivered is subtracted because a reserve stand-in does NOT consult that durable guard: leaving a
+    // crash-proven-delivered group in the ledger would let _owedStandins re-post it. [ADR-0008: markDelivered,
+    // alreadyDelivered and EVERY owed filter must agree on what counts as delivered.]
+    // The post must still be DEALT to drive a re-pick: a Loop-campaign recycle clears the dealt-set to re-deliver the
+    // whole library to ALL groups, and a leftover owed subset must not narrow that back down. Note the un-dealt case
+    // still falls into the `claim` cleanup below rather than skipping this block — the entry MUST be dropped there,
+    // because _runAccount's _owedSelf (~line 880) keys off the ledger alone and would otherwise scope this recycled
+    // post's delivery down to the stale owed subset. (A recycle cannot fire while owed work is live: its ~line 2005
+    // pick probe sees this override return the post.)
+    const owedUS = this._owed && this._owed[account.name];
+    if (owedUS && owedUS.postId && (owedUS.gids || []).length) {
+      const _asg = this._groupIdsOf(account); // prune owed groups the operator has since UN-assigned (as daily-rotation does above) — else an undeliverable owed post livelocks this account forever
+      const _live = owedUS.gids.filter((gid) => _asg.has(gid) && !(this._inflightDelivered && this._inflightDelivered.has(owedUS.postId + '::' + gid)));
+      const op = (_live.length && this._dealt.has(owedUS.postId)) ? (data.posts || []).find((p) => p.id === owedUS.postId) : null; // looked up in the FULL library (not `filtered`, like campaign-plan): an owed post is ALREADY live in its delivered groups, so finish it even if the operator has since re-tagged/re-filtered it out of this account's set
+      if (op) { if (claim && _live.length !== owedUS.gids.length) this._owed[account.name] = { postId: owedUS.postId, gids: _live }; return [op]; }
+      if (claim) { try { delete this._owed[account.name]; } catch {} } // owed post gone from the library / un-dealt by a recycle, OR every owed group un-assigned or already-delivered → drop the stale obligation, fall through to the normal deal
+    }
     // `remaining` = posts not yet dealt AND not already claimed by another account this cycle.
     let remaining = filtered.filter((p) => !this._dealt.has(p.id) && !(claimedSet && claimedSet.has(p.id)));
     if (!remaining.length) return [];
@@ -747,6 +804,11 @@ class Orchestrator {
     const data = this._data;
     const accountStart = Date.now();
     const posts = this._postsForAccount(account, cycle, true); // claim at run time so parallel accounts don't collide
+    // #5: did THIS account actually CLAIM its posts? Claims are added (_postsForAccount ~762) ONLY on the unique/sequence
+    // pick path — a stand-in returns earlier (~666) and campaign-plan/daily-rotation/post-centric never claim. Capture the
+    // discriminator NOW (same synchronous instant _postsForAccount read _campaignTakeover) so the finally releases ONLY
+    // self-made claims; deleting a DIFFERENT unique account's live claim from the shared _claimed set = deal-once/double-post.
+    const _madeClaims = !(this._campaignTakeover && this._campaignTakeover[account.name]) && ((account.postingOrder || '').includes('unique') || account.postingOrder === 'sequence');
     if (!posts.length) {
       // Surface WHY this account posted nothing. Otherwise a MISCONFIGURED account (no groups / empty post-set /
       // filter excludes everything) idles all run, reading as a healthy 'done' on the dashboard with no stated reason.
@@ -852,7 +914,7 @@ class Orchestrator {
             isLoginOpen: this.isLoginOpen, isCheckOpen: this.isCheckOpen,
             registerAborter: (abort) => this._registerAborter(abort),
             isOnline: () => isOnline(), // lets the worker bail fast when offline instead of burning nav timeouts
-            ipPostGate: () => this._ipPostGate(), // OPT-IN per-IP aggregate post spacing → ms to wait before this account's next group post (0 = off / proxied)
+            ipPostGate: (projectedDelayMs) => this._ipPostGate(projectedDelayMs, !!(this._proxyForAccount && this._proxyForAccount(account))), // OPT-IN per-IP aggregate post spacing → ms to wait; pass the caller's inter-group gap so the shared clock reserves the REAL post instant (#13); pass THIS account's proxied status (#E) so a self-proxied account (distinct IP) is a no-op and doesn't pollute the shared real-IP clock; 0 = off / proxied
             reportProxy: (p, ok, reason) => this.reportProxy(p, ok, reason), // E-X3: per-proxy health from the worker
             isOnCooldown: (p) => { try { return this._proxyHealth.isOnCooldown(p); } catch { return false; } }, // skip a dead POOL proxy at pick time
             waitIfPaused: () => this._waitWhilePaused(), // Pause holds between groups, mid-account
@@ -1023,9 +1085,11 @@ class Orchestrator {
     this.log(`📊 [${account.name}] posted=${posted} pending=${pendingApproval} errors=${errors}`);
     return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag, offline: accountOffline };
     } finally {
-      // Release claims for posts this account did NOT publish (blocked/failed), so a healthy
-      // account can pick them up this same run. In a finally so it runs even if the body throws.
-      if (this._claimed) for (const pp of posts) { if (!dealtIds.includes(pp.id)) this._claimed.delete(pp.id); }
+      // Release claims for posts this account did NOT publish (blocked/failed), so a healthy account can pick them up
+      // this same run. In a finally so it runs even if the body throws. #5: gate on _madeClaims — release ONLY claims
+      // THIS account actually made (unique/sequence, non-stand-in); a campaign/daily/post-centric/stand-in run never
+      // populated _claimed, so deleting `posts` ids here would release ANOTHER unique account's live claim (double-deal).
+      if (this._claimed && _madeClaims) for (const pp of posts) { if (!dealtIds.includes(pp.id)) this._claimed.delete(pp.id); }
     }
   }
 
@@ -1137,7 +1201,7 @@ class Orchestrator {
     try {
       await store.updateComments((cs) => {
         for (const h of safe) {
-          if (!(h.comment && String(h.comment).trim())) continue; // caption-only post — nothing to comment
+          if (!(String(h.comment || '').trim() || h.commentImg)) continue; // review-fix: keep IMAGE-ONLY comments (text blank, image set) — a valid wanted comment (worker addFirstComment supports image-only); the old text-only guard silently dropped them, marking the post approved with its link-comment never placed
           if (cs.pending.some((x) => x.status !== 'done' && same(x, h))) continue; // already queued — no double-comment
           cs.pending.push({ gid: h.gid, postId: h.postId || null, posterAccount: h.posterAccount || null, fbDisplayName: h.fbDisplayName || null, groupName: h.groupName || null, captionSnip: h.captionSnip || null, postCaption: h.postCaption || h.captionSnip || null, comment: h.comment, commentImg: h.commentImg || null, postPermalink: h.permalink || h.postPermalink || null, status: 'pending', queuedAt: Date.now(), attempts: 0, commentedAt: null, source: 'approved' });
           added++;
@@ -1223,9 +1287,12 @@ class Orchestrator {
           if (on && held.length && !this._approving && !this._paused && !this._modBackedOff(data)) {
             this._approving = true;
             this.log(`🛡️ Concurrent moderator: ${held.length} held post(s) detected — approving in the background (posting continues)…`);
-            try { await this._runModeratorApproval(data, () => this._stop); }
+            // #9: the abort signal is GENERATION-scoped — a quick Stop→Start bumps _runGen, so this in-flight pass aborts
+            // PROMPTLY (tearing down its moderator Chromium) instead of running on un-aborted after start() reset _stop=false.
+            try { await this._runModeratorApproval(data, () => this._stop || this._runGen !== myGen); }
             catch (e) { this.log(`⚠️ moderator loop error: ${e.message}`); }
-            finally { this._approving = false; }
+            finally { if (this._runGen === myGen) this._approving = false; } // #9: release the single-flight guard ONLY for THIS generation — a stale prior-gen pass must not clear a guard the CURRENT run's pass now holds
+
           }
         } catch (e) { this.log(`⚠️ moderator loop: ${e.message}`); }
         await this._modSleep(CHECK_MS);
@@ -1280,13 +1347,19 @@ class Orchestrator {
   // the fleet land closer than the configured minimum on the one shared line (each account's FIRST post is spaced by the launch
   // throttle instead — ~15-45s — so a gap up to that is fully covered; larger values bound the sustained rate). Off (0) or a
   // proxied fleet → returns 0 (no-op). Only ever RAISES a gap; never touches any double-post/coverage guard. Awaited at each inter-group boundary.
-  _ipPostGate() {
-    if (this._data && this._data.useProxies) return 0; // a proxied fleet spreads across IPs — no shared-IP aggregate limit applies
+  // #13: reserve the slot on the PROJECTED post instant (now + the caller's own inter-group gap), NOT the boundary — the
+  // worker sleeps _cfgGap (120–300s) AFTER this call, so reserving `now` made the shared-IP clock reflect the wrong time
+  // and the worker's max(_cfgGap, gateWait) then ignored the (moot) reservation, so two concurrent accounts' real posts
+  // could drift sub-floor. Reserving on now+projectedDelayMs makes the returned wait ≥ projectedDelayMs and correctly
+  // serializes REAL post instants across the fleet. ONE reservation per post (never double-advance). Only ever RAISES.
+  _ipPostGate(projectedDelayMs = 0, accountIsProxied = false) {
+    if (accountIsProxied || (this._data && this._data.useProxies)) return 0; // #E: a genuinely proxied account (its OWN proxy, even with the global useProxies toggle OFF) posts from a DISTINCT IP → it must NOT enter or advance the shared real-IP clock. proxyForAccount (per-account) is the discriminator, matching the launch throttle's _isProxied — the fleet-wide useProxies flag alone let a self-proxied account slow the real-IP fleet.
     const minGapSec = Math.max(0, Number((this._data && this._data.settings && this._data.settings.realIpMinPostGapSec)) || 0);
     if (!minGapSec) return 0;
-    const now = Date.now();
-    this._lastRealIpPostAt = Math.max(now, (this._lastRealIpPostAt || 0) + minGapSec * 1000);
-    return this._lastRealIpPostAt - now;
+    const now = Date.now(); // review-fix: capture ONCE and use for both the clamp and the return — two Date.now() calls let the no-arg free-slot path return a sub-ms NEGATIVE (flaking the antispam w1===0 check) and the with-arg return dip below projectedDelayMs
+    const projected = now + Math.max(0, Number(projectedDelayMs) || 0); // when this post will ACTUALLY land (after the caller's gap sleep)
+    this._lastRealIpPostAt = Math.max(projected, (this._lastRealIpPostAt || 0) + minGapSec * 1000);
+    return this._lastRealIpPostAt - now; // total wait from NOW (≥ projectedDelayMs when active) — the caller uses this directly
   }
 
   async _recordAccountOutcome(name, res, settings) {
@@ -1600,6 +1673,19 @@ class Orchestrator {
               } else {
                 for (const g of rec.gids) this._inflightDelivered.add(p + '::' + g); // PARTIAL → durable delivered-guard. #10: normalize to the ''-scope key (drop rec.s) — matches how the unique/sequence worker's alreadyDelivered looks it up (_dkScope returns '' for unique/sequence). No-op on the normal path (rec.s already ''); fixes ONLY the daily-rotation→unique operator-switch case, where a stale 'name::' scope made the key never match → re-post to already-delivered groups.
               }
+              // [9] Keep the PERSISTENT owed ledger honest about what this fold just proved delivered. A unique/sequence
+              // partial is now DEALT + carried in this._owed, so a crash DURING an owed re-pick leaves an entry that
+              // still lists the groups the dead run actually reached. _inflightDelivered stops the agent itself from
+              // re-posting them, but the persistent-owed synthesis (~line 2530) hands the RAW ledger gids to a reserve
+              // stand-in, which does NOT consult that guard → it would re-post them. Subtract them here, in the SAME
+              // fold that seeds the guard, so ledger and guard agree the moment the run resumes. Mirrors the
+              // rotation branch above; only ever SHRINKS the entry (no un-reached group can be dropped).
+              const _ow = this._owed[agent];
+              if (_ow && _ow.postId === p && Array.isArray(_ow.gids)) {
+                const _left = _ow.gids.filter((g) => !rec.gids.has(g));
+                if (_left.length) this._owed[agent] = { postId: p, gids: _left };
+                else delete this._owed[agent];                                   // every owed group reached before the crash → the post is fully delivered, nothing carries
+              }
             }
             if (fullMaxQ) this._inflightSeq[agent] = Math.max((this._inflightSeq[agent]) || 0, fullMaxQ);
           }
@@ -1617,24 +1703,68 @@ class Orchestrator {
       // line whose post is still UN-dealt (a partial that _inflightDelivered guards) — those must survive to re-seed the
       // durable delivered-guard on the next fold (second-crash safe). Once the post reaches full delivery (added to
       // _dealt), the unique/sequence clause goes false and the line is dropped on a later fold. [HOLE 1]
-      if (safeToCompact) { try { store.compactInflight((e) => e && e.a && (((Number(e.q) || 0) > watermark(e.a)) || ((e.o && (String(e.o).includes('unique') || e.o === 'sequence')) && !this._dealt.has(e.p)))); } catch {} }
+      // Classify the unique/sequence keep-clause by the RESPONSIBLE agent e.a (isRotAgent), NOT the stored e.o (the
+      // DELIVERING account's own mode): a reserve whose OWN mode is unique/sequence writes o:'unique' while standing in
+      // for a rotation/campaign agent e.a, so an e.o-based test kept that line forever (its campaign post never enters
+      // _dealt) even after e.a's icommit superseded it → unbounded pcu-inflight.jsonl growth. Keep the unique-partial
+      // clause ONLY when e.a is itself unique/sequence, mirroring the survivor/watermark classifier above.
+      if (safeToCompact) { try { store.compactInflight((e) => e && e.a && (((Number(e.q) || 0) > watermark(e.a)) || (!isRotAgent(e.a) && !this._dealt.has(e.p)))); } catch {} }
     } catch (err) {
       try { this.log(`⚠️ R5 inflight-journal recovery skipped (${(err && err.message) || err}) — a delivered group could at worst be re-posted once on this run; no data lost. Free disk / fix data-folder permissions if this repeats.`); } catch {}
     }
   }
 
-  _persistDealt(cycleDealtIds) {
+  // #3 (hardening): compact the crash-durability inflight journal BETWEEN cycles. appendInflight adds a line per dedup-mode
+  // delivery, but compaction ran ONLY at Start/fold — so a run that never restarts grew pcu-inflight.jsonl unbounded (and
+  // the eventual restart fold then read+parsed the whole thing). Reuses the EXACT fold keepFn (see ~_recoverInflightJournal):
+  // KEEP a line only if it is NOT yet durably superseded — its q is above its agent's committed watermark (icommit for
+  // rotation/campaign, inflightSeq for unique/sequence — both persisted WITH the pointer via saveRotation) OR it is a
+  // partial unique/sequence line whose post isn't fully dealt yet. Dropping only durably-superseded lines can't weaken
+  // crash recovery. Safe here: the run only reaches a new cycle if the prior cycle's pointer/dealt/inflightSeq saves
+  // succeeded (_persistDealt STOPS the run on a persist failure), so the in-memory watermark reflects durable disk state.
+  _compactInflightJournal() {
+    try {
+      const accOf = (name) => ((this._data && this._data.accounts) || []).find((a) => a && a.name === name);
+      const isRot = (name) => { const a = accOf(name); const o = (a && a.postingOrder) || ''; return o === 'daily-rotation' || o === 'campaign-plan'; };
+      const wm = (name) => isRot(name) ? (((this._perAccountRotation[name] || {}).icommit) || 0) : ((this._inflightSeq[name]) || 0);
+      // Classify by the RESPONSIBLE agent e.a (isRot), NOT the delivering account's stored e.o — a unique/sequence
+      // reserve standing in for a rotation/campaign agent writes o:'unique' on a campaign post that never enters _dealt,
+      // so an e.o-based keep-clause retained the line forever (unbounded growth) even after e.a's icommit superseded it.
+      store.compactInflight((e) => e && e.a && (((Number(e.q) || 0) > wm(e.a)) || (!isRot(e.a) && !this._dealt.has(e.p))));
+    } catch {}
+  }
+
+  // Does ANY agent still owe un-reached groups for this post? Gates the _inflightDelivered purge: a dealt post that is
+  // still owed keeps its durable delivered-guard (see _persistDealt). [9]
+  _owedRefsPost(postId) {
+    try { return Object.values(this._owed || {}).some((ow) => ow && ow.postId === postId && ((ow.gids) || []).length); }
+    catch { return false; }
+  }
+
+  async _persistDealt(cycleDealtIds) {
     if (!cycleDealtIds || !cycleDealtIds.length) return true;
     const merged = [...new Set([...this._dealt, ...cycleDealtIds])];
-    if (store.saveRotation({ dealt: merged, roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null, owedLedger: this._owed || {}, inflightSeq: this._inflightSeq || {} })) {
-      this._dealt = new Set(merged);
-      // R5 [HOLE 1]: each unique/sequence post that just reached full delivery no longer needs its crash-durable
-      // delivered-guard — purge its keys so _inflightDelivered stays bounded (no-op for rotation/campaign ids, which
-      // never have keys). Only after the save succeeds: a failed save keeps _dealt (and the guard) so a retry re-skips.
-      for (const id of cycleDealtIds) this._clearInflightDelivered(id);
-      return true;
+    // #hardening: RETRY a transient file-lock (AV / OneDrive / Search-indexer momentarily holding run-state.json) ×3 with a
+    // short backoff before giving up — this is the MOST critical persist path (a failure STOPS the whole run), yet it was
+    // the only one with no retry while held/comment persists already retry ×3. The write is atomic + idempotent (full-state
+    // temp→fsync→rename), so a retry can NEVER corrupt or double-post; a ~200ms lock must not end a days-long run. Only a
+    // PERSISTENT failure (all 3 tries) stops the run.
+    for (let _t = 0; _t < 3; _t++) {
+      if (store.saveRotation({ dealt: merged, roundOffset: this._roundOffset || 0, staggerRotation: this._staggerRotation || 0, lastDailyRunDate: this._lastDailyRunDate || null, perAccountRotation: this._perAccountRotation || {}, campaignPlan: this._campaignPlan || null, owedLedger: this._owed || {}, inflightSeq: this._inflightSeq || {} })) {
+        this._dealt = new Set(merged);
+        // R5 [HOLE 1]: each unique/sequence post that just reached full delivery no longer needs its crash-durable
+        // delivered-guard — purge its keys so _inflightDelivered stays bounded (no-op for rotation/campaign ids, which
+        // never have keys). Only after the save succeeds: a failed save keeps _dealt (and the guard) so a retry re-skips.
+        // [9] STILL-OWED posts are EXEMPT: a dealt id no longer implies full delivery now that a PARTIAL is dealt +
+        // carried in the owed ledger. Purging a still-owed post's guard would drop the only durable proof of which
+        // groups a pre-crash run already reached → the next owed re-pick (and any reserve stand-in, which never
+        // consults the guard) would re-post them. The guard is purged on the cycle that finally discharges the owed.
+        for (const id of cycleDealtIds) if (!this._owedRefsPost(id)) this._clearInflightDelivered(id);
+        return true;
+      }
+      if (_t < 2) await this._interruptibleSleep(200); // SHORT backoff between tries (matches the held/comment persist retries)
     }
-    this.log('🚨 CRITICAL: could not save rotation state (disk full / file locked / no write permission). Posts published this batch are NOT recorded as done — continuing would risk RE-POSTING them after a crash or restart. STOPPING the run now. Free disk space or fix the data-folder permissions, then Start again.');
+    this.log('🚨 CRITICAL: could not save rotation state after 3 tries (disk full / file locked / no write permission). Posts published this batch are NOT recorded as done — continuing would risk RE-POSTING them after a crash or restart. STOPPING the run now. Free disk space or fix the data-folder permissions, then Start again.');
     this._stop = true;
     this.emit('automation-progress', { ...this._progress });
     return false;
@@ -1675,7 +1805,13 @@ class Orchestrator {
     await this._foldObligationJournal(getData());
     let cycle = 0;
     while (!this._shouldStop()) {
+      // #hardening: clear the loss-halt at the TOP of each cycle so a TRANSIENT persist-lock (which sets it mid-pool at
+      // ~:2347) that has since CLEARED lets the run self-recover — the affected post is already dealt (no double-post), so
+      // the flag's only job is to pause; a lock that persists just re-sets it next cycle (bounds loss to one cycle instead
+      // of wedging the run until a manual restart). Mirrors _diskHalt's self-healing (Start-only reset was the wedge).
+      this._recordLossHalt = false;
       this._data = getData(); // re-read each cycle so mid-run edits take effect
+      this._compactInflightJournal(); // #3: keep the crash-durability inflight journal bounded on a run that never restarts (drops only durably-superseded lines; best-effort)
       const data = this._data; // the moderator/rescue phases below reference `data` — bind it (was a latent ReferenceError swallowed by their try/catch, silently disabling rescue + the end-of-cycle approval sweep)
       const { posts, accounts, settings } = this._data;
       if (!posts.length) {
@@ -1737,6 +1873,7 @@ class Orchestrator {
         if (runNow && waitMs === 0 && doneToday === 0) this.log(`▶️ Running the first cycle now; the daily schedule (${settings.dailyPostTime}) applies from the next cycle.`);
         if (waitMs > 0) {
           this._pruneProfileCaches(getData); // B2: reclaim Chrome caches now that this cycle's browsers are closed — before the rest AND before the next cycle's disk check, so freed space can avert a pause
+          try { if (typeof sweepOrphanTemps === 'function') sweepOrphanTemps(); } catch {} // #11: reclaim CONSUMED comment-image temps (>24h, not referenced by a persisted queue) so a days-long no-restart run doesn't leak tmpdir
           // Overnight wait (all cycles done → waiting for TOMORROW) may sleep the laptop. Waiting for a TODAY cycle must stay awake.
           const overnight = (doneToday >= N);
           const hrs = Math.round(waitMs / 360000) / 10;
@@ -1818,17 +1955,18 @@ class Orchestrator {
           this.log(`🟡 Standby (backup) accounts ready: ${standbyAccounts.map((a) => a.alias || a.name).join(', ')} — they post ONLY when a working account in their groups drops, a post stays held, or a comment needs placing.`);
         }
       }
-      // CAMPAIGN PLAN: (re)compute the per-cluster day-by-day split when there are campaign-plan agents and
-      // either no plan yet OR the library/agent-set changed (batchId mismatch). Recompute preserves each
-      // agent's delivered pointer (perAccountRotation) — only future slots change — so edits don't re-post.
+      // CAMPAIGN PLAN: build the per-cluster day-by-day split ONCE per round, then FREEZE it. #2 (defer-to-next-round):
+      // a mid-round library/roster EDIT changes batchId, but recomputing now would repartition the slices AND wipe every
+      // agent's delivered pointer → the campaign re-posts already-delivered content to the shared IP (a whole-library
+      // re-burst = the ban-risk axis). So an existing plan is held for the rest of the round; the edit applies cleanly at
+      // the next round boundary (the loop-wrap recompute with the fresh roster/posts, ~line 2863) or on Stop→edit→Start.
       {
         const planAgents = this._campaignRoster(); // CP1: the STABLE full roster (not the per-cycle `active` set) → batchId doesn't churn under reserve rotation, so the plan advances instead of re-posting slice[0] every cycle. Excludes group-less agents (can't deliver a slice → would block completion forever).
         if (planAgents.length) {
           // ⚠️ SAFETY (ban-footgun): the NUMERIC "Reserve Accounts" hold-back rotates WHICH accounts are active each
-          // cycle (Pass 1/2 above), so the campaign plan's roster — and thus its batchId (keyed on the active-agent
-          // set) — changes every cycle, tripping the batchId-mismatch branch below that RESETS every agent's slice
-          // pointer. The campaign then re-posts its earliest posts every cycle and never advances → silent
-          // over-delivery on the shared IP. Campaign-plan backup belongs to STANDBY accounts instead: they never
+          // cycle (Pass 1/2 above), so the campaign plan's roster — and thus its batchId — would change every cycle.
+          // Before the freeze below this tripped the batchId-mismatch RESET every cycle → re-posted early posts forever →
+          // silent over-delivery on the shared IP. Campaign-plan backup belongs to STANDBY accounts instead: they never
           // churn the active set, and _campaignStandins already covers a DROPPED campaign agent from the standby pool.
           if (reserveN > 0 && !this._reserveCampaignWarned) {
             this._reserveCampaignWarned = true;
@@ -1836,24 +1974,10 @@ class Orchestrator {
           }
           const planPosts = (this._data.posts || []); // full library — _computeCampaignPlan applies EACH cluster's own postFilter (+ post-set) so clusters with different filters aren't all gated by the first agent's
           const fresh = this._computeCampaignPlan(planPosts, planAgents, this._roundOffset || 0);
-          if (!this._campaignPlan || this._campaignPlan.batchId !== fresh.batchId) {
-            // A CHANGED plan (content/roster edited) → reset the per-agent slice pointers so distribution
-            // restarts cleanly with the new content. An UNCHANGED restart keeps the same batchId → no
-            // recompute → pointers preserved → it resumes mid-campaign. (Edit content between rounds, or
-            // Stop→edit→Start, to avoid re-posting mid-round.)
-            const wasExisting = !!this._campaignPlan;
-            this._campaignPlan = fresh;
-            if (wasExisting) for (const a of planAgents) delete (this._perAccountRotation || (this._perAccountRotation = {}))[a.name];
-            this._saveRotationState();
-            const totalDays = Math.max(0, ...fresh.clusters.map((c) => c.days));
-            const _setsUsed = planAgents.some((a) => a.postSetId);
-            this.log(`🗓️ Campaign Plan: ${planPosts.length} post(s) split across ${planAgents.length} agent(s) in ${fresh.clusters.length} group-set(s) → ~${totalDays} day(s); ${_setsUsed ? 'each batch delivers its assigned post-set' : 'each group-set receives the whole library'}.`);
-            // Empty-set trap: an agent assigned to a post-set with zero matching posts would idle silently every cycle.
-            const _emptySets = fresh.clusters.filter((c) => c.totalPosts === 0);
-            if (_emptySets.length) this.log(`⚠️ ${_emptySets.length} batch(es) have an assigned post-set with NO posts — those accounts will post NOTHING. Tag posts to that set (Posts tab) or clear the batch's set in Quick Setup.`);
-          }
+          this._reconcileCampaignPlan(fresh, planAgents, planPosts.length); // #2: build once, then FREEZE — never re-partition/wipe pointers mid-round
         } else if (this._campaignPlan) {
           this._campaignPlan = null; // no campaign-plan agents this cycle
+          this._pendingPlanBatchId = null;
         }
       }
       // Shared-IP warning (once per run): many accounts from ONE IP is a top coordinated-spam signal.
@@ -2181,8 +2305,15 @@ class Orchestrator {
         // each real-IP post-start by a jittered gap on the SHARED _lastRealIpLaunchAt. #3: this now covers the initial fill
         // too (the per-account stagger above is proxy-only), so myLaunch=0 still starts immediately (stale prev-cycle
         // timestamp) while #1,#2… space by the gap. Placed AFTER the skip-checks so a cooling/rested account isn't paced for nothing.
-        if (!_isProxied && settings.staggerAccounts !== false && !this._shouldStop() && !stopPool && !this._finish) {
-          const _gap = normalizeSpeedMode(settings.speedMode) === 'max' ? (5000 + Math.round(Math.random() * 8000)) : (15000 + Math.round(Math.random() * 30000)); // max 5–13s, else 15–45s
+        // #12/#15: enforce a per-launch floor of AT LEAST realIpMinPostGapSec even when staggerAccounts is OFF — the
+        // stagger toggle governs cadence, not the ban-safety floor — AND so the Max-tier launch gap (5–13s) can't land an
+        // account's FIRST post (spaced ONLY by this launch throttle; ipPostGate covers only inter-group posts) below a
+        // configured realIpMinPostGapSec. Only ever RAISES the gap; never lowers it.
+        const _ipFloorMs = _isProxied ? 0 : Math.max(0, Number(settings.realIpMinPostGapSec) || 0) * 1000;
+        const _wantStagger = settings.staggerAccounts !== false;
+        if (!_isProxied && (_wantStagger || _ipFloorMs > 0) && !this._shouldStop() && !stopPool && !this._finish) {
+          const _baseGap = _wantStagger ? (normalizeSpeedMode(settings.speedMode) === 'max' ? (5000 + Math.round(Math.random() * 8000)) : (15000 + Math.round(Math.random() * 30000))) : 0; // stagger off → no cadence gap, only the floor
+          const _gap = Math.max(_baseGap, _ipFloorMs); // never below the configured per-IP floor
           this._lastRealIpLaunchAt = Math.max(Date.now(), (this._lastRealIpLaunchAt || 0) + _gap);
           const _w = this._lastRealIpLaunchAt - Date.now();
           if (_w > 0) await this._interruptibleSleep(_w);
@@ -2236,12 +2367,16 @@ class Orchestrator {
             // just those owed groups (it only targeted them); otherwise its whole assigned group set (a fresh post).
             const _prevOwed = (this._owed && this._owed[account.name] && this._owed[account.name].postId === _pid && Array.isArray(this._owed[account.name].gids)) ? this._owed[account.name].gids : null;
             const _expected = _prevOwed ? _prevOwed.slice() : [...this._groupIdsOf(account)];
-            const _owedNow = _expected.filter((gid) => !this._cycleDelivered.has(this._dkScope(account.name) + _pid + '::' + gid));
+            const _owedNow = _expected.filter((gid) => !this._owedDelivered(account.name, _pid, gid));
             if (_owedNow.length) this._cycleOwed[account.name] = { postId: _pid, gids: _owedNow }; // same-cycle: a healthy reserve finishes these un-reached groups (unchanged for unique/sequence/campaign)
-            // PERSISTENT carry-over ([7][8]) — only the per-agent-pointer modes (daily-rotation / campaign-plan) can
-            // re-pick the SAME post next cycle via the owed pick-override; record the obligation so end-of-pool
-            // reconciliation writes what's STILL un-reached (after any same-cycle reserve cover) into this._owed.
-            if (_po === 'daily-rotation' || _po === 'campaign-plan') this._cycleObligation[account.name] = { postId: _pid, expectedGids: _expected };
+            // PERSISTENT carry-over ([7][8][9]) — record the obligation so end-of-pool reconciliation writes what is
+            // STILL un-reached (after any same-cycle reserve cover) into this._owed. Recorded for EVERY dedup mode:
+            // unique/sequence used to be excluded because only the per-agent-pointer modes had an owed pick-override,
+            // so a carried entry could never be discharged — but a PARTIAL was still added to the fleet-wide dealt-set,
+            // which meant the un-reached groups stranded forever whenever no same-cycle reserve covered them (a false
+            // 100% at completion). unique/sequence now has its own owed pick-override (~line 756), so the carry-over
+            // discharges exactly like the pointer modes. [9]
+            this._cycleObligation[account.name] = { postId: _pid, expectedGids: _expected };
           }
         }
         if ((account.postingOrder || '') === 'daily-rotation' || (account.postingOrder || '') === 'campaign-plan' || isStandin) {
@@ -2282,9 +2417,33 @@ class Orchestrator {
               // stand-in's _target subset: with SPLIT coverage several reserves each cover a subset, so keying the
               // obligation off one subset would drop the groups the OTHER reserves were meant to reach. And only when
               // forAgent didn't already record it via its OWN partial run this cycle (that record is authoritative).
-              const _faOrd = (_faObj && _faObj.postingOrder) || '';
-              if ((_faOrd === 'daily-rotation' || _faOrd === 'campaign-plan') && !this._cycleObligation[stand.forAgent]) {
-                const _prevFa = (this._owed && this._owed[stand.forAgent] && this._owed[stand.forAgent].postId === _P && Array.isArray(this._owed[stand.forAgent].gids)) ? this._owed[stand.forAgent].gids : null;
+              // [DISABLED-AGENT FIX] Resolve the covered agent's mode from the FULL account list, not just _active: a
+              // stand-in can cover an agent DISABLED (enabled=false) between cycles via the persistent-owed synthesis.
+              // A disabled agent is absent from _active → _faObj is undefined → _faOrd was '' → this guard never fired →
+              // _cycleObligation was never recorded → _reconcileOwedFor could neither CLEAR nor CARRY this._owed[forAgent]
+              // → the reserve re-posted the SAME owed groups to the SAME FB groups EVERY cycle (recurring per-(post,group)
+              // double-post on the shared IP). We resolve ONLY the mode here (NOT _faObj itself) so the _target/_unreached
+              // math above is untouched — expectedGids below still comes from _prevFa (the owed SUBSET, never the whole
+              // assigned set), so already-delivered groups from the original partial are not re-owed and re-posted.
+              const _faOrd = (_faObj && _faObj.postingOrder)
+                || (((this._data && this._data.accounts) || []).find((x) => x.name === stand.forAgent) || {}).postingOrder
+                || '';
+              const _prevFa = (this._owed && this._owed[stand.forAgent] && this._owed[stand.forAgent].postId === _P && Array.isArray(this._owed[stand.forAgent].gids)) ? this._owed[stand.forAgent].gids : null;
+              // [9/UNIQUE-COVER FIX] ADMIT unique/sequence too — but ONLY with a _prevFa baseline. [9] gave unique/sequence
+              // a persistent owed ledger (the ~773 pick-override + the obligation at ~2379), and _hasPersistentOwed (2544)
+              // + the synthesis/_owedStandins (2565) are MODE-AGNOSTIC — so a reserve now covers a UNIQUE agent's owed.
+              // But this gate still admitted only the pointer modes, so that cover recorded NO obligation →
+              // _reconcileOwedFor early-returns (!ob) → this._owed[forAgent] SURVIVES A SUCCESSFUL COVER → the synthesis
+              // re-dispatches the IDENTICAL gids next cycle, and a stand-in's _uniqueSeqGuard is false so its ONLY defense
+              // is _cycleDelivered — which resets each cycle. Result: the reserve re-posts the SAME (post,group) EVERY
+              // cycle on the shared IP — verbatim the failure the [DISABLED-AGENT FIX] above closed for the pointer modes.
+              // The crash-fold's [9] block clears the stale entry on RESTART, so only a HEALTHY days-unattended run
+              // accumulates duplicates (a crash-looping one self-heals) — which is why a whole green suite never caught it.
+              // The `_prevFa &&` conjunct is LOAD-BEARING: expectedGids must be the owed SUBSET, never the full assigned
+              // set (else the original partial's already-delivered groups are re-owed → re-posted), and for an absent
+              // _faObj the fallback yields an EMPTY set → expectedGids=[] → still=[] → delete _owed = a silent STRAND. No
+              // baseline → record nothing → today's behavior (a strand: recoverable) instead of a double-post (a ban).
+              if (standinObligationAdmits(_faOrd, !!_prevFa) && !this._cycleObligation[stand.forAgent]) {
                 this._cycleObligation[stand.forAgent] = { postId: _P, expectedGids: _prevFa ? _prevFa.slice() : [...this._groupIdsOf(_faObj || {})] };
               }
             }
@@ -2322,7 +2481,13 @@ class Orchestrator {
         // re-post). this._runSeq is monotonically ≥ every q this account appended this run. Rotation/campaign/stand-in
         // use perAccountRotation[ptrName].icommit (above); this is the unique/sequence dealt-set analogue.
         if ((account.postingOrder || '') !== 'daily-rotation' && (account.postingOrder || '') !== 'campaign-plan' && !isStandin && res.dealtIds.length) { this._inflightSeq = this._inflightSeq || {}; this._inflightSeq[account.name] = this._runSeq; }
-        if ((account.postingOrder || '') !== 'daily-rotation' && (account.postingOrder || '') !== 'campaign-plan' && !isStandin && res.dealtIds.length && !this._persistDealt(res.dealtIds)) { stopPool = true; return; }
+        // CRASH-SAFE OWED (unique/sequence analogue of the rotation lock-step reconcile ~line 2415): reconcile THIS
+        // account's owed entry INLINE so the _persistDealt below writes the ledger ATOMICALLY with the dealt-set that
+        // supersedes the post. For unique/sequence the dealt-set IS the pointer, so ADR-0008's rule applies verbatim: a
+        // hard kill must never leave the post dealt while the ledger still omits its un-reached groups (silent skip) or
+        // still lists an already-delivered one (double-post). [9]
+        if ((account.postingOrder || '') !== 'daily-rotation' && (account.postingOrder || '') !== 'campaign-plan' && !isStandin && res.dealtIds.length) this._reconcileOwedFor(account.name);
+        if ((account.postingOrder || '') !== 'daily-rotation' && (account.postingOrder || '') !== 'campaign-plan' && !isStandin && res.dealtIds.length && !(await this._persistDealt(res.dealtIds))) { stopPool = true; return; }
         // R2 halt: a held/comment record failed to persist after retries (above). The post is ALREADY dealt (durable via
         // saveRotation ~1829 for rotation/campaign accounts, or _persistDealt just above for unique/sequence), so re-owning
         // it would DOUBLE-POST. Keep it dealt (no double-post) and STOP the pool so the operator fixes the disk/lock before
@@ -2447,7 +2612,14 @@ class Orchestrator {
         // and in campaign-plan a non-assigned reserve returns [] from _postsForAccount so this can't over-take.
         const _probeCap = Math.max(maxTakeover, Object.keys(this._campaignTakeover || {}).length);
         const takeovers = [];
-        for (const a of cand) {
+        // #F: probe ASSIGNED stand-ins (already paired to a dropped agent's exact owed groups via _campaignTakeover /
+        // _splitCover) BEFORE classic-takeover candidates. Many classic unique/sequence reserves probe-positive on the SAME
+        // one released post (claim=false), so if they preceded the stand-ins in reserve order they'd fill _probeCap and a
+        // real split-cover stand-in would be dropped — slipping its un-reached groups a full cycle. _probeCap ≥ #stand-ins,
+        // so all assigned stand-ins are admitted first, then classic candidates fill any remaining slots.
+        const _standinNames = new Set(Object.keys(this._campaignTakeover || {}));
+        const _probeOrder = cand.slice().sort((x, y) => (_standinNames.has(y.name) ? 1 : 0) - (_standinNames.has(x.name) ? 1 : 0));
+        for (const a of _probeOrder) {
           if (takeovers.length >= _probeCap) break;
           if (this._postsForAccount(a, cycle, false).length > 0) takeovers.push(a); // an undealt post exists for it to deliver
         }
@@ -2674,8 +2846,15 @@ class Orchestrator {
                 this.log(`↩️ [${reserve.name}] could NOT re-post "${rec.groupName || rec.gid}" (${why}) — left for retry next cycle (re-login/replace the reserve). Cap not consumed.`);
               }
               this._setAcctState(reserve.name, (result && (result.posted || 0) > 0) ? 'done' : 'error', { posted: (result && result.posted) || 0, action: (result && (result.posted || 0) > 0) ? '✓ re-posted held content' : `re-post ${(result && result.flag) || 'not live'}` });
-              // Space consecutive re-posts so a batch of held records doesn't fan out as a coordinated burst.
-              if (!this._shouldStop()) await this._interruptibleSleep(30000 + Math.floor(Math.random() * 60000));
+              // Space consecutive re-posts so a batch of held records doesn't fan out as a coordinated burst. Phase-4
+              // re-posts are REAL group posts on the shared IP but bypass the pool's launch throttle, so ALSO honor the
+              // opt-in realIpMinPostGapSec floor AND advance/reserve the shared _lastRealIpPostAt clock via _ipPostGate —
+              // keeping re-posts coordinated with the pool's real-IP pacing (a no-op for a proxied reserve). Math.max only
+              // ever RAISES the existing 30-90s guard, never lowers it.
+              if (!this._shouldStop()) {
+                const _reserveProxied = !!(this._proxyForAccount && this._proxyForAccount(reserve));
+                await this._interruptibleSleep(Math.max(30000 + Math.floor(Math.random() * 60000), this._ipPostGate(0, _reserveProxied)));
+              }
             }
           }
         } catch (e) { this.log(`⚠️ held re-post phase error: ${e.message}`); }
@@ -2729,7 +2908,7 @@ class Orchestrator {
                 // advances/closes the browser — shrinking the crash-window between FB-placing a comment and its 'done'
                 // marker reaching disk (which otherwise re-dispatches next cycle → a DOUBLE-COMMENT). The chain preserves
                 // order so a concurrent moderator-loop/handoff write can't clobber this update.
-                return store.updateComments((d2) => {
+                return store.updateComments(async (d2) => { // async: the notfound re-home AWAITS its moderator-queue write before flipping the record (queue-first/flip-after)
                   // Scope by posterAccount too (as the enqueue-dedup does): two DIFFERENT accounts can each hold a live
                   // pending record in the SAME group with an empty captionSnip + null postId (comment_notfound path), so
                   // an account-agnostic match could mark the WRONG account's record done/failed.
@@ -2743,7 +2922,7 @@ class Orchestrator {
                       // MODERATION ON: live-but-not-in-public-feed → actually HELD in Spam potentiel. RE-HOME it into the
                       // moderator queue (so the moderator approves it → the comment re-queues), then close THIS record.
                       if (task.captionSnip || task.postId) {
-                        store.updateModeration((ms) => { // serialized moderation write
+                        const _mod = await store.updateModeration((ms) => { // serialized moderation write — AWAITED so we flip the record only after the held card durably lands (independent chain, no deadlock)
                           ms.held = ms.held || [];
                           const match = (x) => x.gid === task.gid && ((task.captionSnip && x.captionSnip) ? x.captionSnip === task.captionSnip : (!!x.postId && !!task.postId && x.postId === task.postId));
                           // RE-OPEN a stale 'approved' record (set when this comment was handed off) back to 'held' so the
@@ -2769,7 +2948,18 @@ class Orchestrator {
                           const dup = ms.held.some((x) => match(x) && (x.status === 'held' || x.status === 'failed_held' || x.status === 'superseded'));
                           if (!dup) { ms.held.push({ postId: task.postId || null, gid: task.gid, posterAccount: task.posterAccount || null, fbDisplayName: '', captionSnip: task.captionSnip || '', postCaption: task.postCaption || null, groupName: task.groupName || null, comment: task.comment || '', commentImg: task.commentImg || null, postPermalink: task.postPermalink || null, status: 'held', heldAt: Date.now(), approvedAt: null, source: 'rescue_notfound' }); this.log(`🔁 [${task.groupName || task.gid}] orphaned comment looks HELD — re-homed to moderator approval`); }
                         });
-                        rec.status = 'rehomed'; rec.note = 're-homed to moderator approval (held in Spam potentiel)';
+                        // Flip to 'rehomed' ONLY if the held-card write durably landed. A failed moderation save (file
+                        // lock / disk full) that still flipped the record durably lost the orphaned comment (no card, no
+                        // pending record, no journal entry) → the post stayed live WITHOUT its link and the run falsely
+                        // reported it delivered. On a transient failure, retry the re-home next cycle (leave 'pending') —
+                        // but BOUND it exactly like every sibling terminal branch: once the 3 attempts are exhausted,
+                        // SURFACE it as 'failed'. A naked 'pending' at attempts>=3 wedges INVISIBLY — _outstandingWork
+                        // stops counting it (→ completionMode can declare 100% + STOP), it's excluded from re-dispatch,
+                        // and the no-link report never lists it; worse, while attempts<3 a re-dispatch re-PLACES a HELD
+                        // comment. 'failed' is terminal + surfaced in the completion no-link report.
+                        if (_mod && _mod.ok !== false) { rec.status = 'rehomed'; rec.note = 're-homed to moderator approval (held in Spam potentiel)'; }
+                        else if (rec.attempts >= 3) { rec.status = 'failed'; rec.note = 'post held in "Spam potentiel" but its moderator-queue re-home write kept failing (disk full/locked?) — live WITHOUT its comment; approve/place it manually and free disk.'; this.log(`❌ [${task.groupName || task.gid}] could NOT re-home the held comment (moderation store write failed) — live without its comment; fix disk/permissions.`); }
+                        else this.log(`⚠️ [${task.groupName || task.gid}] re-home moderation save failed — left the comment PENDING to retry (not dropped).`);
                       } else if (rec.attempts >= 3) {
                         // No id/caption to re-home to a specific card → surface after 3 attempts instead of a silent 'rehomed' drop.
                         rec.status = 'failed'; rec.note = 'post held in "Spam potentiel" but has no id/caption to re-home to the moderator — live WITHOUT its comment';
@@ -2861,6 +3051,7 @@ class Orchestrator {
           for (const a of planAgents) (this._perAccountRotation || (this._perAccountRotation = {}))[a.name] = { lastPostId: null, lastPostedDate: _dk, postsToday: _N, postsTodayDate: _dk }; } // reset slice; mark today's quota FULL so a new round paces to next day (matches "resumes next day")
         const planPosts = (this._data.posts || []); // full library — per-cluster postFilter applied inside _computeCampaignPlan
         this._campaignPlan = this._computeCampaignPlan(planPosts, planAgents, this._roundOffset);
+        this._pendingPlanBatchId = null; // #2: the new round IS the recompute — any edit held during the last round is now applied, so clear the pending marker
         this._saveRotationState();
         this.log('🔁 Campaign Plan: every group-set received the full library — new round started (reshuffled who posts what); resumes next day.');
       }
@@ -2913,20 +3104,23 @@ class Orchestrator {
       // breaker and STOPPING (which would leave the app dead hours before tomorrow). A rate-limited or
       // flagged fleet is NOT a cap-hold (those still fall through to the real stop below).
       const _cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
-      if (cycleDealtIds.length === 0 && _cap > 0 && settings.scheduleMode !== 'daily') { // daily mode's gate already waits a day
+      if (cycleDealtIds.length === 0 && _cap > 0) { // #4: applies in DAILY mode too — the daily gate waits on the cyclesPerDay COUNT, not the per-account daily CAP, so a fleet that hits its cap before the day's cycles are used up would otherwise fall through to the stall-breaker and STOP mid-day (with a self-contradicting "resumes after midnight" message)
         const _now = Date.now();
         const _liveAccts = (getData().accounts || []);
         const _activePosters = (this._active || []).filter((a) => a.enabled !== false && !a.isModerator);
         const _allCapped = _activePosters.length > 0 && _activePosters.every((a) => {
           const live = _liveAccts.find((x) => x.name === a.name) || a;
           if ((Number(live.rateLimitedUntil) || 0) > _now) return false; // cooling down → not a cap-only stall
-          if (this._runFlags && this._runFlags[a.name]) return false;     // flagged → not a cap-only stall
+          if (live.status && live.status !== 'logged_in' && live.status !== 'idle') return false; // review-fix: gate on LIVE status (matches line 2987 + the "bad account" definition ~3193), NOT the sticky run-lifetime _runFlags — a single EARLIER rate-limit that has since RECOVERED otherwise poisons _allCapped forever, so a capped fleet skips the midnight hold and the stall-breaker STOPS the run mid-day (defeating days-unattended)
           return store.dailyUsed(live.daily) >= _cap;
         });
         if (_allCapped) {
           const d = new Date(_now);
-          const nextMidnightUtc = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 30); // +30s past the UTC rollover
-          const waitMs = Math.max(60000, nextMidnightUtc - _now);
+          // #3: wait to the next LOCAL midnight (+30s) — store.dailyUsed/todayKey roll the cap window at LOCAL midnight
+          // (store.js), not UTC. The old Date.UTC(...) idled the whole timezone offset every capped day (e.g. ~2h in
+          // UTC+2) and could re-hold ~24h in negative-offset zones. Mirrors the sibling daily-rotation hold just below.
+          const nextLocalMidnight = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 30).getTime();
+          const waitMs = Math.max(60000, nextLocalMidnight - _now);
           this._zeroProgressCycles = 0; // a deliberate cap hold is NOT a stall
           this.log(`📵 All active accounts hit today's daily cap (${_cap}/day) — waiting ~${Math.round(waitMs / 360000) / 10}h for the next day, then resuming automatically.`);
           await this._waitWithCountdown(waitMs, 'Next day (daily cap)');
@@ -3000,7 +3194,7 @@ class Orchestrator {
         const capN = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
         const capped = capN > 0 ? active.filter((a) => { const live = (getData().accounts || []).find((x) => x.name === a.name) || a; return store.dailyUsed(live.daily) >= capN; }).length : 0;
         let cause;
-        if (active.length && capped === active.length) cause = `all ${active.length} active account(s) have hit today's daily cap (${capN}/day) — they will resume automatically after midnight UTC (no action needed)`;
+        if (active.length && capped === active.length) cause = `all ${active.length} active account(s) have hit today's daily cap (${capN}/day) — they will resume automatically after local midnight (no action needed)`;
         else if (active.length && rl === active.length) cause = `all ${active.length} active account(s) are rate-limited and cooling down — wait for the cool-down to elapse, then Start again`;
         else if (active.length && noGroups === active.length) cause = 'no active account has any groups assigned — assign groups in the Accounts tab';
         else if (flagged) cause = `${flagged} account(s) need attention (logged out, checkpoint, or blocked) — fix the flagged accounts, then Start again`;
@@ -3080,10 +3274,12 @@ class Orchestrator {
   _localDayKey(d = new Date()) { const z = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`; }
   // ms until the next 'daily' fire for dailyPostTime ('HH:MM' local). 0 = fire NOW (today's time has
   // arrived and we haven't run today). If we already ran today, returns ms until tomorrow's time.
-  _msUntilDailyFire(timeStr, lastRunDateKey) {
+  // nowMs is injectable (defaults to the real clock) SOLELY so the scheduling decision is unit-testable
+  // at a fixed instant — production passes no argument, so behavior is byte-identical to `new Date()`.
+  _msUntilDailyFire(timeStr, lastRunDateKey, nowMs = Date.now()) {
     const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(timeStr || '09:00')) || [null, '9', '0'];
     const hh = parseInt(m[1], 10) || 0, mm = parseInt(m[2], 10) || 0;
-    const now = new Date();
+    const now = new Date(nowMs);
     const fireToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hh, mm, 0, 0);
     if (lastRunDateKey === this._localDayKey(now)) { const t = new Date(fireToday.getTime()); t.setDate(t.getDate() + 1); return t.getTime() - now.getTime(); }
     return Math.max(0, fireToday.getTime() - now.getTime());
@@ -3113,13 +3309,33 @@ class Orchestrator {
       for (const a of finite) for (const p of postsForSet(data.posts || [], a).filter((p) => matchesFilter(p, a.postFilter || 'all'))) if (!this._dealt.has(p.id)) seen.add(p.id);
       undealt = seen.size;
     }
-    // Campaign-plan posts not yet delivered (tracked by per-agent pointers, not the shared dealt-set).
-    const campaignAgents = (active || []).filter((a) => (a.postingOrder || '') === 'campaign-plan' && (a.assignedGroups || []).length);
-    const campaignRemaining = campaignAgents.length ? this._campaignRemaining() : 0;
-    undealt += campaignRemaining;
-    // PARTIAL-DELIVERY owed ([8]): un-reached (post,group) pairs a campaign agent still owes are outstanding work —
-    // count them so completionMode doesn't declare "100% delivered" and stop before those groups get the post.
-    for (const a of campaignAgents) { const o = (this._owed || {})[a.name]; if (o && (o.gids || []).length) undealt += o.gids.length; }
+    // Campaign-plan posts not yet delivered (tracked by per-agent pointers, not the shared dealt-set). #1: tally over the
+    // PLAN ROSTER (agentLists keys), NEVER the per-cycle `active` set — a cycle that RESERVES all campaign agents (the
+    // reserve pass can hold a whole cluster) would else see no active campaign agents → skip _campaignRemaining + the owed
+    // loop → collapse undealt to 0 → a FALSE 100%-complete that STOPS the run with campaign posts still owed (the CP1
+    // active-vs-roster anti-pattern — fixed for _campaignAllFinished/_campaignRemaining — had been reintroduced here).
+    // _campaignRemaining() self-gates to 0 when there is no campaign plan; adding it can only RAISE outstanding work.
+    const _campRosterNames = (this._campaignPlan && this._campaignPlan.agentLists) ? Object.keys(this._campaignPlan.agentLists) : [];
+    undealt += this._campaignRemaining();
+    // PARTIAL-DELIVERY owed ([8]): un-reached (post,group) pairs the ROSTER still owes are outstanding — count over the
+    // roster (not `active`), so completionMode can't declare "100% delivered" before those groups get the post.
+    for (const name of _campRosterNames) { const o = (this._owed || {})[name]; if (o && (o.gids || []).length) undealt += o.gids.length; }
+    // [9] The same for unique/sequence: a PARTIAL delivery is added to the fleet-wide dealt-set, so its post drops out
+    // of the `undealt` tally above while its un-reached groups are still owed — completionMode would declare a false
+    // 100% and STOP with groups un-served (the ADR-0009 invariant: total===0 must mean everything DELIVERABLE was
+    // delivered). Tallied over the ACCOUNT ROSTER, not `active`: an owed agent disabled or fully reserved this cycle
+    // still has its groups finished by the persistent-owed synthesis, and an active-only tally would collapse to a
+    // false 100% exactly as it did for campaign-plan (#1).
+    // Two guards keep the count HONEST rather than merely conservative — either would otherwise wedge the run at
+    // total>0 forever: only DEALT posts (an un-dealt owed post is already counted whole by the `undealt` tally above →
+    // no double-count), and only posts still IN the library (a deleted post has no recovery path; the owed pick-override
+    // drops that stale entry on the agent's next real pick).
+    for (const [name, o] of Object.entries(this._owed || {})) {
+      if (!o || !(o.gids || []).length || !this._isUniqueSeqAgent(name)) continue;
+      if (!this._dealt.has(o.postId)) continue;
+      if (!((data.posts) || []).some((p) => p.id === o.postId)) continue;
+      undealt += o.gids.length;
+    }
     let pending = 0, held = 0, failed = 0, failedHeld = 0, superseded = 0;
     try { pending = (store.loadComments().pending || []).filter((c) => c.status === 'pending' && (c.attempts || 0) < 3).length; } catch {}
     try { const hh = (store.loadModeration().held || []); held = hh.filter((h) => h.status === 'held').length; failed = hh.filter((h) => h.status === 'failed').length; failedHeld = hh.filter((h) => h.status === 'failed_held').length; superseded = hh.filter((h) => h.status === 'superseded').length; } catch {}
@@ -3134,7 +3350,7 @@ class Orchestrator {
     // delivered" before _pruneModeration reverts it (30-min window) → 'failed' → a re-post. Only DELAYS completion; the
     // Phase-1 re-hold dedup already excludes superseded, so counting it can never cause a double-post.
     const repostOn = !!(this._data && this._data.settings && this._data.settings.repostEnabled);
-    return { undealt, pending, held, failed, failedHeld, superseded, total: undealt + pending + held + (repostOn ? failed + superseded : 0), hasFinite: finite.length > 0 || campaignAgents.length > 0 };
+    return { undealt, pending, held, failed, failedHeld, superseded, total: undealt + pending + held + (repostOn ? failed + superseded : 0), hasFinite: finite.length > 0 || _campRosterNames.length > 0 }; // #1: hasFinite's campaign term is roster-based so it never flips based on which agents were reserved this cycle
   }
 
   // Final report when a completion-mode run ends: what got delivered, what's left (if undeliverable), and
@@ -3255,10 +3471,49 @@ class Orchestrator {
       preview.push({ groupKey: k, agents: cAgents.map((a) => a.name), totalPosts: cPosts.length, days: days.length, grid: days });
     }
     // Hash includes each POST's set tag and each agent's sig (which already carries the agent's set) → re-tagging a
-    // post to a different set, or reassigning an agent's set, changes the batchId and triggers a clean recompute.
+    // post to a different set, reassigning an agent's set/groups, or adding/removing/reordering posts changes the
+    // batchId. A change is DETECTED mid-round (see _reconcileCampaignPlan) but the reshuffle is DEFERRED to the next
+    // round — recomputing mid-round would wipe pointers and re-post already-delivered content (#2).
     const fp = posts.map((p) => p.id + ':' + (p.postSetId || '')).join(',') + '::' + agents.map((a) => a.name + ':' + sig(a)).join(',');
     let h = 5381; for (let i = 0; i < fp.length; i++) h = ((h * 33) ^ fp.charCodeAt(i)) >>> 0; // djb2 change-detection hash
     return { batchId: String(h), planStartDate: this._localDayKey(), roundOffset, agentLists, clusters: preview };
+  }
+
+  // #2 (defer-to-next-round): reconcile the campaign plan against the latest roster/library WITHOUT re-bursting. Called
+  // once per cycle from _loop. The FIRST call builds the plan; every later call FREEZES it — a mid-round edit (added
+  // agent, changed groups/sets, added/removed/reordered posts) is held for the next round boundary, because recomputing
+  // now would repartition slices AND wipe every agent's delivered pointer → the whole library re-posts to the shared IP
+  // (a re-burst = the ban-risk axis). The one consistency step that is safe to apply immediately is a ROSTER SHRINK:
+  // prune slices of agents that LEFT the campaign (operator turned them OFF, cleared their groups, or switched them off
+  // campaign-plan → gone from _campaignRoster()). Their pointer can never advance (they never run), so leaving them in
+  // agentLists would wedge _campaignAllFinished/_campaignRemaining forever (loop never wraps, completion never fires).
+  // Pruning leaves every SURVIVING agent's slice untouched (no re-partition → no re-burst); the freed posts redistribute
+  // at the next round. _owed is left intact so standby coverage of a removed agent's partial delivery still runs. A
+  // benched or reserve-HELD agent stays enabled in _campaignRoster() → NOT pruned → CP1's no-premature-reloop holds.
+  _reconcileCampaignPlan(fresh, planAgents, planPostsLen) {
+    if (!this._campaignPlan) {
+      // FIRST plan of the run — build it. No pointers exist yet, so nothing is wiped.
+      this._campaignPlan = fresh;
+      this._pendingPlanBatchId = null;
+      this._saveRotationState();
+      const totalDays = Math.max(0, ...fresh.clusters.map((c) => c.days));
+      const _setsUsed = planAgents.some((a) => a.postSetId);
+      this.log(`🗓️ Campaign Plan: ${planPostsLen} post(s) split across ${planAgents.length} agent(s) in ${fresh.clusters.length} group-set(s) → ~${totalDays} day(s); ${_setsUsed ? 'each batch delivers its assigned post-set' : 'each group-set receives the whole library'}.`);
+      // Empty-set trap: an agent assigned to a post-set with zero matching posts would idle silently every cycle.
+      const _emptySets = fresh.clusters.filter((c) => c.totalPosts === 0);
+      if (_emptySets.length) this.log(`⚠️ ${_emptySets.length} batch(es) have an assigned post-set with NO posts — those accounts will post NOTHING. Tag posts to that set (Posts tab) or clear the batch's set in Quick Setup.`);
+      return;
+    }
+    // Plan exists → FREEZE. Roster shrink: prune departed agents so a stuck pointer can't wedge completion.
+    const liveNames = new Set(planAgents.map((a) => a.name));
+    let prunedAgents = false;
+    for (const n of Object.keys(this._campaignPlan.agentLists || {})) if (!liveNames.has(n)) { delete this._campaignPlan.agentLists[n]; prunedAgents = true; }
+    if (prunedAgents) this._saveRotationState();
+    // Edit notice: any other batchId change is held for the next round; tell the operator once per distinct edit.
+    if (this._campaignPlan.batchId !== fresh.batchId && this._pendingPlanBatchId !== fresh.batchId) {
+      this._pendingPlanBatchId = fresh.batchId;
+      this.log('📝 Campaign edited while running — the change is held for the NEXT round (the current round finishes on the existing plan so already-delivered posts are not re-posted). To apply it now: Stop → edit → Start.');
+    }
   }
 
   // The next index into an agent's campaign list (after its last-delivered post), skipping deleted posts.
@@ -3465,6 +3720,36 @@ class Orchestrator {
     catch { return ''; }
   }
 
+  // Is this agent a unique/sequence agent (fleet-wide dealt-set, NEVER re-delivers a (post,group))? Resolved from the
+  // FULL account list, not this._active — a stand-in can cover an agent disabled between cycles, and its owed ledger
+  // must still reconcile under the same rules. [9]
+  _isUniqueSeqAgent(agentName) {
+    try { const a = ((this._data && this._data.accounts) || []).find((x) => x.name === agentName); const o = (a && a.postingOrder) || ''; return o.includes('unique') || o === 'sequence'; }
+    catch { return false; }
+  }
+
+  // THE owed-ledger delivered-predicate: has (postId → gid) been delivered on `agent`'s behalf? Every owed filter routes
+  // through this so the ledger AGREES with the worker's alreadyDelivered (ADR-0008's load-bearing invariant) — a
+  // mismatch either re-owes a delivered group (→ a reserve stand-in re-posts it = double-post) or drops an un-reached
+  // one (silent skip).
+  // For unique/sequence it must ALSO honor _inflightDelivered, the crash-fold's durable per-(post,group) guard: those
+  // groups were genuinely delivered before a crash, the worker skips them, and a reserve stand-in — which does NOT
+  // consult the guard — would re-post them if they stayed in the ledger. Rotation/campaign legitimately RE-deliver, so
+  // the guard is never consulted for them (it would suppress a real delivery).
+  // SIDE EFFECT (deliberate): a guard hit is promoted into _cycleDelivered. _inflightDelivered is PURGED the moment its
+  // post is no longer owed (_persistDealt), while _cycleDelivered only ever grows within a cycle — so promoting makes
+  // _reconcileOwedFor IDEMPOTENT across that purge. Without it the end-of-pool sweep would recompute a just-cleared
+  // obligation against a purged guard and RESURRECT already-delivered groups into the ledger. [9]
+  _owedDelivered(agent, postId, gid) {
+    try {
+      const k = this._dkScope(agent) + postId + '::' + gid;
+      this._cycleDelivered = this._cycleDelivered || new Set(); // _loop seeds this per cycle; never let an unset ledger throw into the catch below — "not delivered" is the DOUBLE-POST direction
+      if (this._cycleDelivered.has(k)) return true;
+      if (this._isUniqueSeqAgent(agent) && this._inflightDelivered && this._inflightDelivered.has(postId + '::' + gid)) { this._cycleDelivered.add(k); return true; }
+      return false;
+    } catch { return false; }
+  }
+
   // Reconcile ONE agent's persistent owed entry from its obligation this cycle (expectedGids) minus what has ACTUALLY
   // been delivered so far this cycle (_cycleDelivered). In-memory only — the caller persists. Returns true if it
   // changed. CRASH-SAFETY: called INLINE right before each per-account rotation save (the one that advances the
@@ -3477,8 +3762,7 @@ class Orchestrator {
     this._owed = this._owed || {};
     const ob = (this._cycleObligation || {})[agent];
     if (!ob || !ob.postId) return false;
-    const _sc = this._dkScope(agent);
-    const still = (ob.expectedGids || []).filter((gid) => !this._cycleDelivered.has(_sc + ob.postId + '::' + gid));
+    const still = (ob.expectedGids || []).filter((gid) => !this._owedDelivered(agent, ob.postId, gid)); // _owedDelivered (not a raw _cycleDelivered probe): for unique/sequence it also subtracts the crash-fold's durable delivered-guard, so a crash-proven delivery is never re-owed → never re-posted by a reserve stand-in [9]
     const prev = this._owed[agent];
     if (still.length) {
       if (!prev || prev.postId !== ob.postId || (prev.gids || []).join(',') !== still.join(',')) { this._owed[agent] = { postId: ob.postId, gids: still }; return true; }
@@ -3501,4 +3785,36 @@ class Orchestrator {
   }
 }
 
-module.exports = { Orchestrator };
+// #1 (stall breaker): after the loop throws, decide whether to AUTO-RESTART it IN-PROCESS or give up (breaker). Re-entering
+// _loop reloads durable state from disk + re-folds the crash journal, so a restart loses NO progress — it is what a relaunch
+// does, minus the human. A crash after a long HEALTHY run (ranMs ≥ healthyMs) is a transient fault → reset the streak so
+// isolated faults days apart never accumulate; only RAPID consecutive crashes count toward maxRestarts, which stops a
+// DETERMINISTIC crash-loop from hammering the shared IP. Pure → unit-tested. Returns { restart, restarts, backoffMs }.
+function crashRestartDecision(restarts, ranMs, opts = {}) {
+  const { maxRestarts = 3, healthyMs = 600000, baseBackoffMs = 30000, maxBackoffMs = 300000 } = opts;
+  let r = (Number(ranMs) || 0) >= healthyMs ? 0 : (Number(restarts) || 0);
+  if (r >= maxRestarts) return { restart: false, restarts: r, backoffMs: 0 };
+  r += 1;
+  return { restart: true, restarts: r, backoffMs: Math.min(maxBackoffMs, baseBackoffMs * r) };
+}
+
+// [9/UNIQUE-COVER FIX] Should a reserve stand-in's cover record a _cycleObligation for the agent it COVERED? The
+// obligation is what lets _reconcileOwedFor clear (full cover) or carry (partial) this._owed[forAgent]. Without it the
+// ledger NEVER moves, and the mode-agnostic persistent-owed synthesis re-dispatches the IDENTICAL gids every cycle → a
+// reserve re-posts the SAME (post,group) forever on the shared IP (a stand-in's _uniqueSeqGuard is false, so only the
+// per-cycle _cycleDelivered guarded it). Admit:
+//   • daily-rotation / campaign-plan — always (the pointer modes; expectedGids falls back to the full assigned set).
+//   • unique / sequence — ONLY with a prior-owed baseline (hasBaseline). expectedGids MUST be the owed SUBSET: the
+//     full-assigned-set fallback would re-owe the original partial's already-delivered groups (→ re-post), and for an
+//     absent/disabled forAgent that fallback is EMPTY → expectedGids=[] → still=[] → delete _owed = a silent STRAND.
+//     No baseline → record nothing → the pre-[9] behavior (a strand: recoverable) instead of a double-post (a ban).
+// Pure → unit-tested. Every live unique cover comes from _owedStandins seeded off _cycleOwed/_owed, so a baseline is
+// always present on the real path; the conjunct is a free fail-safe, not a functional restriction.
+function standinObligationAdmits(faOrd, hasBaseline) {
+  const o = String(faOrd || '');
+  if (o === 'daily-rotation' || o === 'campaign-plan') return true;
+  if ((o.includes('unique') || o === 'sequence') && hasBaseline) return true;
+  return false;
+}
+
+module.exports = { Orchestrator, crashRestartDecision, standinObligationAdmits };

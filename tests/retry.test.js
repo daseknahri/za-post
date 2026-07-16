@@ -59,3 +59,25 @@ test('retryAsync: exposes the upload-or-skip decision the worker relies on', asy
   const wouldPublishImageless = up.ok === false ? false : true; // worker publishes ONLY when up.ok
   assert.equal(wouldPublishImageless, false, 'worker must not reach publish when the upload failed');
 });
+
+// #17: shouldRetry lets a caller STOP retrying a permanent error (e.g. HTTP 4xx) instead of burning the full
+// retry+backoff budget. downloadImage uses this so a dead image URL (404/410/403) doesn't cost 3 attempts + 4.5s
+// every cycle for a whole multi-day run. Transient failures (timeout, 408, 429, 5xx, network) still retry.
+test('#17: retryAsync stops immediately when shouldRetry returns false (permanent error)', async () => {
+  let calls = 0;
+  const notFound = () => { calls++; const e = new Error('Request failed 404'); e.response = { status: 404 }; return Promise.reject(e); };
+  const stop4xx = (e) => { const s = e && e.response && e.response.status; if (!Number.isFinite(s)) return true; if (s === 408 || s === 429) return true; return !(s >= 400 && s < 500); };
+  const r = await retryAsync(notFound, { attempts: 3, baseDelayMs: 1, shouldRetry: stop4xx });
+  assert.equal(r.ok, false);
+  assert.equal(calls, 1, 'a permanent 404 is attempted ONCE, not 3× (no wasted backoff)');
+});
+
+test('#17: retryAsync still retries a TRANSIENT error (5xx / 429 / no status) under the same predicate', async () => {
+  const stop4xx = (e) => { const s = e && e.response && e.response.status; if (!Number.isFinite(s)) return true; if (s === 408 || s === 429) return true; return !(s >= 400 && s < 500); };
+  let c1 = 0; await retryAsync(() => { c1++; const e = new Error('502'); e.response = { status: 502 }; return Promise.reject(e); }, { attempts: 3, baseDelayMs: 1, shouldRetry: stop4xx });
+  assert.equal(c1, 3, '5xx is transient → all attempts used');
+  let c2 = 0; await retryAsync(() => { c2++; const e = new Error('429'); e.response = { status: 429 }; return Promise.reject(e); }, { attempts: 3, baseDelayMs: 1, shouldRetry: stop4xx });
+  assert.equal(c2, 3, '429 rate-limit is transient → all attempts used');
+  let c3 = 0; await retryAsync(() => { c3++; return Promise.reject(new Error('ECONNRESET')); }, { attempts: 3, baseDelayMs: 1, shouldRetry: stop4xx });
+  assert.equal(c3, 3, 'a network error (no status) → all attempts used');
+});
