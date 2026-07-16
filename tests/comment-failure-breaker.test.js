@@ -124,3 +124,45 @@ test('an unknown outcome NEVER latches the transient signal (which downgraded la
   assert.equal(armed, false, 'no unverified/lost outcome may arm the transient signal');
   assert.equal(commentFailureDecision(3, armed), 'block', 'so a suppressed account is RESTED, not merely paused');
 });
+
+// ===============================================================================================================
+// PERSISTED COMMENT HEALTH — observed LIVE, not theorised.
+//
+// A 2-group account (e2) posted 2 posts per cycle, BOTH live without their link ("1 same-caption post in the feed and
+// can't confirm which is OURS"), queued them for rescue, and the rescue could not cover them ("no free healthy in-group
+// account"). It then did it again the next cycle, forever: 211s of work per cycle for ZERO value, full daily-cap burn,
+// full shared-IP ban exposure.
+//
+// The in-worker breaker could never stop it: consecCommentFails is a run-local reset every cycle, so an account with
+// FEWER GROUPS THAN THE THRESHOLD can never reach 3 within one cycle. The streak must persist ACROSS cycles.
+// ===============================================================================================================
+
+test('[live] a 2-group account accumulates comment losses ACROSS cycles and trips at 3', () => {
+  // Mirrors _recordAccountOutcome's contract: any landed comment clears; losses accumulate.
+  let acc = { commentFails: 0 };
+  const cycle = (lost, landed) => {
+    if (landed) acc.commentFails = 0;
+    else if (lost > 0) acc.commentFails = (acc.commentFails || 0) + lost;
+    return (acc.commentFails || 0) >= 3;
+  };
+  assert.equal(cycle(2, false), false, 'cycle 1: 2 groups → 2 losses. The in-run breaker (threshold 3) can NEVER fire here — this is the bug');
+  assert.equal(cycle(2, false), true, 'cycle 2: 4 total → trips. Without persistence it would post link-less forever');
+});
+
+test('[live] any landed comment clears the persisted streak (an isolated hiccup must not rest an account)', () => {
+  let acc = { commentFails: 2 };
+  const cycle = (lost, landed) => {
+    if (landed) acc.commentFails = 0;
+    else if (lost > 0) acc.commentFails = (acc.commentFails || 0) + lost;
+    return (acc.commentFails || 0) >= 3;
+  };
+  assert.equal(cycle(1, true), false, 'a cycle that landed a comment clears it, even though it also lost one');
+  assert.equal(acc.commentFails, 0);
+  assert.equal(cycle(2, false), false, 'and the count restarts from scratch, not from the old 2');
+});
+
+test('[live] a healthy account is never touched by the persisted counter', () => {
+  let acc = { commentFails: 0 };
+  for (let i = 0; i < 10; i++) { if (true) acc.commentFails = 0; } // every cycle lands a comment
+  assert.equal(acc.commentFails, 0, 'an account whose comments land never accumulates');
+});

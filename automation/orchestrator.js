@@ -863,6 +863,7 @@ class Orchestrator {
     // the same wall, which is ban-escalation. targetCount likewise fed the "how early did FB block this?" tier as
     // undefined → `_tgt = 1`, making the 1.5× (blocked within the first quarter of its groups) tier unreachable.
     let accountRlKind = null, accountTargetCount = 0;
+    let acctCommentLost = 0, acctCommentLanded = false; // comment health, summed across this cycle's posts → persisted by _recordAccountOutcome
     let accountCrashes = 0; // M3-09: consecutive posts that crashed out for this account
     const postedIds = []; // posts confirmed PUBLISHED — safe to auto-delete
     const dealtIds = [];  // posts dealt this cycle (published OR pending) — don't re-deal
@@ -1075,6 +1076,8 @@ class Orchestrator {
           // targetCount is carried from EVERY run (not only a flagged one): it is the "how early was this blocked?"
           // denominator, and the run that reports the flag may not be the one that saw the groups.
           if (r && Number.isFinite(Number(r.targetCount))) accountTargetCount = Math.max(accountTargetCount, Number(r.targetCount) || 0);
+          if (r && Number(r.commentLost)) acctCommentLost += Number(r.commentLost) || 0;
+          if (r && r.commentLanded) acctCommentLanded = true;
           if (r && r.flag) {
             accountFlag = r.flag;
             accountRlKind = r.rlKind || accountRlKind; // keep it paired with the flag above — losing it downgrades an account-level block to the mild posting ladder
@@ -1128,7 +1131,7 @@ class Orchestrator {
     // Surface the outcome so the operator sees pending/error counts in the log pane.
     this.log(`[${account.name}] ✅ Done in ${Math.round((Date.now() - accountStart) / 1000)}s`);
     this.log(`📊 [${account.name}] posted=${posted} pending=${pendingApproval} errors=${errors}`);
-    return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag, offline: accountOffline, runSeq: _runSeq, rlKind: accountRlKind, targetCount: accountTargetCount }; // runSeq: THIS run's journal sequence — the pool commits it as the watermark (a shared field let a split-cover sibling's seq supersede in-flight lines)
+    return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag, offline: accountOffline, runSeq: _runSeq, rlKind: accountRlKind, targetCount: accountTargetCount, commentLost: acctCommentLost, commentLanded: acctCommentLanded }; // runSeq: THIS run's journal sequence — the pool commits it as the watermark (a shared field let a split-cover sibling's seq supersede in-flight lines)
     } finally {
       // Release claims for posts this account did NOT publish (blocked/failed), so a healthy account can pick them up
       // this same run. In a finally so it runs even if the body throws. #5: gate on _madeClaims — release ONLY claims
@@ -1427,6 +1430,25 @@ class Orchestrator {
         // keeps counting, so the cap can't be cleared by rewinding the clock.
         if (store.dailyRolledOver(acc.daily, today)) acc.daily = { date: today, count: 0 };
         acc.daily.count = (Number(acc.daily.count) || 0) + (res.posted || 0) + (res.pendingApproval || 0); // held posts DID reach FB (gated for review) — count them so tomorrow's cap reflects real volume
+        // ── PERSISTED COMMENT HEALTH ────────────────────────────────────────────────────────────────────────────
+        // The in-worker breaker counts CONSECUTIVE comment losses within ONE runAccount call, so it resets every
+        // cycle — an account with fewer than 3 groups can NEVER reach the threshold on its own and re-posts link-less
+        // forever. Observed live: a 2-group account produced 2 uncommented posts per cycle, indefinitely, with the
+        // rescue queue unable to cover them ("no free healthy in-group account"). The link IS the payload, so those
+        // cycles were 100% waste: full daily-cap burn + full shared-IP ban exposure for zero value.
+        // Accumulate ACROSS cycles here; ANY landed comment clears it (so an isolated hiccup never rests an account).
+        if (res.commentLanded) acc.commentFails = 0;
+        else if (Number(res.commentLost) > 0) acc.commentFails = (Number(acc.commentFails) || 0) + Number(res.commentLost);
+        // Comment-dead ⇒ stop posting. Reuses the LOCKED comment ladder (rlKind 'comment'), which every eligibility gate
+        // already honors via rateLimitedUntil, so no new gate is needed. Only fires when the account is NOT already
+        // flagged/resting (a real wall this cycle takes precedence and sets its own rest below).
+        if ((Number(acc.commentFails) || 0) >= 3 && !res.flag && (Number(acc.rateLimitedUntil) || 0) <= Date.now()) {
+          acc.rlStrikes = (acc.rlStrikes || 0) + 1;
+          const _cHours = Math.min(48, Math.max(0.5, baseHours) * Math.pow(2, acc.rlStrikes - 1));
+          acc.rateLimitedUntil = Date.now() + Math.round(_cHours * 3600000);
+          acc.commentFails = 0; // the rest IS the response — start the next window fresh so it gets a real chance
+          note = `🛑 ${name}: ${res.commentLost ? 'its comments are not landing' : 'comment failures'} — ${Math.round(_cHours * 10) / 10}h rest (strike ${acc.rlStrikes}). Every post it makes goes live WITHOUT its link (no value, full ban exposure), so it stops posting until it can comment again; its live posts go to comment rescue.`;
+        }
         if (res.flag === 'rate_limited') {
           // rlStrikes is the EXPONENT of the rest ladder (2^(strikes-1), capped 48h). It used to only ever GROW while
           // walls kept happening: the "recovered → clear" branch below is an `else if (!res.flag)`, which is UNREACHABLE
@@ -2406,7 +2428,7 @@ class Orchestrator {
         // survivor forever (q > 0), so the R5 clean-commit was never recorded and a fold would re-apply deliveries that
         // were already committed. The supervisor's catch path (above) legitimately has no runSeq; the Math.max guards at
         // the commit sites turn that into a no-op rather than a regression.
-        const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null, offline: (r && r.offline) || false, durationMs: dur, runSeq: (r && r.runSeq), rlKind: (r && r.rlKind) || null, targetCount: (r && r.targetCount) || 0 };
+        const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null, offline: (r && r.offline) || false, durationMs: dur, runSeq: (r && r.runSeq), rlKind: (r && r.rlKind) || null, targetCount: (r && r.targetCount) || 0, commentLost: (r && r.commentLost) || 0, commentLanded: !!(r && r.commentLanded) };
         // Persist this account's daily count + rate-limit cool-down.
         await this._recordAccountOutcome(account.name, res, settings);
         // E-N4: track per-account rate-limit retries for stagger decay (reset on a clean post).

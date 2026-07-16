@@ -4346,7 +4346,11 @@ async function runAccount(o) {
   }
   // fullyPosted = the post landed in EVERY targeted group, none pending, no errors — only then is it
   // safe to auto-delete from the library (a partial publish must be kept). See orchestrator deal gate.
-  return { posted, errors, pendingApproval, noRetry, flag, rlKind, offline, targetCount: targetGroups.length, heldRecords, commentQueue, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length && !droppedImage };
+  // commentLost / commentLanded: the comment-health signal the ORCHESTRATOR accumulates ACROSS cycles
+  // (acc.commentFails). consecCommentFails is a run-local, so an account with fewer than 3 groups can never reach the
+  // in-run threshold on its own — it just re-posts link-less every cycle forever. Persisting it is what makes the
+  // breaker reachable for a 2-group account.
+  return { posted, errors, pendingApproval, noRetry, flag, rlKind, offline, commentLost: consecCommentFails, commentLanded: anyCommentLanded, targetCount: targetGroups.length, heldRecords, commentQueue, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length && !droppedImage };
 }
 
 // Cookie normalizer — consolidated into lib/store (SINGLE source, shared with main.js). Re-exported below so
