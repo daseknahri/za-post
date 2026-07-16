@@ -952,6 +952,29 @@ function mixedPushbackDecision(consecPushback, deliveredToday, threshold = 3) {
   return deliveredToday ? 'transient' : 'block';
 }
 
+// The COMMENT-side twin of mixedPushbackDecision — the guard the comment path never had.
+//
+// WHY THIS EXISTS (operator-reported): an account kept POSTING while its comments never landed. Only an explicitly
+// DETECTED wall (blocked_comment / blocked_account, i.e. FB's red text) ever rested an account. Every other comment
+// failure — 'failed' (no comment box), 'error', 'timeout', 'notfound' (submitted but never visible = silently dropped /
+// shadow-suppressed) — just returned, and the account moved on to its next group and posted again. So a comment-
+// suppressed account burned its whole daily cap producing posts with NO link-comment.
+//
+// That is the worst possible outcome for this product: the link IS the payload, so a link-less post has zero value while
+// still consuming the daily cap, adding shared-IP ban exposure, and queueing orphan-comment rescue work. Posting more is
+// strictly negative EV. This mirrors the existing operator policy already stated for a detected comment limit ("a COMMENT
+// limit STOPS the whole account"), and extends it to the far more common SILENT case.
+//
+// consecCommentFails counts CONSECUTIVE comment attempts that did not land (any cause), and RESETS the moment one lands
+// — so an isolated hiccup never trips it; only a sustained inability to comment does. Same threshold + transient/block
+// split as the posting twin: if the account HAS landed a comment today, 3-in-a-row is more likely an FB hiccup than a
+// wall → stop it for this cycle only (no rest). If it has landed NOTHING today, FB is suppressing it → rest it on the
+// LOCKED comment ladder (rlKind 'comment'). Pure → unit-tested.
+function commentFailureDecision(consecCommentFails, commentedToday, threshold = 3) {
+  if ((Number(consecCommentFails) || 0) < threshold) return null;
+  return commentedToday ? 'transient' : 'block';
+}
+
 // #3 (time-waste): how many composer-open attempts to make. FULL (4) on a fresh/healthy account — a slow / hidden /
 // proxied feed legitimately needs the retries. But once FB is already pushing this account back (pushback>0), the feed
 // usually won't render at all, so 4 attempts just idle ~30s before the skip — cut to 2 so the account reaches its
@@ -2429,6 +2452,11 @@ async function runAccount(o) {
     try { const proc = browser && browser.process && browser.process(); if (proc) proc.kill(); } catch {}
   };
   let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false, rlKind = null, consecPubTimeouts = 0, consecNoPostBtn = 0, consecNoComposer = 0, consecPushback = 0;
+  // Comment-side breaker state (see commentFailureDecision). consecCommentFails counts CONSECUTIVE non-landing comment
+  // attempts and resets the moment one lands; anyCommentLanded is the run-local analogue of deliveredToday() — there is
+  // no persisted per-day comment counter, and "landed one earlier in THIS run, now failing" is exactly the transient
+  // signal we want (something changed mid-run) vs "has never landed one" (FB is suppressing this account).
+  let consecCommentFails = 0, anyCommentLanded = false;
   // #7 (d4 false-bench guard — shared probe): an account that has ALREADY delivered today (persisted daily count, updated
   // after each prior cycle) is provably NOT blocked. Consulted at the THREE likely_blocked flag-sites to SUPPRESS a false
   // "blocked" escalation caused by transient single-IP composer/feed/post-button misses. FAILS SAFE toward FB: returns
@@ -2994,6 +3022,15 @@ async function runAccount(o) {
         const _mpb = mixedPushbackDecision(consecPushback, deliveredToday());
         if (_mpb === 'transient') { step('⚠️ 3 posting failures in a row (mixed timeout / composer / post-button), but this account already delivered today — treating as transient (slow IP / FB hiccup), NOT blocked. Stopping it this cycle; it retries next.'); noRetry = true; break; }
         if (_mpb === 'block') { step('🛑 3 posting failures in a row (mixed timeout / composer / post-button) — Facebook is pushing this account back; stopping it so a reserve / the next cycle covers its remaining groups.'); noRetry = true; flag = 'rate_limited'; rlKind = 'post'; break; }
+        // COMMENT-side twin. Checked at the same loop top and for the same reason: it only fires when there ARE
+        // remaining groups to protect. Its posts are LANDING fine — that is precisely the problem, because each one goes
+        // live WITHOUT its link-comment: zero value, full daily-cap burn, full shared-IP ban exposure, plus orphan-
+        // comment rescue load. Continuing to post is strictly negative EV, so stop the account rather than let it
+        // manufacture link-less posts. (A DETECTED wall already stops it below; this catches the SILENT modes —
+        // dropped / never-visible / no comment box — which previously stopped nothing at all.)
+        const _cfd = commentFailureDecision(consecCommentFails, anyCommentLanded);
+        if (_cfd === 'transient') { step('⚠️ 3 comment failures in a row, but this account DID land a comment earlier this run — treating as transient (FB hiccup), NOT blocked. Stopping it this cycle so it stops posting link-less; its live posts go to comment rescue and it retries next cycle.'); noRetry = true; break; }
+        if (_cfd === 'block') { step('🛑 3 comment failures in a row and NOT ONE comment has landed this run — Facebook is suppressing this account\'s comments. Stopping it: every further post would go live WITHOUT its link (no value, full ban exposure). Resting it on the comment ladder; its live posts go to comment rescue.'); noRetry = true; flag = 'rate_limited'; rlKind = 'comment'; break; }
       }
       // Per-group content variation: expand {a|b|c} spintax so THIS group gets a different caption
       // and comment than the others, and give any link in the comment a unique tracking param. This
@@ -3970,6 +4007,14 @@ async function runAccount(o) {
           // 'blocked_*_landed' = the comment DID land but FB then walled the account — treat as LANDED (never
           // re-queue = never double-comment) while still cooling/stopping the account below.
           const _commentLanded = (cres === 'posted' || cres === 'unconfirmed' || cres === 'not_visible' || cres === 'none' || cres === 'blocked_account_landed' || cres === 'blocked_comment_landed');
+          // Feed the comment-side breaker (see commentFailureDecision). 'none' means no comment was wanted — never an
+          // attempt, so it neither counts nor resets. Everything else IS an attempt: landing resets the streak (and arms
+          // the transient signal), not landing extends it. The blocked_* outcomes already stop the account below, so
+          // this only ever fires for the SILENT failure modes that previously let it keep posting link-less.
+          if (cres !== 'none') {
+            if (_commentLanded) { consecCommentFails = 0; anyCommentLanded = true; }
+            else consecCommentFails++;
+          }
           if (cres === 'failed') step(`Comment: could not place the comment after ${cAttemptsActual} attempt(s) — left uncommented`);
           else if (cres === 'skipped') step('Comment: skipped (could not safely identify our post)');
           else if (cres === 'blocked_account' || cres === 'blocked_account_landed') {
@@ -4253,7 +4298,7 @@ const normalizeCookie = store.normalizeCookie;
 module.exports = {
   runAccount, parseProxy, normalizeCookie, addFirstComment, killChromiumForProfile, sweepOrphanTemps,
   // exported for diagnostics — use the EXACT worker logic
-  clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish, publishWaitCeilingMs, mixedPushbackDecision, composerOpenAttempts, watchdogTickDecision, credentialLogin, moveMouseTo, behaviorFor,
+  clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish, publishWaitCeilingMs, mixedPushbackDecision, commentFailureDecision, composerOpenAttempts, watchdogTickDecision, credentialLogin, moveMouseTo, behaviorFor,
   // exported for tests (no runtime effect)
   jitter, rand, rangeMs, withFloor, ANTI_SPAM_MIN_GROUP_MS, ANTI_SPAM_MIN_COMMENT_MS, antiSpamFloors, postLinkFloorOwed, humanDelay, isFastMode, applyPace, varyLinks, retryAsync, downloadImage, isSafeImageUrl, proxyFormatHint, classifyProxyError, proxyErrorHint, classifyGroupError,
   FB, isRateLimitText, isCheckpointText, isPendingText, isPostButtonLabel, isCommentBoxLabel,
