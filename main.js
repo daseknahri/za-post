@@ -893,7 +893,10 @@ ipcMain.handle('add-post', async (_e, post) => {
     if (post.commentImage) commentImagePath = store.saveBase64Image(post.commentImage, 'comment');
     await store.update((data) => {
       data.posts.push({
-        id: 'post-' + Date.now(),
+        // Minted INSIDE the mutator (serialized by _writeChain) with the same nanosecond+monotonic+random shape as the
+        // bulk paths: a duplicate post.id silently rewinds the campaign slice pointer into a re-post loop. This path
+        // already called Date.now() inside the mutator, but a single tick can still serve two adds — make it exact.
+        id: `post-${Date.now()}-${process.hrtime.bigint()}-${Math.floor(Math.random() * 1e9)}`,
         caption: post.caption || '',
         comment: post.comment || '',
         imagePaths,
@@ -901,7 +904,7 @@ ipcMain.handle('add-post', async (_e, post) => {
         commentImagePath,
         commentImageUrl: post.commentImageUrl || '',
       });
-    });
+    }, { throwIfUnsaved: true }); // the ONE post-creating path the operator uses BY HAND — a silently-skipped save must not report ok(): the renderer clears the compose form on success, so the operator loses the post they just typed (images already written to disk) and believes it saved.
     send('data-updated');
     return ok();
   } catch (e) { return fail(e); }

@@ -2351,7 +2351,12 @@ class Orchestrator {
           .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [], offline: false }; });
         const dur = Date.now() - t0; lastEnd = Date.now(); cpuMs += dur; ranCount++;
         this.log(`✓ [${account.name}] Completed in ${Math.round(dur / 1000)}s`);
-        const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null, offline: (r && r.offline) || false, durationMs: dur };
+        // runSeq MUST be carried: this rebuild is field-by-field, so omitting it made res.runSeq ALWAYS undefined at the
+        // two commit sites below → icommit:undefined → watermark() coerces it with `|| 0` → EVERY journal line stays a
+        // survivor forever (q > 0), so the R5 clean-commit was never recorded and a fold would re-apply deliveries that
+        // were already committed. The supervisor's catch path (above) legitimately has no runSeq; the Math.max guards at
+        // the commit sites turn that into a no-op rather than a regression.
+        const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null, offline: (r && r.offline) || false, durationMs: dur, runSeq: (r && r.runSeq) };
         // Persist this account's daily count + rate-limit cool-down.
         await this._recordAccountOutcome(account.name, res, settings);
         // E-N4: track per-account rate-limit retries for stagger decay (reset on a clean post).
@@ -2406,7 +2411,17 @@ class Orchestrator {
             // consumers dispatch a reserve for it, so an undischargeable entry is immortal and re-posts every cycle.
             // [9] briefly recorded this for unique/sequence too (with a matching override); that combination produced
             // five recurring double-posts and was reverted — see the note at the unique/sequence pick (~line 756).
-            if (owedDischargeableMode(_po)) this._cycleObligation[account.name] = { postId: _pid, expectedGids: _expected };
+            // SELF-path analogue of the stand-in mirror (~2487, standinObligationAdmits(_faOrd, !!_prevFa)) — the two
+            // mirrors of this same decision must agree. owedScopableMode admits unique/sequence for _owedSelf, so a
+            // mode-flipped agent DOES re-pick its pointer-accrued owed post and deliver exactly the owed gids under the
+            // ledger's own scoping — but gating the PRODUCER on owedDischargeableMode recorded no obligation for it, so
+            // _reconcileOwedFor early-returned on !ob and the entry SURVIVED A COMPLETE DELIVERY. Flip the agent back to
+            // daily-rotation and its pick-override re-picks the post (rotation never consults the dealt-set) → the same
+            // (post,group) is RE-POSTED. Cannot re-open ADR-0021: with a baseline, _expected IS _prevOwed (the owed
+            // SUBSET, never the full assigned set), so reconcile can only SHRINK or CLEAR the entry — never create one.
+            // A baseline-less unique/sequence partial still records nothing (hasBaseline=false) → today's accepted
+            // strand. Do NOT widen owedDischargeableMode itself: the DISPATCHING consumers must stay restricted.
+            if (standinObligationAdmits(_po, !!_prevOwed)) this._cycleObligation[account.name] = { postId: _pid, expectedGids: _expected };
           }
         }
         if ((account.postingOrder || '') === 'daily-rotation' || (account.postingOrder || '') === 'campaign-plan' || isStandin) {
@@ -2421,7 +2436,13 @@ class Orchestrator {
               // forAgent pointer for ONE logical daily post; re-bumping would trip _dailyQuotaBlocks early and make the
               // covered agent silently under-deliver its cyclesPerDay. Always refresh the pointer/lastPostedAt.
               const _counted = (this._postCountedThisCycle || (this._postCountedThisCycle = new Set())).has(ptrName);
-              this._perAccountRotation[ptrName] = { lastPostId: res.dealtIds[0], lastPostedDate: _dk, lastPostedAt: Date.now(), postsToday: _counted ? _pt : _pt + 1, postsTodayDate: _dk, icommit: res.runSeq }; // lastPostedAt + postsToday feed _dailyQuotaBlocks (daily pacing / midnight-straddle guard); icommit = R5 clean-commit watermark, persisted ATOMICALLY with the pointer in the saveRotation below so this run's journal lines are superseded (fold no-op) — this._runSeq is monotonically ≥ every q this agent appended this run
+              // icommit is MONOTONIC — never a plain replace. Split-cover runs N stand-ins against the SAME forAgent, so
+              // they share this one watermark field; whoever returns LAST would otherwise write ITS seq. A low-seq
+              // sibling finishing after a high-seq one would REGRESS the watermark, resurrecting the high-seq sibling's
+              // already-committed journal lines as survivors (q > watermark goes true again) → the next fold re-applies
+              // its deliveries → re-post. Math.max also makes a missing runSeq (the supervisor catch path) a no-op
+              // instead of zeroing a good watermark.
+              this._perAccountRotation[ptrName] = { lastPostId: res.dealtIds[0], lastPostedDate: _dk, lastPostedAt: Date.now(), postsToday: _counted ? _pt : _pt + 1, postsTodayDate: _dk, icommit: Math.max(((this._perAccountRotation[ptrName] || {}).icommit) || 0, Number(res.runSeq) || 0) }; // lastPostedAt + postsToday feed _dailyQuotaBlocks (daily pacing / midnight-straddle guard); icommit = R5 clean-commit watermark, persisted ATOMICALLY with the pointer in the saveRotation below so this run's journal lines are superseded (fold no-op) — this._runSeq is monotonically ≥ every q this agent appended this run
               this._postCountedThisCycle.add(ptrName); }
             if (stand) {
               // Only suppress the "deferred" warning if the stand-in covered ALL of forAgent's slice groups. A PARTIAL
@@ -2510,7 +2531,7 @@ class Orchestrator {
         // lines are superseded ATOMICALLY in the SAME _persistDealt saveRotation (the next-run fold drops them, no
         // re-post). this._runSeq is monotonically ≥ every q this account appended this run. Rotation/campaign/stand-in
         // use perAccountRotation[ptrName].icommit (above); this is the unique/sequence dealt-set analogue.
-        if ((account.postingOrder || '') !== 'daily-rotation' && (account.postingOrder || '') !== 'campaign-plan' && !isStandin && res.dealtIds.length) { this._inflightSeq = this._inflightSeq || {}; this._inflightSeq[account.name] = res.runSeq; }
+        if ((account.postingOrder || '') !== 'daily-rotation' && (account.postingOrder || '') !== 'campaign-plan' && !isStandin && res.dealtIds.length) { this._inflightSeq = this._inflightSeq || {}; this._inflightSeq[account.name] = Math.max(this._inflightSeq[account.name] || 0, Number(res.runSeq) || 0); } // MONOTONIC (see the icommit sibling): never let a late low-seq return regress the watermark and resurrect committed lines as survivors; a missing runSeq is a no-op, not a zeroing.
         // CRASH-SAFE OWED (unique/sequence analogue of the rotation lock-step reconcile ~line 2415): reconcile THIS
         // account's owed entry INLINE so the _persistDealt below writes the ledger ATOMICALLY with the dealt-set that
         // supersedes the post. For unique/sequence the dealt-set IS the pointer, so ADR-0008's rule applies verbatim: a
@@ -2617,8 +2638,18 @@ class Orchestrator {
         for (const [name, ow] of Object.entries(this._owed || {})) {
           if ((this._cycleOwed || {})[name] || !ow || !ow.postId || !((ow.gids) || []).length) continue; // a same-cycle partial already recorded it authoritatively
           if (!((this._data && this._data.posts) || []).some((p) => p.id === ow.postId)) continue; // owed post gone from the library → the agent's own owed pick will drop it
-          // Undischargeable entries never reach here (_hasPersistentOwed gates this block on _owedDischargeable), so the
-          // drop-and-log lives in _pruneUndischargeableOwed(), swept unconditionally at the cycle top instead.
+          // PER-ENTRY DISPATCH GATE — load-bearing, do NOT hoist it to the block condition. This loop is a DISPATCH: it
+          // writes _cycleOwed, which _owedStandins turns into a NEW reserve delivery. So it must refuse an entry whose
+          // owner cannot DISCHARGE it (no pick-override → no obligation → _reconcileOwedFor early-returns → the entry
+          // survives even a COMPLETE cover → this loop re-dispatches the identical gids EVERY cycle; a stand-in has
+          // _uniqueSeqGuard=false, so only the per-cycle _cycleDelivered ever guarded it) = a recurring double-post.
+          // The block's own entry condition does NOT do this: it is a DISJUNCTION (any unrelated _cycleDrops opens it
+          // with _hasPersistentOwed false), and _hasPersistentOwed is an existential .some() that never filters this
+          // loop. CONTINUE, never delete: the entry must survive for _owedSelf/owedScopableMode to scope a mode-flipped
+          // agent's own re-pick — deleting it re-opens the v1.0.112 double-post. _pruneUndischargeableOwed reaps it once
+          // the owner is truly dead (broadcast/absent). Skipping here converts the double-post into the accepted
+          // unique/sequence strand (ADR-0022 trade).
+          if (!this._owedDischargeable(name)) continue;
           const acc = ((this._data && this._data.accounts) || []).find((a) => a.name === name);
           const asg = acc ? this._groupIdsOf(acc) : new Set();
           const live = ow.gids.filter((g) => asg.has(g)); // prune groups the operator has since un-assigned
@@ -3092,8 +3123,17 @@ class Orchestrator {
       // slices). If Loop Campaign is ON, start a fresh round (rotate who-posts-what; pace from the next day).
       // If OFF, the completion engine just below drains any last comments/held, then reports + stops.
       if (this._campaignPlan && settings.loopCampaign && this._campaignAllFinished()) {
-        this._roundOffset = (this._roundOffset || 0) + 1;
         const planAgents = this._campaignRoster(); // CP1: reloop over the STABLE roster too, so the new round's batchId matches the in-cycle plan build (line ~1694) and the reserve rotation can't desync them
+        // EMPTY-ROSTER GUARD — the same one the build block has, and for the same reason. _campaignAllFinished() is
+        // vacuously TRUE when agentLists is empty, so a roster that momentarily empties (an operator flipping a poster
+        // off campaign-plan, clearing its groups, or standby/disable) would reach here and recompute the plan from ZERO
+        // agents: _computeCampaignPlan returns empty agentLists, which OVERWRITES the frozen plan and PERMANENTLY
+        // destroys every parked+live slice (nothing can rebuild them — the freeze means `fresh` is only ever compared,
+        // never installed). It would also burn a _roundOffset increment per cycle, silently reshuffling who-posts-what.
+        // An empty roster means "no campaign work right now", never "the round is over".
+        if (!planAgents.length) { this.log('ℹ️ Campaign round-boundary skipped: no campaign-plan agents are eligible right now (all disabled / standby / re-moded / groups cleared) — the existing plan is kept until they return.'); }
+        else {
+        this._roundOffset = (this._roundOffset || 0) + 1;
         { const _dk = this._localDayKey(); const _N = Math.max(1, Math.min(20, parseInt(settings.cyclesPerDay, 10) || 1));
           // MERGE, never REPLACE. A wholesale replace dropped two fields the round reset has no business clearing:
           //   • lastPostedAt — the ONLY bench _dailyQuotaBlocks' ~20h anti-straddle floor measures elapsed-since-post
@@ -3113,6 +3153,7 @@ class Orchestrator {
         this._pendingPlanBatchId = null; // #2: the new round IS the recompute — any edit held during the last round is now applied, so clear the pending marker
         this._saveRotationState();
         this.log('🔁 Campaign Plan: every group-set received the full library — new round started (reshuffled who posts what); resumes next day.');
+        }
       }
 
       // ── COMPLETION ENGINE ────────────────────────────────────────────────────────────────────────
@@ -3598,6 +3639,18 @@ class Orchestrator {
     // longer be that agent's partition; the next round's recompute assigns it properly instead.
     for (const n of Object.keys(_plan.parkedLists || {})) {
       if (!liveNames.has(n) || _plan.agentLists[n]) continue;
+      // THE GUARD (previously only described, never implemented — a double-post): restore ONLY when the roster+library
+      // still hash to the plan's own batchId. The frozen plan partitions by CLUSTER sig
+      // (assignedGroups.sort().join('|') + '::' + postSetId), but delivery targets are read LIVE from
+      // account.assignedGroups every cycle. So an agent that is parked and then RE-PURPOSED to different groups before
+      // returning would get its OLD cluster's partition and deliver it into its NEW cluster's groups — which that
+      // cluster's own members already delivered. Campaign-plan has no durable per-(post,group) guard
+      // (_uniqueSeqGuard is false for it) and _cycleDelivered resets each cycle, so nothing would catch it.
+      // fresh is recomputed from the CURRENT roster+library each cycle: unchanged agent → same batchId → restore;
+      // re-purposed agent (or an edited library) → different batchId → leave it PARKED and let the next round's
+      // recompute assign it properly. Conservative in the safe direction: a parked slice is a strand (surfaced by
+      // _emitCompletionReport), never a re-burst.
+      if (_plan.batchId !== fresh.batchId) continue;
       _plan.agentLists[n] = _plan.parkedLists[n];
       delete _plan.parkedLists[n];
       prunedAgents = true;
@@ -3616,8 +3669,21 @@ class Orchestrator {
     const plan = this._campaignPlan; if (!plan || !plan.agentLists) return { idx: 0, len: 0 };
     const list = plan.agentLists[name] || [];
     const rec = (this._perAccountRotation || {})[name] || {};
-    let idx = rec.lastPostId ? list.indexOf(rec.lastPostId) + 1 : 0;
-    if (idx < 1) idx = 0;
+    // An UNRESOLVABLE pointer must NOT restart the slice. `indexOf(lastPostId)` returns -1 when the pointer does not
+    // belong to THIS slice at all — e.g. the operator flipped the agent to daily-rotation (whose run overwrites
+    // lastPostId with a rotation post) and back, or a parked slice was restored against a changed partition. The old
+    // `-1 + 1 = 0` then silently RESTARTED the agent at element 0 and re-posted its already-delivered slice, on the one
+    // shared IP — campaign-plan has no durable per-(post,group) guard and _cycleDelivered resets each cycle, so nothing
+    // caught it. Treat it as CONSUMED instead: we cannot know where the agent got to, and stranding the remainder is
+    // recoverable (surfaced at completion; the next round re-partitions) whereas restarting is a ban. A genuinely fresh
+    // agent (no lastPostId at all) still correctly starts at 0.
+    let idx;
+    if (!rec.lastPostId) idx = 0;
+    else {
+      const _at = list.indexOf(rec.lastPostId);
+      if (_at < 0) return { idx: list.length, len: list.length }; // pointer not in this slice → consumed, never restart
+      idx = _at + 1;
+    }
     while (idx < list.length && !(this._data.posts || []).some((p) => p.id === list[idx])) idx++; // skip deleted
     return { idx, len: list.length };
   }

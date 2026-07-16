@@ -287,14 +287,47 @@ test('[#7] a departed agent\'s slice is PARKED (not deleted) and RESTORED when i
   assert.ok(!o._campaignPlan.parkedLists.B, 'and it is no longer parked');
 });
 
-test('[#7] a parked slice is NOT restored across a round/library change (batchId differs → next round assigns it)', () => {
+// NOTE: this test previously ASSERTED the opposite of its own title — it required the slice to be restored on a batchId
+// mismatch — and passed, codifying a double-post: the frozen plan partitions by CLUSTER sig, but delivery targets are
+// read LIVE, so restoring an agent RE-PURPOSED to different groups hands it its OLD cluster's partition and it delivers
+// that into its NEW cluster's groups (which those members already covered). The title was right; the assertion was
+// wrong. Fixed to match the title, and the guard it describes is now actually implemented.
+test('[#7] a parked slice is NOT restored across a roster/library change (batchId differs → next round assigns it)', () => {
+  const o = mk();
+  const B = { name: 'B', postingOrder: 'campaign-plan', enabled: true, assignedGroups: ['g2'], standby: false }; // re-purposed: was on g1 when parked
+  o._saveRotationState = () => true;
+  o._campaignPlan = { batchId: 'b1', agentLists: {}, parkedLists: { B: ['P2', 'P4'] }, clusters: [], roundOffset: 0 };
+  o._reconcileCampaignPlan({ batchId: 'b2-changed', agentLists: {}, clusters: [] }, [B], 4);
+  assert.ok(!o._campaignPlan.agentLists.B, 'B must NOT get its old partition back after a roster/library change — it would deliver its OLD cluster\'s posts into its NEW groups (a double-post)');
+  assert.deepEqual(o._campaignPlan.parkedLists.B, ['P2', 'P4'], 'the slice stays PARKED (a strand, surfaced at completion) until the next round re-partitions it — strand, never re-burst');
+  assert.equal(o._pendingPlanBatchId, 'b2-changed', 'and the edit is still held for the next round');
+});
+
+test('[#7] a parked slice IS restored when the agent returns UNCHANGED (same batchId → same partition is still valid)', () => {
   const o = mk();
   const B = { name: 'B', postingOrder: 'campaign-plan', enabled: true, assignedGroups: ['g1'], standby: false };
   o._saveRotationState = () => true;
   o._campaignPlan = { batchId: 'b1', agentLists: {}, parkedLists: { B: ['P2', 'P4'] }, clusters: [], roundOffset: 0 };
-  // Same-round restore is keyed on the PLAN's own batchId, which the freeze never mutates mid-round; a library edit
-  // only sets _pendingPlanBatchId. So a returning agent restores here, and the next ROUND recomputes partitions afresh.
-  o._reconcileCampaignPlan({ batchId: 'b2-edited', agentLists: {}, clusters: [] }, [B], 4);
-  assert.deepEqual(o._campaignPlan.agentLists.B, ['P2', 'P4'], 'B returns within the SAME frozen round → slice restored (the pending edit is still deferred to the next round)');
-  assert.equal(o._pendingPlanBatchId, 'b2-edited', 'and the library edit is still held for the next round');
+  o._reconcileCampaignPlan({ batchId: 'b1', agentLists: {}, clusters: [] }, [B], 4); // nothing changed → fresh hashes to the SAME batchId
+  assert.deepEqual(o._campaignPlan.agentLists.B, ['P2', 'P4'], 'an unchanged agent (disable→re-enable to fix a login) resumes its exact slice — that is the whole point of parking');
+  assert.ok(!o._campaignPlan.parkedLists.B, 'and it is no longer parked');
+});
+
+// [#4] AN UNRESOLVABLE SLICE POINTER MUST NOT RESTART THE SLICE. `indexOf(lastPostId)` returns -1 when the pointer does
+// not belong to this slice — e.g. the operator flipped the agent to daily-rotation (whose run overwrites lastPostId with
+// a rotation post) and back. `-1 + 1 = 0` silently restarted the agent at element 0 and re-posted its whole delivered
+// slice on the shared IP. Campaign-plan has no durable per-(post,group) guard, so nothing caught it.
+test('[#4] an unresolvable lastPostId is treated as CONSUMED, never restarted at 0', () => {
+  const o = mk();
+  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }, { id: 'P3' }, { id: 'R9' }], accounts: [], groups: [], settings: {} };
+  o._campaignPlan = { batchId: 'b1', agentLists: { A: ['P1', 'P2', 'P3'] }, clusters: [] };
+
+  o._perAccountRotation = { A: { lastPostId: 'R9' } }; // a daily-rotation post — not in A's campaign slice
+  assert.deepEqual(o._campaignNextIdx('A'), { idx: 3, len: 3 }, 'pointer not in this slice → CONSUMED (idx===len → nothing left), not idx 0 which would re-post P1,P2,P3');
+
+  o._perAccountRotation = { A: { lastPostId: 'P2' } };  // a normal, resolvable pointer
+  assert.deepEqual(o._campaignNextIdx('A'), { idx: 2, len: 3 }, 'a resolvable pointer still advances normally');
+
+  o._perAccountRotation = { A: {} };                    // a genuinely fresh agent
+  assert.deepEqual(o._campaignNextIdx('A'), { idx: 0, len: 3 }, 'no pointer at all → correctly starts at the beginning');
 });
