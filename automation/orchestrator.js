@@ -3255,86 +3255,66 @@ class Orchestrator {
           break;
         }
       }
-      // DAILY-CAP HOLD: if every active poster simply hit today's cap (not cooling, not flagged), the run
-      // is DONE FOR TODAY — wait for the UTC day to roll over and resume, instead of tripping the stall-
-      // breaker and STOPPING (which would leave the app dead hours before tomorrow). A rate-limited or
-      // flagged fleet is NOT a cap-hold (those still fall through to the real stop below).
-      const _cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
-      if (cycleDealtIds.length === 0 && _cap > 0) { // #4: applies in DAILY mode too — the daily gate waits on the cyclesPerDay COUNT, not the per-account daily CAP, so a fleet that hits its cap before the day's cycles are used up would otherwise fall through to the stall-breaker and STOP mid-day (with a self-contradicting "resumes after midnight" message)
-        const _now = Date.now();
-        const _liveAccts = (getData().accounts || []);
-        const _activePosters = (this._active || []).filter((a) => a.enabled !== false && !a.isModerator);
-        const _allCapped = _activePosters.length > 0 && _activePosters.every((a) => {
-          const live = _liveAccts.find((x) => x.name === a.name) || a;
-          if ((Number(live.rateLimitedUntil) || 0) > _now) return false; // cooling down → not a cap-only stall
-          if (live.status && live.status !== 'logged_in' && live.status !== 'idle') return false; // review-fix: gate on LIVE status (matches line 2987 + the "bad account" definition ~3193), NOT the sticky run-lifetime _runFlags — a single EARLIER rate-limit that has since RECOVERED otherwise poisons _allCapped forever, so a capped fleet skips the midnight hold and the stall-breaker STOPS the run mid-day (defeating days-unattended)
-          return store.dailyUsed(live.daily) >= _cap;
-        });
-        if (_allCapped) {
-          const d = new Date(_now);
-          // #3: wait to the next LOCAL midnight (+30s) — store.dailyUsed/todayKey roll the cap window at LOCAL midnight
-          // (store.js), not UTC. The old Date.UTC(...) idled the whole timezone offset every capped day (e.g. ~2h in
-          // UTC+2) and could re-hold ~24h in negative-offset zones. Mirrors the sibling daily-rotation hold just below.
-          const nextLocalMidnight = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 30).getTime();
-          const waitMs = Math.max(60000, nextLocalMidnight - _now);
-          this._zeroProgressCycles = 0; // a deliberate cap hold is NOT a stall
-          this.log(`📵 All active accounts hit today's daily cap (${_cap}/day) — waiting ~${Math.round(waitMs / 360000) / 10}h for the next day, then resuming automatically.`);
-          await this._waitWithCountdown(waitMs, 'Next day (daily cap)');
-          if (this._shouldStop() || this._finish) break;
-          continue; // resume next day with fresh daily counts
-        }
-      }
-      // DAILY-ROTATION HOLD: in continuous schedule (no daily gate), once every active daily-rotation agent
-      // has posted its one-per-day, wait for the next LOCAL day instead of looping idle (which would trip the
-      // stall-breaker). Lets daily-rotation self-pace to 1/day even without the Daily schedule. (In Daily
-      // schedule mode the top-of-loop gate already does the waiting, so this is skipped there.)
-      if (cycleDealtIds.length === 0 && settings.scheduleMode !== 'daily' && (this._active || []).length > 0) {
-        const _today = this._localDayKey();
-        // Fire when every DAILY-ROTATION / CAMPAIGN-PLAN agent has posted today. We filter to THOSE agents
-        // first (the old code used .every() over ALL active accounts, so any non-DR account — e.g. a finished
-        // unique agent still in the active set — made it return false, so the hold never fired in a mixed
-        // fleet and the stall-breaker wrongly STOPPED the run, killing the daily-rotation agents). The
-        // cycleDealtIds===0 guard above already means nothing else produced this cycle, so holding to the next
-        // day is safe — everyone retries tomorrow.
-        const drAgents = (this._active || []).filter((a) => {
-          const o = a.postingOrder || '';
-          if (o === 'daily-rotation') return true;
-          // campaign-plan: EXCLUDE surplus-idle agents (empty slice from the spread pass) — they never post, so
-          // requiring them to have "posted today" would block the hold forever and trip the stall-breaker.
-          if (o === 'campaign-plan') return this._campaignNextIdx(a.name).len > 0;
-          return false;
-        });
-        const _allRotatedToday = drAgents.length > 0 && drAgents.every((a) => ((this._perAccountRotation || {})[a.name] || {}).lastPostedDate === _today);
-        if (_allRotatedToday) {
-          const d = new Date();
-          const nextLocalMidnight = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 30).getTime();
-          const waitMs = Math.max(60000, nextLocalMidnight - Date.now());
-          this._zeroProgressCycles = 0; // a deliberate rotation hold is NOT a stall
-          this.log(`🔁 All daily-rotation agents have posted today — waiting ~${Math.round(waitMs / 360000) / 10}h for the next day, then each posts its next post.`);
-          await this._waitWithCountdown(waitMs, 'Next day (daily rotation)');
-          if (this._shouldStop() || this._finish) break;
-          continue;
-        }
-      }
-      // ALL-RATE-LIMITED HOLD: if nothing posted (reserves included) and EVERY active poster is cooling down
-      // from a rate-limit, the fleet isn't dead — it just needs to wait out the cool-down. Sleep until the
-      // earliest expiry, then resume — instead of burning cycles into the stall-breaker and STOPPING (which
-      // would leave the app dead for hours when it would have recovered on its own). The single wait is capped
-      // at ~1h so it re-checks periodically (an account may re-login or the operator may intervene sooner).
-      if (cycleDealtIds.length === 0 && (this._active || []).length > 0) {
+      // ── UNIFIED WAIT ────────────────────────────────────────────────────────────────────────────────────────
+      // ONE hold, replacing three separate "is EVERYONE blocked the SAME way?" unanimity tests (all-capped /
+      // all-rotated-today / all-rate-limited). Each asked its own question and disqualified on the others' causes: the
+      // cap test returned false for any cooling account, the cool-down test returned false for any capped one, and the
+      // rotation test only ever looked at daily-rotation/campaign-plan. So a MIXED fleet — 3 capped, 2 cooling down,
+      // 1 attention-rested — satisfied NONE of them, fell through to the stall-breaker, and the run STOPPED when it
+      // only needed to wait. For a days-unattended product that is the worst possible outcome: it dies overnight and
+      // the operator finds it dead in the morning, hours after it would have recovered on its own.
+      // Worse, NOTHING anywhere read nextAttnRetry, so the attention ladder's own promise to the operator ("it retries
+      // automatically after the rest") was never true — an attention-rested fleet stopped rather than retrying.
+      //
+      // The right question is not "is everyone blocked identically?" but "can ANYONE act right now, and if not, when is
+      // the soonest anyone could?" — one wake-time per account (_accountWakeAt), hold until the EARLIEST. This
+      // subsumes all three old holds exactly (capped → next local midnight; cooling → rateLimitedUntil; rotation spent
+      // → next local midnight) and adds the attention rest they all missed. An account that could act NOW yields 0, so
+      // the hold cannot fire while any real work is possible — a genuinely dead fleet still reaches the stall-breaker
+      // below and stops with its named cause, exactly as before.
+      // Never wait for a fleet the run is about to stop anyway: maxCycles is evaluated BELOW, so holding first would
+      // idle up to an hour before honoring it. Mirrors that guard's own condition EXACTLY — including its
+      // !_completionDriven exemption, so a completion drain (which ignores maxCycles because it has its own 100%-
+      // delivered stop) still waits here. That exemption is the point: the drain used to give up in ~39 minutes on a
+      // fleet whose SHORTEST possible rest is 4-8h, declaring posts undeliverable that were merely resting.
+      const _drivenByCompletion = settings.completionMode || (this._campaignPlan && !settings.loopCampaign && (this._active || []).some((a) => (a.postingOrder || '') === 'campaign-plan'));
+      const _cycleCapReached = !_drivenByCompletion && (settings.maxCycles || 0) > 0 && cycle >= (settings.maxCycles || 0);
+      if (cycleDealtIds.length === 0 && !_cycleCapReached) {
         const _now = Date.now();
         const _live = (getData().accounts || []);
-        const _posters = (this._active || []).filter((a) => a.enabled !== false && !a.isModerator);
-        const _until = _posters.map((a) => Number((_live.find((x) => x.name === a.name) || a).rateLimitedUntil) || 0);
-        if (_posters.length > 0 && _until.every((t) => t > _now)) {
-          const waitMs = Math.max(60000, Math.min(Math.min(..._until) - _now + 30000, 3600000)); // earliest expiry +30s, capped at 1h
-          this._zeroProgressCycles = 0; // a deliberate cool-down hold is NOT a stall
-          this.log(`🧊 All active accounts are cooling down from rate-limits — waiting ~${Math.round(waitMs / 60000)} min for the earliest to recover, then resuming automatically (the run does not stop).`);
-          await this._waitWithCountdown(waitMs, 'Rate-limit cool-down');
+        const _posters = this._waitPosters();
+        const _wakes = _posters.map((a) => this._accountWakeAt(a, (_live.find((x) => x.name === a.name) || a), _now, settings));
+        if (_posters.length > 0 && _wakes.every((w) => w > _now)) {
+          const _earliest = Math.min(..._wakes);
+          // Sleep to the earliest wake, but cap ONE sleep at 1h so the fleet re-checks periodically: an account may be
+          // re-logged-in, a cap raised, or the operator may intervene long before a midnight rollover. Re-checking is
+          // free (no browser launches) and strictly safer than committing to an 8h sleep.
+          const _waitMs = Math.max(60000, Math.min(_earliest - _now + 30000, 3600000));
+          const _eta = _earliest - _now;
+          const _etaHuman = _eta >= 5400000 ? `~${Math.round(_eta / 360000) / 10}h` : `~${Math.max(1, Math.round(_eta / 60000))} min`;
+          // Name the causes so the operator knows WHY the fleet is idle rather than guessing.
+          const _why = [];
+          const _cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
+          let _nCap = 0, _nRl = 0, _nAttn = 0, _nRot = 0;
+          for (const a of _posters) {
+            const l = _live.find((x) => x.name === a.name) || a;
+            if ((Number(l.rateLimitedUntil) || 0) > _now) _nRl++;
+            else if ((Number(l.nextAttnRetry) || 0) > _now) _nAttn++;
+            else if (_cap > 0 && store.dailyUsed(l.daily) >= _cap) _nCap++;
+            else _nRot++;
+          }
+          if (_nCap) _why.push(`${_nCap} at today's cap`);
+          if (_nRl) _why.push(`${_nRl} cooling down from a rate-limit`);
+          if (_nAttn) _why.push(`${_nAttn} resting (logged out / checkpoint / delivered nothing)`);
+          if (_nRot) _why.push(`${_nRot} already posted today`);
+          this._zeroProgressCycles = 0; // a deliberate wait is NOT a stall — never let it trip the dead-fleet breaker
+          this.log(`⏸️ Nothing can post right now — ${_why.join(', ')}. Soonest recovery ${_etaHuman}; waiting and resuming automatically (the run does NOT stop).`);
+          await this._waitWithCountdown(_waitMs, 'Waiting for the fleet to recover');
           if (this._shouldStop() || this._finish) break;
           continue;
         }
       }
+
       // Dead-fleet / stall breaker: if the run dealt NOTHING for several cycles in a row (every account
       // likely-blocked, group-less, or disabled — NOT merely cooling, which the hold above now handles), STOP
       // instead of relaunching browsers forever unattended.
@@ -4052,6 +4032,39 @@ class Orchestrator {
   // leave the pointer advanced past a post while the ledger still lists an already-delivered group (double-post) or
   // omits an un-reached one (silent skip). No obligation for this agent → its owed is left untouched (a full drop
   // that delivered nothing keeps any prior owed). [7][8]
+  // [UNIFIED WAIT] When could this account act again? Returns 0 if it could act NOW (so the fleet is not merely
+  // waiting — something else is wrong and the stall-breaker should judge it), else the ms timestamp of its soonest
+  // possible next action. THIS IS THE SINGLE SOURCE OF TRUTH for the hold: every TIMED limit must be represented here,
+  // or a fleet blocked only by that limit will STOP instead of waiting for it (which is exactly what happened to
+  // nextAttnRetry — nothing read it, so the attention ladder's "it retries automatically" was never true).
+  // Order matters only for the log/ETA, not correctness: any positive wake means "cannot act yet".
+  _accountWakeAt(a, live, now, settings) {
+    const _rl = Number(live.rateLimitedUntil) || 0;
+    if (_rl > now) return _rl;                    // rate-limit cool-down (the account/post/comment ladder)
+    const _attn = Number(live.nextAttnRetry) || 0;
+    if (_attn > now) return _attn;                // attention rest (logged-out / checkpoint / delivered-nothing)
+    // LOCAL midnight (+30s): store.dailyUsed/todayKey roll the day LOCALLY, not in UTC.
+    const _midnight = () => { const d = new Date(now); return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 30).getTime(); };
+    const _cap = Number.isFinite(settings.dailyCap) ? settings.dailyCap : 0;
+    if (_cap > 0 && store.dailyUsed(live.daily) >= _cap) return _midnight(); // daily cap → tomorrow
+    const _o = a.postingOrder || '';
+    if ((_o === 'daily-rotation' || _o === 'campaign-plan')
+      && ((this._perAccountRotation || {})[a.name] || {}).lastPostedDate === this._localDayKey()) return _midnight(); // its one-per-day is spent
+    return 0; // it could act now
+  }
+
+  // The posters the unified wait reasons about. Excludes agents that are idle BY DESIGN rather than blocked by a timed
+  // limit — a campaign agent whose slice is empty (the spread pass leaves surplus agents with nothing this round) never
+  // posts, so demanding a wake-time from it would block the hold forever and hand the run to the stall-breaker. This
+  // mirrors the exclusion the old rotation-hold already made.
+  _waitPosters() {
+    return (this._active || []).filter((a) => {
+      if (a.enabled === false || a.isModerator) return false;
+      if ((a.postingOrder || '') === 'campaign-plan' && this._campaignNextIdx(a.name).len === 0) return false;
+      return true;
+    });
+  }
+
   _reconcileOwedFor(agent) {
     if (!agent) return false;
     this._owed = this._owed || {};
