@@ -883,11 +883,13 @@ class Orchestrator {
     // An agent DISCHARGING its own PERSISTENT owed post (daily-rotation / campaign-plan, from a prior cycle) covers
     // ONLY its still-owed groups — tied to the actually-picked post so a stale/deleted owed entry can't mis-scope a
     // different post. A reserve STAND-IN's onlyGroups (the dropped agent's un-reached groups) takes precedence. [7][8]
-    // [LEDGER COHERENCE] _owedDischargeable gate: this scoping is only correct for a mode whose pick-override
-    // deliberately re-picked the owed post. A BROADCAST mode (post-centric/random) picks its posts normally, so a stale
-    // entry that merely happened to match one of them would silently NARROW that run to the owed subset — starving the
-    // account's other groups. Keyed on the owner's CURRENT mode, so an operator mode-flip can't mis-scope a live run.
-    const _owedSelf = (!_stand && this._owed && this._owed[account.name] && this._owedDischargeable(account.name)
+    // [LEDGER COHERENCE] owedScopableMode — the SCOPING predicate, deliberately NOT owedDischargeableMode (see both).
+    // _owedSelf only ever REMOVES groups from this run's target set, so it can never cause a double-post — only its
+    // ABSENCE can. It therefore covers the whole DEDUP family (incl. unique/sequence, where a mode-flipped agent may
+    // still re-pick a pointer-accrued owed post off `remaining` and MUST stay scoped to the un-reached groups), and
+    // excludes only the BROADCAST modes, where a stale entry matching a normally-picked post would starve the account's
+    // other groups. Tied to the actually-picked post so a stale/deleted entry can't mis-scope a different one.
+    const _owedSelf = (!_stand && this._owed && this._owed[account.name] && owedScopableMode(_ord)
       && posts.length === 1 && posts[0] && posts[0].id === this._owed[account.name].postId
       && Array.isArray(this._owed[account.name].gids) && this._owed[account.name].gids.length)
       ? this._owed[account.name] : null;
@@ -2014,6 +2016,7 @@ class Orchestrator {
       this._cycleOwed = {}; // { agentName -> { postId, gids[] } }: an account that delivered its post to SOME but not all groups → a reserve covers the un-reached groups
       this._cycleObligation = {}; // { agentName -> { postId, expectedGids[] } }: what each daily-rotation/campaign-plan agent (or the agent a stand-in covered) TRIED to deliver this cycle → reconciled against the FINAL delivered set at end-of-pool into the PERSISTENT this._owed ledger (carry a partial delivery across cycles/days). [7][8]
       this._postCountedThisCycle = new Set(); // agents whose postsToday was already incremented THIS cycle — a partial delivery + N split reserves all advance the SAME forAgent pointer for ONE logical daily post, so count it once (else _dailyQuotaBlocks under-delivers cyclesPerDay).
+      this._pruneUndischargeableOwed(); // [LEDGER COHERENCE] reap _owed entries whose owner can neither discharge NOR scope them (a broadcast/deleted owner). Unconditional + per-cycle: the old drop-and-log sat behind _hasPersistentOwed, whose gate is the exact NEGATION of its own trigger, so it could never reach its own patients on a healthy run.
       this._campaignTakeover = {}; // { reserveName -> { postId, forAgent, gids? } }: reserve stand-ins covering a dropped/partial agent's slice this cycle (gids = the owed subset, absent = whole group set)
       // Unique modes deal each post once across accounts. When every active account is unique
       // and no un-dealt posts remain, the campaign is complete — stop and reset for the next run.
@@ -2366,7 +2369,12 @@ class Orchestrator {
             const _pid = res.dealtIds[0];
             // Groups this run was RESPONSIBLE for: if it was discharging an existing owed obligation for THIS post,
             // just those owed groups (it only targeted them); otherwise its whole assigned group set (a fresh post).
-            const _prevOwed = (this._owed && this._owed[account.name] && this._owed[account.name].postId === _pid && Array.isArray(this._owed[account.name].gids)) ? this._owed[account.name].gids : null;
+            // MIRROR of _owedSelf (~890) — the two MUST agree on the same predicate. _owedSelf decided what this run
+            // actually TARGETED; _prevOwed decides what it was RESPONSIBLE for. If _owedSelf scoped the run to the owed
+            // subset but _prevOwed fell back to the full assigned set (or vice-versa), _owedNow is computed against the
+            // wrong baseline → either a bogus same-cycle reserve cover for groups this run never targeted, or a silently
+            // suppressed one. Same predicate, same argument (owedScopableMode, keyed on this run's own mode).
+            const _prevOwed = (this._owed && this._owed[account.name] && owedScopableMode(_po) && this._owed[account.name].postId === _pid && Array.isArray(this._owed[account.name].gids)) ? this._owed[account.name].gids : null;
             const _expected = _prevOwed ? _prevOwed.slice() : [...this._groupIdsOf(account)];
             const _owedNow = _expected.filter((gid) => !this._owedDelivered(account.name, _pid, gid));
             if (_owedNow.length) this._cycleOwed[account.name] = { postId: _pid, gids: _owedNow }; // same-cycle: a healthy reserve finishes these un-reached groups (unchanged for unique/sequence/campaign)
@@ -2588,17 +2596,8 @@ class Orchestrator {
         for (const [name, ow] of Object.entries(this._owed || {})) {
           if ((this._cycleOwed || {})[name] || !ow || !ow.postId || !((ow.gids) || []).length) continue; // a same-cycle partial already recorded it authoritatively
           if (!((this._data && this._data.posts) || []).some((p) => p.id === ow.postId)) continue; // owed post gone from the library → the agent's own owed pick will drop it
-          // [LEDGER COHERENCE] DROP-AND-LOG an entry whose owner can no longer discharge it (operator flipped the mode to
-          // one with no owed pick-override, so nothing prunes it and no obligation is ever recorded → _reconcileOwedFor
-          // early-returns → the entry is IMMORTAL). Dispatching a reserve for it re-posts the SAME gids EVERY cycle on
-          // the shared IP. Dropping is the SAFE direction: the groups strand (recoverable, and the post is already live
-          // in the groups it did reach), whereas re-delivering risks a ban. Self-healing — the entry cannot outlive the
-          // mode change. Surfaced so the operator can finish those groups manually if they matter.
-          if (!this._owedDischargeable(name)) {
-            this.log(`⚠️ [${name}] carried ${((ow.gids) || []).length} un-reached group(s) for a post, but its posting method can no longer finish them — dropping the obligation (those groups stay undelivered; re-post manually if needed).`);
-            try { delete this._owed[name]; } catch {}
-            continue;
-          }
+          // Undischargeable entries never reach here (_hasPersistentOwed gates this block on _owedDischargeable), so the
+          // drop-and-log lives in _pruneUndischargeableOwed(), swept unconditionally at the cycle top instead.
           const acc = ((this._data && this._data.accounts) || []).find((a) => a.name === name);
           const asg = acc ? this._groupIdsOf(acc) : new Set();
           const live = ow.gids.filter((g) => asg.has(g)); // prune groups the operator has since un-assigned
@@ -3336,22 +3335,17 @@ class Orchestrator {
     // PARTIAL-DELIVERY owed ([8]): un-reached (post,group) pairs the ROSTER still owes are outstanding — count over the
     // roster (not `active`), so completionMode can't declare "100% delivered" before those groups get the post.
     for (const name of _campRosterNames) { const o = (this._owed || {})[name]; if (o && (o.gids || []).length) undealt += o.gids.length; }
-    // [9] The same for unique/sequence: a PARTIAL delivery is added to the fleet-wide dealt-set, so its post drops out
-    // of the `undealt` tally above while its un-reached groups are still owed — completionMode would declare a false
-    // 100% and STOP with groups un-served (the ADR-0009 invariant: total===0 must mean everything DELIVERABLE was
-    // delivered). Tallied over the ACCOUNT ROSTER, not `active`: an owed agent disabled or fully reserved this cycle
-    // still has its groups finished by the persistent-owed synthesis, and an active-only tally would collapse to a
-    // false 100% exactly as it did for campaign-plan (#1).
-    // Two guards keep the count HONEST rather than merely conservative — either would otherwise wedge the run at
-    // total>0 forever: only DEALT posts (an un-dealt owed post is already counted whole by the `undealt` tally above →
-    // no double-count), and only posts still IN the library (a deleted post has no recovery path; the owed pick-override
-    // drops that stale entry on the agent's next real pick).
-    for (const [name, o] of Object.entries(this._owed || {})) {
-      if (!o || !(o.gids || []).length || !this._isUniqueSeqAgent(name)) continue;
-      if (!this._dealt.has(o.postId)) continue;
-      if (!((data.posts) || []).some((p) => p.id === o.postId)) continue;
-      undealt += o.gids.length;
-    }
+    // [9-REVERTED] There is deliberately NO unique/sequence owed tally here. [9] added one to catch the strand its own
+    // pick-override created; the override was reverted (see the note at the unique/sequence pick), and this tally was
+    // residue. Post-revert its gate was exactly INVERTED against the producer: the obligation gate can only create
+    // daily-rotation/campaign-plan entries (for which _isUniqueSeqAgent is FALSE, so the loop was dead for its stated
+    // purpose), while the ONLY reachable unique/sequence-owned entry is a STALE mode-flipped one (for which it is TRUE)
+    // — so it counted as outstanding precisely the entries nothing can discharge → completionMode wedged at total>0
+    // FOREVER (a livelock). Its own rationale ("the owed pick-override drops that stale entry on the agent's next real
+    // pick") described a safety net that no longer exists.
+    // KNOWN GAP, tracked in ADR-0022: a stranded unique/sequence partial is therefore NOT counted, so completion can
+    // imply 100% for it. The fix is a READ-ONLY strand report — never an _owed entry, because anything a consumer can
+    // turn back into a post needs the whole coherence invariant again.
     let pending = 0, held = 0, failed = 0, failedHeld = 0, superseded = 0;
     try { pending = (store.loadComments().pending || []).filter((c) => c.status === 'pending' && (c.attempts || 0) < 3).length; } catch {}
     try { const hh = (store.loadModeration().held || []); held = hh.filter((h) => h.status === 'held').length; failed = hh.filter((h) => h.status === 'failed').length; failedHeld = hh.filter((h) => h.status === 'failed_held').length; superseded = hh.filter((h) => h.status === 'superseded').length; } catch {}
@@ -3761,6 +3755,37 @@ class Orchestrator {
     return owedDischargeableMode(a && a.postingOrder);
   }
 
+  // [LEDGER COHERENCE] Sweep _owed entries that are DEAD — the owner can neither DISCHARGE (no pick-override → no
+  // obligation → _reconcileOwedFor early-returns) nor SCOPE (never re-picks the post, so _owedSelf can't use it) them.
+  // In practice: a BROADCAST owner (post-centric/random), or an account deleted from the library.
+  //
+  // WHY UNCONDITIONALLY, AT THE CYCLE TOP: the drop-and-log used to live inside the reserve-takeover block, whose entry
+  // condition (_hasPersistentOwed) requires _owedDischargeable === TRUE — the exact NEGATION of the drop-and-log's own
+  // trigger. The heal could never reach its own patients: it fired only by coincidence, when some UNRELATED condition
+  // opened the block (another agent's drop/owed) AND a reserve existed AND _uniqueMode was true. On the healthy
+  // days-unattended path an entry could outlive the mode change indefinitely, and every saveRotation re-persisted it.
+  //
+  // WHY NOT !_owedDischargeable (THE SUBTLE PART — do not "simplify" this): once an operator flips a pointer agent to
+  // unique/sequence, its entry is NOT dead. The agent can still re-pick that post off `remaining` (2491 keeps
+  // pointer-mode posts OUT of _dealt), and _owedSelf/owedScopableMode then scopes that ONE re-pick to the un-reached
+  // groups — which is the ONLY thing stopping a full-assigned-set re-post of the already-delivered ones. Pruning on
+  // !_owedDischargeable would delete exactly that entry and re-open the double-post. So prune only when the owner can do
+  // NEITHER. After that scoped re-pick the post is dealt and the entry is inert; it is then reaped by the next sweep
+  // once the owner is broadcast/absent, or harmlessly ignored (no consumer can reach it, and no tally counts it).
+  _pruneUndischargeableOwed() {
+    let changed = false;
+    for (const [name, ow] of Object.entries(this._owed || {})) {
+      if (!ow || !ow.postId) continue;
+      const a = ((this._data && this._data.accounts) || []).find((x) => x && x.name === name);
+      const ord = a && a.postingOrder;
+      if (owedDischargeableMode(ord) || owedScopableMode(ord)) continue; // still usable for a discharge OR a scoped re-pick
+      this.log(`⚠️ [${name}] carried ${((ow.gids) || []).length} un-reached group(s) for a post, but its posting method can no longer finish them — dropping the obligation (those groups stay undelivered; re-post them manually if they matter).`);
+      try { delete this._owed[name]; changed = true; } catch {}
+    }
+    if (changed) { try { this._saveRotationState(); } catch {} }
+    return changed;
+  }
+
   _isUniqueSeqAgent(agentName) {
     try { const a = ((this._data && this._data.accounts) || []).find((x) => x.name === agentName); const o = (a && a.postingOrder) || ''; return o.includes('unique') || o === 'sequence'; }
     catch { return false; }
@@ -3854,6 +3879,29 @@ function owedDischargeableMode(postingOrder) {
   return o === 'daily-rotation' || o === 'campaign-plan';
 }
 
+// [LEDGER COHERENCE — THE SCOPING PREDICATE. NOT the same question as owedDischargeableMode. Do not merge them.]
+// May a run that HAPPENS to pick the owed post be NARROWED to only its still-owed groups (via _owedSelf → onlyGroups)?
+//
+// THE ASYMMETRY THAT MAKES THIS A SEPARATE PREDICATE — read before touching either:
+//   • The DISPATCHING consumers (_hasPersistentOwed / the persistent-owed synthesis / _owedStandins) turn a ledger entry
+//     into a NEW delivery. Gating them PREVENTS a re-post → they gate on owedDischargeableMode (dispatch only for a mode
+//     that can actually discharge, else the entry is immortal and a reserve re-posts it every cycle).
+//   • _owedSelf does the OPPOSITE: it REMOVES groups from a run's target set. It is a GUARD, not an action. Narrowing a
+//     target set can NEVER cause a double-post — only its ABSENCE can. So gating it on the DISPATCH predicate deleted the
+//     one guard protecting already-delivered groups: a daily-rotation agent with _owed{P,[g1,g2]} that the operator flips
+//     to unique re-picks P off `remaining` (2491 keeps pointer-mode posts OUT of _dealt, so P is still re-pickable),
+//     _owedSelf went null, onlyGroups went null, and the run re-posted the already-delivered g3,g4. _uniqueSeqGuard is
+//     true post-flip but consults _inflightDelivered, which ONLY the crash-fold seeds → empty in a healthy run. (v1.0.113)
+//
+// So: scope for the whole DEDUP family (one post per run, where narrowing is always correct), and exclude only the
+// BROADCAST modes (post-centric/random), where a stale entry that merely matched one of the normally-picked posts would
+// silently starve the account's other groups. Widening this to broadcast causes starvation; NARROWING it causes a
+// double-post — err toward including a mode, not excluding it. Pure → unit-tested + mutation-verified.
+function owedScopableMode(postingOrder) {
+  const o = String(postingOrder || '');
+  return o === 'campaign-plan' || o === 'daily-rotation' || o.includes('unique') || o === 'sequence';
+}
+
 // [9/UNIQUE-COVER FIX] Should a reserve stand-in's cover record a _cycleObligation for the agent it COVERED? The
 // obligation is what lets _reconcileOwedFor clear (full cover) or carry (partial) this._owed[forAgent]. Without it the
 // ledger NEVER moves, and the mode-agnostic persistent-owed synthesis re-dispatches the IDENTICAL gids every cycle → a
@@ -3873,4 +3921,4 @@ function standinObligationAdmits(faOrd, hasBaseline) {
   return false;
 }
 
-module.exports = { Orchestrator, crashRestartDecision, standinObligationAdmits, owedDischargeableMode };
+module.exports = { Orchestrator, crashRestartDecision, standinObligationAdmits, owedDischargeableMode, owedScopableMode };

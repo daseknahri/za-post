@@ -141,30 +141,6 @@ test('[a] _persistDealt keeps the durable guard for a STILL-OWED post, purges it
 
 // ───────────────────────────── UNIT: completion-awareness ──────────────────────────────────────────────────
 
-test('[c] unique owed blocks completion: _outstandingWork counts the owed gids (no false 100%)', () => {
-  const tmp = mkTmp('comp-us'); store.init(tmp);
-  const o = new Orchestrator(() => {}, {});
-  const A = UQ('A', ['g1', 'g2', 'g3', 'g4', 'g5']);
-  o._data = { posts: [{ id: 'P1' }], groups: [], settings: {}, accounts: [A] };
-  o._dealt = new Set(['P1']); // every post dealt → the old tally said "100% delivered"
-  o._owed = {};
-  assert.equal(o._outstandingWork([A]).undealt, 0, 'nothing owed → nothing outstanding');
-  o._owed = { A: { postId: 'P1', gids: ['g3', 'g4', 'g5'] } };
-  assert.equal(o._outstandingWork([A]).undealt, 3, 'the 3 un-reached (post,group) pairs are outstanding → completion waits');
-  fs.rmSync(tmp, { recursive: true, force: true });
-});
-
-test('[c] _outstandingWork counts a DISABLED unique agent\'s owed (a reserve still finishes it)', () => {
-  const tmp = mkTmp('comp-disabled'); store.init(tmp);
-  const o = new Orchestrator(() => {}, {});
-  const A = { ...UQ('A', ['g1', 'g2']), enabled: false };
-  o._data = { posts: [{ id: 'P1' }], groups: [], settings: {}, accounts: [A] };
-  o._dealt = new Set(['P1']);
-  o._owed = { A: { postId: 'P1', gids: ['g2'] } };
-  assert.equal(o._outstandingWork([]).undealt, 1, 'tallied over the ROSTER, not `active` — an active-only tally collapses to a false 100%');
-  fs.rmSync(tmp, { recursive: true, force: true });
-});
-
 test('[c] _outstandingWork does NOT count an owed post that is un-dealt or deleted (no wedged run)', () => {
   const tmp = mkTmp('comp-honest'); store.init(tmp);
   const o = new Orchestrator(() => {}, {});
@@ -308,4 +284,82 @@ test('[a] pointer-mode carry-over is UNCHANGED by the revert (regression guard f
   o._cycleDelivered.add(o._dkScope('DR') + 'P1::g1');
   o._reconcileOwedFor('DR');
   assert.deepEqual(o._owed.DR.gids, ['g2'], 'daily-rotation still carries its un-reached groups — only the unique/sequence extension was reverted');
+});
+
+// ===============================================================================================================
+// [a] SCOPING vs DISPATCH — two predicates, deliberately NOT one. (v1.0.113)
+//
+// v1.0.112 gated _owedSelf on owedDischargeableMode (the DISPATCH predicate) and thereby INTRODUCED a double-post:
+// _owedSelf only ever REMOVES groups from a run's target set, so it is a GUARD, not an action. Narrowing can never
+// re-post anything — only its ABSENCE can. Gating it deleted the one guard protecting already-delivered groups from
+// a mode-flipped agent that re-picks its pointer-accrued owed post off `remaining` (2491 keeps pointer-mode posts out
+// of _dealt, so it stays re-pickable; _inflightDelivered is crash-fold-only and empty in a healthy run).
+// ===============================================================================================================
+
+test('[a] owedScopableMode covers the DEDUP family (narrowing is always safe) and excludes only BROADCAST', () => {
+  const { owedScopableMode } = require('../automation/orchestrator');
+  for (const m of ['daily-rotation', 'campaign-plan', 'unique', 'unique-random', 'sequence']) {
+    assert.equal(owedScopableMode(m), true, `${m} picks ONE post per run → scoping to the un-reached groups is always correct, and its absence re-posts them`);
+  }
+  for (const m of ['post-centric', 'random', '', null, undefined]) {
+    assert.equal(owedScopableMode(m), false, `${JSON.stringify(m)} is broadcast → a stale entry must not narrow it (starvation)`);
+  }
+});
+
+test('[a] the SCOPING and DISPATCH predicates are deliberately DIFFERENT (unique may scope but must never dispatch)', () => {
+  const { owedScopableMode, owedDischargeableMode } = require('../automation/orchestrator');
+  for (const m of ['unique', 'unique-random', 'sequence']) {
+    assert.equal(owedScopableMode(m), true, `${m} MUST scope: it can re-pick a pointer-accrued owed post after a mode flip`);
+    assert.equal(owedDischargeableMode(m), false, `${m} must NEVER dispatch: it has no owed pick-override, so an entry would be immortal`);
+  }
+  // Merging the two predicates re-opens one bug or the other — that is the whole point of keeping them apart.
+  assert.notDeepEqual(
+    ['unique', 'sequence', 'post-centric'].map(owedScopableMode),
+    ['unique', 'sequence', 'post-centric'].map(owedDischargeableMode),
+    'the predicates must not be collapsed into one');
+});
+
+test('[a] REGRESSION (v1.0.112 double-post): a pointer-accrued owed entry still scopes after an operator flips the agent to unique', () => {
+  const o = mkO();
+  // X accrued its owed while it was daily-rotation (so P is NOT in _dealt — 2491 excludes pointer modes), then the
+  // operator bulk-flips X to unique mid-run. X re-picks P off `remaining`. The owed entry MUST still scope the run to
+  // the un-reached groups, or the run re-posts the already-delivered g3,g4 on the shared IP.
+  const { owedScopableMode } = require('../automation/orchestrator');
+  o._data = { accounts: [{ name: 'X', postingOrder: 'unique', assignedGroups: ['g1', 'g2', 'g3', 'g4'] }], groups: [], posts: [{ id: 'P' }], settings: {} };
+  o._owed = { X: { postId: 'P', gids: ['g1', 'g2'] } }; // g3,g4 already delivered pre-flip
+  assert.equal(owedScopableMode('unique'), true, 'post-flip the run is unique → it must STILL be scopable, else onlyGroups goes null and g3,g4 are re-posted');
+  assert.equal(o._owedDischargeable('X'), false, 'and it must still NOT be dispatchable (no pick-override → an entry would be immortal)');
+});
+
+test('[c] the [9] unique/sequence owed tally is GONE — it counted exactly what nothing can discharge (livelock)', () => {
+  const o = mkO();
+  // Post-revert the producer can only create daily-rotation/campaign-plan entries, so the [9] tally's
+  // _isUniqueSeqAgent gate was INVERTED: dead for its stated purpose, and TRUE only for a stale mode-flipped entry —
+  // which nothing can discharge, so completionMode wedged at total>0 forever. Removing it restores pre-[9] behavior.
+  o._data = { accounts: [UQ('A', ['g1', 'g2', 'g3'])], groups: [{ id: 'g1', groupId: 'g1' }, { id: 'g2', groupId: 'g2' }, { id: 'g3', groupId: 'g3' }], posts: [{ id: 'P1' }], settings: {} };
+  o._dealt = new Set(['P1']);                              // fully dealt: nothing outstanding from the post tally
+  o._owed = { A: { postId: 'P1', gids: ['g2', 'g3'] } };    // a stale unique-owned entry (mode-flip residue)
+  assert.equal(o._outstandingWork([o._data.accounts[0]]).undealt, 0,
+    'a stale unique/sequence owed entry must NOT be counted — nothing can discharge it, so counting it wedges the run forever (ADR-0022 known gap: the strand is instead reported, never auto-re-delivered)');
+});
+
+test('[a] _pruneUndischargeableOwed reaps a BROADCAST/deleted owner (dead entry) but SPARES a mode-flipped unique owner', () => {
+  const o = mkO();
+  o._saveRotationState = () => true; // isolate from disk
+  o._data = { accounts: [
+    { name: 'PC', postingOrder: 'post-centric', assignedGroups: ['g1'] },   // can neither discharge nor scope -> DEAD
+    { name: 'UQ', postingOrder: 'unique', assignedGroups: ['g1'] },         // cannot discharge, but CAN still scope one re-pick
+    { name: 'DR', postingOrder: 'daily-rotation', assignedGroups: ['g1'] }, // can discharge
+  ], groups: [], posts: [{ id: 'P1' }], settings: {} };
+  o._owed = {
+    PC: { postId: 'P1', gids: ['g2'] },
+    UQ: { postId: 'P1', gids: ['g2'] },
+    DR: { postId: 'P1', gids: ['g2'] },
+    GONE: { postId: 'P1', gids: ['g2'] }, // owner deleted from the library
+  };
+  o._pruneUndischargeableOwed();
+  assert.ok(!o._owed.PC, 'a broadcast owner can neither discharge nor scope -> reaped (else it lives forever, re-persisted every save)');
+  assert.ok(!o._owed.GONE, 'an owner absent from the library -> reaped');
+  assert.ok(o._owed.UQ, 'a mode-flipped unique owner MUST be spared: its entry still scopes the ONE re-pick that stops a full-assigned-set re-post of the already-delivered groups (pruning it re-opens the v1.0.112 double-post)');
+  assert.ok(o._owed.DR, 'a dischargeable owner is untouched');
 });
