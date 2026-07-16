@@ -857,6 +857,12 @@ class Orchestrator {
     if (_effPace) this.log(`[${account.name}] ⏱ Pace: ${_PACE_LABELS[_effPace] || _effPace}`);
     this.log(`[${account.name}] 🚀 Starting...`);
     let progressed = false, posted = 0, pendingApproval = 0, errors = 0, accountFlag = null, accountOffline = false;
+    // rlKind + targetCount travel WITH the flag. The worker returns both, but _runAccount used to drop them, so
+    // _recordAccountOutcome always saw rlKind === undefined and fell back to 'post': an FB ACCOUNT-LEVEL block (the
+    // serious one, mult 3) rested on the MILD posting ladder — hours instead of half a day — and was re-launched into
+    // the same wall, which is ban-escalation. targetCount likewise fed the "how early did FB block this?" tier as
+    // undefined → `_tgt = 1`, making the 1.5× (blocked within the first quarter of its groups) tier unreachable.
+    let accountRlKind = null, accountTargetCount = 0;
     let accountCrashes = 0; // M3-09: consecutive posts that crashed out for this account
     const postedIds = []; // posts confirmed PUBLISHED — safe to auto-delete
     const dealtIds = [];  // posts dealt this cycle (published OR pending) — don't re-deal
@@ -1066,8 +1072,12 @@ class Orchestrator {
           // the fold. Keyed on posterAccount (= the account that ran, reserve or not). Best-effort.
           try { store.compactObligations((e) => (e && e.posterAccount) !== account.name); } catch {}
           // Persist flag to account status so the UI shows it (serialized via store.update).
+          // targetCount is carried from EVERY run (not only a flagged one): it is the "how early was this blocked?"
+          // denominator, and the run that reports the flag may not be the one that saw the groups.
+          if (r && Number.isFinite(Number(r.targetCount))) accountTargetCount = Math.max(accountTargetCount, Number(r.targetCount) || 0);
           if (r && r.flag) {
             accountFlag = r.flag;
+            accountRlKind = r.rlKind || accountRlKind; // keep it paired with the flag above — losing it downgrades an account-level block to the mild posting ladder
             this._runFlags[account.name] = r.flag; // remember for the end-of-run "needs attention" list
             try {
               await store.update((d) => {
@@ -1118,7 +1128,7 @@ class Orchestrator {
     // Surface the outcome so the operator sees pending/error counts in the log pane.
     this.log(`[${account.name}] ✅ Done in ${Math.round((Date.now() - accountStart) / 1000)}s`);
     this.log(`📊 [${account.name}] posted=${posted} pending=${pendingApproval} errors=${errors}`);
-    return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag, offline: accountOffline, runSeq: _runSeq }; // runSeq: THIS run's journal sequence — the pool commits it as the watermark (a shared field let a split-cover sibling's seq supersede in-flight lines)
+    return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag, offline: accountOffline, runSeq: _runSeq, rlKind: accountRlKind, targetCount: accountTargetCount }; // runSeq: THIS run's journal sequence — the pool commits it as the watermark (a shared field let a split-cover sibling's seq supersede in-flight lines)
     } finally {
       // Release claims for posts this account did NOT publish (blocked/failed), so a healthy account can pick them up
       // this same run. In a finally so it runs even if the body throws. #5: gate on _madeClaims — release ONLY claims
@@ -1418,7 +1428,24 @@ class Orchestrator {
         if (store.dailyRolledOver(acc.daily, today)) acc.daily = { date: today, count: 0 };
         acc.daily.count = (Number(acc.daily.count) || 0) + (res.posted || 0) + (res.pendingApproval || 0); // held posts DID reach FB (gated for review) — count them so tomorrow's cap reflects real volume
         if (res.flag === 'rate_limited') {
-          acc.rlStrikes = (acc.rlStrikes || 0) + 1;
+          // rlStrikes is the EXPONENT of the rest ladder (2^(strikes-1), capped 48h). It used to only ever GROW while
+          // walls kept happening: the "recovered → clear" branch below is an `else if (!res.flag)`, which is UNREACHABLE
+          // for the single most common healthy shape — an account that delivers its whole quota and THEN hits its
+          // natural Facebook ceiling. That account is behaving exactly as intended, yet it ratcheted 4h → 8h → 16h →
+          // 32h → 48h and effectively retired itself; on a days-unattended run the whole fleet grinds down.
+          //
+          // Escalation should punish an account Facebook is progressively SHUTTING DOWN — i.e. consecutive walls with
+          // little or nothing delivered — not one that keeps hitting a ceiling after real work. So reuse the ladder's
+          // OWN existing tier language (the _early tiers below already treat <25% of target as "blocked early"): a wall
+          // that follows >=25% delivery restarts the ladder at 1 (a first offence: rest baseHours × its tier, which is
+          // precisely what the ladder was designed to do for a first wall), while an early/unproductive wall still
+          // escalates exponentially exactly as before.
+          //
+          // NOTE this is the one change here that LOOSENS a rest rather than tightening it, so it is deliberately
+          // narrow: the per-wall rest VALUES, the multipliers and the 48h cap are all untouched — only the exponent's
+          // memory resets, and only for a demonstrably productive cycle.
+          const _prod = (res.posted || 0) / (res.targetCount || 1) >= 0.25;
+          acc.rlStrikes = _prod ? 1 : (acc.rlStrikes || 0) + 1;
           // THREE tiers, proportionate to what Facebook actually blocked (× the exponential per-strike
           // backoff, capped 48h): an ACCOUNT-LEVEL temporary block ("the big one") rests longest; a
           // POSTING limit rests at the base; a COMMENT limit (mildest, account can still post) rests
@@ -2371,7 +2398,7 @@ class Orchestrator {
         this.log(`[${account.name}] Starting with ${(account.assignedGroups || []).length} groups`);
         this._setAcctState(account.name, 'running', { action: 'starting…' }); // flip the dashboard row to live
         const r = await this._runAccount(account, cycle, maxThisRun)
-          .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [], offline: false }; });
+          .catch((e) => { this.log(`❌ [${account.name}] supervisor caught: ${e.message}`); return { progressed: false, posted: 0, pendingApproval: 0, errors: 1, postedIds: [], dealtIds: [], offline: false, rlKind: null, targetCount: 0 }; });
         const dur = Date.now() - t0; lastEnd = Date.now(); cpuMs += dur; ranCount++;
         this.log(`✓ [${account.name}] Completed in ${Math.round(dur / 1000)}s`);
         // runSeq MUST be carried: this rebuild is field-by-field, so omitting it made res.runSeq ALWAYS undefined at the
@@ -2379,7 +2406,7 @@ class Orchestrator {
         // survivor forever (q > 0), so the R5 clean-commit was never recorded and a fold would re-apply deliveries that
         // were already committed. The supervisor's catch path (above) legitimately has no runSeq; the Math.max guards at
         // the commit sites turn that into a no-op rather than a regression.
-        const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null, offline: (r && r.offline) || false, durationMs: dur, runSeq: (r && r.runSeq) };
+        const res = { account, progressed: !!(r && r.progressed), posted: (r && r.posted) || 0, pendingApproval: (r && r.pendingApproval) || 0, errors: (r && r.errors) || 0, postedIds: (r && r.postedIds) || [], dealtIds: (r && r.dealtIds) || [], flag: (r && r.flag) || null, offline: (r && r.offline) || false, durationMs: dur, runSeq: (r && r.runSeq), rlKind: (r && r.rlKind) || null, targetCount: (r && r.targetCount) || 0 };
         // Persist this account's daily count + rate-limit cool-down.
         await this._recordAccountOutcome(account.name, res, settings);
         // E-N4: track per-account rate-limit retries for stagger decay (reset on a clean post).
