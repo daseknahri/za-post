@@ -875,11 +875,20 @@ class Orchestrator {
     // agree. A per-account-run monotonic run-sequence: strictly greater than this agent's last clean-commit watermark
     // (icommit for rotation/campaign, inflightSeq for unique/sequence) AND any q already in the journal (journalHigh),
     // so a line committed this run is always superseded (fold no-op) and a line lost to a hard kill always survives.
-    // journalHigh only grows (pool-wide + reseeded from the journal's max q at init), so even the shared-field write
-    // race between parallel accounts is safe: at commit time this._runSeq is monotonically ≥ every q this run appended.
+    // journalHigh only grows (pool-wide + reseeded from the journal's max q at init), so concurrent prologues always get
+    // DISTINCT seqs (read+write with no await between). The seq itself is run-LOCAL — see below for why that matters.
     const _respAgent = _stand ? _stand.forAgent : account.name;
-    this._runSeq = Math.max(((this._perAccountRotation[_respAgent] || {}).icommit) || 0, (this._inflightSeq && this._inflightSeq[_respAgent]) || 0, this._journalHigh || 0) + 1;
-    this._journalHigh = this._runSeq;
+    // PER-RUN, not per-orchestrator. The old shared this._runSeq justified its write race with "at commit time
+    // this._runSeq is monotonically ≥ every q this run appended" — true only if there is ONE LIVE RUN PER _respAgent.
+    // _splitCover breaks exactly that: it pairs a SET of reserves against the SAME forAgent for disjoint gid subsets, so
+    // two concurrent stand-ins share ONE watermark (_perAccountRotation[forAgent].icommit). With a shared field, R1's
+    // commit wrote R2's higher seq → it PRE-SUPERSEDED R2's still-in-flight journal lines (q > watermark goes false), so
+    // a crash before R2 returned left the fold blind to R2's real deliveries → the pointer/owed state is rebuilt as if
+    // they never happened → re-post. A run-local seq means a stand-in can only ever commit a watermark ≥ its OWN q and
+    // can never supersede a sibling's. this._journalHigh stays the SHARED monotonic allocator (read+written with no
+    // await between, so concurrent prologues still get distinct seqs), which is what keeps q values globally unique.
+    const _runSeq = Math.max(((this._perAccountRotation[_respAgent] || {}).icommit) || 0, (this._inflightSeq && this._inflightSeq[_respAgent]) || 0, this._journalHigh || 0) + 1;
+    this._journalHigh = _runSeq;
     // An agent DISCHARGING its own PERSISTENT owed post (daily-rotation / campaign-plan, from a prior cycle) covers
     // ONLY its still-owed groups — tied to the actually-picked post so a stale/deleted owed entry can't mis-scope a
     // different post. A reserve STAND-IN's onlyGroups (the dropped agent's un-reached groups) takes precedence. [7][8]
@@ -926,7 +935,7 @@ class Orchestrator {
 
             // Per-(post,group) delivery ledger (deal-once / stand-in only): record a confirmed/held delivery and let
             // the worker skip a group already delivered this cycle. onlyGroups restricts a stand-in to the owed groups.
-            markDelivered: _dedup ? (gid) => { try { if (post.id) { this._cycleDelivered.add(_dkPrefix + post.id + '::' + gid); store.appendInflight({ q: this._runSeq, a: _respAgent, o: _ord, s: _dkPrefix, p: post.id, g: gid, d: this._localDayKey(), t: Date.now() }); } } catch {} } : undefined, // t = REAL delivery instant (H1): lets the crash-fold measure true elapsed-since-post for the 20h anti-straddle floor instead of the restart instant. Additive/opaque field — loadInflight ignores unknowns, old lines simply carry no t.
+            markDelivered: _dedup ? (gid) => { try { if (post.id) { this._cycleDelivered.add(_dkPrefix + post.id + '::' + gid); store.appendInflight({ q: _runSeq, a: _respAgent, o: _ord, s: _dkPrefix, p: post.id, g: gid, d: this._localDayKey(), t: Date.now() }); } } catch {} } : undefined, // t = REAL delivery instant (H1): lets the crash-fold measure true elapsed-since-post for the 20h anti-straddle floor instead of the restart instant. Additive/opaque field — loadInflight ignores unknowns, old lines simply carry no t.
             alreadyDelivered: _dedup ? (gid) => { try { if (!post.id) return false; const k = _dkPrefix + post.id + '::' + gid; return this._cycleDelivered.has(k) || (_uniqueSeqGuard && this._inflightDelivered && this._inflightDelivered.has(k)); } catch { return false; } } : undefined, // R5 [HOLE 1]: a resumed unique/sequence partial post ALSO skips the crash-surviving delivered groups (durable guard) — never for rotation/campaign (they re-deliver)
             journalObligation: (kind, rec) => { try { store.appendObligation({ k: kind, a: _respAgent, ...rec }); } catch {} }, // v1.0.72 crash-durability: durably record a held/comment obligation at CREATION → folded on the next Start if this account crashes before its return-persist (see _foldObligationJournal)
             onlyGroups: _onlyGroups,
@@ -1086,7 +1095,7 @@ class Orchestrator {
     // Surface the outcome so the operator sees pending/error counts in the log pane.
     this.log(`[${account.name}] ✅ Done in ${Math.round((Date.now() - accountStart) / 1000)}s`);
     this.log(`📊 [${account.name}] posted=${posted} pending=${pendingApproval} errors=${errors}`);
-    return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag, offline: accountOffline };
+    return { progressed, posted, pendingApproval, errors, postedIds, dealtIds, flag: accountFlag, offline: accountOffline, runSeq: _runSeq }; // runSeq: THIS run's journal sequence — the pool commits it as the watermark (a shared field let a split-cover sibling's seq supersede in-flight lines)
     } finally {
       // Release claims for posts this account did NOT publish (blocked/failed), so a healthy account can pick them up
       // this same run. In a finally so it runs even if the body throws. #5: gate on _madeClaims — release ONLY claims
@@ -2412,7 +2421,7 @@ class Orchestrator {
               // forAgent pointer for ONE logical daily post; re-bumping would trip _dailyQuotaBlocks early and make the
               // covered agent silently under-deliver its cyclesPerDay. Always refresh the pointer/lastPostedAt.
               const _counted = (this._postCountedThisCycle || (this._postCountedThisCycle = new Set())).has(ptrName);
-              this._perAccountRotation[ptrName] = { lastPostId: res.dealtIds[0], lastPostedDate: _dk, lastPostedAt: Date.now(), postsToday: _counted ? _pt : _pt + 1, postsTodayDate: _dk, icommit: this._runSeq }; // lastPostedAt + postsToday feed _dailyQuotaBlocks (daily pacing / midnight-straddle guard); icommit = R5 clean-commit watermark, persisted ATOMICALLY with the pointer in the saveRotation below so this run's journal lines are superseded (fold no-op) — this._runSeq is monotonically ≥ every q this agent appended this run
+              this._perAccountRotation[ptrName] = { lastPostId: res.dealtIds[0], lastPostedDate: _dk, lastPostedAt: Date.now(), postsToday: _counted ? _pt : _pt + 1, postsTodayDate: _dk, icommit: res.runSeq }; // lastPostedAt + postsToday feed _dailyQuotaBlocks (daily pacing / midnight-straddle guard); icommit = R5 clean-commit watermark, persisted ATOMICALLY with the pointer in the saveRotation below so this run's journal lines are superseded (fold no-op) — this._runSeq is monotonically ≥ every q this agent appended this run
               this._postCountedThisCycle.add(ptrName); }
             if (stand) {
               // Only suppress the "deferred" warning if the stand-in covered ALL of forAgent's slice groups. A PARTIAL
@@ -2501,7 +2510,7 @@ class Orchestrator {
         // lines are superseded ATOMICALLY in the SAME _persistDealt saveRotation (the next-run fold drops them, no
         // re-post). this._runSeq is monotonically ≥ every q this account appended this run. Rotation/campaign/stand-in
         // use perAccountRotation[ptrName].icommit (above); this is the unique/sequence dealt-set analogue.
-        if ((account.postingOrder || '') !== 'daily-rotation' && (account.postingOrder || '') !== 'campaign-plan' && !isStandin && res.dealtIds.length) { this._inflightSeq = this._inflightSeq || {}; this._inflightSeq[account.name] = this._runSeq; }
+        if ((account.postingOrder || '') !== 'daily-rotation' && (account.postingOrder || '') !== 'campaign-plan' && !isStandin && res.dealtIds.length) { this._inflightSeq = this._inflightSeq || {}; this._inflightSeq[account.name] = res.runSeq; }
         // CRASH-SAFE OWED (unique/sequence analogue of the rotation lock-step reconcile ~line 2415): reconcile THIS
         // account's owed entry INLINE so the _persistDealt below writes the ledger ATOMICALLY with the dealt-set that
         // supersedes the post. For unique/sequence the dealt-set IS the pointer, so ADR-0008's rule applies verbatim: a
@@ -2790,6 +2799,7 @@ class Orchestrator {
               // claim a SIBLING held record — e.g. the same account holding a different post in the same group
               // (a reused/blank postId after a library edit could otherwise match the wrong row). Narrows only.
               const recMatch = (x) => x.gid === rec.gid
+                && (x.posterAccount || '') === (rec.posterAccount || '') // scope by POSTER, as the Phase-1 dedup (~973) and the handoff (~1204) already do: two DIFFERENT accounts can hold same-caption (or id-less) cards in the SAME group, and .find() returns the FIRST match regardless of which candidate this loop iteration is on — so it claimed/resolved/stamped the WRONG account's record (stranding the other for ~24h and corrupting the R6 repostedBy identity). Only NARROWS the match: a single-poster hold (the common case) is byte-identical.
                 && ((rec.postId && x.postId) ? x.postId === rec.postId : true)
                 && ((rec.captionSnip && x.captionSnip) ? x.captionSnip === rec.captionSnip : true)
                 && (!!(rec.postId && x.postId) || !!(rec.captionSnip && x.captionSnip)); // require ≥1 real identifier

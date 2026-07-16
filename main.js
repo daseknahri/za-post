@@ -413,8 +413,16 @@ function addPostFromRemote(fields) {
   }, { throwIfUnsaved: true }).then(() => send('data-updated'));
 }
 function deletePostByIndex(index) {
+  // TRUTHFUL FAILURE: a NaN / out-of-range index used to fall through the guard and still resolve, so the route replied
+  // 200 "deleted" having deleted NOTHING. Reject instead, so the caller learns it failed rather than believing a phantom
+  // delete. (Index-addressing is itself a TOCTOU — the orchestrator removes posts BY ID concurrently (autoDeletePosted),
+  // so a stale index from a prior GET can delete the WRONG post. Narrowed here to a truthful error; the real fix is an
+  // id-addressed route, which is an API change for the client — tracked, not silently patched.)
+  const i = Number(index);
+  if (!Number.isInteger(i)) return Promise.reject(new Error(`delete post: index must be an integer (got ${JSON.stringify(index)})`));
   return store.update((data) => {
-    if (index >= 0 && index < data.posts.length) data.posts.splice(index, 1);
+    if (!(i >= 0 && i < data.posts.length)) throw new Error(`delete post: index ${i} is out of range (library has ${data.posts.length} post(s)) — refresh and retry; the library may have changed since you listed it`);
+    data.posts.splice(i, 1);
   }, { throwIfUnsaved: true }).then(() => send('data-updated'));
 }
 // Bulk-insert posts pushed from the client's external server (POST /api/posts/bulk). Mirrors the add-posts-bulk IPC
@@ -424,18 +432,25 @@ function deletePostByIndex(index) {
 function addPostsBulkFromRemote(posts, opts) {
   if (!Array.isArray(posts)) return Promise.resolve({ added: 0, skipped: 0 });
   const replace = !!(opts && opts.replace);
-  const now = Date.now();
   let added = 0, skipped = 0;
   return store.update((data) => {
+    // COLLISION-PROOF IDS. Date.now() used to be captured OUTSIDE this mutator, so store's _writeChain serialization
+    // gave ZERO protection: two concurrent bulk adds both read the clock before either mutator ran → identical id
+    // sequences (post-N-0..post-N-k). Nothing anywhere enforces post.id uniqueness, and duplicate ids are a DOUBLE-POST:
+    // campaign-plan is the one mode with no durable per-(post,group) guard, so its monotonic slice pointer is the only
+    // defense — and _campaignNextIdx resolves it with list.indexOf(lastPostId)+1, which returns the FIRST occurrence and
+    // silently REWINDS the slice into a permanent re-post loop. Mint inside the mutator (serialized) and use the same
+    // nanosecond+monotonic+random shape as lib/imageVary.js, which already solved this for parallel accounts.
+    const mint = (i) => `post-${Date.now()}-${process.hrtime.bigint()}-${i}-${Math.floor(Math.random() * 1e9)}`;
     if (replace) data.posts = [];
     for (let i = 0; i < posts.length; i++) {
       const p = posts[i] || {};
       const caption = (p.caption || '').trim();
       if (!caption) { skipped++; continue; }
-      data.posts.push({ id: `post-${now}-${i}`, caption, comment: p.comment || '', imagePaths: [], imageUrl: p.imageUrl || '', commentImagePath: null, commentImageUrl: p.commentImageUrl || '' });
+      data.posts.push({ id: mint(i), caption, comment: p.comment || '', imagePaths: [], imageUrl: p.imageUrl || '', commentImagePath: null, commentImageUrl: p.commentImageUrl || '' });
       added++;
     }
-  }).then(() => { send('data-updated'); return { added, skipped }; });
+  }, { throwIfUnsaved: true }).then(() => { send('data-updated'); return { added, skipped }; }); // throwIfUnsaved: matches the two siblings above AND this function's own contract — without it a SKIPPED save (transient data.json lock) still resolved, so the route returned HTTP 200 with a truthful-looking { added } while nothing was persisted. server.js's apiErr turns the rejection into the documented 500 so the caller can retry instead of believing a phantom import.
 }
 
 // Companion-extension import: create/update the account for a Facebook session pushed from Chrome. Keyed by c_user
@@ -899,14 +914,17 @@ ipcMain.handle('add-posts-bulk', async (_e, posts) => {
   try {
     if (!Array.isArray(posts)) return fail('Expected an array of posts');
     let added = 0, skipped = 0;
-    const now = Date.now();
     await store.update((data) => {
+      // COLLISION-PROOF IDS — see the /api/posts/bulk sibling. Minting from a Date.now() captured OUTSIDE the mutator
+      // defeats store's _writeChain serialization: two concurrent bulk adds mint IDENTICAL id sequences, and a duplicate
+      // post.id silently rewinds the campaign slice pointer (indexOf returns the first occurrence) into a re-post loop.
+      const mint = (i) => `post-${Date.now()}-${process.hrtime.bigint()}-${i}-${Math.floor(Math.random() * 1e9)}`;
       for (let i = 0; i < posts.length; i++) {
         const p = posts[i] || {}; // one null/garbage record must not throw out of the mutator and reject the whole batch (matches the /api/posts/bulk sibling)
         const caption = (p.caption || '').trim();
         if (!caption) { skipped++; continue; }
         data.posts.push({
-          id: `post-${now}-${i}`,
+          id: mint(i),
           caption,
           comment: p.comment || '',
           imagePaths: [],
@@ -916,7 +934,7 @@ ipcMain.handle('add-posts-bulk', async (_e, posts) => {
         });
         added++;
       }
-    });
+    }, { throwIfUnsaved: true }); // a SKIPPED save (transient data.json lock) must REJECT → fail(), not report ok({added}): the renderer clears the operator's pasted batch on success, so a phantom import silently loses the paste.
     send('data-updated');
     return ok({ added, skipped });
   } catch (e) { return fail(e); }
