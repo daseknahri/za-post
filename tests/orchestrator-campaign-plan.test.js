@@ -331,3 +331,28 @@ test('[#4] an unresolvable lastPostId is treated as CONSUMED, never restarted at
   o._perAccountRotation = { A: {} };                    // a genuinely fresh agent
   assert.deepEqual(o._campaignNextIdx('A'), { idx: 0, len: 3 }, 'no pointer at all → correctly starts at the beginning');
 });
+
+// [#5] DAILY-ROTATION MUST NOT WRAP WITHIN ONE LOCAL DAY. The pointer advance is `% list.length`, so when cyclesPerDay
+// exceeds the agent's eligible library the pointer wraps and re-delivers a post the agent ALREADY posted today — same
+// groups, ~45-90 min apart, on the one shared IP. daily-rotation legitimately re-delivers across DAYS (which is why it
+// has no durable per-(post,group) guard), but a same-day repeat is a spam burst. The cyclesPerDay gate only counts N;
+// it never notices the library is smaller than N.
+test('[#5] daily-rotation stops after ONE full library pass per day (never wraps into a same-day re-post)', () => {
+  const o = mk();
+  const today = o._localDayKey();
+  const A = { name: 'A', assignedGroups: ['g1'], postingOrder: 'daily-rotation', postFilter: 'all', enabled: true, status: 'logged_in' };
+  o._data = { accounts: [A], groups: [{ id: 'g1', groupId: 'g1' }], posts: [{ id: 'P1' }, { id: 'P2' }], settings: { cyclesPerDay: 5 } }; // N=5 > library of 2
+  o._owed = {};
+
+  // Already delivered both posts today → a 3rd pick would wrap to P1 and re-post it hours after the first.
+  o._perAccountRotation = { A: { lastPostId: 'P2', lastPostedDate: today, postsToday: 2, postsTodayDate: today } };
+  assert.deepEqual(o._postsForAccount(A, 0, false), [], 'whole library covered today → nothing more today (the old `% list.length` wrapped to P1 = a same-day re-post)');
+
+  // Mid-pass is unaffected: one delivered, one to go.
+  o._perAccountRotation = { A: { lastPostId: 'P1', lastPostedDate: today, postsToday: 1, postsTodayDate: today } };
+  assert.deepEqual(o._postsForAccount(A, 0, false).map((p) => p.id), ['P2'], 'a partial pass still advances normally');
+
+  // A NEW day resets the pass — cross-day re-delivery is the mode's whole point and must still work.
+  o._perAccountRotation = { A: { lastPostId: 'P2', lastPostedDate: '2000-01-01', postsToday: 2, postsTodayDate: '2000-01-01' } };
+  assert.deepEqual(o._postsForAccount(A, 0, false).map((p) => p.id), ['P1'], 'next day → wraps to P1 as designed (cross-day rotation is intended)');
+});

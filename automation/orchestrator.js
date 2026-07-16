@@ -708,6 +708,15 @@ class Orchestrator {
         if (op) { if (claim && _live.length !== owedDR.gids.length) this._owed[account.name] = { postId: owedDR.postId, gids: _live }; return [op]; }
         if (claim) { try { delete this._owed[account.name]; } catch {} } // owed post gone from the library OR all owed groups un-assigned → drop the stale obligation, fall through to the normal next pick
       }
+      // SAME-DAY WRAP GUARD. The advance below is `% list.length`, so when cyclesPerDay (N) EXCEEDS this agent's
+      // eligible library the pointer WRAPS WITHIN ONE LOCAL DAY and re-delivers a post the agent already posted today —
+      // to the SAME groups, ~45-90 min apart, on the ONE shared IP. daily-rotation legitimately re-delivers across DAYS
+      // (that is the whole mode, and why it has no durable per-(post,group) guard), but a same-day repeat is a spam
+      // burst, not a rotation — and the gate above only counts N, it never notices the library is smaller than N.
+      // Cap the day at ONE full pass: postsToday is persisted (and reconstructed by the crash-fold), so a restart cannot
+      // reset it into another pass. Only ever REDUCES posting; N <= library size is byte-identical.
+      const _todayPasses = (rec.postsTodayDate === this._localDayKey()) ? (Number(rec.postsToday) || 0) : 0;
+      if (list.length && _todayPasses >= list.length) return []; // whole library already delivered today → wait for tomorrow rather than wrap
       const li = rec.lastPostId ? list.findIndex((p) => p.id === rec.lastPostId) : -1;
       let nextIdx = li < 0 ? 0 : (li + 1) % list.length;
       let pick = list[nextIdx];
@@ -3458,12 +3467,26 @@ class Orchestrator {
     // completion path must SURFACE it, or "🎉 complete" would claim 100% while a parked agent's posts were never
     // delivered. Report it; never auto-redistribute (that is the re-burst/ban direction — it resolves at the next round
     // or when the operator re-enables the agent, which restores the slice exactly where it left off).
+    let _parkedLeft = 0, _parkedNames = [];
     try {
       const _parked = (this._campaignPlan && this._campaignPlan.parkedLists) || {};
-      const _names = Object.keys(_parked).filter((n) => ((_parked[n]) || []).length);
-      if (_names.length) {
-        const _pairs = _names.reduce((s, n) => s + (_parked[n] || []).length, 0);
-        this.log(`⚠️ NOT fully delivered: ${_pairs} post(s) across ${_names.length} parked agent(s) [${_names.join(', ')}] were never delivered — those accounts left the campaign (disabled / standby / groups cleared / method changed) and their slice is parked. Re-enable them to finish it, or start a new round to redistribute. This report covers only the ACTIVE roster.`);
+      const _live = (this._data && this._data.posts) || [];
+      for (const n of Object.keys(_parked)) {
+        // Count the UNDELIVERED REMAINDER, not the whole slice: a parked agent had usually delivered part of it, and
+        // reporting the full slice overstates the loss (and would contradict the posted counts). Mirror
+        // _campaignNextIdx exactly — including its "unresolvable pointer ⇒ CONSUMED" rule, so the two can never
+        // disagree — then drop ids no longer in the library (a deleted post is not outstanding work).
+        const list = _parked[n] || [];
+        if (!list.length) continue;
+        const lastId = ((this._perAccountRotation || {})[n] || {}).lastPostId;
+        let idx;
+        if (!lastId) idx = 0;
+        else { const at = list.indexOf(lastId); idx = at < 0 ? list.length : at + 1; }
+        const left = list.slice(idx).filter((id) => _live.some((p) => p.id === id)).length;
+        if (left) { _parkedLeft += left; _parkedNames.push(`${n} (${left})`); }
+      }
+      if (_parkedLeft) {
+        this.log(`⚠️ NOT fully delivered: ${_parkedLeft} post(s) still owed by ${_parkedNames.length} PARKED agent(s) [${_parkedNames.join(', ')}] — those accounts left the campaign (disabled / standby / groups cleared / method changed), so their remaining slice was delivered by nobody. Re-enable them to resume exactly where they left off, or start a new round to redistribute. The counts below cover only the ACTIVE roster.`);
       }
     } catch {}
     let posted = 0, pending = 0, errors = 0;
@@ -3477,8 +3500,11 @@ class Orchestrator {
     // "live without its comment" gap the held-only count above misses. Surface them so 'every comment delivered' never
     // fires while a live post lacks its link.
     let noLink = []; try { noLink = (store.loadComments().pending || []).filter((c) => c.status === 'failed' || c.status === 'skipped'); } catch {}
-    if (reason === 'completed' && !undeliv && !noLink.length) this.log('🎉 Campaign complete — every post published and every comment delivered. Stopping.');
-    else if (reason === 'completed') this.log(`🏁 Campaign delivered its posting work${undeliv ? `, but ${undeliv} post(s) are still HELD / undelivered — Facebook held them and there's no moderator or reserve to recover them (turn on 🛡️ Moderator Approval, or Reserve Re-post)` : ''}${noLink.length ? `${undeliv ? '; also ' : ', but '}${noLink.length} live post(s) are WITHOUT their link-comment (place manually): ${[...new Set(noLink.map((c) => c.groupName || c.gid))].slice(0, 20).join(', ')}` : ''}. Stopping.`);
+    // _parkedLeft joins undeliv/noLink as a completion blocker: it is REAL undelivered posting work, so "every post
+    // published" must not fire while it exists. (Previously the parked warning was logged and then contradicted by the
+    // 🎉 line in the same call.)
+    if (reason === 'completed' && !undeliv && !noLink.length && !_parkedLeft) this.log('🎉 Campaign complete — every post published and every comment delivered. Stopping.');
+    else if (reason === 'completed') this.log(`🏁 Campaign delivered its posting work${_parkedLeft ? `, but ${_parkedLeft} post(s) were never delivered because their agent left the campaign (see the parked warning above — re-enable it, or start a new round)` : ''}${undeliv ? `${_parkedLeft ? '; also ' : ', but '}${undeliv} post(s) are still HELD / undelivered — Facebook held them and there's no moderator or reserve to recover them (turn on 🛡️ Moderator Approval, or Reserve Re-post)` : ''}${noLink.length ? `${(undeliv || _parkedLeft) ? '; also ' : ', but '}${noLink.length} live post(s) are WITHOUT their link-comment (place manually): ${[...new Set(noLink.map((c) => c.groupName || c.gid))].slice(0, 20).join(', ')}` : ''}. Stopping.`);
     else this.log(`🏁 Stopping: ${out ? out.total : '?'} item(s) could not be delivered (${out ? `${out.undealt} unposted, ${out.pending} comments, ${out.held} held` : ''}) — see below.`);
     this.log(`📊 Delivered this run: ${posted} published, ${pending} pending-approval, ${errors} error(s).`);
     if (bad.length) this.log(`🔧 Accounts to REPLACE/check (went bad this run): ${bad.map((a) => `${a.alias || a.name}${(Number(a.rateLimitedUntil) || 0) > now ? ' (rate-limited)' : (this._runFlags && this._runFlags[a.name] ? ` (${this._runFlags[a.name]})` : '')}`).join(', ')}`);
@@ -3660,7 +3686,15 @@ class Orchestrator {
     // Edit notice: any other batchId change is held for the next round; tell the operator once per distinct edit.
     if (this._campaignPlan.batchId !== fresh.batchId && this._pendingPlanBatchId !== fresh.batchId) {
       this._pendingPlanBatchId = fresh.batchId;
-      this.log('📝 Campaign edited while running — the change is held for the NEXT round (the current round finishes on the existing plan so already-delivered posts are not re-posted). To apply it now: Stop → edit → Start.');
+      // The escape hatch named here must be one that ACTUALLY exists and is SAFE. It used to say "Stop → edit → Start",
+      // which does nothing: the plan is persisted with the rotation state and reloaded on Start, so a restart re-freezes
+      // the SAME plan and the edit stays deferred exactly as before. Nor could it safely be made to work — clearing only
+      // the plan on Start would repartition against surviving pointers, and an agent whose lastPostId lands in another
+      // agent's new slice is then treated as CONSUMED (see _campaignNextIdx) and silently strands its remainder; the
+      // alternative, resetting pointers too, re-delivers already-live posts (the re-burst this freeze exists to stop).
+      // Start Fresh is the real hatch: it deliberately clears the plan, the pointers, _owed and the dealt-set, and
+      // re-delivers the whole library from #1 — which is exactly what "apply a new partition now" means.
+      this.log('📝 Campaign edited while running — the change is held for the NEXT round (the current round finishes on the existing plan, so already-delivered posts are never re-posted). It applies automatically at the next round boundary. To apply it immediately instead, use Start Fresh — but note that re-delivers the WHOLE library from #1 to every group.');
     }
   }
 
