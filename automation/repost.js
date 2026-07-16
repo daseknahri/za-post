@@ -134,9 +134,20 @@ async function isContentLive(account, gid, captionSnip, settings, log, shouldSto
       if (!caps.length) return false;
       if (!authors.length) return true; // no author to check → any same-caption match = live (prior behaviour)
       // ANY of OUR authors (original OR reserve), OR an unreadable author (could be ours → don't risk a dup). A readable STRANGER's post is NOT ours.
-      return caps.some((a) => { const au = authorOf(a); return !au || authors.includes(au); });
-    }, { sn: snip, authors }).catch(() => false);
-    return found ? 'live' : 'absent';
+      // THREE outcomes, not two. A caption match under an author we do NOT recognise must NEVER read as 'absent':
+      // 'absent' AUTHORISES a re-post, and isContentLive is the ONLY thing standing between Phase-4 and a duplicate
+      // (runAccount below is called with no alreadyDelivered/onlyGroups ledger, and the reserve is a DIFFERENT account
+      // from the poster, so no poster-keyed durable guard applies either). The author list is a stored display name
+      // that is written once and never refreshed, so a Facebook rename or a mis-captured import makes EVERY author
+      // read "not ours" — and the reserve then re-posts content that is already live, stamps it approved, and retires
+      // it. Silent, permanent, and repeating for every held→auto-released post of that account.
+      if (!caps.length) return 'absent';                                                  // our content genuinely is NOT here → safe to re-post
+      if (caps.some((a) => { const au = authorOf(a); return !au || authors.includes(au); })) return 'live'; // ours (an UNREADABLE author still accepts — don't lose coverage on a flaky render)
+      return 'mismatch';                                                                  // our caption IS here, under a name we don't recognise → we do NOT know
+    }, { sn: snip, authors }).catch(() => 'err');
+    if (found === 'live') return 'live';
+    if (found === 'mismatch') { try { log(`♻️ [${account.name}] found our caption in the group but under an author we don't recognise (expected: ${authors.join(' / ') || '—'}) — NOT re-posting (it may already be live). If that IS this account, its saved display name is STALE: fix fbDisplayName (or re-import it from Chrome).`); } catch {} return 'unconfirmed'; }
+    return found === 'absent' ? 'absent' : 'absent'; // 'err' keeps the pre-existing best-effort behaviour (cap-1 bounds any dup)
   } catch { return 'absent'; } // best-effort: an error shouldn't permanently block delivery (cap-1 bounds any dup)
   finally {
     try { if (browser) await Promise.race([browser.close().catch(() => {}), sleep(8000)]); } catch {} // BOUNDED — browser.close() is an OS process-shutdown that bypasses protocolTimeout; a proxied Chromium can hang on a CLOSE_WAIT socket forever and wedge the whole re-post phase (matches worker.js/rescue.js/moderator.js)
@@ -163,6 +174,15 @@ async function runRepost(o) {
   if (presence === 'no_proxy') {
     log(`♻️ ${where} no usable proxy (proxies are ON) — not re-posting; leaving the held post for retry (assign a proxy to this account).`);
     return { posted: 0, heldRecords: [], flag: 'proxy_invalid' };
+  }
+  // UNCONFIRMED ⇒ do NOT re-post. We found our caption but under an author we don't recognise, so we cannot tell
+  // "already live" (re-posting = a DUPLICATE, the ban axis) from "a stranger's same-caption post" (re-posting = fine).
+  // The hard invariant decides it: a strand is recoverable, a double-post is a ban. Returning no alreadyLive/posted
+  // leaves the held record in its retryable 'failed' state (the orchestrator's transientFailures cap bounds retries),
+  // so the operator can fix the display name and the next cycle resolves it properly.
+  if (presence === 'unconfirmed') {
+    log(`♻️ ${where} could NOT confirm whether the original is already live (author not recognised) — NOT re-posting, to avoid a duplicate. Fix the account's display name if it is stale; the record retries next cycle.`);
+    return { posted: 0, heldRecords: [], commentQueue: [], flag: 'unconfirmed_author' };
   }
   if (presence === 'live') {
     log(`♻️ ${where} original is ALREADY LIVE (FB released it) — NOT re-posting; its link-comment will be placed on the live post instead.`);

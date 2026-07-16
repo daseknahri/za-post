@@ -2785,7 +2785,16 @@ async function runAccount(o) {
     // recognise OUR held posts in the queue). Best-effort, non-blocking; on failure stay silent and
     // leave it empty (approval is fail-closed on an empty name — the operator can set it in the UI).
     // Mutates the in-memory account so THIS run's held records carry the name, and persists for next.
-    if (!(account.fbDisplayName && String(account.fbDisplayName).trim())) { // ALWAYS capture: the comment author-gate (wrong-post guard) needs it, not just moderation
+    // ALWAYS READ IT — do not gate on "is it empty?". This used to only ever capture a MISSING name, so a stored one
+    // was never re-checked: a Facebook rename (or a mis-captured import) was PERMANENT until someone edited the UI.
+    // That single stale string silently breaks two guards at once, and both fail toward the WRONG side:
+    //   • the comment author-gate refuses EVERY comment (observed live: one account, 56/56) → its posts go out link-less;
+    //   • Phase-4's isContentLive cannot recognise its own post → reads 'absent' → the reserve RE-POSTS content that is
+    //     already live = a duplicate on the shared IP (the ban axis).
+    // Reading it costs one page eval per run. We WARN rather than auto-overwrite: the capture is validated but not
+    // infallible, and a flaky read clobbering a GOOD name would break the same two guards — surfacing it lets the
+    // operator fix it in one click, which is the strand-and-surface direction the invariants require.
+    { const _storedName = String(account.fbDisplayName || '').trim();
       try {
         const fbName = await evalTimed(page, () => {
           const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -2809,10 +2818,16 @@ async function runAccount(o) {
           return '';
         }, null, 6000).catch(() => '');
         if (fbName && fbName.length >= 2) {
-          account.fbDisplayName = fbName;
-          await store.update((d) => { const a = (d.accounts || []).find((x) => x.name === name); if (a && !(a.fbDisplayName && String(a.fbDisplayName).trim())) a.fbDisplayName = fbName; }).catch(() => {});
-          log(`🪪 [${name}] captured FB display name: "${fbName}"`);
-        } else { log(`🪪 [${name}] could not read FB display name — set it on the account card for moderator approval`); }
+          if (!_storedName) {
+            account.fbDisplayName = fbName;
+            await store.update((d) => { const a = (d.accounts || []).find((x) => x.name === name); if (a && !(a.fbDisplayName && String(a.fbDisplayName).trim())) a.fbDisplayName = fbName; }).catch(() => {});
+            log(`🪪 [${name}] captured FB display name: "${fbName}"`);
+          } else if (fbName !== _storedName) {
+            // STALE NAME — the highest-value warning this app can emit. BOTH guards keyed on it fail toward the wrong
+            // side, silently and permanently. Not auto-corrected on purpose (see the block comment above).
+            log(`🪪 ⚠️ [${name}] STALE DISPLAY NAME — Facebook shows "${fbName}" but this account is saved as "${_storedName}". Until you fix it: EVERY comment is refused (its posts go live WITHOUT their link) and a held re-post can DUPLICATE an already-live post. Set fbDisplayName to "${fbName}" on the account card, or re-import it from Chrome.`);
+          }
+        } else if (!_storedName) { log(`🪪 [${name}] could not read FB display name — set it on the account card for moderator approval`); }
       } catch {}
     }
 
