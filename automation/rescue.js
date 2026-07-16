@@ -11,7 +11,7 @@
 const { launchStealth, viewportFor, applyProxyGeo } = require('../lib/browser'); // ONE hardened launch path (real Chrome + no automation flag + stealth)
 const store = require('../lib/store');
 const { chromiumPath } = require('../lib/chromium');
-const { addFirstComment, killChromiumForProfile, applyPace, withFloor, antiSpamFloors, parseProxy } = require('./worker');
+const { addFirstComment, killChromiumForProfile, applyPace, withFloor, antiSpamFloors, parseProxy, commentFailureDecision, commentOutcomeClass } = require('./worker');
 let proxyChain = null; try { proxyChain = require('proxy-chain'); } catch {}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -29,6 +29,13 @@ async function runRescue(o) {
   const hidden = o.hidden !== false; // default hidden, mirrors the worker
   const name = account.name;
   const out = { placed: 0, failed: 0, blocked: false, needsLogin: false };
+  // Rescue had NO consecutive-failure breaker. A rescuer whose comments never land (silently dropped / no comment box /
+  // shadow-suppressed — i.e. anything short of an explicitly DETECTED wall) walked its ENTIRE task list, burning one of
+  // every orphan post's 3 attempts per cycle. Three such cycles and every one of those posts is TERMINALLY failed —
+  // permanently abandoned, live without its link — because one broken rescuer spent everyone else's retries. Same shape
+  // as the poster-side report ("keeps posting, never comments"), and it destroys the rescue queue rather than just
+  // wasting time. Reuses the poster's helpers so the two can never drift apart.
+  let consecFails = 0, anyLanded = false;
   // R3: persist the outcome and CONFIRM it reached disk before moving on. onResult (markResult) now returns the
   // store.updateComments promise → { ok }. A landed 'done' write that fails (disk busy) is RETRIED (idempotent: the
   // mutator flips exactly one matching pending record), so a transient lock can't leave the record 'pending' → a
@@ -108,6 +115,11 @@ async function runRescue(o) {
             t.postPermalink || null, settings, t.postId || null, t.fbDisplayName || '', false, false, true).catch(() => 'error'), // checkExisting=true (last arg): if the ORIGINAL account's comment already landed (mis-reported), skip → never a cross-account DOUBLE-comment. R9: swallow a LATE rejection (after the timeout already won the race) so it can't surface as an unhandledRejection
           new Promise((r) => setTimeout(() => r('timeout'), PER_TASK_MS)), // per-task hang ceiling → treated as failure
         ]);
+        // Feed the breaker BEFORE the routing dispatch, so every outcome is classified uniformly. Note the routing
+        // below deliberately treats 'unconfirmed'/'not_visible' as PLACED (Enter was pressed → never re-queue → no
+        // double-comment); commentOutcomeClass answers the OTHER question ("did a comment become VISIBLE?") and counts
+        // 'not_visible' as a loss. Same split as the poster path — do not collapse them.
+        { const _k = commentOutcomeClass(res); if (_k === 'landed') { consecFails = 0; anyLanded = true; } else if (_k === 'lost') consecFails++; }
         if (res === 'posted' || res === 'unconfirmed' || res === 'not_visible' || res === 'already_present') {
           out.placed++; await record(t, 'done');
           log(res === 'already_present'
@@ -139,6 +151,15 @@ async function runRescue(o) {
           // would let that orphaned call keep driving the page (→ its Enter lands on the NEXT task's post = wrong-post /
           // double-comment). Stop this rescuer instead; the remaining comments stay pending for a fresh rescuer next cycle.
           if (res === 'timeout') { log(`💬 [rescue:${name}] ⏱️ a task exceeded ${Math.round(PER_TASK_MS / 1000)}s — stopping this rescuer so a hung call can't drive the shared page into the next task (remaining comments retry next cycle)`); break; }
+          // BREAKER: stop a rescuer that cannot place comments, BEFORE it spends the rest of the queue's attempts. The
+          // remaining tasks keep attempts UNCHANGED and stay pending, so a healthy rescuer (or the next cycle) still
+          // gets them — which is the entire point: one broken account must not terminally fail everyone else's posts.
+          const _cfd = commentFailureDecision(consecFails, anyLanded);
+          if (_cfd) {
+            if (_cfd === 'block') { out.blocked = true; log(`💬 [rescue:${name}] 🛑 3 comment failures in a row and NOT ONE landed — this rescuer cannot place comments (Facebook is suppressing it). Stopping it and resting it; the remaining ${tasks.length - i - 1} comment(s) keep their attempts and go to a healthy account next cycle.`); }
+            else log(`💬 [rescue:${name}] ⚠️ 3 comment failures in a row, but it DID land one earlier — treating as transient. Stopping this rescuer; the remaining ${tasks.length - i - 1} comment(s) keep their attempts and retry next cycle.`);
+            break;
+          }
         }
       } catch (e) { out.failed++; await record(t, 'error'); log(`💬 [rescue:${name}] error on a "${label}" post: ${e.message}`); }
       // Human gap between rescue comments so the rescuer doesn't burst-comment links (its own anti-spam).

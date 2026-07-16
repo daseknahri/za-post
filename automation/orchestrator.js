@@ -2934,6 +2934,12 @@ class Orchestrator {
                 const ms3 = store.loadModeration();
                 const r3 = (ms3.held || []).find(recMatch);
                 if (r3) { r3.status = 'failed_held'; r3.repostAttempts = 1; r3.note = 'replacement re-post was also held — no further attempts (group-level spam gate)'; store.saveModeration(ms3); }
+                // A HELD re-post still REACHED Facebook, so it must consume the reserve's daily cap exactly as the pool
+                // path counts held posts ("held posts DID reach FB (gated for review) — count them"). Only the
+                // posted>=1 branch recorded an outcome, so a reserve whose re-posts kept getting held did unlimited
+                // FB-visible work per day while its cap read zero — the picker's `dailyUsed < cap` gate could never
+                // stop it. pendingApproval (not posted) is what runRepost reports for a held delivery.
+                try { await this._recordAccountOutcome(reserve.name, { posted: 0, pendingApproval: (result.pendingApproval || (result.heldRecords || []).length || 1), errors: result.errors || 0, flag: null, postedIds: [], dealtIds: [] }, settings); } catch {}
                 this.log(`⚠️ [${reserve.name}] replacement re-post to "${rec.groupName || rec.gid}" was ALSO held → reported undeliverable (2 accounts held = group-level spam gate). Warm/replace accounts for this group.`);
               } else {
                 // Session/infra/transient failure (logged out, profile lock, crash, no composer) — NOT a
