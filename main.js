@@ -1553,6 +1553,22 @@ function setAccountStatus(name, status, message, result) {
     // is what lets the author-aware guards (repost liveness, publish-timeout rescan, moderator, comment
     // targeting) engage without a manual per-account step. Mirrors worker.js's capture-once semantics.
     if (result && result.fbName && !(a.fbDisplayName && String(a.fbDisplayName).trim())) a.fbDisplayName = String(result.fbName).trim();
+    // DRIFT WARNING. fbName is refreshed from the LIVE page on EVERY status check (just above), but fbDisplayName is
+    // seeded only when EMPTY — capture-once, so a manual UI value is never clobbered, which is correct. The consequence
+    // is that the two drift apart silently and NOTHING ever compares them: the app holds the right name and the wrong
+    // name side by side and says nothing. That one stale string breaks TWO guards, both toward the WRONG side:
+    //   • the comment author-gate refuses EVERY comment → that account's posts go live WITHOUT their link (zero value,
+    //     full daily-cap burn, full shared-IP ban exposure);
+    //   • Phase-4's isContentLive cannot recognise the account's own post → reads 'absent' → the reserve RE-POSTS
+    //     content that is already live = a duplicate on the shared IP (the ban axis).
+    // Measured on the live fleet: 2 of 26 accounts had drifted; one had refused 56/56 comments and nobody could tell
+    // why. We still do NOT auto-override (a flaky read clobbering a GOOD name would break the same two guards) — but
+    // the comparison is free here, so the operator gets a one-line, one-click fix instead of a silent dead account.
+    if (result && result.fbName && a.fbDisplayName
+      && String(result.fbName).trim() && String(a.fbDisplayName).trim()
+      && String(result.fbName).trim() !== String(a.fbDisplayName).trim()) {
+      try { emit('automation-log', `🪪 ⚠️ [${name}] STALE DISPLAY NAME — Facebook shows "${String(result.fbName).trim()}" but this account is saved as "${String(a.fbDisplayName).trim()}". Until you fix it: EVERY comment is refused (its posts go live WITHOUT their link) and a held re-post can DUPLICATE an already-live post. Set the account's display name to "${String(result.fbName).trim()}" on its card.`); } catch {}
+    }
     if (result && result.status === 'logged_in') a.lastChecked = Date.now();
     // Opportunistically prune any assignedGroups that no longer exist in data.groups.
     const valid = new Set(data.groups.map((g) => g.id));
