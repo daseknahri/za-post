@@ -1,6 +1,6 @@
 # ADR-0020: Interchangeable account pool — weighted shared-pool posting (evolve unique/sequence, not campaign-plan slices)
 
-- **Status:** Proposed
+- **Status:** Superseded by [ADR-0023](ADR-0023-batch-pool-floor-the-spread.md) — the direction is retained; the opening move is not. Live data showed the pool is concurrency-bound at parallelAccounts=3, so pull-dispatch adds ZERO throughput; ADR-0023 sequences the cheap reversible wins first and gates the rewrite on evidence.
 - **Date:** 2026-07-16
 - **Deciders:** owner + engineering
 
