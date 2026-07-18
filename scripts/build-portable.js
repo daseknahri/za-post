@@ -143,11 +143,31 @@ function ensureWinCodeSign() {
   const enableTunnel = process.env.ENABLE_TUNNEL || '1';
   const bat = [
     '@echo off',
-    'REM ── Launches Za Post with the remote API enabled (token + tunnel set for THIS launch only). ──',
-    'REM Use this same token as the X-Access-Token header when POSTing from your external server.',
+    'setlocal',
+    'REM ── Launches Za Post (remote API token + tunnel set for THIS launch) AND auto-relaunches it after a CRASH. ──',
+    'REM No admin / scheduled task needed — just double-click this. A clean quit or Stop does NOT relaunch.',
+    'REM Keep this window open while the app runs (it is the watchdog). Use the token as your X-Access-Token header.',
     `set "ZAPOST_API_TOKEN=${apiToken}"`,
     `set "ENABLE_TUNNEL=${enableTunnel}"`,
-    `start "" "%~dp0${APP_FOLDER}.exe"`,
+    'set "ZAPOST_WATCHDOG=1"',
+    'set /a _fails=0',
+    ':launch',
+    `start /wait "" "%~dp0${APP_FOLDER}.exe"`,
+    'REM The run that just exited reached healthy uptime (the app wrote .healthy) -> reset the crash streak so isolated crashes days apart never accumulate to the cap; then consume the marker.',
+    'if exist "%~dp0.healthy" set /a _fails=0',
+    'if exist "%~dp0.healthy" del /q "%~dp0.healthy" >nul 2>&1',
+    'REM run-active.flag next to the exe = a run was ACTIVE when the process died (a CRASH) -> relaunch. No flag = a clean quit / Stop / completed run -> exit.',
+    'if not exist "%~dp0run-active.flag" goto done',
+    'set /a _fails+=1',
+    'if %_fails% geq 5 (',
+    '  echo [start.bat] The app crashed 5 times in a row - not relaunching. Check the app, then run start.bat again.',
+    '  goto done',
+    ')',
+    'echo [start.bat] The app exited while a run was active - crash - relaunching in 30s, attempt %_fails% of 5...',
+    'timeout /t 30 /nobreak >nul',
+    'goto launch',
+    ':done',
+    'endlocal',
     '',
   ].join('\r\n');
   fs.writeFileSync(path.join(staging, APP_FOLDER, 'start.bat'), bat, 'utf8');
@@ -164,6 +184,13 @@ function ensureWinCodeSign() {
 
   if (!fs.existsSync(zipPath)) throw new Error('zip was not created');
   const mb = Math.round(fs.statSync(zipPath).size / 1e6);
+  // Keep ONLY the latest portable zip (operator's rule: "we just need one"). Prune every OTHER *-portable.zip in
+  // dist/ now that THIS build succeeded (done after the new zip exists so a failed build never deletes the last good one).
+  try {
+    for (const f of fs.readdirSync(DIST)) {
+      if (/-portable\.zip$/i.test(f) && f !== ZIP_NAME) { fs.rmSync(path.join(DIST, f), { force: true }); console.log(`> pruned old build: dist/${f}`); }
+    }
+  } catch (e) { console.warn('> (could not prune old zips:', e.message + ')'); }
   console.log(`\n✅ Portable build ready: dist/${ZIP_NAME}  (${mb} MB)`);
   console.log(`   Zip root: "${APP_FOLDER}/" (app + bundled Chromium) + READ-ME-FIRST.txt`);
   console.log('   Send this single .zip — the recipient extracts it and runs the .exe inside.');

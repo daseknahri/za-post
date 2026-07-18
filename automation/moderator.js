@@ -217,19 +217,19 @@ async function runModerator(o) {
           // Best-effort poster-name read from the matched row → a VETO for a confident STRANGER (fail-open).
           // Names are short links/headings; the caption preview is long → length-filtered out. If we can't
           // read a name (obfuscated DOM) OR no ourNames configured, authorOurs stays true (caption-only).
-          let author = '', authorOurs = true;
+          let author = '', authorOurs = true, authorConfirmedOurs = false; // #6: authorConfirmedOurs is STRICTER than authorOurs — true ONLY on a POSITIVE ourNames match (never the fail-open default), used to gate caption-only approvals on a shared/common caption
           try {
             const cand = Array.from(n.querySelectorAll('a[role="link"], strong, h2, h3, h4'))
               .map((e) => nm(e.textContent || ''))
               .filter((s) => s && s.length >= 2 && s.length <= 50 && !APPROVE.test(s) && !snips.some((sn) => sn && s.includes(sn.slice(0, 20)))); // DECLINE not applied to author names (a name may contain 'remove'/'hide'/etc.)
             if (ourNames && ourNames.length) {
-              const hit = cand.find((c) => ourNames.some((on) => c.includes(on) || on.includes(c)));
-              if (hit) { author = hit; authorOurs = true; }
+              const hit = cand.find((c) => ourNames.some((on) => c.includes(on) || (on.includes(c) && c.length >= Math.max(5, Math.floor(on.length * 0.6))))); // S3: length-gate the reverse-substring direction so a short stranger token (e.g. "ali") can't pass the veto as our "ali baba store" → wrong-approve. A truncated real display-name still matches; a missed truly-ours card falls to Phase-4 (never worse for the wrong-approve guard).
+              if (hit) { author = hit; authorOurs = true; authorConfirmedOurs = true; } // #6: a POSITIVE name match → confidently ours
               else if (cand.length) { author = cand[0]; authorOurs = false; } // a readable, non-matching name → veto
             } else if (cand.length) { author = cand[0]; }
           } catch {}
           const zpTag = String(tag++); btn.setAttribute('data-zp-mod', zpTag);
-          results.push({ author, authorOurs, capMatch: true, capSnipMatched: matched, hasApprove: true, zpTag, snippet: rowText.slice(0, 70) });
+          results.push({ author, authorOurs, authorConfirmedOurs, capMatch: true, capSnipMatched: matched, hasApprove: true, zpTag, snippet: rowText.slice(0, 70) });
         }
         // diagnostics: distinct labels of the approve-looking buttons we considered
         const nearbyBtns = [...new Set(approveBtns.map((b) => nm((b.getAttribute && b.getAttribute('aria-label')) || b.textContent || '')).filter(Boolean))].slice(0, 12);
@@ -241,6 +241,13 @@ async function runModerator(o) {
       log(`🛡️ [moderator] [${gname}] ${scan.approveBtnCount || 0} approve-button(s) on page, ${scan.count} matched OUR caption(s); approve labels: [${(scan.nearbyBtns || []).join(' | ') || 'none'}]`);
       let matchedThisGroup = 0;
       const handledSnips = new Set(); // snippets already acted on this group — never approve/queue one held post twice
+      // #6: capSnips appearing on 2+ cards where NONE positively confirmed OUR author are AMBIGUOUS — an author-unknown
+      // (fail-open) caption-only match on such a snippet could be a STRANGER's held post carrying byte-identical ad copy,
+      // and approving it would land OUR link-comment on their post. Decline all of them (leave 'held' → recovered next
+      // pass / Phase-4). An author-CONFIRMED card still approves normally even amid same-caption strangers.
+      const _snipCounts = {}, _snipConfirmed = {};
+      for (const rr of scan.results) { if (rr.capSnipMatched) { _snipCounts[rr.capSnipMatched] = (_snipCounts[rr.capSnipMatched] || 0) + 1; if (rr.authorConfirmedOurs) _snipConfirmed[rr.capSnipMatched] = true; } }
+      const _ambiguousSnip = (s) => (_snipCounts[s] || 0) >= 2 && !_snipConfirmed[s];
       for (let i = 0; i < scan.results.length; i++) {
         if (shouldStop()) break;
         const r = scan.results[i];
@@ -254,6 +261,12 @@ async function runModerator(o) {
         const fullMatch = r.capMatch && r.hasApprove && r.zpTag != null && r.authorOurs; // caption + (author-ours OR author-unknown)
         if (fullMatch && handledSnips.has(r.capSnipMatched)) {
           log(`🛡️ [moderator] [${gname}] card ${i + 1}: duplicate of an already-handled held post — skipping (no double-approve)`);
+          continue;
+        }
+        // #6: caption-only (author-unknown) match on a caption SHARED by 2+ unconfirmed cards → could be a stranger's
+        // identical-copy post; decline all → leave 'held' (fails safe). Set the account's FB display name to approve confidently.
+        if (fullMatch && !r.authorConfirmedOurs && _ambiguousSnip(r.capSnipMatched)) {
+          log(`🛡️ [moderator] [${gname}] card ${i + 1}: caption matched but ${_snipCounts[r.capSnipMatched]} cards share this exact caption and NONE has a confirmed author — NOT approving (could be a stranger's identical-copy post). Set this account's FB display name on the Accounts tab to approve it confidently.`);
           continue;
         }
         if (fullMatch) {

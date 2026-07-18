@@ -38,12 +38,36 @@ automation/
                       (cookies → credential auto-login), navigate, open composer,
                       caption (paste/type), image upload, publish, pending-approval
                       detection, block detection, first-comment, per-account watchdog.
+  moderator.js ...... The MODERATOR phase: a designated admin account approves OUR posts
+                      that Facebook held in a group's "Spam potentiel"/pending queue so they
+                      go live. Fail-closed (author AND caption must match our accounts).
+  repost.js ......... Last-resort held-post re-post: a healthy reserve account re-posts the
+                      same content when moderation couldn't approve it — checks the feed
+                      first and skips if FB already auto-released it (no duplicate).
+  rescue.js ......... Comment rescue: a healthy member account places an orphaned first
+                      comment (rate-limit / feed-miss) so a live post is never left without
+                      its link. Wrong-post-safe (reuses worker.addFirstComment).
 lib/
   store.js .......... JSON data store (data.json), durable atomic writes + .bak recovery,
                       write-serialization mutex, rotation state (pcu-state.json), cookies,
                       images, run-report (audit). DEFAULT_SETTINGS lives here.
   chromium.js ....... Resolves the Chromium exe (bundled resources/chrome when packaged,
                       else Puppeteer's cache).
+  browser.js ........ THE single Puppeteer launch path (real Chrome, stealth, anti-automation
+                      args) — every browser in the app launches through it.
+  license.js ........ Client license: hwid bind, validate/activate/checkCached, offline-allow.
+  spintax.js ........ {a|b|c} caption/comment expansion (seedable) for per-group variation.
+  imageVary.js ...... Per-(account,group) image perturbation (crop/tone/hue/noise) to shift the
+                      perceptual hash while looking identical (jimp; degrades gracefully).
+  plan.js ........... Builds the day-by-day campaign plan + delivered-progress overlay for the UI.
+  proxy.js .......... Per-proxy failure tracking + exponential cool-down (off the posting path).
+  chrome-bridge.js .. Localhost token-gated receiver for the "Import from Chrome" extension (reads
+                      the full FB cookie set incl. datr so the profile keeps its device identity).
+  secret.js ......... Encrypts account email/password at rest via Electron safeStorage (DPAPI/…).
+  geo.js ............ Detects a proxy's timezone/locale (geo-IP through the proxy) to align the
+                      browser clock+language to the proxy region.
+  brand.js .......... Single source of truth for per-brand identity (name, app id, port, icon)
+                      for white-label builds; falls back to the "Za Post" defaults.
 server.js ........... Local Express API + remote dashboard (port 3000), token-gated.
 renderer/ ........... Desktop UI (index.html + renderer.js): accounts, groups, posts,
                       settings, start/pause/stop, live log, run summary.
@@ -183,7 +207,7 @@ re-queued; Facebook DOM changes can break selectors (see `scripts/` diagnostics)
 
 ## 9. Build & packaging — see also §11
 
-`npm run pack:portable` → `dist\Za-Post-Comment-Tool-1.0.0-portable.zip` (~315 MB): a
+`npm run pack:portable` → `dist\Za-Post-Comment-Tool-<ver>-portable.zip` (~315 MB): a
 `Za Post Comment Tool\` folder (the app + bundled Chromium) + `READ-ME-FIRST.txt`. The
 recipient extracts and runs `Za Post Comment Tool.exe`; data still lives in `%APPDATA%`.
 
@@ -235,7 +259,7 @@ contains macOS symlinks whose extraction needs admin / Windows Developer Mode. S
 ### Verifying a build (no Facebook login needed)
 ```bash
 node scripts/test-fingerprint.js   # 10 checks — proves the fingerprint fixes take effect in a real browser
-node scripts/test-antispam.js      # 27 checks — proves content variation + cap/cool-down/persistence
+node scripts/test-antispam.js      # 34 checks — proves content variation + cap/cool-down/persistence
 ```
 Both exit 0 on success. They cover everything except an actual post to Facebook (which needs a
 logged-in account + a real group — do that manually with ONE account first; see §13 + HANDOFF.md).

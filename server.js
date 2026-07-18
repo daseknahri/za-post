@@ -126,8 +126,8 @@ function startServer(port, injected) {
     const posts = (hooks.getData().posts || []).map((p) => ({
       caption: p.caption || '',
       comment: p.comment || '',
-      imagePath: (p.imagePaths && p.imagePaths[0]) || p.imagePath || '',
-      commentImagePath: p.commentImagePath || '',
+      imagePath: require('path').basename((p.imagePaths && p.imagePaths[0]) || p.imagePath || ''), // L2: basename only — the /images/<name> static route already serves by basename (consumer does .split(/[\/\\]/).pop()); the full on-disk path leaked the OS username + userData layout
+      commentImagePath: require('path').basename(p.commentImagePath || ''),
     }));
     res.json({ posts });
   });
@@ -246,7 +246,7 @@ function stopTunnel() { try { activeTunnel && activeTunnel.stop && activeTunnel.
 // We parse the URL from cloudflared's own output (the bundled cloudflared package's built-in
 // 'url' regex is outdated for newer cloudflared builds, so it never fires). Robust + isolated:
 // child errors/exit can't crash the app.
-async function startTunnel(port, onUrl) {
+async function startTunnel(port, onUrl, onDown) {
   try {
     // Use Tunnel.quick() — it builds `cloudflared tunnel --url …` (a quick trycloudflare
     // tunnel). NB: the package's tunnel({'--url':…}) builds `tunnel run --url …` which is
@@ -266,6 +266,11 @@ async function startTunnel(port, onUrl) {
     });
     if (url) { addLog(`🌐 Remote access ready: ${url}`); onUrl && onUrl(url); }
     else { addLog('🌐 Tunnel started but no URL was captured (check connectivity).'); }
+    // #10: watch for the tunnel CHILD dying AFTER establishment. The in-promise 'exit' handler above is idempotent (a
+    // no-op once the URL resolved), so without this a dead trycloudflare quick-tunnel (they exit after hours) is never
+    // noticed: activeTunnel points at a dead handle and the caller's tunnelActive flag stays true → a re-enable is a
+    // no-op and the remote dashboard 502s for the rest of the run. Surface it so the caller resets + revives.
+    if (url) { try { t.on('exit', () => { if (activeTunnel !== t) return; activeTunnel = null; addLog('🌐 Remote tunnel exited (cloudflared child died) — remote access is down until it revives.'); if (typeof onDown === 'function') { try { onDown(); } catch {} } }); } catch {} } // review-fix: gate the WHOLE handler (incl. onDown) on identity — a STALE tunnel's delayed exit must not reset the state of a DIFFERENT live tunnel (would flap the URL + leak cloudflared children over a long run)
     return url;
   } catch (e) { addLog(`🌐 Tunnel unavailable: ${e && e.message ? e.message : e}`); return null; }
 }

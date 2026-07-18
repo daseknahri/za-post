@@ -7,7 +7,7 @@ const ALLOWED_CHANNELS = new Set([
   'get-data', 'save-data',
   'add-post', 'delete-post', 'delete-posts', 'edit-post', 'add-posts-bulk', 'add-groups-bulk', 'bulk-assign-post-set', 'delete-post-set',
   'add-group', 'delete-group', 'delete-groups',
-  'create-account', 'login-account', 'auto-login-account', 'open-account-browser', 'check-account-status', 'check-account-memberships', 'delete-account', 'import-cookies',
+  'create-account', 'login-account', 'auto-login-account', 'open-account-browser', 'open-account-groups', 'check-account-status', 'check-account-memberships', 'delete-account', 'import-cookies',
   'close-login-browser', 'toggle-account', 'set-account-credentials', 'get-account-credentials',
   'rename-account', 'batch-account-action', 'add-accounts-bulk', 'pick-cookies-folder',
   'setup-chrome-import', 'open-chrome-import-folder', 'chrome-import-info', 'assign-chrome-groups',

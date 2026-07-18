@@ -25,12 +25,15 @@ npm run dev        # same, with DevTools open
 
 | Path | Purpose |
 |---|---|
-| `main.js` | Electron main process — every IPC handler, account login/status, license stub, server wiring |
+| `main.js` | Electron main process — every IPC handler, account login/status, per-seat license gate, server wiring |
 | `preload.js` | `window.electronAPI` bridge (recovered, unchanged) |
 | `renderer/` | UI: `index.html`, `renderer.js`, `styles.css` (recovered, unchanged) |
 | `lib/store.js` | JSON data store + per-account profile/cookie/image paths |
 | `automation/orchestrator.js` | Posting cycle: per-account filters, parallel batches, delays, stop control |
 | `automation/worker.js` | One account → its groups: open composer, upload image, caption, post, first comment |
+| `automation/moderator.js` | Held-post approval: admin account approves our accounts' posts held in the pending/spam queue |
+| `automation/repost.js` | Held-post re-post rescue: a reserve account re-posts held content (auto-release-checked to avoid duplicates) |
+| `automation/rescue.js` | Orphaned link-comment rescue: a healthy account places a first comment a post's own account couldn't |
 | `server.js` | Express remote-control dashboard + best-effort Cloudflare tunnel |
 | `public/index.html` | Remote dashboard page (recovered) |
 
@@ -91,9 +94,10 @@ it publicly when available; the URL is pushed to the desktop UI.
 
 ## Notes / what to tune next
 
-- **License** is a permissive **local stub** (`get-license-info` returns lifetime + 9999 limits);
-  there is no validation server. Replace `get-license-info` / `validate-license-async` in
-  `main.js` if you want real gating.
+- **License** — opt-in **per-seat licensing** validated against the configured license server
+  (see `LICENSE_SERVER_URL` / `lib/license.js`), with a **7-day offline grace** and an unlimited
+  owner key; enabled via `ENABLE_LICENSE` / `settings.licenseEnabled` or a packaged `ENFORCE_LICENSE`
+  build (see `ENV.md` / `docs/decisions/` ADR-0004).
 - **Facebook selectors** in `automation/worker.js` are best-effort with fallbacks; Facebook's
   DOM changes often, so these are the first thing to verify/tune on a live run.
 - Posting requires accounts that are actually logged in — use **Accounts → Login** (opens a real

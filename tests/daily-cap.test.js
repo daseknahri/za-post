@@ -55,3 +55,13 @@ test('load() coerces account numeric fields so strings/NaN never reach the cap/c
   assert.strictEqual(a.rateLimitedUntil, futureRl, 'coerced to a number and preserved (valid future cool-down)');
   fs.rmSync(tmp, { recursive: true, force: true });
 });
+
+test('#16: a hand-edited STRING dailyCap is coerced/clamped on LOAD so the ban-safety cap can never silently switch off', () => {
+  // A stopped-app hand-edit / import can put "dailyCap":"5" (a JSON string) into data.json. Before the fix normalize()
+  // passed it through untouched and the engine's Number.isFinite(dailyCap) gate saw false → cap=0 → cap OFF, no warning.
+  assert.strictEqual(store.normalize({ settings: { dailyCap: '5' } }).settings.dailyCap, 5, 'string "5" → number 5 on load');
+  const s = store.normalize({ settings: { dailyCap: '5' } }).settings;
+  assert.ok(Number.isFinite(s.dailyCap) && s.dailyCap > 0, 'the cap gate (Number.isFinite && >0) now stays active');
+  assert.strictEqual(store.normalize({ settings: { dailyCap: 'abc' } }).settings.dailyCap, 0, 'garbage → default 0 (no NaN into the cap math)');
+  assert.strictEqual(store.normalize({ settings: { dailyCap: -5 } }).settings.dailyCap, 0, 'negative → clamped to the 0 floor');
+});

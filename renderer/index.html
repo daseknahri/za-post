@@ -280,6 +280,9 @@
           </div>
         </div>
 
+        <!-- Needs-attention: the actionable problems (logged-out accounts, held posts, misconfig) — the first thing an unattended operator should see. Hidden logic in renderAttention(). -->
+        <div id="dash-attention" class="mb-6"></div>
+
         <div class="stats-grid grid grid-cols-4 gap-4 mb-6">
           <div
             class="stat-card group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5 hover:border-accent/30 hover:shadow-glow transition-all duration-300 cursor-default">
@@ -370,6 +373,10 @@
               <div class="flex items-center gap-2 text-xs text-gray-300">
                 <span>🟠</span><span class="text-gray-500">Rate-limited:</span>
                 <span id="health-ratelimited" class="font-bold text-cyber-amber ml-auto">0</span>
+              </div>
+              <div class="flex items-center gap-2 text-xs text-gray-300">
+                <span>🔐</span><span class="text-gray-500">Needs verify:</span>
+                <span id="health-checkpoint" class="font-bold text-red-400 ml-auto">0</span>
               </div>
               <div class="flex items-center gap-2 text-xs text-gray-300">
                 <span>⚪</span><span class="text-gray-500">Other:</span>
@@ -655,7 +662,9 @@
           .set-sec[open]>summary .set-chev{transform:rotate(90deg);}
           .set-sec>summary:hover{background:rgba(255,255,255,0.03);}
           .set-sec-desc{font-size:12px;color:#8a99ad;padding:0 18px 4px;margin-top:-6px;}
-          .set-sec-body{padding:14px 16px 16px;display:flex;flex-direction:column;gap:14px;}
+          .set-sec-body{padding:12px 14px 14px;display:flex;flex-direction:column;gap:10px;}
+          #settings-view .set-sec-body .form-group{padding:13px 15px !important;}
+          #settings-view .set-sec-body .form-group small{font-size:11px;line-height:1.45;}
           .set-sub{background:rgba(15,23,42,0.5);border:1px dashed rgba(255,255,255,0.1);border-radius:14px;}
           .set-sub>summary{cursor:pointer;padding:11px 15px;font-size:13px;font-weight:600;color:#cbd5e1;list-style:none;display:flex;align-items:center;gap:8px;user-select:none;}
           .set-sub>summary::-webkit-details-marker{display:none;}
@@ -670,25 +679,12 @@
             <summary>⚡ Speed <span class="set-chev">▸</span></summary>
             <div class="set-sec-body">
               <div class="form-group bg-gradient-to-br from-accent/10 to-dark-700/40 backdrop-blur-sm border border-accent/25 rounded-2xl p-5">
-                <label class="block text-sm font-semibold text-gray-200 mb-1">Posting speed (one click sets everything)</label>
-                <small class="block mb-3 text-xs text-gray-400">Fills all the timing below at once. <b class="text-cyber-green">Slow</b> = safest · <b class="text-cyber-blue">Normal</b> = balanced · <b class="text-cyber-amber">Fast</b> = quickest still-safe · <b class="text-red-400">Turbo</b> = power-user, extremely fast · <b class="text-red-500">Instant</b> = MAX speed: everything pasted, 0–7s between actions, post lands in seconds (highest ban risk — warmed accounts + proxies only). Quick Setup has the same selector.</small>
-                <div class="grid grid-cols-2 gap-3">
-                  <button type="button" data-speed="instant" class="speed-btn px-4 py-3 rounded-xl border border-red-500/40 bg-dark-900/60 text-sm font-semibold text-red-300 hover:border-red-500 transition-all">⚡ Instant (max speed · spam risk)</button>
-                  <button type="button" data-speed="turbo" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">🚀 Turbo (power user)</button>
+                <label class="block text-sm font-semibold text-gray-200 mb-1">Posting speed</label>
+                <small class="block mb-3 text-xs text-gray-400">One fleet-wide baseline — each account can <b>Inherit</b> it or override on the Accounts tab. <b class="text-cyber-green">🛡️ Safe</b> = full human behavior (real typing, reading pauses, full anti-spam gaps): safest, for cold / warming / reserve accounts. <b class="text-cyber-amber">⚡ Fast</b> = pastes + skips the reading pauses but KEEPS the full anti-spam gaps: the quickest still-safe pace, for warmed accounts. <b class="text-red-500">🚀 Max</b> = everything pasted, smallest gaps, aggressive: highest ban risk (all-warmed fleet only; post the first item manually). Quick Setup uses the same three.</small>
+                <div class="grid grid-cols-3 gap-3">
+                  <button type="button" data-speed="safe" class="speed-btn px-4 py-3 rounded-xl border border-cyber-green/40 bg-dark-900/60 text-sm font-semibold text-cyber-green hover:border-cyber-green transition-all">🛡️ Safe</button>
                   <button type="button" data-speed="fast" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">⚡ Fast</button>
-                  <button type="button" data-speed="normal" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">⚖️ Normal</button>
-                  <button type="button" data-speed="slow" class="speed-btn px-4 py-3 rounded-xl border border-white/10 bg-dark-900/60 text-sm font-semibold text-gray-300 hover:border-accent/50 transition-all">🐢 Slow</button>
-                </div>
-                <div style="margin-top:14px;border-top:1px solid rgba(255,255,255,0.06);padding-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-                  <label for="setting-default-pace" class="block text-xs font-semibold text-gray-400" style="white-space:nowrap;">Default account pace</label>
-                  <select id="setting-default-pace" class="px-3 py-2 bg-dark-900/60 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-accent/50 transition-all">
-                    <option value="safe">🐢 Safe — 2× slower, most human</option>
-                    <option value="normal">⚖️ Normal — global tempo (default)</option>
-                    <option value="fast">⚡ Fast — ½ gaps, instant typing</option>
-                    <option value="turbo">🚀 Turbo — ¼ gaps, power-user</option>
-                    <option value="instant">⚡ Instant — max speed (trusted accounts + proxies only)</option>
-                  </select>
-                  <small class="text-xs text-gray-500" style="flex:1;min-width:200px;">Fleet fallback for accounts with no individual pace (override per-account on the Accounts tab or in Quick Setup). <b class="text-red-400">Turbo/Instant here applies to your whole fleet</b> — pick it only if every account is warmed.</small>
+                  <button type="button" data-speed="max" class="speed-btn px-4 py-3 rounded-xl border border-red-500/40 bg-dark-900/60 text-sm font-semibold text-red-300 hover:border-red-500 transition-all">🚀 Max (spam risk)</button>
                 </div>
               </div>
 
@@ -696,7 +692,7 @@
           </details>
 
           <!-- ════ SECTION 3 — CONTENT & VARIATION ════ -->
-          <details class="set-sec" open>
+          <details class="set-sec">
             <summary>🖼️ Content &amp; variation <span class="set-chev">▸</span></summary>
             <div class="set-sec-body">
               <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
@@ -733,7 +729,7 @@
           </details>
 
           <!-- ════ SECTION 4 — ACCOUNTS & WARM-UP ════ -->
-          <details class="set-sec" open>
+          <details class="set-sec">
             <summary>🌱 Accounts &amp; warm-up <span class="set-chev">▸</span></summary>
             <div class="set-sec-body">
               <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
@@ -769,6 +765,26 @@
                 <small class="block mt-2 text-xs text-gray-500">How many drops ONE reserve may cover in a single cycle. <b>1 (default) = one job per account/cycle</b> (safest). Raise to 2–5 so a healthy reserve covers multiple dropped accounts when drops outnumber reserves.</small>
               </div>
               <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-campaign-min-agents" class="block text-sm font-semibold text-gray-300 mb-2">Minimum active agents per group-set (Campaign Plan · 0 = off)</label>
+                <input type="number" id="setting-campaign-min-agents" min="0" max="100" value="0" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500"><b>Campaign Plan only.</b> A group-set that would finish early is paced by benching some of its accounts, so every set spans the slowest set's day-count. This forces at least this many accounts to stay active. <b>It does NOT add posts</b> — the set delivers the same posts either way, just across more accounts in <b>fewer days</b>, i.e. a <b>higher daily volume into those groups</b>. Capped by the set's own account count (it can never seat an account that isn't there), and it never speeds up the slowest set. Check the <b>🪑 Campaign Plan seats</b> log line for what's actually seated — if a set already seats 4 of 6, values of 2–4 change nothing. Applies at the next round boundary; no Start Fresh needed.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-parallel-accounts" class="block text-sm font-semibold text-gray-300 mb-2">Parallel accounts (browsers open at once)</label>
+                <input type="number" id="setting-parallel-accounts" min="1" max="20" value="3" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">How many accounts run at the same time (how many browsers open together). Set <b>10</b> to run 10 at once. On a single shared IP the effective number is <b>min(this, "Max browsers on one IP" below)</b> — so to actually reach 10 on one IP, set that one to 10+ too. Also bounded by your machine's free RAM (~300–500 MB per browser). <b>Quick Setup no longer lowers this below what you set here.</b></small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-realip-max-concurrent" class="block text-sm font-semibold text-gray-300 mb-2">Max browsers at once on one IP (no-proxy fleets · speed ⇄ ban)</label>
+                <input type="number" id="setting-realip-max-concurrent" min="1" max="20" value="3" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">The per-IP safety cap on how many accounts post <b>simultaneously</b> from your one shared IP. The real concurrency is <b>min("Parallel accounts" above, this)</b>. <b>3 (default)</b> ≈ a normal household, the safe balance. Raise for more <b>SPEED</b> (now up to 20), but more simultaneous Facebook sessions from one line is a stronger spam/correlation signal — you saw throttling at 8, so above that the ban risk on that IP is real and yours to own. Also limited by free RAM. Proxied accounts ignore this.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-realip-post-gap" class="block text-sm font-semibold text-gray-300 mb-2">Min seconds between posts on your IP (0 = off · no-proxy fleets)</label>
+                <input type="number" id="setting-realip-post-gap" min="0" max="3600" value="15" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">Anti-ban ceiling on your <b>whole fleet's</b> posting rate from one shared IP (only when running WITHOUT proxies). Spaces every post so no two land closer than this many seconds across all accounts — e.g. <b>60 ≈ ~60 posts/hour</b> max from your line. <b>Default 15s</b> (anti-burst hardening for one shared IP — barely slows a 3-browser run); <b>0 = off</b> (per-account pacing only). Only ever slows; never changes which posts go where. Raise it if Facebook starts blocking; lower toward 0 for max speed.</small>
+              </div>
+              <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
                 <label class="block text-sm font-semibold text-gray-300 mb-2">🌍 Proxy geo alignment (proxied accounts)</label>
                 <small class="block mb-3 text-xs text-gray-500">Make each <b>PROXIED</b> account's browser report its proxy's timezone + language instead of this computer's — a mismatch Facebook can use to link accounts. Applies to every proxied account that has no per-account override (Accounts tab). Leave blank for no override.</small>
                 <div style="display:flex;gap:12px;flex-wrap:wrap;">
@@ -797,14 +813,27 @@
                 <small class="block mt-2 text-xs text-gray-500">Your accounts start their daily cycle(s) at this time.</small>
               </div>
               <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
-                <label for="setting-cycles-per-day" class="block text-sm font-semibold text-gray-300 mb-2">Cycles per run</label>
-                <input type="number" id="setting-cycles-per-day" min="1" max="8" value="1" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-                <small class="block mt-2 text-xs text-gray-500">How many cycles each run delivers, then it's done for the day (the next run auto-starts at the time above). Each cycle every account posts its NEXT post — so <b>5</b> = each account posts 5 of its posts this run, spaced by the gap below. Never the same post twice; posts stay spaced for safety.</small>
+                <label class="flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" id="setting-full-batch-daily" onchange="applyFullBatchDailyUI()" class="w-5 h-5 rounded bg-dark-900/60 border border-white/10 accent-accent">
+                  <span class="text-sm font-semibold text-gray-300">Full-batch daily — post the whole batch in one run, then done</span>
+                </label>
+                <small class="block mt-2 text-xs text-gray-500"><b>The simple mode.</b> Each account posts its whole share of its batch, once per day, then stops. <b>You control the volume by how many posts you put in the batch</b> — 30 posts across 3 accounts = 10 each; 3 posts across 3 accounts = 1 each. No numbers to set: the two dials below are computed for you and hidden. Delivers once and is done — feed new posts for the next day.</small>
+                <div id="fbd-preview" class="mt-3 text-xs" style="display:none;"></div>
+              </div>
+              <div id="fbd-cycles-row" class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-cycles-per-day" class="block text-sm font-semibold text-gray-300 mb-2">Posts per account per day (cycles per run)</label>
+                <input type="number" id="setting-cycles-per-day" min="1" max="50" value="1" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500"><b>This is your posts-per-day budget</b> — the most posts one account may make in a day. <b>30</b> = each account posts up to 30 posts per day, then rests until tomorrow's time above. Never the same post twice. <b>Max 50.</b> Use <b>Posts per cycle</b> below to control how many of them land in one go.</small>
+              </div>
+              <div id="fbd-ppc-row" class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
+                <label for="setting-posts-per-cycle" class="block text-sm font-semibold text-gray-300 mb-2">Posts per cycle (Campaign Plan · 1 = one at a time)</label>
+                <input type="number" id="setting-posts-per-cycle" min="1" max="50" value="1" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500"><b>Removes the waiting.</b> A cycle is a checkpoint — <b>every account must finish before the next cycle starts</b>, so an account that ends early sits idle until the slowest one lands. At <b>1</b> you pay that wait once per post. Raise it and each account walks that many of its posts <b>back-to-back</b>, with no waiting in between. <b>Set it to the same number as your posts-per-day</b> to get one continuous run per account per day. <b>It never adds posts</b> — the day's budget above still decides the total; this only changes whether they land in one run or many. Stops early and finishes next cycle if a post doesn't reach all its groups.</small>
               </div>
               <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
                 <label for="setting-cycle-gap-min" class="block text-sm font-semibold text-gray-300 mb-2">Time between cycles (minutes)</label>
-                <input type="number" id="setting-cycle-gap-min" min="5" max="720" placeholder="auto (uses speed preset)" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
-                <small class="block mt-2 text-xs text-gray-500">The gap between cycles within a run (jittered up to +30% so the cadence isn't a fixed spam tell). Lower = the run's cycles fire closer together; minimum 5 min. <b>Leave blank</b> to use your speed preset's timing. (Also sets the between-cycle gap in Continuous mode.)</small>
+                <input type="number" id="setting-cycle-gap-min" min="0.5" max="720" step="0.5" placeholder="auto (uses speed preset)" class="w-full px-4 py-2.5 bg-dark-900/60 border border-white/10 rounded-xl text-white text-sm outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20 transition-all">
+                <small class="block mt-2 text-xs text-gray-500">The gap between cycles within a run (jittered up to +30% so the cadence isn't a fixed spam tell). Lower = the run's cycles fire closer together. <b>Min 0.5 = 30s</b> (e.g. <b>0.5</b>=30s, <b>1</b>=1 min). ⚠️ <b class="text-red-400">Gaps under ~5 min raise ban risk on a shared IP</b> — more total posts/hour from one line; the per-post anti-spam gaps still pace each post, but overall velocity goes up. <b>Leave blank</b> to use your speed preset's timing. (Also sets the between-cycle gap in Continuous mode.)</small>
               </div>
               <div class="form-group bg-dark-700/50 backdrop-blur-sm border border-white/5 rounded-2xl p-5">
                 <label for="setting-tabs-per-browser" class="block text-sm font-semibold text-gray-300 mb-2">⚡ Parallel group tabs (speed)</label>

@@ -30,7 +30,11 @@ test('no-proxy (real-IP) accounts run CONCURRENTLY up to parallelAccounts (not s
     posts: [{ id: 'p1', caption: 'x', comment: '', imagePaths: [] }],
     groups: [{ id: 'g1', name: 'G1', groupId: '111' }],
     accounts: ['A', 'B', 'C'].map((n) => ({ name: n, enabled: true, assignedGroups: ['g1'], postingOrder: 'post-centric' })), // NO proxies → all on the operator's real IP
-    settings: { parallelAccounts: 3, accountDelay: 0, waitInterval: 0, groupDelay: 0, maxCycles: 1, staggerAccounts: false, varyImages: false, postsPerGroup: 0 },
+    // realIpMinPostGapSec:0 turns the per-IP LAUNCH FLOOR off so this isolates the CONCURRENCY property (no-proxy accounts
+    // are not serialized to 1). #15: with the floor > 0 (default 15s) launch STARTS are now spaced even when
+    // staggerAccounts is off — but real (minutes-long) account runs still overlap, so concurrency holds; a 350ms mock
+    // just can't show that. Concurrency (this test) and start-spacing (the floor) are separate properties.
+    settings: { parallelAccounts: 3, accountDelay: 0, waitInterval: 0, groupDelay: 0, maxCycles: 1, staggerAccounts: false, realIpMinPostGapSec: 0, varyImages: false, postsPerGroup: 0 },
     proxies: [], useProxies: false,
   });
 

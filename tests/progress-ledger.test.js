@@ -62,3 +62,26 @@ test('recordProgress: different groups of the same post are separate cells', () 
   assert.equal(day.posted, 2);
   assert.deepEqual(Object.keys(day.items).sort(), ['A|p1|g1', 'A|p1|g2']);
 });
+
+test('coalesced write: cache is immediate; flushProgress persists round+cycle to disk', () => {
+  const dir = freshStore();
+  const file = path.join(dir, 'daily-progress.json');
+  store.recordProgress(rec({ round: 2, cycle: 3 }));
+  // cache reflects it at once (this is what get-plan reads) even before the debounced disk write.
+  const day = store.loadProgress().days[Object.keys(store.loadProgress().days)[0]];
+  assert.equal(day.items['A|p1|g1'].round, 2);
+  assert.equal(day.items['A|p1|g1'].cycle, 3);
+  // flush → persisted with the tags intact.
+  assert.equal(store.flushProgress(), true);
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const k = Object.keys(onDisk.days)[0];
+  assert.equal(onDisk.days[k].items['A|p1|g1'].round, 2, 'round survives the write');
+  assert.equal(onDisk.days[k].items['A|p1|g1'].cycle, 3, 'cycle survives the write');
+});
+
+test('coalesced write: a second flush with nothing dirty is a no-op success', () => {
+  freshStore();
+  store.recordProgress(rec());
+  assert.equal(store.flushProgress(), true);
+  assert.equal(store.flushProgress(), true, 'no pending write → still succeeds');
+});

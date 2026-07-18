@@ -27,7 +27,7 @@ const agent = (name, groups, standby = false) => ({ name, assignedGroups: groups
 // ---- unit: the picker routes a reserve stand-in to the dropped agent's slice-post -----------------------
 test('campaign takeover: _postsForAccount routes a stand-in reserve to the dropped agent\'s slice-post', () => {
   const o = mk();
-  o._data = { posts: [1, 2, 3, 4].map((n) => ({ id: 'P' + n })), settings: {}, accounts: [] };
+  o._data = { posts: [1, 2, 3, 4].map((n) => ({ id: 'P' + n })), settings: {}, accounts: [], groups: [{ id: 'g1', groupId: '1' }, { id: 'g2', groupId: '2' }, { id: 'g9', groupId: '9' }] };
   const A = agent('A', ['g1']), B = agent('B', ['g1']);
   o._active = [A, B];
   o._campaignPlan = o._computeCampaignPlan(o._data.posts, [A, B], 0); // A=[P1,P3] B=[P2,P4]
@@ -42,7 +42,7 @@ test('campaign takeover: _postsForAccount routes a stand-in reserve to the dropp
 // ---- unit: pairing a dropped agent with a healthy in-cluster reserve ------------------------------------
 test('campaign takeover: _campaignStandins pairs a dropped agent with a healthy SAME-cluster reserve only', () => {
   const o = mk();
-  o._data = { posts: [1, 2, 3, 4].map((n) => ({ id: 'P' + n })), settings: {}, accounts: [] };
+  o._data = { posts: [1, 2, 3, 4].map((n) => ({ id: 'P' + n })), settings: {}, accounts: [], groups: [{ id: 'g1', groupId: '1' }, { id: 'g2', groupId: '2' }, { id: 'g9', groupId: '9' }] };
   const A = agent('A', ['g1', 'g2']), B = agent('B', ['g1', 'g2']);
   o._active = [A, B];
   o._campaignPlan = o._computeCampaignPlan(o._data.posts, [A, B], 0); // A=[P1,P3]
@@ -50,13 +50,13 @@ test('campaign takeover: _campaignStandins pairs a dropped agent with a healthy 
   o._cycleDrops = new Set(['A']);
   const R = agent('R', ['g1', 'g2'], true); // SAME cluster
   const X = agent('X', ['g9'], true);       // different cluster
-  assert.deepEqual(o._campaignStandins([A, B], [X, R], () => true, 3), { R: { postId: 'P1', forAgent: 'A' } },
+  assert.deepEqual(o._campaignStandins([A, B], [X, R], () => true, 3), { R: { postId: 'P1', forAgent: 'A', gids: ['1', '2'] } },
     'only the in-cluster reserve R covers A\'s slice P1; X (wrong groups) is ignored');
 });
 
 test('campaign takeover: a SUPERSET reserve (covers all of A\'s groups + extras) is accepted; a missing-group one is not', () => {
   const o = mk();
-  o._data = { posts: [1, 2, 3, 4].map((n) => ({ id: 'P' + n })), settings: {}, accounts: [] };
+  o._data = { posts: [1, 2, 3, 4].map((n) => ({ id: 'P' + n })), settings: {}, accounts: [], groups: [{ id: 'g1', groupId: '1' }, { id: 'g2', groupId: '2' }, { id: 'g9', groupId: '9' }] };
   const A = agent('A', ['g1', 'g2']), B = agent('B', ['g1', 'g2']);
   o._active = [A, B];
   o._campaignPlan = o._computeCampaignPlan(o._data.posts, [A, B], 0); // A=[P1,P3]
@@ -64,7 +64,7 @@ test('campaign takeover: a SUPERSET reserve (covers all of A\'s groups + extras)
   o._cycleDrops = new Set(['A']);
   const SUP = agent('SUP', ['g1', 'g2', 'g3'], true); // member of all A's groups + an extra → valid cover
   const MISS = agent('MISS', ['g1', 'g9'], true);     // missing g2 → cannot cover A
-  assert.deepEqual(o._campaignStandins([A, B], [MISS, SUP], () => true, 3), { SUP: { postId: 'P1', forAgent: 'A' } },
+  assert.deepEqual(o._campaignStandins([A, B], [MISS, SUP], () => true, 3), { SUP: { postId: 'P1', forAgent: 'A', gids: ['1', '2'] } },
     'superset reserve covers A; a reserve missing one of A\'s groups is rejected');
 });
 
@@ -207,7 +207,7 @@ test('#1 split coverage: partial — delivers what it can when one group has no 
   assert.deepEqual((out.R1 && out.R1.gids || []).slice().sort(), ['1', '2'], 'R1 delivers g1+g2; g3 stays uncovered but the rest still ships');
 });
 
-test('#1 split coverage: a single SUPERSET reserve still uses the whole-cover path (no gids) — unchanged', () => {
+test('#1 split coverage: a single SUPERSET reserve uses the whole-cover path, SCOPED to the covered agent groups', () => {
   const o = mk();
   o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], settings: {}, groups: [{ id: 'g1', groupId: '1' }, { id: 'g2', groupId: '2' }], accounts: [] };
   const A = agent('A', ['g1', 'g2']);
@@ -216,6 +216,6 @@ test('#1 split coverage: a single SUPERSET reserve still uses the whole-cover pa
   o._perAccountRotation = {};
   o._cycleDrops = new Set(['A']);
   const SUP = agent('SUP', ['g1', 'g2', 'g9'], true); // full superset → single-cover path, NOT split
-  assert.deepEqual(o._campaignStandins([A], [SUP], () => true, 3), { SUP: { postId: 'P1', forAgent: 'A' } },
-    'a superset reserve takes the whole slice via the unchanged single-cover path (no gids field)');
+  assert.deepEqual(o._campaignStandins([A], [SUP], () => true, 3), { SUP: { postId: 'P1', forAgent: 'A', gids: ['1', '2'] } },
+    'a superset reserve takes the whole slice SCOPED to the covered agent groups. It previously carried NO gids, so _onlyGroups went null and the worker targeted the RESERVE OWN set — delivering the post to SUP extra g9 too. With each campaign cluster holding the WHOLE library, such an extra belongs to another cluster whose own agent delivers that same postId = an unguarded DOUBLE-POST (campaign-plan has no durable per-(post,group) ledger, and a stand-in _uniqueSeqGuard is false). Scoping is what the takeover comment always promised: the exact slice.');
 });

@@ -11,7 +11,7 @@
 const { launchStealth, viewportFor, applyProxyGeo } = require('../lib/browser'); // ONE hardened launch path (real Chrome + no automation flag + stealth)
 const store = require('../lib/store');
 const { chromiumPath } = require('../lib/chromium');
-const { addFirstComment, killChromiumForProfile, applyPace, withFloor, antiSpamFloors, parseProxy } = require('./worker');
+const { addFirstComment, killChromiumForProfile, applyPace, withFloor, antiSpamFloors, parseProxy, commentFailureDecision, commentOutcomeClass } = require('./worker');
 let proxyChain = null; try { proxyChain = require('proxy-chain'); } catch {}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -28,7 +28,30 @@ async function runRescue(o) {
   const waitIfPaused = o.waitIfPaused || (async () => {});
   const hidden = o.hidden !== false; // default hidden, mirrors the worker
   const name = account.name;
-  const out = { placed: 0, failed: 0, blocked: false, needsLogin: false };
+  const out = { placed: 0, failed: 0, blocked: false, needsLogin: false, rlKind: null }; // rlKind: WHICH wall — 'account' (FB blocked the whole account: the serious one) vs 'comment' (commenting only). Collapsing them into `blocked` alone made the orchestrator rest an ACCOUNT-level block on the MILD comment ladder and re-launch it into the same wall — ban-escalation.
+  // Rescue had NO consecutive-failure breaker. A rescuer whose comments never land (silently dropped / no comment box /
+  // shadow-suppressed — i.e. anything short of an explicitly DETECTED wall) walked its ENTIRE task list, burning one of
+  // every orphan post's 3 attempts per cycle. Three such cycles and every one of those posts is TERMINALLY failed —
+  // permanently abandoned, live without its link — because one broken rescuer spent everyone else's retries. Same shape
+  // as the poster-side report ("keeps posting, never comments"), and it destroys the rescue queue rather than just
+  // wasting time. Reuses the poster's helpers so the two can never drift apart.
+  let consecFails = 0, anyLanded = false;
+  // R3: persist the outcome and CONFIRM it reached disk before moving on. onResult (markResult) now returns the
+  // store.updateComments promise → { ok }. A landed 'done' write that fails (disk busy) is RETRIED (idempotent: the
+  // mutator flips exactly one matching pending record), so a transient lock can't leave the record 'pending' → a
+  // next-cycle re-dispatch → a DOUBLE-COMMENT. Non-'done' outcomes are awaited but NOT retried (they touch the
+  // moderation reopenCount, which must not be double-incremented).
+  const record = async (task, outcome) => {
+    if (!o.onResult) return;
+    for (let a = 0; a < 3; a++) {
+      let r; try { r = await o.onResult(task, outcome); } catch { r = null; }
+      if (!r || r.ok !== false) return; // persisted (or an old-style void return) → done
+      if (outcome !== 'done') return; // only the landed 'done' write is safe to retry
+      log(`⚠️ [rescue:${name}] could not persist 'done' for a "${task.groupName || task.gid}" comment (disk busy) — retry ${a + 1}/3`);
+      await sleep(400 + a * 400);
+    }
+    log(`❌ [rescue:${name}] FAILED to persist 'done' after retries — record stays pending; a next-cycle re-dispatch may re-place it. Fix disk/permissions.`);
+  };
   const PER_TASK_MS = 300000; // per-task hang ceiling (normal nav timeouts are ~90s, so 300s is safe)
   let browser = null, sessionWatchdog = null, anonLocal = null;
   try {
@@ -89,27 +112,56 @@ async function runRescue(o) {
         const res = await Promise.race([
           addFirstComment(page, t.gid, post, t.commentImg || null,
             (m) => log(`💬 [rescue:${name}] [${label}] ${m}`),
-            t.postPermalink || null, settings, t.postId || null, t.fbDisplayName || ''),
+            t.postPermalink || null, settings, t.postId || null, t.fbDisplayName || '', false, false, true).catch(() => 'error'), // checkExisting=true (last arg): if the ORIGINAL account's comment already landed (mis-reported), skip → never a cross-account DOUBLE-comment. R9: swallow a LATE rejection (after the timeout already won the race) so it can't surface as an unhandledRejection
           new Promise((r) => setTimeout(() => r('timeout'), PER_TASK_MS)), // per-task hang ceiling → treated as failure
         ]);
-        if (res === 'posted' || res === 'unconfirmed' || res === 'not_visible') {
-          out.placed++; o.onResult && o.onResult(t, 'done');
-          log(`💬 [rescue:${name}] ✅ link-comment placed on a "${label}" post (${res})`);
+        // Feed the breaker BEFORE the routing dispatch, so every outcome is classified uniformly. Note the routing
+        // below deliberately treats 'unconfirmed'/'not_visible' as PLACED (Enter was pressed → never re-queue → no
+        // double-comment); commentOutcomeClass answers the OTHER question ("did a comment become VISIBLE?") and counts
+        // 'not_visible' as a loss. Same split as the poster path — do not collapse them.
+        { const _k = commentOutcomeClass(res); if (_k === 'landed') { consecFails = 0; anyLanded = true; } else if (_k === 'lost') consecFails++; }
+        if (res === 'posted' || res === 'unconfirmed' || res === 'not_visible' || res === 'already_present') {
+          out.placed++; await record(t, 'done');
+          log(res === 'already_present'
+            ? `💬 [rescue:${name}] ✅ link already present on the "${label}" post (original landed after all) — marked done, NOT re-commented (no double)`
+            : `💬 [rescue:${name}] ✅ link-comment placed on a "${label}" post (${res})`);
         } else if (res === 'blocked_account_landed' || res === 'blocked_comment_landed') {
           // The rescuer's comment LANDED, but Facebook then walled the rescuer on the next action. Mark THIS task
           // DONE (never re-attempt a landed comment = no double-comment) AND stop the rescuer.
-          out.placed++; o.onResult && o.onResult(t, 'done'); out.blocked = true;
+          out.placed++; await record(t, 'done'); out.blocked = true; out.rlKind = (res === 'blocked_account_landed') ? 'account' : 'comment'; // carry the KIND: an ACCOUNT-level block is the serious one (mult 3) and must not rest on the mild COMMENT ladder
           log(`💬 [rescue:${name}] ✅ placed, then this rescuer hit a rate-limit — stopping it; remaining comments stay pending for next cycle`);
           break;
         } else if (res === 'blocked_account' || res === 'blocked_comment') {
-          out.blocked = true; o.onResult && o.onResult(t, 'blocked');
+          out.blocked = true; out.rlKind = (res === 'blocked_account') ? 'account' : 'comment'; await record(t, 'blocked');
           log(`💬 [rescue:${name}] ⛔ this rescuer hit a rate-limit — stopping it; remaining comments stay pending for next cycle`);
           break; // never keep hammering with a blocked rescuer
+        } else if (res === 'blocked_login' || res === 'blocked_checkpoint') {
+          // The rescuer's SESSION died mid-run (logged out / checkpoint) — the failure is the rescuer's, NOT the post's.
+          // Do NOT record() (that would burn one of this post's 3 attempts on the dead session); leave the comment
+          // 'pending' with attempts UNCHANGED. Flag needsLogin so the orchestrator _markLoggedOut's the account (2880)
+          // and STOP immediately — driving a logged-out browser through the remaining tasks just consumes attempts and
+          // never flags the logout. Mirrors the poster path, which classifies a login wall as needs_login and stops.
+          out.needsLogin = true;
+          log(`💬 [rescue:${name}] 🔒 rescuer is logged out / checkpointed — stopping it and flagging for re-login; remaining comments stay pending`);
+          break;
         } else {
-          out.failed++; o.onResult && o.onResult(t, res);
+          out.failed++; await record(t, res);
           log(`💬 [rescue:${name}] ⚠️ could not place the comment on a "${label}" post (${res})`);
+          // R9: a per-task timeout means addFirstComment is still HUNG on THIS shared page. Advancing to the next task
+          // would let that orphaned call keep driving the page (→ its Enter lands on the NEXT task's post = wrong-post /
+          // double-comment). Stop this rescuer instead; the remaining comments stay pending for a fresh rescuer next cycle.
+          if (res === 'timeout') { log(`💬 [rescue:${name}] ⏱️ a task exceeded ${Math.round(PER_TASK_MS / 1000)}s — stopping this rescuer so a hung call can't drive the shared page into the next task (remaining comments retry next cycle)`); break; }
+          // BREAKER: stop a rescuer that cannot place comments, BEFORE it spends the rest of the queue's attempts. The
+          // remaining tasks keep attempts UNCHANGED and stay pending, so a healthy rescuer (or the next cycle) still
+          // gets them — which is the entire point: one broken account must not terminally fail everyone else's posts.
+          const _cfd = commentFailureDecision(consecFails, anyLanded);
+          if (_cfd) {
+            if (_cfd === 'block') { out.blocked = true; out.rlKind = 'comment'; log(`💬 [rescue:${name}] 🛑 3 comment failures in a row and NOT ONE landed — this rescuer cannot place comments (Facebook is suppressing it). Stopping it and resting it; the remaining ${tasks.length - i - 1} comment(s) keep their attempts and go to a healthy account next cycle.`); }
+            else log(`💬 [rescue:${name}] ⚠️ 3 comment failures in a row, but it DID land one earlier — treating as transient. Stopping this rescuer; the remaining ${tasks.length - i - 1} comment(s) keep their attempts and retry next cycle.`);
+            break;
+          }
         }
-      } catch (e) { out.failed++; o.onResult && o.onResult(t, 'error'); log(`💬 [rescue:${name}] error on a "${label}" post: ${e.message}`); }
+      } catch (e) { out.failed++; await record(t, 'error'); log(`💬 [rescue:${name}] error on a "${label}" post: ${e.message}`); }
       // Human gap between rescue comments so the rescuer doesn't burst-comment links (its own anti-spam).
       // Interruptible so Stop wakes the rescuer within ~1s instead of after the full (up to 180s) gap.
       if (i < tasks.length - 1 && !shouldStop() && !out.blocked) {

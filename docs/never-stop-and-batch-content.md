@@ -56,13 +56,13 @@ What happens when an agent finishes its posts, per mode:
 | **Post to All** | never | re-posts everything every cycle |
 | Sequence/Unique + Loop OFF | stops after one pass | by design (completion report) |
 
-**The library re-reads every cycle** (`getData()` at the top of `_loop`), so **edited posts and changed wizard settings take effect on the next round** automatically. Adding/removing/reordering posts also reshuffles the campaign partition (the `batchId` change-hash).
+**The library re-reads every cycle** (`getData()` at the top of `_loop`), so **edited posts and changed wizard settings take effect on the next round** automatically. Adding/removing/reordering posts changes the campaign partition's `batchId` change-hash, but the reshuffle is **deferred to the next round boundary** — recomputing the partition mid-round would wipe every agent's delivered pointer and re-post the whole library to the shared IP (a re-burst). A mid-round edit is held and applied cleanly at the next round (or on Stop→edit→Start); see [ADR-0019](decisions/ADR-0019-campaign-plan-frozen-within-round.md).
 
 ### So the operator's "never stop, rotate posts" goal is **already met** by **Campaign Plan + Loop** (the mode the wizard sets). No code change needed for that.
 
 ### Two known caveats (documented, not blocking)
 1. **Sequence/Unique + Loop ON without a Daily schedule** re-deals within the inter-cycle wait (~90–180 s), not "1 round per day." Campaign Plan does not have this issue (it paces to the next day). *Fix if ever needed:* after the `_dealt.clear()` + `roundOffset++`, set `this._lastDailyRunDate = this._localDayKey()` when `scheduleMode !== 'daily'` (mirrors what Campaign Plan already does). **Or simply use `scheduleMode = daily`.**
-2. **Campaign Plan with an in-place content edit** (caption/image changed but the post **id** unchanged): the new content **is** delivered, but the partition doesn't reshuffle (the `batchId` only hashes ids). To force a reshuffle, add/remove/reorder a post.
+2. **Campaign Plan with an in-place content edit** (caption/image changed but the post **id** unchanged): the new content **is** delivered on the next slot (the library re-reads each cycle), but the partition doesn't reshuffle (the `batchId` only hashes ids). To force a reshuffle, add/remove/reorder a post — which takes effect at the **next round boundary**, not mid-round (see the reshuffle note above and [ADR-0019](decisions/ADR-0019-campaign-plan-frozen-within-round.md)).
 
 ---
 

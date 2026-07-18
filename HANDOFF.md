@@ -1,5 +1,7 @@
 # Za Post Comment Tool - Session Handoff
 
+> ⚠️ **POINT-IN-TIME RECORD (v1.0.27 era).** For current status see [`CHANGELOG.md`](CHANGELOG.md) (now v1.0.56).
+
 Last updated: 2026-07-08. Read this first when continuing in a new session.
 
 > **Full project reference: [`DOCS.md`](DOCS.md)** — architecture, run lifecycle, settings,
@@ -7,7 +9,7 @@ Last updated: 2026-07-08. Read this first when continuing in a new session.
 > the *how it works*. **Engineering process: [`DEVELOPMENT.md`](DEVELOPMENT.md)** · **never-break rules:
 > [`INVARIANTS.md`](INVARIANTS.md)** · **decision log: [`docs/decisions/`](docs/decisions/).**
 
-## ⭐ STATUS 2026-07-08 — v1.0.27
+## ⭐ STATUS 2026-07-08 — v1.0.27  ·  (historical; current release is v1.0.56 — see CHANGELOG.md)
 
 ### ➡️ CONTINUE HERE (switching laptops / new session)
 

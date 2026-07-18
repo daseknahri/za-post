@@ -70,11 +70,15 @@ test('migration: a legacy single timing key derives the min/max range on load', 
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-test('clampSettings: speedMode is coerced to a valid preset name (incl. turbo)', () => {
-  assert.equal(store.clampSettings({ speedMode: 'slow' }).speedMode, 'slow');
+test('clampSettings: speedMode migrates legacy tokens to the canonical tier (safe/fast/max)', () => {
+  assert.equal(store.clampSettings({ speedMode: 'slow' }).speedMode, 'safe', 'legacy slow → safe');
+  assert.equal(store.clampSettings({ speedMode: 'normal' }).speedMode, 'safe', 'legacy normal → safe');
   assert.equal(store.clampSettings({ speedMode: 'fast' }).speedMode, 'fast');
-  assert.equal(store.clampSettings({ speedMode: 'turbo' }).speedMode, 'turbo', 'turbo (super-experienced-user preset) is valid');
-  assert.equal(store.clampSettings({ speedMode: 'bogus' }).speedMode, 'normal', 'invalid → normal');
+  assert.equal(store.clampSettings({ speedMode: 'turbo' }).speedMode, 'max', 'legacy turbo → max');
+  assert.equal(store.clampSettings({ speedMode: 'instant' }).speedMode, 'max', 'legacy instant → max');
+  assert.equal(store.clampSettings({ speedMode: 'safe' }).speedMode, 'safe'); // canonical passthrough
+  assert.equal(store.clampSettings({ speedMode: 'max' }).speedMode, 'max');
+  assert.equal(store.clampSettings({ speedMode: 'bogus' }).speedMode, 'safe', 'invalid → safe');
 });
 
 test('isFastMode: turbo + fast + humanize-off take the instant path; normal/slow do not', () => {
@@ -86,16 +90,16 @@ test('isFastMode: turbo + fast + humanize-off take the instant path; normal/slow
   assert.equal(w.isFastMode({}), false, 'default is not fast');
 });
 
-test('normalizeAccount: pace=instant + postSetId SURVIVE a load (were being silently wiped before)', () => {
+test('normalizeAccount: pace migrates to a canonical override tier + postSetId SURVIVES a load', () => {
   const n = store.normalize({ accounts: [
     { name: 'a', pace: 'instant', postSetId: 'setA', assignedGroups: ['g1', 'g2'] },
     { name: 'b', pace: 'turbo' },
     { name: 'c', pace: 'bogus', postSetId: '', assignedGroups: 'corrupt' },
   ] });
-  assert.equal(n.accounts[0].pace, 'instant', 'instant pace is preserved (not reset to inherit)');
+  assert.equal(n.accounts[0].pace, 'max', 'legacy instant pace → max (migrated, not wiped)');
   assert.equal(n.accounts[0].postSetId, 'setA', 'account postSetId is preserved');
   assert.deepEqual(n.accounts[0].assignedGroups, ['g1', 'g2'], 'assignedGroups preserved');
-  assert.equal(n.accounts[1].pace, 'turbo');
+  assert.equal(n.accounts[1].pace, 'max', 'legacy turbo pace → max');
   assert.equal(n.accounts[2].pace, undefined, 'a genuinely invalid pace still drops to inherit');
   assert.equal(n.accounts[2].postSetId, null, 'a blank postSetId coerces to null (never an empty-set filter)');
   assert.deepEqual(n.accounts[2].assignedGroups, [], 'a corrupt non-array assignedGroups coerces to []');
@@ -107,21 +111,35 @@ test('clampSettings: sanitizes postSets (drops malformed entries, coerces id/nam
   assert.deepEqual(store.clampSettings({ postSets: 'nope' }).postSets, [], 'non-array → []');
 });
 
-test('INSTANT mode: valid preset; fast+turbo paths on; tiny-but-nonzero anti-spam floors; pace overrides speedMode', () => {
-  // clampSettings accepts it (so a saved instant config survives a reload)
-  assert.equal(store.clampSettings({ speedMode: 'instant' }).speedMode, 'instant', 'instant is a valid preset');
-  // paste-everything + skip-dwells path
-  assert.equal(w.isFastMode({ speedMode: 'instant' }), true, 'instant pastes all text + skips dwells');
-  // collapses the post-publish settle (the single isTurboMode gate)
-  assert.equal(w.isTurboMode({ speedMode: 'instant' }), true, 'instant collapses the post-publish settle');
-  // floors are aggressively small but NEVER zero (a truly-instant post→link is FB's top ban trigger)
+test('MAX tier: clamps to max; the worker-internal token pastes/collapses/floors; a per-account override wins', () => {
+  // clampSettings migrates the legacy instant preset to the canonical max tier (a saved config survives a reload)
+  assert.equal(store.clampSettings({ speedMode: 'instant' }).speedMode, 'max', 'legacy instant → max');
+  assert.equal(store.clampSettings({ speedMode: 'max' }).speedMode, 'max');
+  // max maps to the worker's INTERNAL token 'instant' — the behavior helpers + Sacred floors read THAT and are unchanged
+  assert.equal(w.isFastMode({ speedMode: 'instant' }), true, 'internal max token pastes all text + skips dwells');
   const f = w.antiSpamFloors({ speedMode: 'instant' });
-  assert.equal(f.group, 1500, 'instant group floor');
-  assert.equal(f.comment, 4000, 'instant comment floor — never a truly-instant post→link');
-  assert.ok(f.comment >= 4000, 'comment floor stays >= 4s for instant (de-risk note)');
-  // per-account pace 'instant' overrides speedMode (unless a deliberate global slow)
-  assert.equal(w.applyPace({ speedMode: 'normal' }, 'instant').speedMode, 'instant', 'pace=instant sets speedMode=instant');
-  assert.equal(w.applyPace({ speedMode: 'slow' }, 'instant').speedMode, 'slow', 'a deliberate global slow is respected');
+  assert.equal(f.group, 1500, 'internal max group floor (helper value)');
+  assert.equal(f.comment, 4000, 'internal max comment floor (helper value; the call sites intentionally bypass it for max)');
+  // a per-account override ALWAYS wins now (no more asymmetric "global slow protection") — override selects the tier
+  assert.equal(w.applyPace({ speedMode: 'safe' }, 'max').speedMode, 'instant', 'pace=max → internal instant token, over a safe fleet');
+  assert.equal(w.applyPace({ speedMode: 'safe' }, 'instant').speedMode, 'instant', 'legacy pace=instant migrates to max → internal instant');
+});
+
+test('two-phase post→link floor: safe/fast keep the 30s floor; postLinkFloorOwed waits only the shortfall', () => {
+  const now = 1_000_000;
+  // TIER CONTRACT: safe (internal 'normal') and fast (internal 'fast') keep the FULL 30s comment floor; max does not.
+  assert.equal(w.antiSpamFloors({ speedMode: 'normal' }).comment, 30000, 'safe keeps the 30s comment floor');
+  assert.equal(w.antiSpamFloors({ speedMode: 'fast' }).comment, 30000, 'fast keeps the full 30s comment floor (paste, but NOT reduced gaps)');
+  // A FRESH deferred post (published 5s ago) owes the remainder to reach the tier floor.
+  assert.equal(w.postLinkFloorOwed({ speedMode: 'normal' }, now - 5000, now), 25000, 'safe fresh post owes 25s');
+  assert.equal(w.postLinkFloorOwed({ speedMode: 'fast' }, now - 10000, now), 20000, 'fast fresh post owes 20s');
+  // A WELL-AGED post (published 60s ago in Phase 1 — the common multi-group case) owes 0: the fix never over-waits.
+  assert.equal(w.postLinkFloorOwed({ speedMode: 'normal' }, now - 60000, now), 0, 'aged post owes nothing');
+  // MAX (internal 'instant') owes 0 — its small gaps are by design and natural aging clears its ~1s minimum.
+  assert.equal(w.postLinkFloorOwed({ speedMode: 'instant' }, now - 500, now), 0, 'max owes 0 (small gaps by design)');
+  // Missing/invalid inputs → 0 (no data must never block the comment).
+  assert.equal(w.postLinkFloorOwed({ speedMode: 'normal' }, undefined, now), 0, 'no publishedAt → owes 0');
+  assert.equal(w.postLinkFloorOwed(null, now - 5000, now), 0, 'no settings → owes 0');
 });
 
 test('rangeMs: a TURBO-style small explicit range actually applies to the real gap (numbers take effect)', () => {
@@ -192,84 +210,39 @@ test('reserve + comment-rescue store: reserveAccounts clamps; pending-comments r
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-test('applyPace: normal/absent/invalid inherit the global tempo unchanged (no per-account effect)', () => {
-  const s = { groupDelayMin: 120, groupDelayMax: 300, commentDelayMin: 60, commentDelayMax: 180, humanizeMaster: true, speedMode: 'normal' };
-  assert.strictEqual(w.applyPace(s, 'normal'), s, 'explicit normal → SAME object (so callers/tests without a pace are unaffected)');
-  assert.strictEqual(w.applyPace(s), s, 'absent pace + no defaultPace → unchanged');
-  assert.strictEqual(w.applyPace(s, 'bogus'), s, 'invalid pace → treated as normal');
+test('applyPace: delegates to the canonical resolver — override SELECTS a tier (no compounding), cadence stays fleet-level', () => {
+  // (Full model coverage is in tests/speed-model.test.js; this asserts the worker's applyPace export wires to it.)
+  // Inherit (no per-account override) → the FLEET tier: safe fleet → internal 'normal' token + safe ranges.
+  const inherit = w.applyPace({ speedMode: 'safe' }, undefined);
+  assert.equal(inherit.speedMode, 'normal', 'safe fleet → internal normal token');
+  assert.equal(inherit.groupDelayMax, 300, 'safe per-post ranges');
+  assert.equal(inherit.humanizeMaster, true, 'safe forces full human behavior on');
+  // Per-account MAX override under a SAFE fleet → internal 'instant' token + max per-post ranges, but cycle cadence stays safe.
+  const over = w.applyPace({ speedMode: 'safe' }, 'max');
+  assert.equal(over.speedMode, 'instant', 'override selects max → internal instant token');
+  assert.equal(over.groupDelayMax, 7, 'per-post cadence = the override tier (max)');
+  assert.equal(over.waitIntervalMax, 180, 'cycle cadence stays the fleet baseline (safe), never the per-account override');
+  // NO compounding: a fast override under a fast fleet yields fast ranges — NOT fast halved again like the old multiplier.
+  assert.equal(w.applyPace({ speedMode: 'fast' }, 'fast').groupDelayMax, 180, 'override selects the tier; it does NOT multiply');
+  // Pure: the input object is never mutated.
+  const src = { speedMode: 'safe', groupDelayMax: 999 };
+  w.applyPace(src, 'max');
+  assert.equal(src.groupDelayMax, 999, 'applyPace never mutates its input');
 });
 
-test('applyPace: SAFE doubles every per-post window + forces human behavior on', () => {
-  const s = { groupDelayMin: 120, groupDelayMax: 300, commentDelayMin: 60, commentDelayMax: 180, pageScrollDwellSecMin: 3, pageScrollDwellSecMax: 15, speedMode: 'fast', humanizeMaster: false, waitIntervalMin: 90, waitIntervalMax: 180, accountDelayMin: 1, accountDelayMax: 4 };
-  const o = w.applyPace(s, 'safe');
-  assert.equal(o.groupDelayMin, 240); assert.equal(o.groupDelayMax, 600);
-  assert.equal(o.commentDelayMin, 120); assert.equal(o.commentDelayMax, 360);
-  assert.equal(o.pageScrollDwellSecMin, 6); assert.equal(o.pageScrollDwellSecMax, 30);
-  assert.equal(o.humanizeMaster, true, 'safe forces humanization ON even if the global preset had it off');
-  assert.equal(o.speedMode, 'normal', 'safe pulls a fast/turbo global back to normal so the human dwells actually run');
-  assert.equal(o.waitIntervalMin, 90); assert.equal(o.waitIntervalMax, 180); // pool-topology gaps NOT scaled
-  assert.equal(o.accountDelayMin, 1); assert.equal(o.accountDelayMax, 4);
-  assert.equal(s.groupDelayMin, 120, 'applyPace is pure — original settings untouched');
-});
-
-test('applyPace: FAST halves per-post windows + takes the instant path', () => {
-  const s = { groupDelayMin: 120, groupDelayMax: 300, commentDelayMin: 60, commentDelayMax: 180, speedMode: 'normal' };
-  const o = w.applyPace(s, 'fast');
-  assert.equal(o.groupDelayMin, 60); assert.equal(o.groupDelayMax, 150);
-  assert.equal(o.commentDelayMin, 30); assert.equal(o.commentDelayMax, 90);
-  assert.equal(o.speedMode, 'fast', 'fast enables the instant typing / dwell-skip path');
-  assert.equal(w.isFastMode(o), true);
-});
-
-test('applyPace: fast respects a conservative global slow + never undercuts the composer floor', () => {
-  // 'fast' must NOT flip a deliberately-slow global to the instant path — but the gaps still halve.
-  const slow = w.applyPace({ groupDelayMin: 200, groupDelayMax: 400, speedMode: 'slow' }, 'fast');
-  assert.equal(slow.speedMode, 'slow', 'fast keeps a global slow preset (max-caution intent preserved)');
-  assert.equal(slow.groupDelayMin, 100, 'gaps still halve under fast even when speedMode stays slow');
-  // composerOpenInitialDelayMs has an 800ms render floor — a 0.5× scale (→750) must clamp up.
-  assert.equal(w.applyPace({ composerOpenInitialDelayMs: 1500, speedMode: 'normal' }, 'fast').composerOpenInitialDelayMs, 800, '750 floored up to 800');
-  assert.equal(w.applyPace({ composerOpenInitialDelayMs: 1500 }, 'safe').composerOpenInitialDelayMs, 3000, 'safe 2× → 3000 (no floor conflict)');
-});
-
-test('applyPace: account pace overrides settings.defaultPace; explicit normal wins', () => {
-  const s = { groupDelayMin: 100, groupDelayMax: 200, defaultPace: 'safe' };
-  assert.equal(w.applyPace(s, undefined).groupDelayMin, 200, 'absent account pace → falls back to defaultPace (safe → 2×)');
-  assert.strictEqual(w.applyPace(s, 'normal'), s, 'an explicit normal on the account beats a safe global default (unchanged)');
-  assert.equal(w.applyPace(s, 'fast').groupDelayMin, 50, 'explicit fast on the account beats the safe default');
-});
-
-test('applyPace: an inherit account resolves to a turbo/instant fleet defaultPace (both scaling AND speedMode)', () => {
-  const base = { groupDelayMin: 120, groupDelayMax: 300, speedMode: 'normal' };
-  const inh = w.applyPace({ ...base, defaultPace: 'instant' }, undefined);
-  assert.equal(inh.groupDelayMin, 12, 'inherit → instant scales the gaps by 0.1×');
-  assert.equal(inh.speedMode, 'instant', 'inherit → instant sets the paste-and-fire speedMode');
-  assert.equal(w.isTurboMode(inh), true, 'inherit → instant is a turbo-class mode');
-  const tur = w.applyPace({ ...base, defaultPace: 'turbo' }, undefined);
-  assert.equal(tur.groupDelayMin, 30, 'inherit → turbo scales the gaps by 0.25×');
-  assert.equal(tur.speedMode, 'turbo', 'inherit → turbo sets speedMode');
-  const explicit = { ...base, defaultPace: 'instant' };
-  assert.strictEqual(w.applyPace(explicit, 'normal'), explicit, 'an explicit account pace=normal still beats defaultPace=instant (object unchanged)');
-  const gslow = w.applyPace({ groupDelayMin: 120, speedMode: 'slow', defaultPace: 'instant' }, undefined);
-  assert.equal(gslow.speedMode, 'slow', 'inherit → instant still respects a deliberate global slow');
-});
-
-test('store: per-account pace + global defaultPace are validated (all 5 tiers; invalid → drop/normal)', () => {
+test('store: per-account pace is validated + migrated on load (safe/fast/max; invalid → inherit)', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zpost-pace-'));
   store.init(tmp);
   store.save({ posts: [], groups: [], proxies: [], useProxies: false, settings: {}, accounts: [
-    { name: 'safe1', pace: 'safe' }, { name: 'fast1', pace: 'fast' }, { name: 'bad', pace: 'ludicrous' }, { name: 'none' },
+    { name: 'safe1', pace: 'safe' }, { name: 'fast1', pace: 'fast' }, { name: 'max1', pace: 'instant' }, { name: 'bad', pace: 'ludicrous' }, { name: 'none' },
   ] });
   const accts = store.load().accounts;
   assert.equal(accts.find((a) => a.name === 'safe1').pace, 'safe');
   assert.equal(accts.find((a) => a.name === 'fast1').pace, 'fast');
-  assert.equal(accts.find((a) => a.name === 'bad').pace, undefined, 'invalid pace dropped → inherit global');
+  assert.equal(accts.find((a) => a.name === 'max1').pace, 'max', 'legacy instant pace → max');
+  assert.equal(accts.find((a) => a.name === 'bad').pace, undefined, 'invalid pace dropped → inherit the fleet speed');
   assert.equal(accts.find((a) => a.name === 'none').pace, undefined, 'absent stays absent (inherit)');
   fs.rmSync(tmp, { recursive: true, force: true });
-  assert.equal(store.clampSettings({ defaultPace: 'safe' }).defaultPace, 'safe');
-  assert.equal(store.clampSettings({ defaultPace: 'fast' }).defaultPace, 'fast');
-  assert.equal(store.clampSettings({ defaultPace: 'turbo' }).defaultPace, 'turbo', 'turbo is a valid fleet default');
-  assert.equal(store.clampSettings({ defaultPace: 'instant' }).defaultPace, 'instant', 'instant is a valid fleet default');
-  assert.equal(store.clampSettings({ defaultPace: 'bogus' }).defaultPace, 'normal', 'invalid → normal');
 });
 
 test('normalizeAccount: corrupt daily / rateLimitedUntil are sanitized on load (DI-3/DI-4)', () => {

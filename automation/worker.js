@@ -12,16 +12,34 @@ let proxyChain; try { proxyChain = require('proxy-chain'); } catch {}
 
 const store = require('../lib/store');
 
-// One-time sweep of orphaned comment-image temps (zpv-*) in the OS temp dir. A temp handed off to the rescue/moderator
-// queue is intentionally kept past runAccount's cleanup so its consumer can upload it; if that consumer never runs
-// (crash/abort between persist and the rescue phase), the file would leak. Reclaim any older than 24h at module load.
-try {
-  const _tmp = os.tmpdir(), _cut = Date.now() - 24 * 3600 * 1000;
-  for (const f of fs.readdirSync(_tmp)) {
-    if (!/^(zpv-|za-img-)/.test(f)) continue; // zpv- = varied images; za-img- = downloaded (URL) images that were handed off un-varied
-    try { const p = path.join(_tmp, f); if (fs.statSync(p).mtimeMs < _cut) fs.unlinkSync(p); } catch {}
-  }
-} catch {}
+// Sweep orphaned comment-image temps (zpv-* varied / za-img-* downloaded) from the OS temp dir. A temp handed off to the
+// rescue/moderator queue is intentionally kept past runAccount's cleanup so its consumer can upload it; if that consumer
+// never runs (crash/abort between persist and the rescue phase) — or its record's queue entry has since been resolved —
+// the file leaks. Reclaim any older than 24h. #14: but NEVER delete one still referenced by a PERSISTED held/pending
+// record (a routine >24h-unapproved moderation image), or its later approval / Phase-4 re-home uploadFile → ENOENT drops
+// the comment. #11: callable periodically (the orchestrator calls it between cycles) so a days-long run that never
+// restarts still reclaims CONSUMED temps, not only at module load — bounding the leak instead of growing it unbounded.
+function sweepOrphanTemps() {
+  try {
+    const referenced = new Set();
+    try { for (const h of (store.loadModeration().held || [])) { if (h && h.commentImg) referenced.add(path.normalize(String(h.commentImg))); } } catch {}
+    try { for (const c of (store.loadComments().pending || [])) { if (c && c.commentImg) referenced.add(path.normalize(String(c.commentImg))); } } catch {}
+    // #6/journal-fix: also protect a temp referenced ONLY by the crash-obligation journal (pcu-obligations.jsonl), which
+    // the module-load sweep runs BEFORE _foldObligationJournal folds into held/pending. A comment obligation that survived
+    // a hard-kill is, at sweep time, referenced only here — dropping its >24h temp would make the later fold restore a
+    // pending comment whose commentImg points at a deleted file (rescue uploadFile → ENOENT: an image-only comment fails,
+    // a text+image comment silently loses its image). Keeping a temp longer is inert for ban-safety.
+    try { for (const o of (store.loadObligations() || [])) { if (o && o.commentImg) referenced.add(path.normalize(String(o.commentImg))); } } catch {}
+    const _tmp = os.tmpdir(), _cut = Date.now() - 24 * 3600 * 1000;
+    for (const f of fs.readdirSync(_tmp)) {
+      if (!/^(zpv-|za-img-)/.test(f)) continue;
+      const p = path.join(_tmp, f);
+      if (referenced.has(path.normalize(p))) continue; // #14: still referenced by a persisted queue → keep regardless of age
+      try { if (fs.statSync(p).mtimeMs < _cut) fs.unlinkSync(p); } catch {} // #11 safety margin: only >24h (a temp in active handoff is younger, so this can't race an in-flight upload)
+    }
+  } catch {}
+}
+sweepOrphanTemps(); // startup reclamation
 const { chromiumPath } = require('../lib/chromium');
 const spintax = require('../lib/spintax');
 const imageVary = require('../lib/imageVary');
@@ -108,19 +126,27 @@ function rangeMs(settings, minKey, maxKey, defMin, defMax, floorSec = 0) {
 // the configured (already-random) gap and a jittered floor, so even a 0/1s config yields a safe ~minMs±jitter.
 const ANTI_SPAM_MIN_GROUP_MS = 20000;   // ≥ ~20s between posts to different groups (per account)
 const ANTI_SPAM_MIN_COMMENT_MS = 30000; // ≥ ~30s after a post before its link-comment (post→instant-link = spam)
-// TURBO mode uses SMALLER (but never zero) anti-spam floors so the operator's fast gaps actually take effect.
-// Never 0: an instant post→link or back-to-back group post is FB's top ban trigger AND can fire before the
-// post is permalink-resolvable (lost comment). Non-turbo modes keep the full 20s/30s floors.
+// The MAX tier (internal token 'instant') uses SMALLER (but never zero) anti-spam floors so its aggressive gaps take
+// effect — this is used by the RESCUE path (the worker's own post/comment sites BYPASS these for instant, taking
+// rand()). Never 0: an instant post→link or back-to-back group post is FB's top ban trigger AND can fire before the
+// post is permalink-resolvable (lost comment). safe/fast keep the full 20s/30s floors.
 function antiSpamFloors(settings) {
   const m = settings && settings.speedMode;
-  // INSTANT = operator's "extra speed" tier: aggressively small but NON-ZERO floors. The comment (link) floor must
+  // INSTANT = the MAX tier's internal token: aggressively small but NON-ZERO floors. The comment (link) floor must
   // never go truly instant — post→link in <~3s is FB's strongest single ban trigger — so 4s is the hard minimum here.
   if (m === 'instant') return { group: 1500, comment: 4000 };
-  if (m === 'turbo') return { group: 8000, comment: 12000 };
   return { group: ANTI_SPAM_MIN_GROUP_MS, comment: ANTI_SPAM_MIN_COMMENT_MS };
 }
-function isTurboMode(settings) { return !!(settings && (settings.speedMode === 'turbo' || settings.speedMode === 'instant')); }
 function withFloor(ms, minMs, pct = 0.25) { return Math.max(jitter(Math.max(0, Number(minMs) || 0), pct), Math.round(Math.max(0, Number(ms) || 0))); }
+// TWO-PHASE post→link floor: the ms still OWED so a deferred comment's gap since ITS post's publish reaches the tier's
+// comment floor. safe/fast keep the FULL 30s floor; max (internal 'instant') deliberately uses small gaps and its own
+// natural aging already clears its ~1s minimum, so it owes 0. Never negative (a well-aged post owes nothing). This
+// guards the narrow case where the ONLY / last-posted deferred comment aged just seconds — Phase-2's comment-to-comment
+// cadence only fires for d>0, so without this the sole deferred comment would skip the post→link anti-spam gap entirely.
+function postLinkFloorOwed(settings, publishedAt, now) {
+  if (!settings || settings.speedMode === 'instant' || !Number.isFinite(publishedAt) || !Number.isFinite(now)) return 0;
+  return Math.max(0, antiSpamFloors(settings).comment - (now - publishedAt));
+}
 
 // Stable per-account BEHAVIORAL personality (seeded by the account-name hash, like viewportFor). Gives every account a
 // CONSISTENT-but-DISTINCT typing speed, reading pace, gap tempo, and typo-proneness — so many accounts on ONE host don't
@@ -148,34 +174,14 @@ function humanDelay(base, settings = {}, variant = 'settle') {
   return jitter(base, pct);
 }
 
-// Per-account PACE profile → an effective settings overlay. Returns settings UNCHANGED for 'normal'/absent
-// (so the global tempo is inherited and any caller/test that doesn't set a pace is unaffected). 'safe' DOUBLES
-// every per-post timing window (and forces human dwell on, even if the global preset was fast); 'fast' HALVES
-// them (and switches on the fast typing/dwell-skip path). We scale the SETTINGS OBJECT — not each call-site —
-// so the per-account watchdog budget (groupDelayMax/commentDelayMax) and humanDwell, which read these same
-// keys, scale automatically with no extra wiring. Pool-topology gaps (waitInterval/accountDelay) are
-// deliberately excluded: they're orchestrator-level, so a per-account pace never alters cycle/stagger cadence.
-const _PACE_MULT = { safe: 2.0, normal: 1.0, fast: 0.5, turbo: 0.25, instant: 0.1 };
-const _PACE_KEYS = ['groupDelayMin', 'groupDelayMax', 'commentDelayMin', 'commentDelayMax', 'pageScrollDwellSecMin', 'pageScrollDwellSecMax', 'commentDwellSecMin', 'commentDwellSecMax', 'prePublishDwellSecMin', 'prePublishDwellSecMax', 'composerOpenInitialDelayMs'];
-function applyPace(settings, pace) {
-  settings = settings || {};
-  const key = (pace === 'safe' || pace === 'normal' || pace === 'fast' || pace === 'turbo' || pace === 'instant') ? pace : (settings.defaultPace || 'normal');
-  const mult = _PACE_MULT[key] || 1.0;
-  if (key === 'normal' || mult === 1.0) return settings; // inherit the global tempo unchanged
-  const s = { ...settings };
-  for (const k of _PACE_KEYS) if (Number.isFinite(s[k])) s[k] = Math.max(0, Math.round(s[k] * mult));
-  // composerOpenInitialDelayMs has a documented 800ms render floor (store.clampSettings) — a 0.5× scale must not undercut it.
-  if (Number.isFinite(s.composerOpenInitialDelayMs)) s.composerOpenInitialDelayMs = Math.max(800, s.composerOpenInitialDelayMs);
-  if (key === 'safe') { s.humanizeMaster = true; if (s.speedMode === 'fast' || s.speedMode === 'turbo' || s.speedMode === 'instant') s.speedMode = 'normal'; } // a 'safe'-pace account must NOT inherit a fast/turbo/INSTANT global speedMode — it would paste + skip all human dwell, contradicting the whole point of 'safe'
-  // 'fast' takes the instant typing/dwell-skip path — but must NOT override a deliberately conservative global 'slow' preset
-  // (the gaps still halve via _PACE_MULT; only the human-behavior switch is withheld so the operator's max-caution intent holds).
-  else if (key === 'fast') { if (s.speedMode !== 'slow') s.speedMode = 'fast'; }
-  // 'turbo' = the very-fast tier: quarter the gaps (×0.25) + the global turbo speed (still respects a deliberate global 'slow').
-  else if (key === 'turbo') { if (s.speedMode !== 'slow') s.speedMode = 'turbo'; }
-  // 'instant' = the operator's max-speed tier: paste everything + 0–7s gaps (still respects a deliberate global 'slow').
-  else if (key === 'instant') { if (s.speedMode !== 'slow') s.speedMode = 'instant'; }
-  return s;
-}
+// Per-account PACE → effective settings. Delegates to the canonical resolver in lib/speed.js: a per-account tier
+// SELECTS its per-post timing (NO multiplier / compounding), cycle+stagger cadence (waitInterval/accountDelay) stays
+// FLEET-level, and the worker's INTERNAL speedMode token is set from the tier (safe→'normal', fast→'fast', max→'instant').
+// Every caller (orchestrator, moderator, repost, rescue) resolves HERE before the worker reads settings, so the ~65
+// internal speedMode branches + the anti-spam floors are byte-for-byte unchanged. Model + invariants: lib/speed.js,
+// tests/speed-model.test.js. Note: unlike the old overlay, this ALWAYS returns a fresh object (never the input).
+const SPEED = require('../lib/speed');
+function applyPace(settings, pace) { return SPEED.resolveEffectiveSettings(settings, pace); }
 
 // Move the cursor to (x,y) along a short multi-step path instead of teleport-clicking. FB's
 // integrity JS expects a real mouse trajectory before a click; a click with no preceding
@@ -214,7 +220,7 @@ async function moveMouseTo(page, x, y) {
 // delays) still apply from their ranges — only the cosmetic dwells/typing speed collapse here.
 function isFastMode(settings) {
   settings = settings || {};
-  return settings.humanizeMaster === false || settings.speedMode === 'fast' || settings.speedMode === 'turbo' || settings.speedMode === 'instant';
+  return settings.humanizeMaster === false || settings.speedMode === 'fast' || settings.speedMode === 'turbo' || settings.speedMode === 'instant'; // 'turbo' kept as a harmless defensive check (never emitted post-migration, but this is the 65-caller hot path — not worth touching for a dead clause)
 }
 
 // Land on a group and behave like a human reading before composing: a little mouse drift and a
@@ -259,8 +265,26 @@ async function warmLikePosts(page, max, shouldStop, log, name) {
 
 async function humanDwell(page, shouldStop = () => false, settings = {}) {
   try {
-    // humanizeMaster off / fast / turbo → skip the human-reading dwell entirely (deterministic + fast).
-    if (isFastMode(settings)) return;
+    // NORMAL/SAFE tiers → the full configurable pageScrollDwell browse below. FAST/MAX/TURBO (humanizeMaster off) is NO
+    // LONGER a no-op: a LIGHT warming dwell (1–2 scrolls + a short read) so an established account isn't a land→instant-
+    // composer bot shape on the single IP (the tell the code warns about at the humanDwell call site). This is WARMING,
+    // not pacing — it ADDS a little time BEFORE the composer and never feeds/shortens the inter-group anti-spam gap.
+    // Operator-tunable via fastDwellMsMin/Max (Max=0 → off), with an occasional skip so it isn't metronomic. (v1.0.93)
+    if (isFastMode(settings)) {
+      const _hi = Number.isFinite(settings.fastDwellMsMax) ? settings.fastDwellMsMax : 3000;
+      const _lo = Number.isFinite(settings.fastDwellMsMin) ? settings.fastDwellMsMin : 1200;
+      if (_hi <= 0 || Math.random() < 0.2) return; // disabled, or a ~20% skip so the warm dwell isn't a metronomic tell
+      const _budget = Math.max(400, _lo + Math.floor(Math.random() * Math.max(1, _hi - _lo)));
+      try { await moveMouseTo(page, 380 + Math.random() * 240, 280 + Math.random() * 160); } catch {}
+      const _sc = 1 + Math.floor(Math.random() * 2); // 1–2 light scrolls
+      const _per = Math.max(300, Math.floor(_budget / (_sc + 1)));
+      for (let s = 0; s < _sc && !shouldStop(); s++) {
+        try { await page.mouse.wheel({ deltaY: 180 + Math.random() * 260 }); } catch {}
+        await sleepInterruptible(jitter(_per, 0.3), shouldStop, 500);
+      }
+      if (!shouldStop()) { try { await page.mouse.wheel({ deltaY: -(120 + Math.random() * 160) }); } catch {} }
+      return;
+    }
     // T5: total browse time is a random draw from the configurable pageScrollDwell range (0/0 = skip).
     const _dm = (settings._behavior && Number.isFinite(settings._behavior.dwellMult)) ? settings._behavior.dwellMult : 1;
     const dwellMs = Math.round(rangeMs(settings, 'pageScrollDwellSecMin', 'pageScrollDwellSecMax', 3, 15, 0) * _dm); // × per-account reading pace
@@ -345,6 +369,7 @@ async function retryAsync(fn, opts = {}) {
   const baseDelayMs = Number.isFinite(opts.baseDelayMs) ? opts.baseDelayMs : 1500;
   const label = opts.label || 'operation';
   const onAttempt = typeof opts.onAttempt === 'function' ? opts.onAttempt : null;
+  const shouldRetry = typeof opts.shouldRetry === 'function' ? opts.shouldRetry : null; // #17: return false to STOP retrying a permanent error (e.g. HTTP 4xx) instead of burning the whole retry+backoff budget on a hopeless outcome
   let lastErr;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     let timer;
@@ -359,6 +384,7 @@ async function retryAsync(fn, opts = {}) {
       clearTimeout(timer);
       lastErr = e;
       if (onAttempt) { try { onAttempt(attempt, attempts, e); } catch {} }
+      if (shouldRetry && !shouldRetry(e)) break; // #17: a permanent failure — stop now rather than retry+backoff a hopeless outcome
       if (attempt < attempts) await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt - 1)));
     }
   }
@@ -403,7 +429,7 @@ async function downloadImage(url, log) {
     },
     maxContentLength: 15 * 1024 * 1024,    // cap the download so a giant/streaming URL can't exhaust memory
     maxBodyLength: 15 * 1024 * 1024,
-  }), { attempts: 3, timeoutMs: 35000, baseDelayMs: 1500, label: 'image download' });
+  }), { attempts: 3, timeoutMs: 35000, baseDelayMs: 1500, label: 'image download', shouldRetry: (e) => { const s = e && e.response && e.response.status; if (!Number.isFinite(s)) return true; if (s === 408 || s === 429) return true; return !(s >= 400 && s < 500); } }); // #17: a permanent 4xx (404/410/403…) can never become 200 — don't spend 3 attempts + 4.5s backoff on it every cycle; still retry transient (timeout, 408, 429, 5xx, network)
   if (!r.ok) { const st = r.error && r.error.response && r.error.response.status; note(`request failed after retries${st ? ` (HTTP ${st})` : ''}: ${r.error && r.error.message}`); return null; }
   // Reject non-image responses (an HTML error page / unexpected content type isn't an image).
   const ct = String((r.result.headers && (r.result.headers['content-type'] || r.result.headers['Content-Type'])) || '').toLowerCase();
@@ -576,8 +602,8 @@ function parseProxy(str) {
   const portN = Number(port);
   if (!PROXY_SCHEMES.has(scheme) || !(Number.isInteger(portN) && portN >= 1 && portN <= 65535)) return null;
   const auth = user ? `${encodeURIComponent(user)}:${encodeURIComponent(pass || '')}@` : '';
-  return { scheme, server: `${scheme}://${ip}:${port}`, username: user || null, password: pass || null,
-    upstream: `${scheme}://${auth}${ip}:${port}` };
+  return { scheme, host: ip, server: `${scheme}://${ip}:${port}`, username: user || null, password: pass || null,
+    upstream: `${scheme}://${auth}${ip}:${port}` }; // host = the exit endpoint (IP or domain) — used by the anti-link gate to serialize one account per IP even across rotating ports
 }
 
 // E-P1: classify a per-group error to decide retry policy. 'block' (rate-limit / checkpoint /
@@ -690,12 +716,27 @@ async function openComposerByText(page) {
 // (the text lives in a placeholder span), so target the SHORT-text placeholder, walk
 // up to its clickable [role=button], real-mouse-click it, and WAIT for the composer
 // dialog's editable to actually appear. Retries — returns true only when it opened.
-async function openComposer(page, log, name, settings = {}) {
+async function openComposer(page, log, name, settings = {}, maxAttempts = 4) {
   // R1: a focused search/"type ahead" box (the "Exit typeahead" seen in failures) steals keyboard
   // focus and obscures the composer trigger — blur it + Escape. R2: scroll to top, clear popups, and
   // WAIT for the feed to actually render (an article or the "Write something" placeholder) ONCE before
   // the attempt loop — scanning a half-rendered page was the cause of the "Could not open composer"
   // skips. All pre-publish + read-only (no double-post path).
+  // A mis-click that lands on a group TAB (Events / Media / About / Members / a post permalink) NAVIGATES off the feed,
+  // so the composer isn't there and every retry then fails → a spurious "Could not open composer" skip. Capture the feed
+  // url; if an attempt finds we've navigated to a tab, return here first and retry (pre-publish, read-only, no double-post).
+  let _feedUrl = null; try { _feedUrl = page.url(); } catch {}
+  const _backToFeedIfTabbed = async () => {
+    try {
+      const seg = (page.url().match(/\/groups\/[^/?#]+\/([^/?#]+)/) || [])[1] || '';
+      if (_feedUrl && seg && /^(events|evenements|media|members|membres|about|photos|videos|files|fichiers|posts|permalink|buy_sell|market|learning|rooms|insights|moderate)/i.test(seg)) {
+        if (log) log(`Composer: a click navigated to the "${seg}" tab — returning to the group feed and retrying (no error)`);
+        await page.goto(_feedUrl, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+        await sleep(humanDelay(800, settings, 'settle'));
+        await dismissPopups(page);
+      }
+    } catch {}
+  };
   try {
     const hadSearch = await page.evaluate(() => {
       const el = document.activeElement; if (!el) return false;
@@ -713,8 +754,9 @@ async function openComposer(page, log, name, settings = {}) {
     return Array.from(document.querySelectorAll('[role="button"], span, div')).some((e) => /write something|what'?s on your mind|irj valamit|mi jar a fejedben|quoi de neuf|écrivez quelque chose|ecrivez quelque chose|créer une publication|creer une publication|que estas pensando|was machst du/i.test(e.textContent || ''));
   }, { timeout: 20000 }).catch(() => {}); // R2: feed-render gate (slow internet)
 
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    if (log) log(`Opening composer (attempt ${attempt}/4)`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (log && attempt > 1) log(`Reopening composer (attempt ${attempt}/${maxAttempts})`); // attempt-1 is immediately followed by 'Composer opened' on success → the line was pure duplication (~800 noise lines/day); only retries carry information. maxAttempts shrinks to 2 once FB is already pushing this account back (see composerOpenAttempts)
+    if (attempt > 1) await _backToFeedIfTabbed(); // if a prior attempt's click navigated to a group tab, return to the feed BEFORE re-scanning
     // The composer lives at the TOP of the feed — make sure we're there and nothing covers it.
     await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
     await sleep(attempt === 1 ? humanDelay(Number.isFinite(settings.composerOpenInitialDelayMs) ? settings.composerOpenInitialDelayMs : 1500, settings, 'settle') : humanDelay(1500, settings, 'settle'));
@@ -740,7 +782,7 @@ async function openComposer(page, log, name, settings = {}) {
         'publiez quelque chose',
         'exprimez-vous',
       ];
-      const reject = ['search', 'comment', 'message', 'photo/video', 'live video', 'reels', 'rechercher', 'commenter', 'photo/video'];
+      const reject = ['search', 'comment', 'message', 'photo/video', 'live video', 'reels', 'rechercher', 'commenter', 'events', 'evenements', 'media', 'members', 'membres', 'buy and sell']; // + group TAB labels: never choose an element (or a wrapper) that spans a nav tab → its click could land on the tab and navigate off the feed
       const all = Array.from(document.querySelectorAll('[role="button"], span, div'));
       const matches = [];
       for (const el of all) {
@@ -772,7 +814,7 @@ async function openComposer(page, log, name, settings = {}) {
     else await openComposerByText(page).catch(() => false);
     const ok = await page.waitForSelector('div[role="dialog"] [contenteditable="true"], div[role="dialog"] [role="textbox"]', { timeout: attempt === 1 ? 6000 : 9000 }).then(() => true).catch(() => false); // R4: more patience on slow-net retries
     if (ok) { if (attempt > 1 && log) log(`Composer opened (attempt ${attempt})`); return true; }
-    if (log) {
+    if (log && attempt === 4) { // #5: gate the full-DOM diagnostic scan to the TERMINAL attempt only — attempts 1-3 self-heal (attempt-2/3 recover the bulk), so ~74/86 of these scans/day diagnosed a problem that had already resolved
       // R3: a read-only readiness probe so a not-yet-rendered feed isn't misdiagnosed as selector drift.
       const hint = await page.evaluate(() => {
         const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
@@ -789,13 +831,14 @@ async function openComposer(page, log, name, settings = {}) {
       }).catch(() => null);
       if (hint) log(`Composer not open yet (feed readiness: ${hint.articles} articles, focused=${hint.focused}, ${hint.composerHits} composer-text matches); visible buttons: ${hint.buttons.join(' | ') || '(none)'}`);
     }
-    await sleep(humanDelay(1500, settings, 'settle'));
+    // #6: removed a redundant second sleep(1500) here — the next attempt's own initial settle (line ~724) is the sole
+    // per-attempt hydration beat; the two fired back-to-back with only a loop-continue between them (failure path only).
   }
   // Distinguish "page never rendered" from genuine selector drift using the last readiness read.
   const ready = await page.evaluate(() => document.querySelectorAll('[aria-posinset], div[role="article"]').length).catch(() => 0);
   if (log) {
-    if (!ready) log('⚠️ Composer never opened after 4 attempts and the group FEED never rendered — likely a slow/blocked network or this account can\'t view this group. Not selector drift.');
-    else log('⚠️ SELECTOR DRIFT? The feed rendered but the "Write something" trigger was not found after 4 attempts — Facebook may have changed it or the page is in an unexpected locale/state. Run scripts/inspect-fb.js to capture the current DOM.');
+    if (!ready) log(`⚠️ Composer never opened after ${maxAttempts} attempt(s) and the group FEED never rendered — likely a slow/blocked network or this account can't view this group. Not selector drift.`);
+    else log(`⚠️ SELECTOR DRIFT? The feed rendered but the "Write something" trigger was not found after ${maxAttempts} attempt(s) — Facebook may have changed it or the page is in an unexpected locale/state. Run scripts/inspect-fb.js to capture the current DOM.`);
   }
   return false;
 }
@@ -808,7 +851,7 @@ async function openComposer(page, log, name, settings = {}) {
 // the feed-scan fallback and can NEVER comment on the wrong post. Best-effort: if FB renames the mutation or
 // changes the response shape and nothing matches, .get() stays null → the feed-scan runs (no regression).
 function armPostIdCapture(page, gid) {
-  let hit = null; // { postId, url }
+  let hit = null; let ambiguous = false, sawCreate = false; // hit={postId,url}; ambiguous/sawCreate diagnose WHY a capture came up empty (== the strict floor's skip rate)
   const gidStr = String(gid || '');
   const onResp = async (resp) => {
     try {
@@ -822,6 +865,7 @@ function armPostIdCapture(page, gid) {
       // no capture (feed-scan fallback), never a wrong capture.
       const friendly = decodeURIComponent((pd.match(/fb_api_req_friendly_name=([^&]+)/) || [])[1] || '');
       if (!/StoryCreate|CreateMutation|Composer.*Create|CreatePost|GroupsCometFeedStoryCreate|useComet.*Create|ComposerStore/i.test(friendly)) return;
+      sawCreate = true; // OUR create-story mutation's response arrived — the publish DID reach FB's composer backend
       let body = ''; try { body = await resp.text(); } catch { return; }
       if (!body || body.length > 3000000) return;
       const clean = body.replace(/\\\//g, '/');                  // FB escapes URL slashes as \/ in JSON
@@ -845,10 +889,11 @@ function armPostIdCapture(page, gid) {
       const ids = new Set(); let mm;
       while ((mm = rx.exec(clean))) ids.add(mm[1]);
       if (ids.size === 1) { const id = [...ids][0]; hit = { postId: id, url: 'https://www.facebook.com/groups/' + gidStr + '/posts/' + id + '/' }; }
+      else if (ids.size > 1) ambiguous = true; // multiple same-group ids in the response → AMBIGUITY-REJECT (recency-unsafe) → no capture
     } catch { /* never let a response probe throw into the publish path */ }
   };
   page.on('response', onResp);
-  return { get: () => hit, dispose: () => { try { page.off('response', onResp); } catch {} } };
+  return { get: () => hit, stats: () => ({ hit: !!hit, ambiguous, sawCreate }), dispose: () => { try { page.off('response', onResp); } catch {} } };
 }
 
 async function clickPostButton(page) {
@@ -864,14 +909,129 @@ async function clickPostButton(page) {
     for (const root of scope) {
       const btn = Array.from(root.querySelectorAll('[role="button"], button')).find((b) =>
         b.getAttribute('aria-disabled') !== 'true' && !b.disabled && labels.includes(norm(b.getAttribute('aria-label') || b.textContent)));
-      if (btn) { btn.scrollIntoView({ block: 'center' }); const r = btn.getBoundingClientRect(); if (r.width && r.height) return { x: r.x + r.width * (0.35 + Math.random() * 0.3), y: r.y + r.height * (0.35 + Math.random() * 0.3) }; }
+      if (btn) { document.querySelectorAll('[data-zp-postbtn]').forEach((e) => e.removeAttribute('data-zp-postbtn')); btn.setAttribute('data-zp-postbtn', '1'); btn.scrollIntoView({ block: 'center' }); const r = btn.getBoundingClientRect(); if (r.width && r.height) return { x: r.x + r.width * (0.35 + Math.random() * 0.3), y: r.y + r.height * (0.35 + Math.random() * 0.3) }; }
     }
     return null;
   }, FB.postButton).catch(() => null);
   // Move the cursor to the button along a path (and a brief hover) before clicking, like a human —
   // a click with no preceding mousemove is a bot tell FB's integrity JS looks for.
-  if (pt) { await moveMouseTo(page, pt.x, pt.y); await page.mouse.click(pt.x, pt.y, { delay: 30 + Math.floor(Math.random() * 70) }).catch(() => {}); return true; }
+  if (pt) {
+    await moveMouseTo(page, pt.x, pt.y);
+    // Re-read the Post button's CURRENT center right before clicking — the composer can resize/shift it (image/caption
+    // render, the "add to your post" row) during the human mouse-move, so a stale coordinate would MISS. Click where it IS.
+    const cur = await page.evaluate(() => { const b = document.querySelector('[data-zp-postbtn="1"]'); if (!b) return null; const r = b.getBoundingClientRect(); return (r.width && r.height) ? { x: r.x + r.width * (0.4 + Math.random() * 0.2), y: r.y + r.height * (0.4 + Math.random() * 0.2) } : null; }).catch(() => null);
+    await page.mouse.click((cur && cur.x) || pt.x, (cur && cur.y) || pt.y, { delay: 30 + Math.floor(Math.random() * 70) }).catch(() => {});
+    try { await page.evaluate(() => { const b = document.querySelector('[data-zp-postbtn="1"]'); if (b) b.removeAttribute('data-zp-postbtn'); }); } catch {}
+    return true;
+  }
   return false;
+}
+
+// #time-waste: how long to wait for FB to confirm a publish before falling back to the (double-post-safe) rescan.
+// The FIRST post of a run — and any post after a CONFIRMED publish (consecPubTimeouts reset to 0) — gets the FULL
+// ceiling: a slow / hidden / proxied window can take 35-45s+, and a too-short wait would be a FALSE "timeout" that the
+// owed/reserve path could re-post = a DUPLICATE (the one ban-risk axis). But once FB has SILENTLY dropped a publish
+// this run (consecPubTimeouts>0 ⇒ its create-story backend didn't acknowledge the prior post), the account is very
+// likely throttled and a full 70s wait is mostly idle time — return the shorter "throttle" ceiling so we reach the
+// 2-in-a-row backoff fast instead of stalling ~70s per post. This does NOT weaken double-post safety: on a timeout the
+// H3 network-capture confirm (~3s), the dialog-close poll (~12s) and the author-matched feed rescan ALL still run —
+// ≈15s of landing-coverage AFTER the ceiling — so 35s still covers the documented 35-45s slow-publish window; a post
+// that actually landed is caught and never re-posted.
+function publishWaitCeilingMs(consecPubTimeouts, fullMs = 70000, throttleMs = 35000) {
+  return (Number(consecPubTimeouts) || 0) >= 1 ? throttleMs : fullMs;
+}
+
+// #hardening: the unified MIXED-failure backoff decision. `consecPushback` counts consecutive FB-pushback failures of
+// ANY type (silent publish-timeout / composer-won't-open / post-button-missing) and resets on a confirmed or held
+// publish. The per-type "2 in a row" counters miss a throttle that makes an account fail DIFFERENT ways each group, so
+// this catches that mix. Below `threshold` → null (keep going). At/above it, FB is pushing the account back: return
+// 'transient' if it already delivered today (a slow-IP/layout hiccup — stop this cycle, no rest) else 'block' (a
+// rate-limit rest so a reserve / the next cycle covers). Pure + exported so the contract is unit-tested.
+function mixedPushbackDecision(consecPushback, deliveredToday, threshold = 3) {
+  if ((Number(consecPushback) || 0) < threshold) return null;
+  return deliveredToday ? 'transient' : 'block';
+}
+
+// The COMMENT-side twin of mixedPushbackDecision — the guard the comment path never had.
+//
+// WHY THIS EXISTS (operator-reported): an account kept POSTING while its comments never landed. Only an explicitly
+// DETECTED wall (blocked_comment / blocked_account, i.e. FB's red text) ever rested an account. Every other comment
+// failure — 'failed' (no comment box), 'error', 'timeout', 'notfound' (submitted but never visible = silently dropped /
+// shadow-suppressed) — just returned, and the account moved on to its next group and posted again. So a comment-
+// suppressed account burned its whole daily cap producing posts with NO link-comment.
+//
+// That is the worst possible outcome for this product: the link IS the payload, so a link-less post has zero value while
+// still consuming the daily cap, adding shared-IP ban exposure, and queueing orphan-comment rescue work. Posting more is
+// strictly negative EV. This mirrors the existing operator policy already stated for a detected comment limit ("a COMMENT
+// limit STOPS the whole account"), and extends it to the far more common SILENT case.
+//
+// consecCommentFails counts CONSECUTIVE comment attempts that did not land (any cause), and RESETS the moment one lands
+// — so an isolated hiccup never trips it; only a sustained inability to comment does. Same threshold + transient/block
+// split as the posting twin: if the account HAS landed a comment today, 3-in-a-row is more likely an FB hiccup than a
+// wall → stop it for this cycle only (no rest). If it has landed NOTHING today, FB is suppressing it → rest it on the
+// LOCKED comment ladder (rlKind 'comment'). Pure → unit-tested.
+function commentFailureDecision(consecCommentFails, commentedToday, threshold = 3) {
+  if ((Number(consecCommentFails) || 0) < threshold) return null;
+  return commentedToday ? 'transient' : 'block';
+}
+
+// Classify a comment outcome for the BREAKER. This is deliberately NOT _commentLanded — do not merge them.
+//
+// The two predicates answer DIFFERENT questions and disagree on purpose:
+//   • _commentLanded asks "was Enter PRESSED?" → it drives RESCUE routing, where the ban-axis invariant is "never
+//     re-queue something that may already be under the post" (a double-comment). It must therefore treat 'unconfirmed'
+//     and 'not_visible' as landed. That is correct, and must stay exactly as it is.
+//   • THIS asks "did a comment actually become VISIBLE (i.e. produce value)?" — the breaker's whole purpose.
+// v1.0.118 reused _commentLanded here, which made the breaker blind to precisely the class it exists for:
+// addFirstComment returns 'not_visible' when the box emptied but a re-scan PROVED our text is not under the post — the
+// shadow-suppression signature (its own log says "sent but NOT visible — verify this group manually"). As a "success"
+// that RESET the streak and latched commentedToday=true forever, so the breaker could never fire again, and any later
+// genuine streak downgraded from 'block' (rest) to 'transient' (no rest).
+//
+// 'unknown' is load-bearing, and 'unconfirmed' MUST map to it:
+//   - counting it as a LOSS would rest every account instantly in instant/max speed mode, where the confirm re-scan is
+//     skipped by design so nearly every outcome is 'unconfirmed' — a catastrophic false positive;
+//   - counting it as a WIN would blind the breaker there, exactly as v1.0.118 did.
+// 'unknown' neither increments NOR resets, so it is honest (we genuinely do not know) AND real losses still accumulate
+// ACROSS it — a not_visible / unconfirmed / not_visible / unconfirmed / not_visible run still reaches 3 and trips.
+// Returns 'landed' | 'lost' | 'unknown'. Pure → unit-tested.
+function commentOutcomeClass(cres) {
+  switch (cres) {
+    case 'posted':                  // re-scan CONFIRMED it visible
+    case 'already_present':         // our link is already under the post — the value exists
+    case 'blocked_account_landed':  // it landed, THEN FB walled the account (the wall stops it separately)
+    case 'blocked_comment_landed':
+      return 'landed';
+    case 'none':                    // no comment wanted — never an attempt
+    case 'unconfirmed':             // Enter pressed, delivery not auto-verified (instant mode skips the re-scan)
+      return 'unknown';
+    default:                        // not_visible / failed / error / timeout / skipped / unplaced / blocked_*
+      return 'lost';
+  }
+}
+
+// #3 (time-waste): how many composer-open attempts to make. Measured over 3 live days: attempt 2 recovered 167 composers,
+// but attempts 3 and 4 recovered only 3 and 0 — while EACH terminal attempt burns a hard 9s waitForSelector (~18s of dead
+// wait) on a fully-starved feed before the skip. So FULL is now 2 (keep attempt 2 — it does the bulk of the real
+// recoveries), not 4. A feed that fails all attempts yields a partition-guarded reserve takeover (a normal single post),
+// never a re-burst. Once FB is already pushing back (pushback>0) the feed usually won't render at all → stay at 2 so the
+// account reaches its backoff fast. The FIRST attempt is always made. READ-ONLY pre-publish path (nothing clicked/
+// submitted), so fewer attempts can NEVER cause a double-post and never touch the publish-confirm.
+function composerOpenAttempts(pushback, fullAttempts = 2, throttledAttempts = 2) {
+  return (Number(pushback) || 0) >= 1 ? throttledAttempts : fullAttempts;
+}
+
+// #5 (hardening): the per-account watchdog tick decision on a budget-elapse. A DEAD browser → abort. A LIVE browser that
+// ADVANCED a group this window → extend (reset the no-progress streak — it's just slow, not stuck). A live browser that
+// made ZERO group progress → extend ONCE (grace: a rare laptop sleep-resume fires the wall-clock timer with no fault,
+// though powerSaveBlocker blocks sleep during a run) then ABORT on the SECOND consecutive no-progress window — a
+// responsive-but-STUCK browser (persistent interstitial / hung SPA) that would otherwise re-extend the full budget
+// FOREVER and stall the cycle drain. Pure → unit-tested. Returns { action:'extend'|'abort', noProgressTicks }.
+function watchdogTickDecision(alive, progressed, noProgressTicks, graceWindows = 1) {
+  if (!alive) return { action: 'abort', noProgressTicks: Number(noProgressTicks) || 0 };
+  if (progressed) return { action: 'extend', noProgressTicks: 0 };
+  const n = (Number(noProgressTicks) || 0) + 1;
+  return n > graceWindows ? { action: 'abort', noProgressTicks: n } : { action: 'extend', noProgressTicks: n };
 }
 
 // Confirm the post actually published: the composer dialog closes OR the enabled
@@ -884,14 +1044,40 @@ async function waitForPublish(page, dialogCountBefore, timeout = 45000, shouldSt
     if (shouldStop()) return 'stopped'; // halt promptly on Stop instead of polling for 30s
     // Count ONLY composer dialogs (a contenteditable / file-input / textbox inside). A Messenger/notification
     // popup opening as the composer closes would keep the RAW dialog count flat and mask the close → false timeout.
-    const dialogCount = await evalTimed(page, () => Array.from(document.querySelectorAll('div[role="dialog"]')).filter((d) => d.querySelector('[contenteditable="true"], input[type="file"], [role="textbox"]')).length, null, 8000).catch(() => -1);
-    if (dialogCount >= 0 && dialogCountBefore > 0 && dialogCount < dialogCountBefore) return 'published';
+    // GAP#2: probe the broad composer-like dialog count (UNCHANGED meaning) AND whether OUR tagged composer shell is
+    // gone, in ONE evaluate so a dead CDP fails both together (probe null → dialogCount -1, exactly as before). ourShellGone
+    // defaults FALSE on a dead probe so a probe failure can never help declare 'published'.
+    const _pp = await evalTimed(page, () => {
+      const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
+      return { c: dialogs.filter((d) => d.querySelector('[contenteditable="true"], input[type="file"], [role="textbox"]')).length, g: !document.querySelector('[data-zp-composer="1"]') };
+    }, null, 8000).catch(() => null);
+    const dialogCount = _pp ? _pp.c : -1;
+    const ourShellGone = _pp ? _pp.g : false;
+    // FAST red-text WALL — caught within one poll (~0.5–1.5s instant) instead of waiting out the 70s ceiling. DOUBLE-SAFE:
+    // fires ONLY while the composer is STILL OPEN (the post provably did NOT land in the client → no create-story id →
+    // routing to a reserve can't double). An already-CLOSED composer means it probably landed → we fall through to the
+    // 'published' path below, markDelivered it, and let the post-publish emergingBlock scan cool the account (no re-post).
+    // A login/checkpoint that NAVIGATED away (composer gone) is caught one step later by the existing verify/login checks.
+    { const _w = await classifyWallScoped(page);
+      if (_w.composerOpen && _w.kind) return _w.kind === 'account' ? 'blocked_account' : _w.kind === 'checkpoint' ? 'checkpoint' : _w.kind === 'login' ? 'needs_login' : 'blocked_post'; }
+    // GAP#2: 'published' now ALSO requires OUR composer shell (tagged at Post-click) to be gone. A Messenger/notification
+    // popup collapsing drops the broad count but NEVER moves this tag → it can no longer masquerade as our composer closing
+    // (a silent lost post). STRICTLY NARROWER than before: on a real publish OUR shell + the broad count vanish on the SAME
+    // DOM mutation → fires the same poll as today. A failed tag (no data-zp-composer) → ourShellGone always true → byte-identical.
+    if (dialogCount >= 0 && dialogCountBefore > 0 && dialogCount < dialogCountBefore && ourShellGone) return 'published';
     const sig = await evalTimed(page, () => {
       // Scope success/error/pending detection to NOTICE surfaces (alert/status/dialog), NEVER feed articles:
       // a moderated group's feed is full of old "pending"/"posted to the group" text that would otherwise
       // FALSE-POSITIVE 'submitted' on the very first poll (before our post even transmitted) → a lost post.
       const nt = Array.from(document.querySelectorAll('[role="alert"], [role="status"], div[role="dialog"]'))
-        .filter((n) => !n.closest('[role="article"]')).map((n) => n.innerText || '').join(' \n ').toLowerCase();
+        .filter((n) => !n.closest('[role="article"]'))
+        // Exclude the OPEN COMPOSER too (a dialog holding an editable/textbox/file-input), exactly as classifyWallScoped /
+        // pendingNoticeForOurPost do. A moderated group renders a "will be reviewed / sera examiné" banner INSIDE the
+        // composer → the pending regex below would false-match on an EARLY poll (before our post transmits; and if the
+        // Post click missed, it never does) → 'submitted' → 'published' → a never-sent post markDelivered'd + lost. Read
+        // pending/error ONLY from SEPARATE toasts; the authoritative dialog-CLOSE below still confirms a real held publish.
+        .filter((n) => !n.querySelector('[contenteditable="true"], [role="textbox"], input[type="file"]'))
+        .map((n) => n.innerText || '').join(' \n ').toLowerCase();
       if (/pending|in review|will be reviewed|shared once approved|post is pending|posted to the group|en attente|en cours d.examen|sera examine|publié dans le groupe|publie dans le groupe|partagé dans le groupe|partage dans le groupe|votre publication a été|votre publication a ete/.test(nt)) return 'submitted';
       // Explicit Facebook failure — never count it as published (so the post is retried, not lost).
       if (/couldn.t post|can.t share|something went wrong|unable to post|failed to post|couldn.t share|impossible de publier|impossible de partager|une erreur s.est produite|un problème est survenu|un probleme est survenu/.test(nt)) return 'error';
@@ -926,6 +1112,7 @@ async function pendingNoticeForOurPost(page) {
       const nodes = Array.from(document.querySelectorAll('[role="alert"], [role="status"], [role="dialog"]'));
       for (const n of nodes) {
         if (n.closest('[role="article"]')) continue; // never trust feed-post text
+        if (n.querySelector('[contenteditable="true"], [role="textbox"], input[type="file"]')) continue; // never trust the OPEN COMPOSER dialog — its text is OUR typed caption (which could itself contain a "pending/review" phrase); it's the editor, not a pending toast. Matters once H3 can reach here with the composer still open after a timeout→published flip.
         const t = norm(n.innerText || '');
         if (t && pats.some((p) => t.includes(p))) return true;
       }
@@ -1013,7 +1200,16 @@ async function dismissPopups(page) {
 async function classifyRateLimit(page) {
   try {
     return await page.evaluate((arg) => {
-      const t = (document.body.innerText || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+      // SCOPE to NOTICE surfaces (banners/dialogs), EXCLUDING feed articles + the open composer — a neighbor's feed post
+      // ("…anyone else getting Action Blocked?") or OUR OWN caption must NEVER trip an account-stop (this runs on healthy
+      // pre-post + post-success paths too; the bare AR محظور is an everyday word). Only a genuine FULL-PAGE block (no feed
+      // article AND no composer on the page) falls back to the whole body — a healthy feed always has articles, so it can't.
+      const notices = Array.from(document.querySelectorAll('[role="alert"], [role="status"], div[role="dialog"]'))
+        .filter((n) => !n.closest('[role="article"]'))
+        .filter((n) => !n.querySelector('[contenteditable="true"], [role="textbox"], input[type="file"]'))
+        .map((n) => n.innerText || '').join(' \n ');
+      const fullPage = !document.querySelector('[role="article"]') && !document.querySelector('[contenteditable="true"], [role="textbox"]');
+      const t = (notices + (fullPage ? (' \n ' + (document.body.innerText || '')) : '')).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
       if (arg.severe.some((p) => t.includes(p))) return 'severe';
       if (arg.all.some((p) => t.includes(p))) return 'limit';
       return null;
@@ -1028,14 +1224,55 @@ async function checkVerification(page) {
   try {
     return await page.evaluate((cfg) => {
       const url = (location.href || '').toLowerCase();
-      if (cfg.urls.some((u) => url.includes(u))) return true;
-      const t = (document.body.innerText || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-      if (cfg.texts.some((p) => t.includes(p))) return true;
-      // Structural cue: a captcha/challenge vendor frame or an explicit checkpoint form/input.
+      if (cfg.urls.some((u) => url.includes(u))) return true; // structural, locale-free — PRIMARY
+      // Structural cue: a captcha/challenge vendor frame or an explicit checkpoint form/input — locale-free, primary.
       if (document.querySelector('iframe[src*="captcha" i], iframe[title*="captcha" i], form[action*="checkpoint" i], input[name*="captcha" i]')) return true;
+      // TEXT branch — SCOPE it (a benign feed post mentioning "security check" must not false-stop a healthy account).
+      // Notice surfaces only (exclude feed articles + composer), + a full-page fallback when there's no feed/composer.
+      const notices = Array.from(document.querySelectorAll('[role="alert"], [role="status"], div[role="dialog"]'))
+        .filter((n) => !n.closest('[role="article"]'))
+        .filter((n) => !n.querySelector('[contenteditable="true"], [role="textbox"], input[type="file"]'))
+        .map((n) => n.innerText || '').join(' \n ');
+      const fullPage = !document.querySelector('[role="article"]') && !document.querySelector('[contenteditable="true"], [role="textbox"]');
+      const t = (notices + (fullPage ? (' \n ' + (document.body.innerText || '')) : '')).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+      if (cfg.texts.some((p) => t.includes(p))) return true;
       return false;
     }, { urls: FB.checkpointUrl, texts: FB.checkpoint });
   } catch { return false; }
+}
+
+// UNIFIED red-text "wall" classifier — the ONE source of truth for the FAST post-click + comment-Enter limit checks.
+// Scans ONLY notice surfaces ([role=alert]/[role=status]/[role=dialog]) that are NOT feed articles AND NOT the OPEN
+// composer/comment box (its text is OUR caption/comment) → an old feed "action blocked" post, or our own typed text,
+// can NEVER trip it. NFD-normalized (matches how FB.* are stored) so accented locales still hit. login + checkpoint are
+// STRUCTURAL (url / login form / captcha frame) so they're locale-free and not gated on composerOpen. Priority:
+// login → checkpoint → account-block → rate-limit. Returns { kind: 'login'|'checkpoint'|'account'|'limit'|null, composerOpen }.
+async function classifyWallScoped(page) {
+  try {
+    return await page.evaluate((cfg) => {
+      const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const url = (location.href || '').toLowerCase();
+      const composerOpen = Array.from(document.querySelectorAll('div[role="dialog"]'))
+        .some((d) => d.querySelector('[contenteditable="true"], input[type="file"], [role="textbox"]'));
+      // LOGIN (logged out) — structural, locale-free: a /login URL, or a VISIBLE email+password pair.
+      if (/^https?:\/\/[^/]*\/login/.test(url)) return { kind: 'login', composerOpen };
+      const em = document.querySelector('input[name="email"], #email'), pw = document.querySelector('input[name="pass"], #pass');
+      const er = em && em.getBoundingClientRect();
+      if (em && pw && er && er.width > 0 && er.height > 0) return { kind: 'login', composerOpen };
+      // CHECKPOINT — url / captcha-challenge structure, locale-free.
+      if (cfg.cpUrls.some((u) => url.includes(u))) return { kind: 'checkpoint', composerOpen };
+      if (document.querySelector('iframe[src*="captcha" i], iframe[title*="captcha" i], form[action*="checkpoint" i], input[name*="captcha" i]')) return { kind: 'checkpoint', composerOpen };
+      // NOTICE SURFACES ONLY — exclude feed articles AND the open composer/box (our own text).
+      const t = Array.from(document.querySelectorAll('[role="alert"], [role="status"], div[role="dialog"]'))
+        .filter((n) => !n.closest('[role="article"]'))
+        .filter((n) => !n.querySelector('[contenteditable="true"], [role="textbox"], input[type="file"]'))
+        .map((n) => norm(n.innerText || '')).join(' \n ');
+      if (cfg.cpText.some((x) => t.includes(x))) return { kind: 'checkpoint', composerOpen };
+      if (cfg.severe.some((x) => t.includes(x))) return { kind: 'account', composerOpen };
+      if (cfg.rate.some((x) => t.includes(x))) return { kind: 'limit', composerOpen };
+      return { kind: null, composerOpen };
+    }, { severe: FB.blockSevere, rate: FB.rateLimit, cpText: FB.checkpoint, cpUrls: FB.checkpointUrl });
+  } catch { return { kind: null, composerOpen: false }; }
 }
 
 // Run a page.evaluate that can NEVER hang to the protocolTimeout — bail after `ms`.
@@ -1063,14 +1300,14 @@ function withTimeout(promise, ms, fallback) {
 // Add the "first comment" (the link) to the JUST-published post. Reloads the group
 // so the new post renders, finds the article containing our caption, and types into
 // ITS "Write a public comment…" box. Returns true on success.
-async function addFirstComment(page, gid, post, commentImg, step, permalink, settings = {}, expectedPostId = null, expectedAuthor = '', preNavigated = false, forceContentVerify = false) {
+async function addFirstComment(page, gid, post, commentImg, step, permalink, settings = {}, expectedPostId = null, expectedAuthor = '', preNavigated = false, forceContentVerify = false, checkExisting = false) {
   // WRONG-POST GUARD inputs: a real FB post id is a long digit string; reject a LOCAL library id (e.g.
   // "post-1718…") passed as expectedPostId so it can't poison the id check (and silently degrade to
   // caption-only). expectedAuthor = the poster's FB display name → used to confirm a same-caption article
   // is actually OURS (or the right account's), so a comment never lands on another account's/stranger's
   // identical-caption post when no FB post id is available.
   const fbId = /^\d{8,}$/.test(String(expectedPostId || '')) ? String(expectedPostId) : null;
-  const expAuthor = String(expectedAuthor || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const expAuthor = String(expectedAuthor || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 60); // slice(0,60) to MATCH authorOf's 60-char slice — else a >60-char display name never author-matches (a false hold / a refused R4 lone-match)
   expectedPostId = fbId; // from here on, only a verified FB id counts as a post-id anchor
   let submitted = false; // once the submitting Enter is pressed, NEVER return false — the caller
                          // retries on false and would post a DUPLICATE comment.
@@ -1141,6 +1378,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
     let boxes = [];
     let permalinkFailed = false;
     let postMissing = false; // set when our published post is NOT in the public feed → likely HELD in Spam potentiel
+    let pageWasSlow = false; // set when the page we'll comment on was slow/not-interactive → EXTEND the post-submit confirm window so a queued/in-flight Enter flushes BEFORE any re-press (double-guard for the "not fully interactive" pages that produced the doubles)
 
     // PRIMARY: comment on the post's OWN page (it's the only article there → unambiguous = right post).
     if (permalink) {
@@ -1163,6 +1401,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       else {
         await page.waitForSelector('[aria-posinset], div[role="article"], [aria-label*="omment"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
         const ready = await waitInteractive(4000); // permalink branch: the waitForSelector above (incl. [role=textbox]) + the commentBoxes/clickLeaveComment retry below are the REAL box gate, so this early-returns fast on a normal post page — a 4s budget is enough (the 10s stays on the busy-feed fallback where it's needed)
+        if (!ready) pageWasSlow = true; // slow/janky permalink page → extend the post-submit confirm window (let a queued/in-flight Enter flush before any re-press — double-guard)
         step(ready ? 'Comment: post page ready' : 'Comment: post page not fully interactive (timeout) — trying anyway');
         await dismissPopups(page);
         const authBad = await withTimeout(page.evaluate(() => /continue as|use another profile|log in to facebook/i.test(document.body.innerText || '')), 8000, false);
@@ -1186,13 +1425,15 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           // NETWORK-CAPTURED id — its provenance is Facebook's publish response, NOT a caption-verified feed article,
           // so the id/URL alone doesn't prove the page is OURS. Confirm on the POST'S OWN PAGE by a POSITIVE CAPTION
           // match — the SAME single-article standard the feed-scan uses (see _scanFeedRaw: "caps.length === 1 → ours").
-          // The author is a positive CORROBORATOR only; a bare author mismatch does NOT reject a caption-confirmed post,
-          // because the account's configured display name is often stale/unknown (FB "logged in as (unknown)") — trusting
-          // it as a NEGATIVE was falsely rejecting our OWN posts and forcing a needless feed-scan on every comment.
-          // POLL: permalink pages render slowly on a real IP (a single early read misfires as a mismatch) — accept as
-          // soon as caption OR author matches; only after the deadline demote to the (wrong-post-guarded) feed-scan.
-          // Wrong-post safety holds: a foreign/mis-parsed id whose page does NOT carry our caption never confirms here
-          // (positiveCaption stays false → fall back for BOTH urlId===id and urlId===null), and the fallback is guarded.
+          // Author is neither a confirmer NOR a rejecter: a mis-parsed id is drawn from our OWN create-story response,
+          // so its page author equals expAuthor EVEN when the id points at a DIFFERENT (older) post of ours with another
+          // caption — author-alone would then confirm a WRONG post (the hole this closes). Hence CAPTION is REQUIRED;
+          // author is only read/logged. A stale/unknown display name (FB "logged in as (unknown)") must never REJECT our
+          // own caption-confirmed post, and a matching name must never OVERRIDE a caption miss.
+          // POLL: permalink pages render slowly on a real IP (a single early read misfires as a mismatch) — retry the
+          // caption read until the deadline, then demote to the (wrong-post-guarded) feed-scan. Wrong-post safety holds:
+          // a foreign/mis-parsed id whose page does NOT carry our caption never confirms here (capOk stays false → fall
+          // back for BOTH urlId===id and urlId===null), and the feed-scan fallback is itself guarded.
           let confirmed = false, sawArticle = false, lastAuth = '';
           const cvDeadline = Date.now() + 5000;
           do {
@@ -1208,9 +1449,8 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
             }, { s: snip.slice(0, 40) }, 3000).catch(() => ({ found: false }));
             if (chk.found) {
               sawArticle = true; if (chk.auth) lastAuth = chk.auth;
-              const positiveCaption = chk.capOk === true;
-              const positiveAuthor = !!(expAuthor && chk.auth && chk.auth === expAuthor);
-              if (positiveCaption || positiveAuthor) { confirmed = true; break; }
+              // Require the caption. Author is read (lastAuth) but is NOT sufficient to confirm — see the note above.
+              if (chk.capOk === true) { confirmed = true; break; }
             }
             if (Date.now() >= cvDeadline) break;
             await sleep(600);
@@ -1219,7 +1459,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
             permalinkFailed = true;
             step(`Comment: the captured link didn't confirm OUR post (${sawArticle ? `caption not matched; author read="${lastAuth || '?'}"` : 'page not rendered'}) — falling back to the group feed`);
           } else {
-            step('Comment: captured link confirmed OUR post (caption/author) — commenting directly');
+            step('Comment: captured link confirmed OUR post (caption) — commenting directly');
           }
         } else if (expectedPostId && !urlId) {
           const domId = await evalTimed(page, () => { const a = document.querySelector('[aria-posinset], div[role="article"]'); const l = a && a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; }, null, 5000).catch(() => null);
@@ -1246,11 +1486,37 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
             step(`Comment: post page does not confirm OUR post (${!chk.found ? 'unreadable' : authMismatch ? 'author mismatch' : 'caption mismatch'}) — falling back to the group feed`);
           }
         }
+        // FINAL WRONG-POST GATE (identical-caption safety): the operator posts the SAME caption + SAME account to
+        // EVERY group, so neither caption nor author can tell our post in group A from our post in group B — ONLY the
+        // POST ID can. Whenever we hold a trusted id, REQUIRE this page to positively show it (the URL first, else the
+        // article DOM) before commenting here; if it can't be confirmed EQUAL, DEMOTE to the id-checked group feed-scan
+        // (which finds OUR post by that id in the CORRECT group). This closes the "all comments on one post" wrong-post
+        // regardless of why a permalink page / pipelined pre-load resolved to the wrong (or an unconfirmable) post.
+        if (!permalinkFailed && expectedPostId) {
+          let _pid = (page.url().match(/\/(?:posts|permalink)\/(\d+)/) || [])[1] || null; // URL id is free (no DOM read) on a real permalink page
+          if (!_pid) _pid = await evalTimed(page, () => { const a = document.querySelector('[aria-posinset], div[role="article"]'); const l = a && a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; }, null, 4000).catch(() => null);
+          if (_pid !== expectedPostId) { permalinkFailed = true; step(`Comment: this page is NOT confirmed to be OUR exact post by id (page=${_pid || 'none'}, expected=${expectedPostId}) — identical captions can't disambiguate, so using the id-checked group feed`); }
+        }
         if (!permalinkFailed) {
           boxes = await withTimeout(commentBoxes(), 15000, []);
           if (!boxes.length) {
             step('Comment: no inline box on the post page — clicking "Leave a comment"');
-            if (await clickLeaveComment()) { step('Comment: comment box opened (post page)'); await sleep(jitter(2300, 0.3)); boxes = await withTimeout(commentBoxes(), 15000, []); }
+            if (await clickLeaveComment()) {
+              step('Comment: comment box opened (post page)');
+              // POLL for the box to render (mirrors the feed path's pollBox ~1447) instead of ONE read at a fixed
+              // delay: the composer opens with an animation + React hydration, so a single commentBoxes() often
+              // fires a beat too early, finds nothing, and needlessly demotes to the heavier feed fallback (or forces
+              // a whole retry — the "did not render" misses). Re-read until it appears or the deadline. DOUBLE-SAFE:
+              // no Enter is pressed here (nothing is submitted); WRONG-POST-SAFE: the permalink page has exactly ONE
+              // (already id/caption/author-verified) article and this uses the SAME commentBoxes() selector — only the
+              // NUMBER of reads changes, never the scope.
+              const _bdl = Date.now() + (isFastMode(settings) ? 4000 : 7000);
+              do {
+                boxes = await withTimeout(commentBoxes(), 15000, []);
+                if (boxes.length || !connected()) break;
+                await sleep(400);
+              } while (Date.now() < _bdl);
+            }
           }
         }
       }
@@ -1264,9 +1530,13 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       step(permalink && !permalinkFailed
         ? 'Comment: post page had no usable comment box — falling back to the group feed (top-3 + caption match)'
         : 'Comment: locating the post in the group feed (fallback)');
-      await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+      // Skip the feed nav ONLY when this tab is ALREADY on THIS group's feed (the pipelined FEED pre-load). On a
+      // DIFFERENT group (a mis-served pre-load) or any other page, navigate to the CORRECT group's feed — the scan is
+      // group-scoped, so the group MUST match, else a same-caption post in the wrong group could be picked.
+      const _onThisGroupFeed = preNavigated && (() => { try { return new RegExp('/groups/' + gid + '(?:[/?#]|$)').test(page.url()); } catch { return false; } })();
+      if (!_onThisGroupFeed) await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
       await page.waitForSelector('[aria-posinset], div[role="article"], [aria-label*="omment"], [aria-label*="ommentaire"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
-      await waitInteractive(10000);
+      if (!(await waitInteractive(10000))) pageWasSlow = true; // slow/janky feed → extend the post-submit confirm window (double-guard)
       await dismissPopups(page);
       const authBad = await withTimeout(page.evaluate(() => /continue as|use another profile/i.test(document.body.innerText || '')), 8000, false);
       if (authBad) { step('Comment: session expired after posting — skipped (re-login needed)'); return 'failed'; }
@@ -1285,7 +1555,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           const idOf = (a) => { const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); const m = l && (l.href || '').match(/\/(?:posts|permalink)\/(\d+)/); return m ? m[1] : null; };
           // The post's AUTHOR (actor) from the article header — the disambiguator when no FB post-id renders.
           const authorOf = (a) => { const c = a.querySelector('h2 a, h3 a, h4 a, strong a, a strong, a[aria-label][href*="/user/"], a[aria-label][role="link"]'); return norm(c ? (c.getAttribute('aria-label') || c.textContent) : '').slice(0, 60); };
-          try { document.querySelectorAll('[data-zp-ctarget]').forEach((e) => e.removeAttribute('data-zp-ctarget')); } catch {}
+          try { document.querySelectorAll('[data-zp-ctarget], [data-zp-cbtn]').forEach((e) => { e.removeAttribute('data-zp-ctarget'); e.removeAttribute('data-zp-cbtn'); }); } catch {}
           const arts = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 15)
             .filter((a) => !/pinned|épingl|rögzít/.test((a.innerText || '').slice(0, 200).toLowerCase()));
           // Collect ALL candidate articles (full-caption contain — the loose 20-char prefix is dropped, it
@@ -1311,11 +1581,17 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           if (!pick) {
             const idmis = cands.find((m) => m.capHit && want && m.id && m.id !== want);
             const caps = cands.filter((m) => m.capHit && !(want && m.id && m.id !== want)); // caption hits not contradicted by a differing id
-            if (caps.length === 1) pick = caps[0];
-            else if (caps.length > 1 && author) { const ours = caps.filter((m) => m.auth && m.auth === author); if (ours.length) pick = ours[0]; }
+            if (caps.length === 1 && (!author || !caps[0].auth || caps[0].auth === author)) pick = caps[0]; // R4: a LONE caption match is ours UNLESS its author is READABLE and DIFFERENT (a stranger's / the reserve's OWN identical-caption post) → refuse, wrong-post-safe. An UNREADABLE author still accepts (don't lose coverage on a flaky render); an UNKNOWN expected author (author unset) also accepts (unchanged).
+            // PICKER PAIR (must match find-poll ~3156): accept a LONE own-match only; MULTIPLE own → refuse (H2 floor)
+            else if (caps.length > 1 && author) { const ours = caps.filter((m) => m.auth && m.auth === author); if (ours.length === 1) pick = ours[0]; }
             if (!pick) {
               if (idmis && !caps.length) return { clicked: false, reason: 'idmismatch', postId: idmis.id, pos: idmis.i };
-              return { clicked: false, reason: 'ambiguous', count: caps.length || cands.length };
+              // Carry WHAT WE SAW. "author not matched" alone is undiagnosable: the operator cannot tell a genuine
+              // stranger's post (the guard working) from a STALE fbDisplayName on their own account (the guard firing
+              // on every post, forever). Observed live: one account refused 56/56 comments while every other account
+              // matched fine — its stored name simply no longer matched what Facebook renders. Reporting the seen vs
+              // expected author turns an unexplained silence into a one-line fix.
+              return { clicked: false, reason: 'ambiguous', count: caps.length || cands.length, seenAuth: (caps[0] && caps[0].auth) || (cands[0] && cands[0].auth) || '', wantAuth: author || '' };
             }
           }
           const a = pick.a;
@@ -1324,7 +1600,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
             const n = (e.getAttribute('aria-label') || e.textContent || '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
             return /leave a comment|^comment$|hozzaszolas|commenter|comentar|kommentar|commenta/.test(n);
           });
-          if (b) { b.scrollIntoView({ block: 'center' }); const r = b.getBoundingClientRect(); const rect = (r.width && r.height) ? { x: r.x + r.width * (0.35 + Math.random() * 0.3), y: r.y + r.height * (0.35 + Math.random() * 0.3) } : null; return { clicked: true, rect, postId: pick.id, pos: pick.i, auth: pick.auth }; }
+          if (b) { b.setAttribute('data-zp-cbtn', '1'); b.scrollIntoView({ block: 'center' }); const r = b.getBoundingClientRect(); const rect = (r.width && r.height) ? { x: r.x + r.width * (0.35 + Math.random() * 0.3), y: r.y + r.height * (0.35 + Math.random() * 0.3) } : null; return { clicked: true, rect, postId: pick.id, pos: pick.i, auth: pick.auth }; }
           return { clicked: false, reason: 'nobtn', postId: pick.id, pos: pick.i };
         }, { s: snip.slice(0, 40), want: expectedPostId, author: expAuthor, idTrusted: !forceContentVerify }, 12000).catch(() => ({ clicked: false, reason: 'err' }));
         // scanFeed marks OUR article (data-zp-ctarget) in-page and returns the comment button's RECT; we click it
@@ -1336,7 +1612,14 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
             // real-mouse-click it — report NOT clicked (the caller's nobtn/re-scan path handles it) instead of
             // falsely claiming success (which would then wait on a comment box that never opened).
             if (!r.rect) return { ...r, clicked: false, reason: 'zerobounds' };
-            try { await moveMouseTo(page, r.rect.x, r.rect.y); await page.mouse.click(r.rect.x, r.rect.y, { delay: 30 + Math.floor(Math.random() * 70) }); }
+            // The human mouse-move takes real time and FB's feed can SHIFT the button (lazy content rendering above it)
+            // between _scanFeedRaw's read and this click → a real-mouse click MISSES it and the box never opens ("did
+            // not render"). Re-read the MARKED button's CURRENT center right before clicking, and click where it IS now.
+            try {
+              await moveMouseTo(page, r.rect.x, r.rect.y);
+              const cur = await page.evaluate(() => { const b = document.querySelector('[data-zp-cbtn="1"]'); if (!b) return null; const q = b.getBoundingClientRect(); return (q.width && q.height) ? { x: q.x + q.width * (0.4 + Math.random() * 0.2), y: q.y + q.height * (0.4 + Math.random() * 0.2) } : null; }).catch(() => null);
+              await page.mouse.click((cur && cur.x) || r.rect.x, (cur && cur.y) || r.rect.y, { delay: 30 + Math.floor(Math.random() * 70) });
+            }
             catch { return { ...r, clicked: false, reason: 'clickfail' }; }
           }
           return r;
@@ -1369,7 +1652,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           step('Comment: our post not found on the 1st feed check — reloading for a 2nd full feed check');
           await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
           await page.waitForSelector('[aria-posinset], div[role="article"], [aria-label*="omment"], [aria-label*="ommentaire"], [role="textbox"]', { timeout: 25000 }).catch(() => {});
-          await waitInteractive(10000);
+          if (!(await waitInteractive(10000))) pageWasSlow = true; // slow/janky feed (2nd check) → extend the post-submit confirm window (double-guard)
           await dismissPopups(page);
           const authBad2 = await withTimeout(page.evaluate(() => /continue as|use another profile/i.test(document.body.innerText || '')), 8000, false);
           if (authBad2) { step('Comment: session expired after posting — skipped (re-login needed)'); return 'failed'; }
@@ -1386,7 +1669,20 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           }
         }
         if (res.reason === 'idmismatch') { step(`Comment: a same-caption post in feed is NOT ours (found id=${res.postId}, expected=${expectedPostId}) — NOT commenting (avoids a wrong-post)`); return 'skipped'; }
-        if (res.reason === 'ambiguous') { step(`Comment: ${res.count} same-caption post(s) in the feed and can't confirm which is OURS (no post-id, author not matched) — NOT commenting (avoids landing the link on another account's/stranger's post)`); return 'skipped'; }
+        if (res.reason === 'ambiguous') {
+          // Name the mismatch. A READABLE author that simply differs from this account's stored fbDisplayName is almost
+          // always a STALE NAME (renamed on Facebook, or mis-captured at import) — not a stranger's post — and it makes
+          // EVERY comment for that account refuse, forever, while its posts keep going out link-less. That is an
+          // instant operator fix, but only if we say what we saw. (An unreadable author stays generic: it really is
+          // ambiguous.)
+          const _seen = (res.seenAuth || '').trim(), _want = (res.wantAuth || '').trim();
+          if (_seen && _want && _seen !== _want) {
+            step(`Comment: found our caption, but the post's author reads "${_seen}" while this account expects "${_want}" — NOT commenting (a wrong-post would land your link on someone else). If "${_seen}" IS this account, its saved display name is STALE: fix fbDisplayName (or re-import it from Chrome) and its comments will work again.`);
+          } else {
+            step(`Comment: ${res.count} same-caption post(s) in the feed and can't confirm which is OURS (no post-id, author not readable) — NOT commenting (avoids landing the link on another account's/stranger's post)`);
+          }
+          return 'skipped';
+        }
         // We matched OUR article (scanFeed marked it via data-zp-ctarget) — either it clicked the
         // "comment" button, or the box was already open (reason 'nobtn'). EITHER WAY take the box that
         // lives INSIDE our marked article; never an unscoped feed box (which could be a different post).
@@ -1400,8 +1696,12 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
         if (res.clicked || res.reason === 'nobtn' || res.reason === 'zerobounds' || res.reason === 'clickfail') {
           const SBOX = '[data-zp-ctarget="1"] [contenteditable="true"], [data-zp-ctarget="1"] [role="textbox"]';
           const pollBox = async () => {
-            if (isFastMode(settings)) { await page.waitForFunction((s) => { const b = document.querySelector(s); return !!(b && b.offsetHeight > 0); }, { timeout: 2500, polling: 150 }, SBOX).catch(() => {}); await sleep(250); }
-            else await sleep(jitter(2300, 0.3));
+            // POLL for the scoped box to actually RENDER (offsetHeight>0), returning as soon as it appears — so a slow
+            // FB render (or a React re-render that briefly drops our marker) no longer reads "not rendered" on a single
+            // timed read → far fewer failed attempts + full-reload retries. Was: a fixed ~2.3s sleep + ONE read (non-fast),
+            // which missed a box that rendered a moment later and forced a whole retry. Returns early = also faster.
+            const timeout = isFastMode(settings) ? 2500 : 4500;
+            await page.waitForFunction((s) => { const b = document.querySelector(s); return !!(b && b.offsetHeight > 0); }, { timeout, polling: 150 }, SBOX).catch(() => {});
             return page.$(SBOX).catch(() => null);
           };
           let scoped = await pollBox();
@@ -1433,6 +1733,28 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
     step(`Comment: ${boxes.length} comment box(es) found`);
 
     const target = boxes[0];
+    // PRE-SUBMIT IDEMPOTENCY (cross-account double-comment defense — RESCUE path only): before typing, check whether OUR
+    // link/comment is ALREADY under THIS post. The original account's comment may have LANDED but been mis-reported (a
+    // lost-ack 'unplaced'), and a reserve must NEVER place a SECOND copy. Gated on checkExisting → ONLY the rescue caller
+    // scans, so a first-time comment never false-skips. Scheme-agnostic, scoped to OUR post (data-zp-ctarget / the article),
+    // excludes the composer box; requires a PATH-unique key (≥12 stripped chars) so it can't false-skip on a short comment.
+    if (checkExisting) {
+      const _idemKey = String(post.comment || '').replace(/https?:\/\//gi, '').replace(/www\./gi, '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, '').toLowerCase().slice(0, 45);
+      if (_idemKey.length >= 12) {
+        const _dup = await evalTimed(page, (arg) => {
+          const { k } = arg;
+          const strip = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/https?:\/\//gi, '').replace(/www\./gi, '').replace(/\s+/g, '').toLowerCase();
+          const scope = document.querySelector('[data-zp-ctarget="1"]') || document.querySelector('[aria-posinset], div[role="article"]');
+          if (!scope) return false;
+          const boxEl = scope.querySelector('[contenteditable="true"], [role="textbox"]');
+          let hay = '';
+          const walk = (node) => { if (node === boxEl) return; if (node.nodeType === 3) { hay += node.nodeValue; return; } if (node.nodeType === 1) { for (let c = node.firstChild; c; c = c.nextSibling) walk(c); } };
+          walk(scope);
+          return strip(hay).includes(k);
+        }, { k: _idemKey }, 4000).catch(() => false);
+        if (_dup === true) { step('Comment: our link is ALREADY under this post (the original account or a co-poster placed it) — NOT commenting again (avoids a cross-account double)'); return 'already_present'; }
+      }
+    }
     // H1 / commentDwell: a human reads the post before commenting — a randomized, configurable pause
     // with an occasional micro-scroll. Pre-focus and pre-keystroke (the focus step below re-centers the
     // box, correcting any scroll drift), so this never moves the box off-screen or touches the text.
@@ -1481,7 +1803,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           // gets a safe re-try — nothing was submitted, so there is no double-comment.
           commentImgOk = previewed;
           step(previewed ? 'Comment: image attached (preview rendered)' : 'Comment: image upload resolved but NO preview — treating the image as NOT attached (an image-only comment routes to rescue; a text comment still posts its text)');
-          await sleep(settings.speedMode === 'instant' ? 300 : 1500); // preview already confirmed above — trim the post-attach settle for instant
+          await sleep(settings.speedMode === 'instant' ? 150 : 1500); // preview already confirmed above (blob-src poll) — instant post-attach settle trimmed 300→150ms (image-comments only)
         } else { step(`Comment: image upload failed after retries (${cu.error && cu.error.message}) — posting text only`); }
       }
       else step('Comment: image input not found — posting text only');
@@ -1489,7 +1811,7 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       // contenteditable — so the keystrokes + Enter below would type into nothing / the wrong element.
       // Re-focus the actual comment box (the attached image stays attached).
       await withTimeout(target.evaluate((el) => { el.scrollIntoView({ block: 'center' }); el.focus(); }), 5000, null);
-      await sleep(300);
+      await sleep(settings.speedMode === 'instant' ? 150 : 300); // image re-focus settle — instant trimmed 300→150 (the paste-landed verify below is the real gate; image-comments only)
     }
     // Enter the comment. In a FB comment box ENTER SUBMITS, so insert newlines as Shift+Enter
     // and enter the rest per-line — otherwise a multi-line comment would submit at the first line.
@@ -1560,21 +1882,99 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       }
       return false;
     };
-    let confirmed = await watchEmptied(4000);
-    if (!confirmed) {
-      step('Comment: not confirmed yet — re-focusing + re-pressing Enter once');
-      try { await target.evaluate((el) => el.focus()); } catch {}
-      try { await page.keyboard.press('Enter'); } catch {} // no-op on an already-empty box (FB rejects empty) — can't double-post
-      confirmed = await watchEmptied(3000);
+    // DOUBLE-COMMENT GUARD helpers (READ-ONLY). A MISS is recoverable (a reserve re-places the comment); a
+    // DOUBLE is not — so we re-submit ONLY with positive proof the first submit did NOT land.
+    const stripWs = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[​-‍﻿]/g, '').replace(/\s+/g, '').toLowerCase(); // also strip zero-width chars (align with editableLen) so an injected ZWSP can't defeat the match
+    const fullText = stripWs(post.comment);         // our whole comment, ALL whitespace stripped (robust to how a contenteditable serializes Shift+Enter newlines). Used by boxHoldsFullText (the box holds the RAW typed text, scheme included).
+    // commentLanded's prefix is SCHEME-STRIPPED: FB commonly renders a URL comment WITHOUT "https://"/"www." (it drops
+    // the scheme in the displayed link), so a raw-URL match would miss a genuinely-POSTED link. Detecting the posted
+    // link reliably is what SUPPRESSES a wrong 'unplaced' rescue on a lost-ack (committed-but-unacked) submit — the one
+    // narrow cross-account-double path — AND closes the plain URL false-negative. 45 chars → PATH-unique (not just domain).
+    const ourCommentPrefix = stripWs(String(post.comment || '').replace(/https?:\/\//gi, '').replace(/www\./gi, '')).slice(0, 45);
+    // Did OUR comment already RENDER under OUR post? (the positive landing signal.) SCOPED to OUR post — the
+    // feed marks our article [data-zp-ctarget="1"]; the permalink page's single article is ours — so it can
+    // never match another post (wrong-post-safe). The composer box lives INSIDE the article, so we SUBTRACT the
+    // box's own (un-submitted) text before matching, else our text sitting in the box would masquerade as landed.
+    const commentLanded = async () => {
+      if (ourCommentPrefix.length < 12) return false; // too short to match safely → never CLAIM landed (bias to a recoverable miss)
+      const r = await evalTimed(page, (arg) => {
+        const { p } = arg;
+        const strip = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[​-‍﻿]/g, '').replace(/\s+/g, '').toLowerCase();
+        const scope = document.querySelector('[data-zp-ctarget="1"]') || document.querySelector('[aria-posinset], div[role="article"]');
+        if (!scope) return false;
+        const boxEl = scope.querySelector('[contenteditable="true"], [role="textbox"]'); // the composer holding our UN-submitted text
+        // Read the scope's text EXCLUDING the composer box subtree via a text-node walk (nodeValue = layout-independent,
+        // works even on a detached node) so ONLY a POSTED comment matches. The old string-subtraction deleted the REAL
+        // landing whenever the posted comment equalled the box text (a false-negative that defeated this guard).
+        let hay = '';
+        const walk = (node) => {
+          if (node === boxEl) return; // skip the composer box entirely
+          if (node.nodeType === 3) { hay += node.nodeValue; return; }
+          if (node.nodeType === 1) { for (let c = node.firstChild; c; c = c.nextSibling) walk(c); }
+        };
+        walk(scope);
+        return strip(hay).includes(p); // p is already stripped by the outer stripWs; strip() here uses the SAME normalization
+      }, { p: ourCommentPrefix }, 4000).catch(() => false);
+      return r === true;
+    };
+    // Does OUR box PROVABLY still hold our FULL text? FB clears the box the instant its handler accepts a submit
+    // (optimistic UI), so a box that STILL holds the full text ⇒ no submit was accepted ⇒ re-pressing can't double.
+    // If it no longer holds the full text (cleared / mid-flush / gone), we do NOT re-press (prefer a recoverable miss).
+    const boxHoldsFullText = async () => {
+      if (!fullText) return false; // image-only / empty → never re-press on text grounds
+      const r = await withTimeout(target.evaluate((el) => ({ text: el.textContent || '', live: !!el.isConnected })), 3000, null).catch(() => null);
+      if (!r || !r.live) return false; // DETACHED/re-rendered box reads STALE text (the remote ref survives) → treat as NOT holding, matching the 'unplaced' guard below. A LIVE box still holding our full text ⇒ FB accepted nothing ⇒ safe to re-press / safe to stop-and-reserve (never a double).
+      return stripWs(r.text).includes(fullText);
+    };
+    // FAST comment-WALL pre-check (~1.2s instant) — classify a comment/account/login/checkpoint wall the INSTANT its red
+    // banner appears, instead of after watchEmptied + re-press + send-button (~10–14s + 2 extra botty submit gestures on
+    // an already-limited box). Read-only. Returns a NON-landed stop ONLY when the box PROVABLY still holds our full text
+    // (⇒ FB accepted nothing → a reserve re-places it, never a double). Early-exits the moment our comment is visible.
+    { const _wdl = Date.now() + (settings.speedMode === 'instant' ? 1200 : 1500);
+      while (Date.now() < _wdl) {
+        if (await commentLanded()) break; // landed → no wall → fall through to the normal confirm below
+        const _w = await classifyWallScoped(page);
+        if (_w.kind && (await boxHoldsFullText())) { // a wall AND the box still holds OUR full text ⇒ nothing was accepted ⇒ safe to stop
+          if (_w.kind === 'account')    { step('Comment: ⛔ Facebook TEMPORARILY BLOCKED this account — stopping it (long cooldown); a reserve covers the rest'); return 'blocked_account'; }
+          if (_w.kind === 'login')      { step('Comment: ⛔ logged out — stopping this account; a reserve covers the rest'); return 'blocked_login'; }
+          if (_w.kind === 'checkpoint') { step('Comment: 🔐 identity/checkpoint — stopping this account; a reserve covers the rest'); return 'blocked_checkpoint'; }
+          step('Comment: ⛔ commenting rate-limited (red text) — stopping this account (pace too high); a reserve covers the rest'); return 'blocked_comment';
+        }
+        if (_w.kind) break; // wall present but box not provably full → let the post-submit classifyRateLimit (below) classify it (→ *_landed, not re-queued)
+        await sleep(200);
+      }
+    }
+    // FIRST confirm window — EXTENDED when the page was slow/janky so a queued or in-flight Enter has time to
+    // flush (empty the box) BEFORE we ever consider re-pressing. This is the primary double-guard for the
+    // "not fully interactive" permalink pages that produced the doubles.
+    let confirmed = await watchEmptied(pageWasSlow ? 8000 : 4000);
+    if (!confirmed && (await commentLanded())) {
+      confirmed = true; // box not emptied, but our comment is already VISIBLE under OUR post → it LANDED → must NOT re-press
+      step('Comment: box not emptied yet but our comment is already visible under the post — it LANDED (not re-pressing — avoids a double)');
     }
     if (!confirmed) {
-      // Enter STILL didn't submit — the box kept our text the whole time (watchEmptied never saw it empty), so nothing
-      // posted. Some FB comment boxes don't submit on Enter (multiline mode / a focus blip). Click FB's comment SEND
-      // control (the paper-plane / bare "Comment"/"Publier" button) instead. Double-post-SAFE: we only reach here when
-      // the box is provably NON-empty (no prior Enter submitted), and the search is SCOPED to OUR box's own composer
-      // (form → our marked article) so it can never submit into a different post.
+      // Re-press Enter ONCE — but ONLY when the box PROVABLY still holds our FULL text (⇒ FB accepted no submit;
+      // the first Enter didn't take) AND our comment is not already visible. If the box no longer holds our full
+      // text, a submit may be IN FLIGHT (slow optimistic-UI) → do NOT re-press: prefer a possible miss (recoverable
+      // by a reserve) over a possible double (not recoverable).
+      if (await boxHoldsFullText()) {
+        step('Comment: not confirmed yet — box still holds our full text — re-focusing + re-pressing Enter once');
+        try { await target.evaluate((el) => el.focus()); } catch {}
+        try { await page.keyboard.press('Enter'); } catch {} // safe: the box provably still held our full text, so no prior submit took
+        confirmed = await watchEmptied(3000);
+        if (!confirmed && (await commentLanded())) confirmed = true; // landed on the re-press → stop (never fall through to a 2nd re-submit)
+      } else {
+        step('Comment: not confirmed and the box no longer holds our full text — NOT re-pressing (a submit may be in flight; preferring a possible miss over a double)');
+      }
+    }
+    if (!confirmed && (await boxHoldsFullText()) && !(await commentLanded())) {
+      // Enter STILL didn't submit — the box PROVABLY still holds our FULL text AND our comment is not visible, so
+      // nothing posted (some FB boxes don't submit on Enter: multiline mode / a focus blip). Click FB's comment SEND
+      // control (the paper-plane / bare "Comment"/"Publier" button) instead. Double-post-SAFE: the box-holds-full-text
+      // (no prior submit took) + not-landed guard is required to enter here, and the search is SCOPED to OUR box's own
+      // composer (form → our marked article) so it can never submit into a different post.
       step('Comment: Enter did not submit — clicking the comment send button');
-      const _sendPt = await target.evaluate((box) => {
+      const _sendPt = await withTimeout(target.evaluate((box) => {
         const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
         const scope = box.closest('form') || box.closest('[aria-posinset]') || box.closest('[role="article"]') || document.querySelector('[data-zp-ctarget="1"]') || document;
         const re = /^(comment|commenter|publier|post|send|envoyer|répondre|repondre)$/; // BARE submit verbs only — not "Leave a comment"/"N Comments"
@@ -1582,8 +1982,8 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
           .find((e) => re.test(norm(e.getAttribute('aria-label') || '')) || re.test(norm(e.textContent || '')));
         if (b) { b.scrollIntoView({ block: 'center' }); const r = b.getBoundingClientRect(); if (r.width > 0 && r.height > 0) return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; }
         return null;
-      }).catch(() => null);
-      if (_sendPt) { try { await moveMouseTo(page, _sendPt.x, _sendPt.y); await page.mouse.click(_sendPt.x, _sendPt.y, { delay: 30 + Math.floor(Math.random() * 60) }); } catch {} confirmed = await watchEmptied(3000); }
+      }), 4000, null).catch(() => null);
+      if (_sendPt) { try { await moveMouseTo(page, _sendPt.x, _sendPt.y); await page.mouse.click(_sendPt.x, _sendPt.y, { delay: 30 + Math.floor(Math.random() * 60) }); } catch {} confirmed = await watchEmptied(3000); if (!confirmed && (await commentLanded())) confirmed = true; }
       else step('Comment: no send button found near our box — leaving as unverified (spot-check this group)');
     }
     // A comment-side rate-limit / "You can't use this feature right now" wall (post→link is FB's most
@@ -1598,6 +1998,15 @@ async function addFirstComment(page, gid, post, commentImg, step, permalink, set
       step(_rl === 'severe' ? 'Comment: landed, but Facebook then blocked the account — cooling it down (comment NOT re-queued)' : 'Comment: landed, but Facebook then comment-limited the account — cooling it down (comment NOT re-queued)');
       return _rl === 'severe' ? 'blocked_account_landed' : 'blocked_comment_landed';
     } }
+    // GENUINE-MISS → RESCUE (never silently drop the link-comment): the box was NOT confirmed emptied, our comment is
+    // NOT visible under the post, and the box is STILL LIVE holding un-submitted text → FB accepted nothing (optimistic
+    // UI clears the box the instant it accepts) → the comment was NOT placed. Return a NON-landed code so the caller
+    // routes it to a RESERVE to place it (double-SAFE: nothing posted, so a reserve can't double). A DETACHED (isConnected
+    // false) or EMPTY box means a submit may have gone through → keep the 'not_visible' path (no rescue → no cross-account double).
+    if (!confirmed && !(await commentLanded())) {
+      const st = await withTimeout(target.evaluate((el) => ({ text: el.textContent || '', live: !!el.isConnected })), 3000, null).catch(() => null);
+      if (st && st.live && stripWs(st.text)) { step('Comment: NOT placed (box still holds our un-submitted text, comment not visible) — routing to a reserve to place the link'); return 'unplaced'; }
+    }
     // C9: landing verification (READ-ONLY) — did our comment text actually appear under the post?
     // We never re-type or re-submit here; this only LABELS the outcome so the operator can tell a
     // confirmed comment from an at-risk one. Outcome: posted / not_visible / unconfirmed.
@@ -1671,7 +2080,22 @@ async function focusEditable(page) {
       }
       return null;
     }).catch(() => null);
-    if (pt) { await moveMouseTo(page, pt.x, pt.y); await page.mouse.click(pt.x, pt.y, { delay: 30 + Math.floor(Math.random() * 70) }).catch(() => {}); await sleep(400); return true; }
+    if (pt) {
+      await moveMouseTo(page, pt.x, pt.y);
+      await page.mouse.click(pt.x, pt.y, { delay: 30 + Math.floor(Math.random() * 70) }).catch(() => {});
+      // #8: replaced a blind sleep(400) with a bounded focus-confirmation poll — SAME 400ms ceiling, ~120ms residual
+      // floor. The click focuses synchronously, so this usually returns in ~120-160ms; it keeps the full ceiling for a
+      // slow re-mount and never returns before 120ms (the residual settle keeps first-try insert-miss + the 9s survival
+      // churn from rising). Reclaimed time is REINVESTED into warming, never banked as posting speed. Fires twice/caption.
+      const _fEnd = Date.now() + 400;
+      await sleep(120);
+      while (Date.now() < _fEnd) {
+        const _ok = await page.evaluate(() => { const el = document.querySelector('[data-zp-editor="1"]'); return !!(el && document.activeElement === el); }).catch(() => false);
+        if (_ok) break;
+        await sleep(40);
+      }
+      return true;
+    }
   } catch {}
   return false;
 }
@@ -1775,6 +2199,7 @@ async function credentialLogin(page, email, password, log, name) {
   for (let attempt = 1; attempt <= MAX; attempt++) {
     const r = await withTimeout(_credentialLoginOnce(page, email, password, log, name), 75000, false); // cap a wedged attempt
     if (r === 'checkpoint' || r === true) return r;
+    if (r === 'rejected') return false; // F1: FB DEFINITIVELY rejected the login — a 2nd identical submit is a guaranteed-fail ban signal; stop (caller flags needs_login without a repeat submit)
     last = r;
     if (attempt < MAX) { log(`🔁 [${name}] auto-login attempt ${attempt} didn't take — retrying once…`); await sleep(3000 + Math.floor(Math.random() * 2000)); }
   }
@@ -1847,15 +2272,42 @@ async function _credentialLoginOnce(page, email, password, log, name) {
       return 'checkpoint';
     }
 
-    // Success: check for c_user cookie (capped — a wedged renderer must not hang auth for 90s)
+    // Success requires a REAL session, mirroring Tier 1/2 + the run-end persist (worker ~3941): c_user ALONE is not
+    // enough — FB sets c_user during a 2FA/checkpoint too (xs withheld), and a Tier-2-injected c_user can linger after a
+    // rejected login. Require BOTH c_user AND the xs session secret AND that we're NOT still on a login/checkpoint wall,
+    // else a false "recovered" would writeCookies a dead/partial jar over the good one and post on a dead session forever.
     const pageCookies = await withTimeout(page.cookies(), 8000, []);
-    if (pageCookies.some((c) => c.name === 'c_user' && c.value)) {
+    const _hasSession = pageCookies.some((c) => c.name === 'c_user' && c.value) && pageCookies.some((c) => c.name === 'xs' && c.value);
+    const _onWall = /\/(login|checkpoint)/.test(url) || /continue as|use another profile/i.test(bodyText);
+    // FB parks a GENUINE, fully-authed login (c_user AND xs both set) on a post-auth "Save your login info?" /
+    // device prompt at /login/save-device (or /login/device-based) WITHOUT auto-redirecting — the URL contains
+    // "/login/" so _onWall is true even though we are logged in. Treat those specific post-auth prompts as SUCCESS.
+    // Gated on _hasSession (requires xs), so it CANNOT resurrect the false-success cases the gate guards (a 2FA/
+    // checkpoint withholds xs; a rejected/Tier-2-lingering c_user has no valid xs). Fixes a v1.0.54 false needs_login.
+    const _saveDevice = /\/login\/(save-device|device-based)/i.test(url);
+    if (_hasSession && (!_onWall || _saveDevice)) {
       log(`✅ [${name}] logged in with stored credentials`);
       // Persisting cookies must NOT flip a confirmed login into a failure — a transient FS error here
       // would otherwise make the caller flag needs_login and skip a genuinely logged-in account.
       try { store.writeCookies(name, pageCookies); } catch (we) { log(`⚠️ [${name}] logged in but failed to persist cookies: ${we.message}`); }
       return true;
     }
+
+    // C1-companion (language-independent 2FA/checkpoint): a login that set c_user but WITHHELD xs (and isn't sitting on a
+    // login wall) is Facebook's identity/2FA challenge, whatever the page language — the text regexes above miss localized
+    // variants. Route it to 'checkpoint' (→ needs_verification: the operator is notified + it does NOT auto-retry into the
+    // wall, and rests 6h not 3h) instead of a plain login failure that would be mis-flagged needs_login.
+    if (!_onWall && pageCookies.some((c) => c.name === 'c_user' && c.value)) {
+      log(`🔐 [${name}] login left a half-session (c_user without xs) — treating as a Facebook checkpoint/2FA`);
+      return 'checkpoint';
+    }
+
+    // F1 (ban-hygiene): a DEFINITIVE post-submit rejection — still on the login page with FB's error rendered (wrong
+    // password / account locked / "unusual activity" / temporarily blocked, EN/FR/AR) — will fail identically if resubmitted.
+    // Signal 'rejected' so credentialLogin does NOT fire a 2nd guaranteed-fail /login POST on the shared IP. A NON-positive
+    // failure (nav didn't complete, form never rendered) is NOT matched here → still returns plain false → still retried once.
+    const _rejected = /\/login/.test(url) && /(incorrect|wrong.?password|isn.?t the right|couldn.?t find|account.*(locked|disabled)|unusual activity|temporarily blocked|try again later|mot de passe|verrouill|activité inhabituelle|réessayer plus tard|كلمة (?:المرور|السر)|غير صحيح|محظور|مؤقت|حاول مرة أخرى)/i.test(bodyText);
+    if (_rejected) { log(`⛔ [${name}] Facebook rejected the login (wrong password / locked / blocked) — not retrying (no repeat login submit on the shared IP)`); return 'rejected'; }
 
     log(`❌ [${name}] credential login failed (wrong password or blocked)`);
     return false;
@@ -1900,7 +2352,7 @@ function stealthSpoof(sx, sy, hwc) {
 }
 
 async function runAccount(o) {
-  const { account, post: basePost, groups, useProxies, proxies, assignedProxy, log, shouldStop, isLoginOpen, isCheckOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused, isDisabled, maxThisRun } = o;
+  const { account, post: basePost, groups, useProxies, proxies, assignedProxy, log, shouldStop, isLoginOpen, isCheckOpen, registerAborter, onResult, isOnline, waitIfPaused, isPaused, isDisabled, maxThisRun, ipPostGate } = o;
   const reportProxy = typeof o.reportProxy === 'function' ? o.reportProxy : () => {}; // E-X3: proxy health (no-op if absent)
   const isOnCooldown = typeof o.isOnCooldown === 'function' ? o.isOnCooldown : () => false; // E-X3: skip a cooling POOL proxy
   // Per-(post,group) dedup ledger — the orchestrator passes these ONLY in deal-once modes (campaign-plan/unique/
@@ -1910,9 +2362,9 @@ async function runAccount(o) {
   const alreadyDelivered = typeof o.alreadyDelivered === 'function' ? o.alreadyDelivered : () => false;
   const onlyGroups = Array.isArray(o.onlyGroups) ? new Set(o.onlyGroups) : null; // owed-group allow-list: a stand-in covers ONLY a dropped account's un-reached groups
   const name = account.name;
-  // Per-account settings COPY (applyPace returns the SHARED settings object by reference for 'normal' pace, so we must
-  // never mutate it) carrying this account's seeded behavioral personality (typing speed / reading dwell / gap tempo /
-  // typo-proneness) — so many accounts on one host don't all share the SAME timing distribution.
+  // Per-account settings COPY (never mutate the caller's o.settings) carrying this account's seeded behavioral
+  // personality (typing speed / reading dwell / gap tempo / typo-proneness) — so many accounts on one host don't all
+  // share the SAME timing distribution. (o.settings is already the applyPace-resolved effective settings for this account.)
   const settings = { ...(o.settings || {}), _behavior: behaviorFor(name) };
   const vp = viewportFor(name); // per-account viewport (seeded) — used for --window-size, defaultViewport AND the off-screen park bounds so they all agree
   // Per-account successful-run counter (file-based) — drives the new-account WARM-UP gate below.
@@ -2001,7 +2453,7 @@ async function runAccount(o) {
   catch (e) { log(`⚠️ [${name}] profile prep failed (${e.message}) — skipping account`); return { posted: 0, errors: 1, pendingApproval: 0, noRetry: false, flag: null, postedIds: [] }; }
   // Proxy: Chrome can't do authenticated SOCKS5 directly, so we wrap the upstream
   // through proxy-chain (a local anonymized HTTP proxy) when credentials are present.
-  let proxyAuth = null, anonLocal = null, watchdog = null;
+  let proxyAuth = null, anonLocal = null, watchdog = null, progressedSinceArm = false, noProgressTicks = 0; // #5: progressedSinceArm = a new group started since the watchdog armed → the account is advancing, not stuck
   const tempImages = []; // downloaded remote images to clean up at the end
   {
     // Per-account STABLE proxy: an account's OWN assigned proxy is ALWAYS honored — even when the global
@@ -2054,9 +2506,25 @@ async function runAccount(o) {
     try { await Promise.race([browser.close().catch(() => {}), sleep(10000)]); } catch {}
     try { const proc = browser && browser.process && browser.process(); if (proc) proc.kill(); } catch {}
   };
-  let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false, rlKind = null, consecPubTimeouts = 0, consecNoPostBtn = 0;
+  let posted = 0, errors = 0, pendingApproval = 0, noRetry = false, flag = null, offline = false, rlKind = null, consecPubTimeouts = 0, consecNoPostBtn = 0, consecNoComposer = 0, consecPushback = 0;
+  // Comment-side breaker state (see commentFailureDecision). consecCommentFails counts CONSECUTIVE non-landing comment
+  // attempts and resets the moment one lands; anyCommentLanded is the run-local analogue of deliveredToday() — there is
+  // no persisted per-day comment counter, and "landed one earlier in THIS run, now failing" is exactly the transient
+  // signal we want (something changed mid-run) vs "has never landed one" (FB is suppressing this account).
+  let consecCommentFails = 0, anyCommentLanded = false;
+  // #7 (d4 false-bench guard — shared probe): an account that has ALREADY delivered today (persisted daily count, updated
+  // after each prior cycle) is provably NOT blocked. Consulted at the THREE likely_blocked flag-sites to SUPPRESS a false
+  // "blocked" escalation caused by transient single-IP composer/feed/post-button misses. FAILS SAFE toward FB: returns
+  // false (→ still benches) when there is no positive same-day health signal. One helper so this ban-critical probe can't drift.
+  const deliveredToday = () => { try { const me = store.load().accounts.find((a) => a.name === name); return !!(me && store.dailyUsed(me.daily) > 0); } catch { return false; } };
   const heldRecords = []; // MOD: posts FB held in the moderation queue this run (for the moderator phase)
   const commentQueue = []; // posts that went LIVE but whose link-comment couldn't be placed (for a healthy reserve account to rescue)
+  // v1.0.72 CRASH-DURABILITY: mirror each obligation into the durable journal AT CREATION (via the orchestrator callback),
+  // so a hard-kill BEFORE this account returns no longer loses it — the next Start folds it back (idempotent, deduped).
+  // Side-write: best-effort, wrapped, never affects posting; the account-return persist stays authoritative for a clean run.
+  const _jrnlObl = (o && typeof o.journalObligation === 'function') ? o.journalObligation : () => {};
+  const addHeld = (rec) => { heldRecords[heldRecords.length] = rec; try { _jrnlObl('held', rec); } catch {} };
+  const addCommentTask = (rec) => { commentQueue[commentQueue.length] = rec; try { _jrnlObl('comment', rec); } catch {} };
   let droppedImage = false; // ≥1 intended local image was missing at resolve time → keep the library post (blocks auto-delete). Declared at FUNCTION scope (not inside the try below) so the final `return { …!droppedImage }` at the bottom can read it — a let-declaration inside the try threw "droppedImage is not defined" at the return on every clean completion.
   try {
     const hidden = settings.hideBrowser !== false; // default: hidden
@@ -2161,7 +2629,7 @@ async function runAccount(o) {
     const _gd = (Number.isFinite(settings.groupDelayMax) ? settings.groupDelayMax : 300) * 1.3; // watchdog tracks the MAX-end group draw
     const _cd = Number.isFinite(settings.commentDelayMax) ? settings.commentDelayMax : 180;
     const perGroupMs = (_gd + _cd + 250) * 1000; // +250s work headroom (dwell + slow-typing fallback + upload + publish)
-    const accountBudget = Math.max(600000, Math.round(targetGroups.length * perGroupMs));
+    const accountBudget = Math.min(24 * 3600 * 1000, Math.max(600000, Math.round(targetGroups.length * perGroupMs))); // ≤24h HARD CAP: a hand-edited data.json (e.g. groupDelayMax in ms, unclamped on load) mustn't overflow setTimeout's 2^31 → Node clamps to 1ms → the watchdog fires every ~1ms and wedges the run
     // The watchdog must fire ONLY when the account is genuinely wedged. setTimeout counts wall-clock,
     // which includes laptop sleep — so on resume the timer can fire immediately on a perfectly healthy
     // run. Before aborting, probe liveness: if the browser still answers a trivial evaluate it just
@@ -2176,8 +2644,12 @@ async function runAccount(o) {
             alive = true;
           }
         } catch { alive = false; }
-        if (alive) { _log(`⏰ [${name}] budget elapsed but browser is alive (likely resumed from sleep) — extending`); armWatchdog(); return; }
-        _log(`⏰ [${name}] time budget exceeded and browser unresponsive — aborting account`);
+        const _wd = watchdogTickDecision(alive, progressedSinceArm, noProgressTicks); // #5: extend while advancing / one grace window; abort a live-but-stuck browser after 2 no-progress windows
+        noProgressTicks = _wd.noProgressTicks;
+        if (_wd.action === 'extend') { progressedSinceArm = false; _log(alive && noProgressTicks === 0 ? `⏰ [${name}] budget elapsed but browser is alive + still advancing groups — extending` : `⏰ [${name}] budget elapsed, browser alive but no group progress this window — extending once (grace for a possible sleep-resume)`); armWatchdog(); return; }
+        _log(alive
+          ? `⏰ [${name}] browser alive but made ZERO group progress across ${noProgressTicks} full budget windows — treating as STUCK, aborting account (a reserve covers its groups)`
+          : `⏰ [${name}] time budget exceeded and browser unresponsive — aborting account`);
         aborted = true;
         await closeBrowserOnce();
         watchdog = null;
@@ -2252,8 +2724,13 @@ async function runAccount(o) {
     if (authed) {
       // Tier 1 must ALSO have the c_user cookie: a silently-expired session can still render the home feed (passing
       // the text check above) with NO c_user — without this it skips cookie/credential recovery then fails mid-run.
-      const cks1 = await withTimeout(page.cookies(), 8000, []);
-      if (!(Array.isArray(cks1) && cks1.some((c) => c && c.name === 'c_user' && c.value))) { authed = false; log(`🔓 [${name}] profile session has no c_user cookie — treating as logged-out (will recover via cookies/credentials)`); }
+      // Use a null (not []) timeout sentinel: a WEDGED page.cookies() (CDP getCookies stalls under 20+ Chrome instances)
+      // must NOT be read as "no c_user" — that would demote a genuinely logged-in account and drive it to a needless
+      // /login submit on the shared IP. Demote ONLY on a real array that truly lacks c_user; a timeout keeps the Tier-1
+      // URL/body verdict (mirrors the run-end persist at ~3941, which also refuses to act on a cookies() timeout).
+      const cks1 = await withTimeout(page.cookies(), 8000, null);
+      if (Array.isArray(cks1) && !cks1.some((c) => c && c.name === 'c_user' && c.value)) { authed = false; log(`🔓 [${name}] profile session has no c_user cookie — treating as logged-out (will recover via cookies/credentials)`); }
+      else if (cks1 === null) log(`🔎 [${name}] cookie read timed out (host busy) — trusting the profile session check rather than forcing a re-login`);
     }
     if (authed) {
       log(`🔑 [${name}] using existing profile session`);
@@ -2266,11 +2743,20 @@ async function runAccount(o) {
         await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
         await sleep(2000);
         const cookieAuthed = await authCheck();
-        authed = cookieAuthed && (await withTimeout(page.cookies(), 8000, [])).some((c) => c.name === 'c_user' && c.value);
+        const _ck2 = await withTimeout(page.cookies(), 8000, null); // null (not []) sentinel — a wedged cookies() must not veto a text-verified session into a needless /login submit
+        authed = cookieAuthed && (_ck2 === null || _ck2.some((c) => c.name === 'c_user' && c.value));
         if (authed) log(`🔄 [${name}] session recovered with saved cookies`);
       }
       // Tier 3 — AUTO-LOGIN with stored credentials (cookies-or-not). credentialLogin fills the FB form + persists cookies.
       if (!authed) {
+        // R1 (ban-hygiene, no-proxy single IP): the session looks invalid — but if the NETWORK is down, a transient blip
+        // during the facebook.com/login nav (NOT a real logout) has cascaded every tier to failure. Do NOT submit a login
+        // form (a wasted ban signal that can't succeed offline) and do NOT flag needs_login (which R2-backoff-sidelines a
+        // HEALTHY account). Return offline → the orchestrator HOLDS the pool + re-runs next cycle, account untouched. Mirrors 2864/3931.
+        if (typeof isOnline === 'function' && !(await isOnline())) {
+          log(`🌐 [${name}] session unverified and the network is DOWN — holding this account (not logging in, not flagging); it retries when the connection returns.`);
+          return { posted: 0, errors: 0, pendingApproval: 0, noRetry: true, flag: null, offline: true, postedIds: [], dealtIds: [] };
+        }
         const credEmail = secret.decrypt(account.email);
         const credPass = secret.decrypt(account.password);
         if (credEmail && credPass) {
@@ -2301,7 +2787,16 @@ async function runAccount(o) {
     // recognise OUR held posts in the queue). Best-effort, non-blocking; on failure stay silent and
     // leave it empty (approval is fail-closed on an empty name — the operator can set it in the UI).
     // Mutates the in-memory account so THIS run's held records carry the name, and persists for next.
-    if (!(account.fbDisplayName && String(account.fbDisplayName).trim())) { // ALWAYS capture: the comment author-gate (wrong-post guard) needs it, not just moderation
+    // ALWAYS READ IT — do not gate on "is it empty?". This used to only ever capture a MISSING name, so a stored one
+    // was never re-checked: a Facebook rename (or a mis-captured import) was PERMANENT until someone edited the UI.
+    // That single stale string silently breaks two guards at once, and both fail toward the WRONG side:
+    //   • the comment author-gate refuses EVERY comment (observed live: one account, 56/56) → its posts go out link-less;
+    //   • Phase-4's isContentLive cannot recognise its own post → reads 'absent' → the reserve RE-POSTS content that is
+    //     already live = a duplicate on the shared IP (the ban axis).
+    // Reading it costs one page eval per run. We WARN rather than auto-overwrite: the capture is validated but not
+    // infallible, and a flaky read clobbering a GOOD name would break the same two guards — surfacing it lets the
+    // operator fix it in one click, which is the strand-and-surface direction the invariants require.
+    { const _storedName = String(account.fbDisplayName || '').trim();
       try {
         const fbName = await evalTimed(page, () => {
           const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -2325,10 +2820,16 @@ async function runAccount(o) {
           return '';
         }, null, 6000).catch(() => '');
         if (fbName && fbName.length >= 2) {
-          account.fbDisplayName = fbName;
-          await store.update((d) => { const a = (d.accounts || []).find((x) => x.name === name); if (a && !(a.fbDisplayName && String(a.fbDisplayName).trim())) a.fbDisplayName = fbName; }).catch(() => {});
-          log(`🪪 [${name}] captured FB display name: "${fbName}"`);
-        } else { log(`🪪 [${name}] could not read FB display name — set it on the account card for moderator approval`); }
+          if (!_storedName) {
+            account.fbDisplayName = fbName;
+            await store.update((d) => { const a = (d.accounts || []).find((x) => x.name === name); if (a && !(a.fbDisplayName && String(a.fbDisplayName).trim())) a.fbDisplayName = fbName; }).catch(() => {});
+            log(`🪪 [${name}] captured FB display name: "${fbName}"`);
+          } else if (fbName !== _storedName) {
+            // STALE NAME — the highest-value warning this app can emit. BOTH guards keyed on it fail toward the wrong
+            // side, silently and permanently. Not auto-corrected on purpose (see the block comment above).
+            log(`🪪 ⚠️ [${name}] STALE DISPLAY NAME — Facebook shows "${fbName}" but this account is saved as "${_storedName}". Until you fix it: EVERY comment is refused (its posts go live WITHOUT their link) and a held re-post can DUPLICATE an already-live post. Set fbDisplayName to "${fbName}" on the account card, or re-import it from Chrome.`);
+          }
+        } else if (!_storedName) { log(`🪪 [${name}] could not read FB display name — set it on the account card for moderator approval`); }
       } catch {}
     }
 
@@ -2362,6 +2863,34 @@ async function runAccount(o) {
           } catch {}
         }
       } catch (e) { log(`⚠️ [${name}] warm-up skipped (${e.message})`); }
+    }
+
+    // #13 ESTABLISHED-account ongoing warm pass (v1.0.93): the new-account warm-up above STOPS after warmupRuns, so a
+    // trusted-but-busy account (the whole long-running fleet) would then go straight auth→composer EVERY cycle with no
+    // browse — a durable spam-shape on the single Moroccan IP. Give established accounts a LIGHT home-feed pass at most
+    // once/~20h, keyed off a PERSISTED lastWarmTs (not per-run probability) so the human signal actually lands and stays
+    // bounded. This is the primary SINK for the wall-clock the waste-audit speedups reclaim. Best-effort + shouldStop-
+    // guarded; it ADDS time BEFORE posting and never counts toward / shortens any group/comment/cycle anti-spam gap.
+    if (settings.enableWarmup && priorRuns >= (Number.isFinite(settings.warmupRuns) ? settings.warmupRuns : 5) && !shouldStop()) {
+      let _lastWarm = 0;
+      try { const _me = store.load().accounts.find((a) => a.name === name); _lastWarm = Number(_me && _me.lastWarmTs) || 0; } catch {}
+      const _warmEveryMs = (Number.isFinite(settings.establishedWarmHours) ? settings.establishedWarmHours : 20) * 3600000;
+      if (_warmEveryMs > 0 && Date.now() - _lastWarm >= _warmEveryMs) {
+        log(`🌿 [${name}] daily warm pass — a light home-feed browse + reaction before posting (keeps a trusted account human-shaped on the single IP)`);
+        try {
+          await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await sleep(1500 + Math.floor(Math.random() * 1500));
+          await dismissPopups(page);
+          const warmSettings = { ...settings, humanizeMaster: true, speedMode: 'normal' }; // force the real browse past isFastMode (warming is trust behavior, not cosmetic pacing)
+          await humanDwell(page, shouldStop, warmSettings);
+          await warmLikePosts(page, 1, shouldStop, log, name); // one genuine reaction (real getBoundingClientRect + mouse click) = an engagement fingerprint, not just scrolling
+          if (!shouldStop() && targetGroups.length && Math.random() < 0.5) { // ~half the time, also dwell ONE of its own groups (builds engagement where it posts)
+            const _g = targetGroups[Math.floor(Math.random() * targetGroups.length)];
+            try { await page.goto(`https://www.facebook.com/groups/${_g.groupId || _g.id}`, { waitUntil: 'domcontentloaded', timeout: 30000 }); await sleep(1200 + Math.floor(Math.random() * 1200)); await dismissPopups(page); await humanDwell(page, shouldStop, warmSettings); } catch {}
+          }
+          try { await store.update((d) => { const a = d.accounts.find((x) => x.name === name); if (a) a.lastWarmTs = Date.now(); }); } catch {} // persist so it's at most once/~20h
+        } catch (e) { log(`⚠️ [${name}] daily warm pass skipped (${e.message})`); }
+      }
     }
 
     // Resolve images once: local files, or download remote URLs to temp.
@@ -2456,13 +2985,16 @@ async function runAccount(o) {
     // With tabsPerBrowser=1 the pool is never grown or rotated (byte-identical to the pre-pool behaviour).
     const _RECYCLE_EVERY = 12;
     const _pool = { free: [], live: 1, activeNavs: 1, epoch: 0 }; // 'live' counts open tabs we own (starts at the main page); 'free' = idle reusable entries {tab,cdp,winId,navs}; 'epoch' bumps at each phase-boundary reset
+    const _ownedTabs = new Set([page]); // every tab THIS run opened (the active page + pool tabs). Anything ELSE open in the browser is an FB-spawned popup / an orphan → _reapOrphans closes it so the count stays bounded (it NEVER closes a tab we own).
     const _makeTab = async () => {
+      let tab = null;
       try {
-        const tab = await browser.newPage();
+        tab = await browser.newPage();
+        _ownedTabs.add(tab); // track EVERY tab we open so the reaper never closes one of ours (added right after newPage — before any await)
         const h = await _hardenTab(tab); // spoofs + own cdp + off-screen park BEFORE any FB nav (persists across re-nav)
         try { await applyProxyGeo(tab, account, settings, useProxies, proxies, () => {}); } catch {}
         return { tab, cdp: h.cdp, winId: h.winId, navs: 0 };
-      } catch { return null; }
+      } catch { try { if (tab) await tab.close().catch(() => {}); } catch {} return null; } // a harden failure must CLOSE the opened tab — else browser.newPage() LEAKS an uncounted tab and the pool over-grows past tabsPerBrowser
     };
     // Take an idle pool tab (recycling any past the nav ceiling), else grow the pool up to tabsPerBrowser, else null
     // (pool momentarily saturated → the caller falls back to navigating the active tab — graceful, never blocks).
@@ -2477,6 +3009,15 @@ async function runAccount(o) {
       return null;
     };
     const _releaseTab = (e) => { if (e && e.tab) _pool.free.push(e); }; // return a tab to the pool for REUSE (never closed mid-run)
+    const _reapOrphans = async () => { // HARDENING: keep the open-tab count bounded — close any page we did NOT open (an FB popup / checkpoint tab / a _makeTab orphan a slow close missed). Only ever closes UNTRACKED pages, never the active page or a pool tab.
+      try {
+        const pages = await browser.pages();
+        if (pages.length <= _tabsWanted + 1) return; // within the pool + active budget → nothing to reap
+        let reaped = 0;
+        for (const p of pages) { if (!_ownedTabs.has(p)) { try { await p.close().catch(() => {}); reaped++; } catch {} } }
+        if (reaped && log) log(`🧹 [${name}] closed ${reaped} stray tab(s) (FB popup / orphan) — keeping the browser tidy`);
+      } catch {}
+    };
     const _prefetchGroup = (idx) => {
       if (_tabsWanted <= 1 || idx >= targetGroups.length || _prefetch.has(idx) || !browser || !browser.isConnected()) return;
       const gg = targetGroups[idx]; const gid2 = gg.groupId || gg.id;
@@ -2488,15 +3029,31 @@ async function runAccount(o) {
         return { entry: e, ok };
       })().catch(() => null));
     };
-    const _dropPrefetch = (idx) => { const p = _prefetch.get(idx); if (!p) return; _prefetch.delete(idx); const ep = _pool.epoch; p.then((x) => { if (!x || !x.entry) return; if (_pool.epoch !== ep) { try { if (x.entry.tab) x.entry.tab.close().catch(() => {}); } catch {} } else _releaseTab(x.entry); }).catch(() => {}); }; // don't need this group's tab → reuse it; but if a phase boundary passed while its nav was still in-flight, CLOSE it instead so a stale-phase tab can't leak into the next pool
-    const _closePrefetch = () => { for (const e of _pool.free) { try { if (e && e.tab) e.tab.close().catch(() => {}); } catch {} } _pool.free.length = 0; for (const p of _prefetch.values()) p.then((x) => { if (x && x.entry && x.entry.tab) x.entry.tab.close().catch(() => {}); }).catch(() => {}); _prefetch.clear(); _pool.live = 1; _pool.activeNavs = 0; _pool.epoch++; }; // phase/account end: close idle + in-flight tabs (the active page is torn down with the browser); reset accounting + bump epoch so a following phase re-grows the pool cleanly
+    const _dropPrefetch = (idx) => { const p = _prefetch.get(idx); if (!p) return; _prefetch.delete(idx); const ep = _pool.epoch; p.then((x) => { if (!x || !x.entry) return; if (_pool.epoch !== ep) { try { if (x.entry.tab) x.entry.tab.close().catch(() => {}); } catch {} _pool.live = Math.max(1, _pool.live - 1); } else _releaseTab(x.entry); }).catch(() => {}); }; // decrement live when the stale-phase tab is CLOSED (was missing → _pool.live over-counted → Phase 2 under-provisioned) // don't need this group's tab → reuse it; but if a phase boundary passed while its nav was still in-flight, CLOSE it instead so a stale-phase tab can't leak into the next pool
+    const _endPostPhase = () => { // Note 1: KEEP the idle pool tabs across the post→comment boundary so Phase 2 REUSES them (navigate, not close+reopen). Only settle the in-flight group-prefetches (release them back to the pool). The active page + _pool.free + _pool.live carry into Phase 2 (recycle-every-N still applies per tab's navs); epoch++ keeps _dropPrefetch's stale-phase guard correct. With no Phase 2 (non-two-phase / acct down) these idle tabs just close with the browser at account end — no leak (_reapOrphans already bounded the count).
+      for (const p of _prefetch.values()) p.then((x) => { if (x && x.entry && x.entry.tab) { try { _releaseTab(x.entry); } catch {} } }).catch(() => {}); _prefetch.clear(); _pool.epoch++; };
     // TWO-PHASE posting (opt-in): when on, the per-group loop below POSTS every group but DEFERS each post's comment
     // into _deferredComments; a second pass (after the loop) places them all. The post is already published +
     // markDelivered'd BEFORE the comment step, so deferring the comment changes NOTHING about double-post safety.
     const _twoPhase = !!settings.postThenComment;
+    // VERIFY-LATER (opt-in: skipInlineVerify setting OR ZA_SKIP_INLINE_VERIFY=1; two-phase only). Skip the inline
+    // post-landed feed-reload (~4s/group) for a COMMENT-bearing post: the deferred comment pass (Phase 2) already
+    // reloads the group, finds OUR post (caption+author+recency guarded), and comments — so the inline reload is a
+    // redundant earlier scan whose captured permalink is usually empty (id=?) anyway. `feedConfirmed` (which this
+    // reload sets) feeds ONLY a log line, so skipping it changes NO behavior beyond deferring the find to Phase 2.
+    // Held detection is preserved (Phase 2's 'notfound' → moderator). No-comment posts still reload (their sole
+    // check). OFF → byte-identical. NOTE: never skips when we captured a network permalink (that fast path stays).
+    const _skipInlineVerify = (settings.skipInlineVerify === true || process.env.ZA_SKIP_INLINE_VERIFY === '1') && _twoPhase;
     const _deferredComments = [];
+    let _netCapture = null; // create-story link-capture, LOOP-OUTER so disposal is guaranteed by dispose-leftover-at-arm + dispose-after-loop (a break/continue mid-group can't leak the 'response' listener on a pooled/reused tab)
+    let _capMiss = 0; // consecutive empty-capture streak (per account): once ≥2, this account's create-story URL isn't arriving → stop paying the full finalize wait (SPEED). Reset on a hit.
+    // WRONG-GROUP guard helper: extract the group segment (numeric id OR vanity slug) from a FB group URL, or null.
+    // Path-based → host-independent (www/web/m) and locale-independent; query/hash tolerant.
+    const _groupSeg = (u) => { const m = /\/groups\/([^/?#]+)/.exec(String(u || '')); return m ? m[1] : null; };
     for (let i = 0; i < targetGroups.length; i++) {
       let publishClicked = false; // E-P1: once true, NEVER retry this group (would risk a double-post)
+      let captionConfirmed = true; // C2: set false only when the image-attach survival loop exhausts WITHOUT confirming OUR caption landed. Consulted at the Post-button-not-found branch to reclassify a doomed-composer publish as a transient (fresh-composer) retry instead of a misleading 'post button not found'. Defaults true so text-only / no-caption / confirmed-caption paths are unaffected.
+      let resolvedGroupSeg = null; // WRONG-GROUP guard: THIS group's resolved /groups/<seg> (numeric or vanity) captured on first nav; per-iteration so an i-- retry re-captures on the fresh nav
       if (aborted) { log(`⏹ [${name}] watchdog aborted this account — not touching the dead browser`); break; }
       if (shouldStop()) { log(`⏹ [${name}] stop requested`); break; }
       // Mid-run toggle: stop between groups if the user turned this account OFF during the run.
@@ -2515,6 +3072,7 @@ async function runAccount(o) {
       // rate-limited off a generic transient error — abandoning the rest of its groups. Removed: the
       // real block checks already run per-group AFTER the group loads, below.)
       const g = targetGroups[i];
+      progressedSinceArm = true; // #5: advancing to a new group = real progress (the prior group finished) → the watchdog won't treat a slow-but-moving account as stuck
       const gid = g.groupId || g.id;
       const groupName = g.name || gid;
       const step = createStepLogger(log, name, groupName);
@@ -2522,6 +3080,28 @@ async function runAccount(o) {
       // here before it fell over, and we're the reserve covering its un-reached groups), SKIP — never re-post a group.
       // Placed before any navigation so a skip costs nothing. Only ever fires in deal-once modes / stand-ins.
       if (alreadyDelivered(gid)) { _dropPrefetch(i); step('↩️ this post already reached this group this cycle — skipping (no double-post)'); report(groupName, gid, 'skipped', 'already delivered this cycle', ''); continue; }
+      // #hardening (mixed-failure backoff): the per-type "2 in a row" counters (composer / post-button / publish-timeout)
+      // each MISS the case where FB throttles an account into failing DIFFERENT ways across its groups (a timeout, then a
+      // composer that won't open, then a missing post-button) — no single counter reaches 2, so the account flails every
+      // remaining group (wasted time + a botty rapid-fail pattern). consecPushback counts ANY of those pushback failures
+      // and RESETS on a confirmed/held publish; ≥3 in a row (any mix) ⇒ FB is pushing this account back → stop hammering
+      // its REMAINING groups and back it off (a reserve / the next cycle covers). Checked HERE (loop top) so it only fires
+      // when there ARE remaining groups to protect — a flail on the last group just ends the cycle (retries next). Purely
+      // ADDITIVE: a same-type 2-in-a-row always breaks first, so same-type behaviour is byte-identical.
+      {
+        const _mpb = mixedPushbackDecision(consecPushback, deliveredToday());
+        if (_mpb === 'transient') { step('⚠️ 3 posting failures in a row (mixed timeout / composer / post-button), but this account already delivered today — treating as transient (slow IP / FB hiccup), NOT blocked. Stopping it this cycle; it retries next.'); noRetry = true; break; }
+        if (_mpb === 'block') { step('🛑 3 posting failures in a row (mixed timeout / composer / post-button) — Facebook is pushing this account back; stopping it so a reserve / the next cycle covers its remaining groups.'); noRetry = true; flag = 'rate_limited'; rlKind = 'post'; break; }
+        // COMMENT-side twin. Checked at the same loop top and for the same reason: it only fires when there ARE
+        // remaining groups to protect. Its posts are LANDING fine — that is precisely the problem, because each one goes
+        // live WITHOUT its link-comment: zero value, full daily-cap burn, full shared-IP ban exposure, plus orphan-
+        // comment rescue load. Continuing to post is strictly negative EV, so stop the account rather than let it
+        // manufacture link-less posts. (A DETECTED wall already stops it below; this catches the SILENT modes —
+        // dropped / never-visible / no comment box — which previously stopped nothing at all.)
+        const _cfd = commentFailureDecision(consecCommentFails, anyCommentLanded);
+        if (_cfd === 'transient') { step('⚠️ 3 comment failures in a row, but this account DID land a comment earlier this run — treating as transient (FB hiccup), NOT blocked. Stopping it this cycle so it stops posting link-less; its live posts go to comment rescue and it retries next cycle.'); noRetry = true; break; }
+        if (_cfd === 'block') { step('🛑 3 comment failures in a row and NOT ONE comment has landed this run — Facebook is suppressing this account\'s comments. Stopping it: every further post would go live WITHOUT its link (no value, full ban exposure). Resting it on the comment ladder; its live posts go to comment rescue.'); noRetry = true; flag = 'rate_limited'; rlKind = 'comment'; break; }
+      }
       // Per-group content variation: expand {a|b|c} spintax so THIS group gets a different caption
       // and comment than the others, and give any link in the comment a unique tracking param. This
       // is the #1 fix for "identical content to many groups" — FB's strongest content-spam signal.
@@ -2586,10 +3166,17 @@ async function runAccount(o) {
         if (offline) break;
         if (!navOk) { step('Navigation failed; skipping group'); errors++; report(groupName, gid, 'error', 'navigation failed', ''); continue; }
         for (let k = 1; k < _tabsWanted; k++) _prefetchGroup(i + k); // paced multi-tab: pre-load the next group(s) DURING this group's posting so their nav overlaps (no-op when tabsPerBrowser=1)
+        if (_tabsWanted > 1) await _reapOrphans(); // bound the tab count each group — close any FB popup / orphan that crept in (pool is active only when tabsPerBrowser>1)
         await sleep(settings.speedMode === 'instant' ? jitter(400, 0.3) : isFastMode(settings) ? jitter(500, 0.3) : jitter(1500, 0.3)); // post-nav settle (OVERHEAD, not an anti-spam gap — the inter-group gap is applied at loop end): gotoGroup already resolved on domcontentloaded and the auth/rate-limit checks below re-read the live DOM with their own waits; keep ~500ms React-hydration margin (fast trimmed 1000→500; instant already 400; normal 1500) so the auth read doesn't false-flag on a bare pre-paint body
 
         // Per-group START banner — fired only after nav succeeds and before the auth checks.
         step('Group loaded');
+        // WRONG-GROUP guard (capture): the FIRST time we land, remember the RESOLVED /groups/<seg> the URL settled on.
+        // gotoGroup navigates by NUMERIC gid, so whatever segment shows here — the numeric id, or the vanity slug FB
+        // 302'd to — provably belongs to THIS group and is our ground-truth alias for the pre-publish assert below.
+        // Captured AFTER the post-nav settle so a numeric→vanity 302 is already reflected. Null on a login-wall/home
+        // redirect → the assert below no-ops and the existing any-/groups/ check still guards.
+        if (!resolvedGroupSeg) resolvedGroupSeg = _groupSeg(page.url());
 
         // Identity / "confirm you're a real person" checkpoint — flag distinctly so the
         // operator knows to VERIFY this account (re-login won't fix it).
@@ -2637,7 +3224,7 @@ async function runAccount(o) {
               if (cr === true && await gotoGroup()) {
                 await sleep(2500);
                 const stillBad = await withTimeout(page.evaluate(() => /login|checkpoint/.test(location.href) || /continue as|use another profile/i.test(document.body.innerText || '')), 8000, true).catch(() => true);
-                if (!stillBad) { step('✅ re-logged in mid-run — continuing this group'); recovered = true; }
+                if (!stillBad) { step('✅ re-logged in mid-run — continuing this group'); recovered = true; if (!resolvedGroupSeg) resolvedGroupSeg = _groupSeg(page.url()); } // WRONG-GROUP guard: capture the gid after the recovery re-nav (the first load may have been a login-walled preview) so the assert stays armed for the one group that publishes post-relogin
               }
             }
           }
@@ -2654,7 +3241,7 @@ async function runAccount(o) {
 
         // Open the composer and CONFIRM the dialog actually opened (the FB trigger has
         // no aria-label — match the placeholder text — and the click must be verified).
-        const opened = await openComposer(page, step, name, settings);
+        const opened = await openComposer(page, step, name, settings, composerOpenAttempts(consecPushback)); // #3: fewer composer attempts once FB is already pushing this account back (consecPushback>0) → reach backoff fast, don't idle on an unloadable group
         if (!opened) {
           // An account-level block can be WHY the composer won't open — confirm it and skip the
           // WHOLE account immediately rather than trying every remaining group.
@@ -2678,7 +3265,12 @@ async function runAccount(o) {
                 step('Composer never opened — the session had actually expired (login wall hydrated late) — auto-login with stored credentials...');
                 const cr = await credentialLogin(page, ce, cp, log, name);
                 if (cr === 'checkpoint') { step('🔐 verification needed — flagging account'); errors++; noRetry = true; flag = 'needs_verification'; report(groupName, gid, 'error', 'identity verification required', ''); break; }
-                if (cr === true && await gotoGroup()) { await sleep(2500); recovered = true; }
+                // credentialLogin returns true ONLY after confirming the session (c_user && xs && !onWall) on a LOADED
+                // post-login page — that IS the connectivity proof, so the extra gotoGroup() here was redundant (its loaded
+                // page was discarded by the `continue` below anyway). KEEP the 2500ms settle: it buffers the fresh session
+                // before the NEXT iteration's terminal auth probe (midRunLoginTried is now spent). A connection drop AFTER
+                // login-confirm is caught by the next iteration's own gotoGroup + navOk/offline handling (retry, not abandon).
+                if (cr === true) { await sleep(2500); recovered = true; }
               }
             }
             if (!recovered) { step('Session expired (login wall appeared after the composer step) — re-login required'); errors++; noRetry = true; flag = 'needs_login'; report(groupName, gid, 'error', 'session-expired', ''); break; }
@@ -2692,9 +3284,25 @@ async function runAccount(o) {
             return null;
           }).catch(() => null);
           step(`Could not open composer — ${why || 'no composer trigger found (account may lack post rights, or Facebook changed the layout)'}; skipping group`);
-          errors++; report(groupName, gid, 'error', why || 'composer did not open', ''); continue;
+          errors++; report(groupName, gid, 'error', why || 'composer did not open', '');
+          // TWO IN A ROW with NO identifiable per-group cause (why===null) = the composer TRIGGER text matched no known
+          // label → this account's Facebook UI is likely in a language the trigger banks don't recognize (e.g. Arabic —
+          // openComposer's trigger list is EN/ES/DE/HU/FR, no AR) or FB changed the layout. A membership / group-
+          // unavailable cause is per-GROUP (the account can still post elsewhere) → it does NOT count and RESETS the
+          // streak. Mirrors the post-button unsupported-language flag (~:3290) so the operator is told to set the account
+          // to English AND reserves cover its groups, instead of it silently erroring on every group and posting nothing.
+          // STOP-direction only (publishClicked never fired, waitForPublish never ran) → structurally cannot double-post.
+          if (why) consecNoComposer = 0;
+          else if (++consecNoComposer >= 2) {
+            // #7: suppress the likely_blocked escalation when the account already delivered today — 2 composer misses in a
+            // row on an account that's been posting is a transient slow-IP/layout hiccup, NOT a block. Still stop this cycle.
+            if (deliveredToday()) { step('⚠️ Composer would not open on 2 groups in a row, but this account already delivered today — treating as transient (slow IP / FB layout hiccup), NOT blocked. Stopping it this cycle; it retries next.'); noRetry = true; break; }
+            step('🛑 Composer would not open on 2 groups in a row — this account\'s Facebook is likely in a language the app doesn\'t recognize (set it to English) or Facebook changed the layout. Stopping it so reserves cover its groups.'); noRetry = true; flag = 'likely_blocked'; break;
+          } else consecPushback++; // #hardening: a composer miss with NO per-group cause (why===null) is FB pushback → feed the unified mixed-failure backoff (loop top)
+          continue;
         }
-        await sleep(settings.speedMode === 'instant' ? jitter(200, 0.3) : isFastMode(settings) ? jitter(500, 0.3) : jitter(1500, 0.3)); // post-composer-open settle (the composer is already CONFIRMED open by the waitForSelector above) — trimmed for the fast tiers
+        consecNoComposer = 0; // composer opened → clear the unsupported-language streak (mirrors consecNoPostBtn's reset)
+        await sleep(settings.speedMode === 'instant' ? jitter(80, 0.3) : isFastMode(settings) ? jitter(500, 0.3) : jitter(1500, 0.3)); // post-composer-open settle (the composer is already CONFIRMED open by the waitForSelector above; the caption entry re-focuses + verifies + self-heals a slow handler-attach) — instant trimmed 200→80ms (keep a small beat so a first-try miss doesn't cost more than it saves)
         await dismissPopups(page);
         // Drift guard: if a popup-dismiss click followed a link, or FB redirected to the home feed / login,
         // we must NOT compose+publish here (it would post to the wrong place / the user's own feed). We check
@@ -2702,6 +3310,17 @@ async function runAccount(o) {
         if (!/\/groups\//.test(String(page.url()))) {
           step(`Page drifted off the group (now ${String(page.url()).slice(0, 80)}) — skipping to avoid posting to the wrong place`);
           errors++; report(groupName, gid, 'error', 'page drifted off the group before posting', ''); continue;
+        }
+        // WRONG-GROUP guard (assert): we're on SOME /groups/ page — confirm it's THIS one before publishing the identical
+        // caption. Publishing is OK only when the live segment is our numeric gid OR the resolved segment captured on
+        // first load (its vanity 302 target). Any OTHER segment = drift onto a DIFFERENT group → do NOT publish; throw
+        // 'transient:' so the pre-publish retry (publishClicked still false → NO double-post, waitForPublish never ran →
+        // NO false verdict) re-navigates to the correct gid + opens a fresh composer. No-op when resolvedGroupSeg is null.
+        {
+          const _curSeg = _groupSeg(page.url());
+          if (resolvedGroupSeg && _curSeg && _curSeg !== String(gid) && _curSeg !== resolvedGroupSeg) {
+            throw new Error(`transient: composer is on a different group (/groups/${_curSeg} != /groups/${resolvedGroupSeg}) — re-navigating to avoid a wrong-group post`);
+          }
         }
         step('Composer opened; preparing post');
 
@@ -2716,9 +3335,12 @@ async function runAccount(o) {
           }
           groupImages = vi;
           if (groupCommentImg) { const cv = await imageVary.varyImage(groupCommentImg, `${name}|${gid}|c|${groupCommentImg}|${runSalt}`); if (cv) { groupCommentImg = cv; tempImages.push(cv); _anyVaried = true; } }
-          // Truthful log: varyImage returns null for a format jimp can't read (notably WEBP) → the ORIGINAL uploads,
-          // identically to every group (image-dedup risk). Say so instead of a misleading "Image varied".
-          step(_anyVaried ? 'Image varied (unique hash for this group)' : '⚠️ Image NOT varied (jimp can\'t read this format, e.g. webp) — uploading the ORIGINAL, which is identical for every group (image-dedup risk). Use JPG/PNG for per-group variation.');
+          // Truthful log: varyImage returns null on ANY failure. Report the REAL reason (was hard-coded to blame "webp",
+          // which misdiagnosed the actual cause — the library is all JPEG; the failures were writeAsync errors on a
+          // near-full disk under heavy browser load). Only say "webp" after a magic-byte check; otherwise surface the
+          // real error so the operator fixes the right thing (free disk / fewer parallel browsers).
+          if (_anyVaried) step('Image varied (unique hash for this group)');
+          else { const _src = resolvedImages[0] || ''; const _why = imageVary.isWebp(_src) ? 'jimp can\'t read WEBP — convert the image to JPG/PNG' : `vary failed (likely low disk / heavy load: ${imageVary.lastVaryError() || 'unknown'}) — free space on the data drive or lower parallel browsers`; step(`⚠️ Image NOT varied (${_why}) — uploading the ORIGINAL, identical for every group (image-dedup risk).`); }
         }
 
         // CAPTION single-entry helper — declared at composer scope so BOTH the caption-first entry AND the post-image
@@ -2727,15 +3349,33 @@ async function runAccount(o) {
         // never the old 3× repaste loop, never a slow retype after a paste. FAST/TURBO/INSTANT paste (Input.insertText
         // targets the focused editor, no OS clipboard → race-free across parallel accounts); NORMAL/SAFE human-TYPE
         // (a real person — anti-bot for cold accounts).
-        const enterCaptionOnce = async (settleMs) => {
-          await focusEditable(page);  // focus + MARK the exact editor (data-zp-editor)
-          await clearEditable(page);  // GUARANTEE empty first → entry can never append to / double a persisted draft
+        const enterCaptionOnce = async (settleMs, stabilize) => {
+          // (no leading focusEditable — clearEditable's OWN first step is focusEditable(page), which focuses + MARKS the
+          // editor identically; the old back-to-back double-focus paid a full ~400ms settle + mouse-arc + click for nothing.)
+          await clearEditable(page);  // GUARANTEE empty first → entry can never append to / double a persisted draft (its first step focuses + MARKS the exact editor data-zp-editor)
           await focusEditable(page);  // re-focus: clearEditable's execCommand('delete') can re-mount Lexical + drop focus (insertText targets the ACTIVE element)
           if (isFastMode(settings)) {
             await sleep(settleMs);
+            // G2 (image-first seed ONLY, opt-in via `stabilize`): the image attach + clearEditable both re-mount Lexical, so a
+            // blind fixed settle can insertText MID-re-mount → the caption lands in a stale editor → 'did not land' → the survival
+            // loop grinds ~9s then owes the group (≈30 'caption did not land' retries/day). After the floor settle above, wait
+            // (bounded) until the MARKED editor's rect is identical across two 150ms reads (settled + still present). STRICTLY
+            // ADDITIVE: never inserts earlier than the old fixed settle; if it never stabilizes we fall through and the survival
+            // loop below still catches it — so this can only improve first-try landing, never regress it. The other two callers
+            // pass no `stabilize` → byte-identical behavior.
+            if (stabilize) {
+              const _cap = Date.now() + (settings.speedMode === 'instant' ? 1800 : 2500);
+              let _lastRect = null, _stableReads = 0;
+              while (Date.now() < _cap && !shouldStop()) {
+                const _rect = await page.evaluate(() => { const el = document.querySelector('[data-zp-editor="1"]'); if (!el) return null; const b = el.getBoundingClientRect(); return Math.round(b.x) + ',' + Math.round(b.y) + ',' + Math.round(b.width) + ',' + Math.round(b.height); }).catch(() => null);
+                if (_rect && _rect === _lastRect) { if (++_stableReads >= 1) break; } else _stableReads = 0; // identical across two consecutive reads → settled
+                _lastRect = _rect;
+                await sleep(150);
+              }
+            }
             try { if (!cdpSession) throw new Error('no cdp session'); await cdpSession.send('Input.insertText', { text: String(post.caption) }); }
             catch { try { await page.evaluate((t) => { const el = document.querySelector('[data-zp-editor="1"]') || document.activeElement; if (el) { el.focus(); document.execCommand('insertText', false, t); } }, post.caption); } catch {} }
-            await sleep(settings.speedMode === 'instant' ? 60 : 300); // let FB's React commit the inserted text before we read it (instant 120→60ms — verifyCaptionLanded polls at 150ms right after, so an under-committed read just re-polls, never mis-verifies)
+            await sleep(settings.speedMode === 'instant' ? 60 : 150); // let FB's React commit the inserted text before we read it (instant 60ms; fast/turbo 300→150ms = ONE verifyCaptionLanded poll-interval of headroom, then the reads-first-then-150ms-poll below with its UNCHANGED deadline absorbs a late commit — an under-committed early read just re-polls, never mis-verifies on the marked/prefix-match path)
             return verifyCaptionLanded(page, post.caption, settings.speedMode === 'instant' ? 1000 : 3000);
           }
           await humanType(page, post.caption, settings);
@@ -2826,7 +3466,7 @@ async function runAccount(o) {
             // its length-only fallback off a STRAY editable (an open Messenger draft, the background feed composer) →
             // falsely "landed" → the loop breaks without ever typing our caption → an image-only post publishes and
             // counts as success (silent caption drop). Idempotent: enterCaptionOnce clears-first, so it can't double.
-            const _capSeed = _captionAfterImage ? await enterCaptionOnce(settings.speedMode === 'instant' ? 250 : 400) : null; // enterCaptionOnce ends by returning verifyCaptionLanded — capture it to skip a duplicate first poll below
+            const _capSeed = _captionAfterImage ? await enterCaptionOnce(settings.speedMode === 'instant' ? 100 : 400, true) : null; // G2: stabilize=true → wait for the re-mounted editor to settle before the seed insert (see enterCaptionOnce). SPEED: instant 250→100 — this pre-insert settle stacks on the re-focus's own ~400ms tail, so 100ms is plenty; a rare under-settled insert is caught by the survival loop's empty-check re-paste below (never caption-less, never a draft). enterCaptionOnce ends by returning verifyCaptionLanded — capture it to skip a duplicate first poll below
             const _capDeadline = Date.now() + (isFastMode(settings) ? 9000 : 11000);
             let _capOk = false, _stale = 0;
             while (!_capOk && Date.now() < _capDeadline && !shouldStop()) {
@@ -2840,7 +3480,8 @@ async function runAccount(o) {
               else if (++_stale >= 2) { await enterCaptionOnce(settings.speedMode === 'instant' ? 250 : 400); _stale = 0; } // text present but NOT our caption after 2 patient checks → a persisted FB DRAFT (not our caption still rendering) → enterCaptionOnce CLEARS-first then re-enters OURS. Without this the editor keeps the draft, the final editableLen>0 guard passes, and we PUBLISH THE DRAFT (wrong caption). Re-pasting our own slow-rendering caption is idempotent, so a false trigger is harmless.
               else await sleepInterruptible(settings.speedMode === 'instant' ? 300 : 400, shouldStop); // maybe still rendering → one more patient check before deciding it's a draft
             }
-            step(_capOk ? 'Caption present ✅' : 'Caption not confirmed after retries — will re-attempt the group');
+            captionConfirmed = _capOk; // C2: remember the outcome for the Post-button branch — a not-confirmed caption that still left text in the editor slips past the empty-editor guard below and would otherwise be misreported as 'post button not found'
+            step(_capOk ? 'Caption present ✅' : 'Caption not confirmed after retries'); // C2: dropped the '— will re-attempt the group' promise: a re-attempt now happens ONLY if the Post button is also not found (below), not unconditionally
           }
         }
 
@@ -2875,51 +3516,80 @@ async function runAccount(o) {
           }
           return false;
         }, { timeout: 8000, polling: 200 }, FB.postButton).catch(() => {}); // swallow timeout — clickPostButton will report 'not found' with diagnostics
-        const dialogCountBefore = await withTimeout(page.evaluate(() => Array.from(document.querySelectorAll('div[role="dialog"]')).filter((d) => d.querySelector('[contenteditable="true"], input[type="file"], [role="textbox"]')).length), 8000, 1).catch(() => 1);
+        // GAP#2: TAG the OUTER shell of OUR composer (the div[role="dialog"] holding the caption editor we marked
+        // data-zp-editor) so waitForPublish confirms 'published' by THIS shell disappearing, never by an unrelated dialog
+        // closing. Tagging the OUTER shell (not the inner data-zp-editor, which re-mounts to a detached node on image-attach
+        // / the publish spinner) survives that re-render. Cleared-then-set so no stale tag persists. dialogCountBefore keeps
+        // its EXACT prior value + fallback (the RETURNED expression is unchanged) → every existing check on it is byte-identical.
+        const dialogCountBefore = await withTimeout(page.evaluate(() => {
+          document.querySelectorAll('[data-zp-composer]').forEach((e) => e.removeAttribute('data-zp-composer'));
+          const _ed = document.querySelector('[data-zp-editor="1"]');
+          const _shell = (_ed && _ed.closest('div[role="dialog"]'))
+            || Array.from(document.querySelectorAll('div[role="dialog"]')).find((d) => d.querySelector('input[type="file"]') && d.querySelector('[contenteditable="true"], [role="textbox"]'))
+            || null;
+          if (_shell) _shell.setAttribute('data-zp-composer', '1');
+          return Array.from(document.querySelectorAll('div[role="dialog"]')).filter((d) => d.querySelector('[contenteditable="true"], input[type="file"], [role="textbox"]')).length;
+        }), 8000, 1).catch(() => 1);
         // Diagnostic Post-button scan (dialogs open, found label + drift breadcrumb) — a REDUNDANT 3rd scan of what the
-        // waitForFunction gate above already gated and clickPostButton below re-scans; it gates nothing (only logs). SKIP
-        // it in INSTANT (fire-fast) — the `if (postBtnInfo)` guard below no-ops on null; slow modes keep the diagnostic.
-        const postBtnInfo = settings.speedMode === 'instant' ? null : await page.evaluate((labels) => {
-          const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-          const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
-          const scope = dialogs.length ? dialogs : [document];
-          for (const root of scope) {
-            const btn = Array.from(root.querySelectorAll('[role="button"], button')).find((b) =>
-              b.getAttribute('aria-disabled') !== 'true' && !b.disabled && labels.includes(norm(b.getAttribute('aria-label') || b.textContent)));
-            if (btn) return { found: true, dialogs: dialogs.length, label: (btn.getAttribute('aria-label') || btn.textContent || '').trim() };
-          }
-          // None matched — collect the enabled button labels we DID see so drift is diagnosable.
-          const seen = [];
-          for (const root of scope) for (const b of root.querySelectorAll('[role="button"], button')) {
-            const l = (b.getAttribute('aria-label') || b.textContent || '').replace(/\s+/g, ' ').trim();
-            if (l && b.getAttribute('aria-disabled') !== 'true') seen.push(l);
-          }
-          return { found: false, dialogs: dialogs.length, seen: seen.slice(0, 10) };
-        }, FB.postButton).catch(() => null);
-        if (postBtnInfo) {
-          if (postBtnInfo.found) step(`Post button found (label="${postBtnInfo.label}")`);
-          else step(`⚠️ Post button NOT found (${postBtnInfo.dialogs} dialog(s)) — possible selector drift. Buttons seen: ${(postBtnInfo.seen || []).join(' | ') || '(none)'}. If this recurs, run scripts/inspect-fb.js.`);
-        }
+        // waitForFunction gate above already gated and clickPostButton below re-scans; it gates NOTHING (only logs). SKIP it
+        // in ALL SPEED tiers (isFastMode = fast/turbo/instant/humanize-off) where the operator chose speed over per-post
+        // diagnostics — the `if (postBtnInfo)` guard below no-ops on null. Human-paced tiers (normal/safe) keep it. On a
+        // genuine miss in the speed tiers the clickPostButton failure path still fires (incl. the 2-in-a-row unsupported-
+        // language flag); for the full enabled-buttons enumeration run scripts/inspect-fb.js or use normal/safe.
+        // #4: removed a REDUNDANT 3rd Post-button diagnostic scan here (was `null` on every fast/instant/turbo post and
+        // only logged — set no DOM attribute, gated nothing). The load-bearing pieces are untouched and elsewhere: the
+        // enable-gate waitForFunction above, the data-zp-composer shell tag + waitForPublish keys, prePublishDwell,
+        // clickPostButton's mouse-move+click, and the independent post-button-not-found failure path (incl. the
+        // 2-in-a-row unsupported-language flag) below.
         // Arm the publish-response capture RIGHT BEFORE the click (so we don't miss the create-story mutation's
-        // response) — only for a two-phase comment post (that's the sole consumer of the captured link) and only
-        // when the operator enabled it. See armPostIdCapture: the id is a candidate, re-verified before commenting.
+        // response) — for ANY comment-bearing post (single- OR two-phase; both consume the captured link now) when
+        // the operator enabled it. See armPostIdCapture: the id is a candidate, re-verified before commenting.
         let _netPost = null;
-        const _armNet = !!(settings.capturePostLinkFromNetwork && _twoPhase && ((post.comment && post.comment.trim()) || groupCommentImg));
-        const _netCapture = _armNet ? armPostIdCapture(page, gid) : null;
+        const _armNet = !!(settings.capturePostLinkFromNetwork && ((post.comment && post.comment.trim()) || groupCommentImg));
+        if (_netCapture) { try { _netCapture.dispose(); } catch {} _netCapture = null; } // dispose a prior group's leftover (a break/continue before the finalize read) BEFORE re-arming — never stack 'response' listeners
+        _netCapture = _armNet ? armPostIdCapture(page, gid) : null;
         const clicked = await clickPostButton(page);
         if (!clicked) {
           if (_netCapture) _netCapture.dispose();
+          // HARDENING: a Post button that EXISTS but is still aria-DISABLED is NOT a missing/unknown one. On a slow
+          // residential IP the image finishes uploading server-side seconds after the local preview renders, and FB keeps
+          // Post disabled until then — a transient "still processing", not an unsupported-language/selector-drift miss.
+          // Treat it as transient so a HEALTHY account isn't dropped + falsely stopped ("unsupported language") under slowness.
+          const _postBtnStillDisabled = await page.evaluate((labels) => {
+            const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
+            const scope = dialogs.length ? dialogs : [document];
+            for (const root of scope) { const b = Array.from(root.querySelectorAll('[role="button"], button')).find((e) => labels.includes(norm(e.getAttribute('aria-label') || e.textContent))); if (b) return b.getAttribute('aria-disabled') === 'true' || !!b.disabled; }
+            return false; // no Post button at all (enabled OR disabled) → genuine drift/unsupported-language → fall through
+          }, FB.postButton).catch(() => false);
+          if (_postBtnStillDisabled) { step('Post button present but still DISABLED (image likely still uploading server-side) — re-attempting the group (nothing was clicked → no double-post)'); throw new Error('transient: post button still disabled'); }
+          // C2: the caption never CONFIRMED in the survival loop (editor was not provably empty, so the caption-less guard
+          // above didn't fire) AND now the Post button isn't found — a doomed publish on a bad composer, NOT a missing/
+          // unknown button. Route to the SAME bounded pre-publish retry (fresh composer; publishClicked still false → no
+          // double-post) instead of misreporting 'post button not found' and wrongly advancing the unsupported-language
+          // streak. Fires ONLY when the button is genuinely absent, so a still-publishable composer (caption actually fine,
+          // only the verify flaked) is never discarded. Bounded by groupRetries<3 like every other transient.
+          if (!captionConfirmed) { step('Caption never confirmed + Post button not found — re-attempting the group with a fresh composer (nothing was clicked → no double-post)'); throw new Error('transient: caption did not confirm — reopening a fresh composer'); }
           // TWO IN A ROW = the composer opened but the submit button matched NO known label → this account's FB UI is
           // almost certainly in an UNSUPPORTED LANGUAGE (e.g. Arabic not in FB.postButton). A single miss can be a slow
           // render (the transient-retry path recovers it), but a genuine can't-find every group would SILENTLY deliver
           // ZERO posts with no reserve coverage (a plain skip isn't a drop flag). Flag it so (a) the operator is told to
           // set it to English, and (b) reserves cover its groups instead of the whole account posting nothing.
           if (++consecNoPostBtn >= 2) {
+            // #7: suppress the likely_blocked escalation when the account already delivered today (transient, not blocked).
+            // Keep errors++ + report so the flag-INDEPENDENT reserve-takeover (orchestrator res.errors>0) still covers these groups.
+            if (deliveredToday()) {
+              step('⚠️ Post button not found on 2 groups in a row, but this account already delivered today — treating as transient (slow IP / FB hiccup), NOT blocked. Stopping it this cycle; reserves still cover these groups.');
+              errors++; noRetry = true;
+              report(groupName, gid, 'error', 'post button not found (transient — account already delivered today, not benched)', '');
+              break;
+            }
             step('🛑 Post button not found on 2 groups in a row — this account\'s Facebook is likely in a language the app doesn\'t recognize (set it to English). Stopping it so reserves cover its groups.');
             errors++; noRetry = true; flag = 'likely_blocked';
             report(groupName, gid, 'error', 'post button not found (unsupported UI language? set the account to English)', '');
             break;
           }
+          consecPushback++; // #hardening: a post-button miss (below the per-type 2-in-a-row) is FB pushback → feed the unified mixed-failure backoff (loop top)
           step('Post button not found; skipping group'); errors++; report(groupName, gid, 'error', 'post button not found', ''); continue;
         }
         // E-P1: set ONLY after the click actually fired (clickPostButton returns true post-mouse-click). If it
@@ -2927,14 +3597,25 @@ async function runAccount(o) {
         publishClicked = true; // from here this group must NOT be retried (would double-post)
         consecNoPostBtn = 0;   // a successful click clears the "unsupported-language" streak
         step('Post button clicked');
-        let publishResult = await waitForPublish(page, dialogCountBefore, 70000, shouldStop, settings.speedMode === 'instant'); // 70s CEILING kept (a slow/hidden/proxied window can take 35-45s+; too-short → false "timeout" → re-post → duplicate); instant only tightens the POLL granularity
+        const _pubCeiling = publishWaitCeilingMs(consecPubTimeouts); // #time-waste: full 70s on a fresh/healthy account; 35s once FB is silently dropping this account's publishes (consecPubTimeouts>0) so we reach the throttle backoff fast instead of idling ~70s/post — the timeout-path double-post guards (H3 capture + dialog poll + author-matched rescan) still run. See publishWaitCeilingMs.
+        let publishResult = await waitForPublish(page, dialogCountBefore, _pubCeiling, shouldStop, settings.speedMode === 'instant'); // instant only tightens the POLL granularity
+        // FINDING-1 DOUBLE-SAFETY: a fast rate/block WALL caught while the composer was still open does NOT prove the post
+        // didn't commit server-side (FB can ACCEPT the post AND show a "posting too fast" banner). So route the rate-limit
+        // sentinels through the SAME landing-confirmation the 'timeout' path uses (create-story id warm-up + feed-rescan):
+        // a committed-but-walled post is then markDelivered (never re-posted by a reserve). We remember the wall class in
+        // _wallStop and apply the account-stop AFTER confirmation. login/checkpoint are NOT mapped — the post provably did
+        // not land (you can't publish logged-out / checkpointed), so they stop immediately below.
+        let _wallStop = null;
+        if (publishResult === 'blocked_account' || publishResult === 'blocked_post') { _wallStop = publishResult; publishResult = 'timeout'; }
         if (_netCapture) {
-          // The create-story mutation's response usually landed by the time the composer closed; give it a brief
-          // grace (~1.8s max) only if it hasn't — normally get() is already set so this returns instantly.
-          for (let i = 0; i < 12 && !_netCapture.get(); i++) await sleep(150);
+          // EARLY read for H3 ONLY (just below): a client 'timeout'/'error' can double-post unless we KNOW FB committed
+          // server-side, so on THAT path wait briefly (~3s) for the id. On a clean 'published' we do NOT wait here —
+          // FB STREAMS the create-story response (@defer), so resp.text()'s body often isn't fully read until several
+          // seconds later (past this point). The real read + the hit/empty log happen in the FINALIZE block right
+          // before the comment decision, which reuses the post-publish settle time for free (→ no happy-path latency).
+          // The listener stays ARMED until then (loop-outer _netCapture → disposed at finalize / re-arm / after-loop).
+          if (publishResult === 'timeout' || publishResult === 'error') { for (let i = 0; i < 20 && !_netCapture.get(); i++) await sleep(150); }
           _netPost = _netCapture.get();
-          _netCapture.dispose();
-          if (_netPost) step(`🔗 Captured the post's link from Facebook's publish response (id=${_netPost.postId}) — the feed re-scan can be skipped`);
         }
         if (publishResult === 'stopped') {
           // Stop hit DURING the publish wait — the Post button was ALREADY clicked (publishClicked), so the
@@ -2943,6 +3624,17 @@ async function runAccount(o) {
           // Stop is far better than duplicating one.)
           if (publishClicked) { posted++; markDelivered(gid); report(groupName, gid, 'posted', 'stopped mid-publish — counted to avoid a duplicate next run', ''); }
           step('Stop requested during publish wait — halting'); break;
+        }
+        // H3 (committed-but-client-unconfirmed double-post): Facebook's create-story RESPONSE (captured above into
+        // _netPost) is the SERVER's acknowledgement that the post was created — a DEFINITIVE "it published" signal,
+        // independent of the CLIENT composer timing out (70s ceiling) or flashing a "couldn't post" error toast AFTER
+        // the server already committed. If we captured OUR post's id, the post reached the group, so treat it as
+        // published and NEVER let the owed/reserve path re-post it. Closes the double-post for BOTH 'timeout' and
+        // 'error' whenever the capture hit (default-on) — with no feed-scan false-negative risk. It can NEVER
+        // false-confirm a post that did not publish: the id is only set from OUR gid-scoped create-story response.
+        if ((publishResult === 'timeout' || publishResult === 'error') && _netPost && _netPost.postId) {
+          step(`Client publish "${publishResult}", but Facebook's publish RESPONSE confirms the post was created (id=${_netPost.postId}) — treating as published (it will NOT be re-posted).`);
+          publishResult = 'published';
         }
         if (publishResult === 'timeout') {
           // E-P5/E-P11: a genuine publish can take 35-40s on a slow connection or a hidden/occluded
@@ -2959,8 +3651,9 @@ async function runAccount(o) {
             // This is the ONLY liveness signal for a no-caption post (the caption rescan below can't help it).
             const _dlg = Date.now() + 12000;
             for (;;) {
-              const dcNow = await evalTimed(page, () => Array.from(document.querySelectorAll('div[role="dialog"]')).filter((d) => d.querySelector('[contenteditable="true"], input[type="file"], [role="textbox"]')).length, null, 5000).catch(() => -1);
-              if (dcNow >= 0 && dialogCountBefore > 0 && dcNow < dialogCountBefore) { step('Publish wait timed out but the composer dialog CLOSED — treating as published (slow publish).'); publishResult = 'published'; break; }
+              const _dc = await evalTimed(page, () => ({ c: Array.from(document.querySelectorAll('div[role="dialog"]')).filter((d) => d.querySelector('[contenteditable="true"], input[type="file"], [role="textbox"]')).length, g: !document.querySelector('[data-zp-composer="1"]') }), null, 5000).catch(() => null);
+              const dcNow = _dc ? _dc.c : -1;
+              if (dcNow >= 0 && dialogCountBefore > 0 && dcNow < dialogCountBefore && (!_dc || _dc.g)) { step('Publish wait timed out but OUR composer dialog CLOSED — treating as published (slow publish).'); publishResult = 'published'; break; } // GAP#2 twin: require OUR tagged shell gone (not just any composer-like dialog) so a popup collapse can't false-confirm; safe-degrade when the tag is absent
               if (Date.now() >= _dlg || shouldStop()) break;
               await sleep(1500);
             }
@@ -2968,6 +3661,11 @@ async function runAccount(o) {
           // Feed rescan gate lowered 12→6 chars: a short (6-11 char) caption is still a usable anchor because the scan
           // REQUIRES an author match when we know our display name (below), so it won't false-confirm on a stranger.
           if (publishResult === 'timeout' && _landSnip.length >= 6) {
+            // WRONG-POST GUARD: dispose the link-capture BEFORE this feed reload. On a timeout the capture is still
+            // "hungry" (hit=null — that's why we're rescanning), and the reloaded feed is full of OUR OLD identical-
+            // caption posts; a feed GraphQL response that slips past the friendly-name gate could otherwise bind an
+            // OLD gid-scoped id. H3's late-arrival window already got its ~3s wait at the early read above.
+            if (_netCapture) { try { _netCapture.dispose(); } catch {} _netCapture = null; }
             step('Publish wait timed out — rescanning the feed (read-only) to see if it landed anyway…');
             await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
             await page.waitForSelector('[aria-posinset], div[role="article"]', { timeout: 20000 }).catch(() => {});
@@ -2990,6 +3688,14 @@ async function runAccount(o) {
           }
         }
         if (publishResult !== 'published') {
+          // FAST-WALL sentinels from waitForPublish. login/checkpoint → the post provably did NOT land (can't publish
+          // logged-out / checkpointed) → stop IMMEDIATELY; reserves cover the groups. A rate/block wall (_wallStop)
+          // reaching HERE means the landing-confirmation above (create-story id warm-up + feed-rescan) did NOT confirm a
+          // landing → the post did not land → reserve THIS group + stop the account. (A wall whose post DID land is
+          // handled right after markDelivered below — that path counts it + never re-posts it.)
+          if (publishResult === 'needs_login')    { step('🛑 Logged out at publish — stopping this account (re-login needed); reserves cover its groups'); errors++; noRetry = true; flag = 'needs_login'; report(groupName, gid, 'error', 'logged out at publish', ''); break; }
+          if (publishResult === 'checkpoint')     { step('🔐 Identity/checkpoint at publish — stopping this account; reserves cover its groups'); errors++; noRetry = true; flag = 'needs_verification'; report(groupName, gid, 'error', 'identity verification required', ''); break; }
+          if (_wallStop) { const _k = _wallStop === 'blocked_account' ? 'account' : 'post'; step(_k === 'account' ? '🛑 Facebook TEMPORARILY BLOCKED this account (red text) — the post did NOT land → reserving it; stopping the account (long cooldown)' : '🛑 Posting rate-limited (red text) — the post did NOT land → reserving it; stopping the account (pace too high)'); errors++; noRetry = true; flag = 'rate_limited'; rlKind = _k; report(groupName, gid, 'error', _k === 'account' ? 'account temporarily blocked' : 'posting rate-limited', ''); break; }
           // The post failed — find out WHY so the account can be flagged for the operator.
           // Facebook's spam/rate-limit message appears in the composer right after clicking Post.
           { const _rl = await classifyRateLimit(page); if (_rl) { const _k = _rl === 'severe' ? 'account' : 'post'; step(_k === 'account' ? '🛑 Facebook TEMPORARILY BLOCKED this account (post) — stopping it (long cooldown)' : '🛑 Posting rate-limited by Facebook — cooling this account down'); errors++; noRetry = true; flag = 'rate_limited'; rlKind = _k; report(groupName, gid, 'error', _k === 'account' ? 'account temporarily blocked' : 'rate-limited — Facebook blocked the post', ''); break; } }
@@ -3006,11 +3712,19 @@ async function runAccount(o) {
           // hammering its remaining groups (each is a 70s wait + another error + a botty rapid-fail pattern) and back
           // it off so the reserve / next cycle takes over. Reset to 0 on any confirmed publish (below).
           if (publishResult === 'timeout') {
-            if (++consecPubTimeouts >= 2) { step('🛑 2 posts in a row went unconfirmed — likely a silent Facebook throttle after a burst. Backing this account off now (its reserve / next cycle continues).'); noRetry = true; flag = 'rate_limited'; rlKind = 'post'; break; }
+            // HARDENING: if FB's create-story mutation RESPONSE arrived (sawCreate) but just lacked a gid-scoped URL, the
+            // publish almost certainly LANDED (slow @defer body) — a slow success, NOT a silent throttle. Don't count it
+            // toward the account-stop streak. (We do NOT flip it to 'published' — the body could be a reject; we only avoid
+            // a false account-stop on a slow-but-successful publish.) _netCapture is still armed here (disposed at finalize).
+            const _sawCreate = !!(_netCapture && (() => { try { return _netCapture.stats().sawCreate; } catch { return false; } })());
+            if (!_sawCreate) {
+              consecPushback++; // #hardening: a silent-throttle timeout is FB pushback → feed the unified mixed-failure backoff (loop top)
+              if (++consecPubTimeouts >= 2) { step('🛑 2 posts in a row went unconfirmed — likely a silent Facebook throttle after a burst. Backing this account off now (its reserve / next cycle continues).'); noRetry = true; flag = 'rate_limited'; rlKind = 'post'; break; }
+            }
           } else { consecPubTimeouts = 0; }
           continue;
         }
-        consecPubTimeouts = 0; // a confirmed publish breaks any unconfirmed-publish streak
+        consecPubTimeouts = 0; consecPushback = 0; // a confirmed publish breaks any unconfirmed-publish streak (per-type AND the unified mixed-failure streak)
         // FUNCTIONAL WAIT: after publish, FB needs time to commit the post server-side and for the
         // pending-approval toast to appear in the DOM before pendingNoticeForOurPost reads it.
         // The old 600ms turbo/instant settle ran AFTER pendingNoticeForOurPost (wrong order) — a
@@ -3018,7 +3732,8 @@ async function runAccount(o) {
         // fell through to the slow 40-56s feed-scan path and ended as 'notfound' (no comment placed).
         // instant → 1800ms, turbo → 1200ms, normal → humanDelay(3000ms). NOT a cosmetic anti-spam
         // gap — this is the gate that lets the pending toast render before we read it.
-        const _postPublishSettle = settings.speedMode === 'instant' ? 1800 : isTurboMode(settings) ? 1200 : isFastMode(settings) ? 1500 : humanDelay(3000, settings, 'settle'); // plain 'fast' was falling through to the full ~3s (treated like normal); give it an intermediate settle — still ≥1200ms so the held-post/"Spam potentiel" toast has hydrated (load-bearing for dedup + reserve)
+        const _fastPublish = settings.fastPublish === true || process.env.ZA_FAST_PUBLISH === '1'; // OPT-IN: cut the held-toast settle for an admin of his OWN groups (no held posts → no toast to wait for)
+        const _postPublishSettle = (_fastPublish && isFastMode(settings)) ? 600 : settings.speedMode === 'instant' ? 1000 : isFastMode(settings) ? 1500 : humanDelay(3000, settings, 'settle'); // MAX/instant trimmed 1800→1000ms (operator-approved): the held/"Spam potentiel" toast is now backstopped by Phase 2's feed-scan (notfound→moderator) for comment posts, so this window's main remaining job is letting an emerging block/checkpoint render for the E-P3 safety check. fastPublish (opt-in) drops it to 600ms — accepts a SLOW toast/warning may be missed. (The old turbo→1200 branch was dead: turbo folded into max = the instant token, caught above.)
         await sleepInterruptible(_postPublishSettle, softStop, 500, isPaused, pauseHold);
         // POST-SPECIFIC pending capture: on THIS post-click page, BEFORE any navigation, scanning only
         // toast/alert/dialog surfaces (never feed articles). A genuinely moderated group shows the
@@ -3035,20 +3750,33 @@ async function runAccount(o) {
         let emergingBlock = false;
         try {
           const suspect = await evalTimed(page, (cfg) => {
-            const t = (document.body.innerText || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+            // SCOPE (same as classifyRateLimit): notice surfaces excluding feed articles + composer, so OUR just-published
+            // caption or a neighbor's feed post can't false-trigger an account cool-down; full body only on a full-page block.
+            const notices = Array.from(document.querySelectorAll('[role="alert"], [role="status"], div[role="dialog"]'))
+              .filter((n) => !n.closest('[role="article"]'))
+              .filter((n) => !n.querySelector('[contenteditable="true"], [role="textbox"], input[type="file"]'))
+              .map((n) => n.innerText || '').join(' \n ');
+            const fullPage = !document.querySelector('[role="article"]') && !document.querySelector('[contenteditable="true"], [role="textbox"]');
+            const t = (notices + (fullPage ? (' \n ' + (document.body.innerText || '')) : '')).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
             return [...cfg.rate, ...cfg.cp].find((p) => t.includes(p)) || null;
           }, { rate: FB.rateLimit, cp: FB.checkpoint }, 6000);
           if (suspect) { emergingBlock = true; step(`🛑 Posted, but an EMERGING block/checkpoint phrase is present ("${suspect}") — cooling down this account immediately`); }
         } catch {}
         if (emergingBlock) {
-          posted++; markDelivered(gid); flag = 'rate_limited'; noRetry = true;
+          posted++; markDelivered(gid); noRetry = true;
+          // GAP-6 fix: classify the block TIER (was a bare rlKind-less 'rate_limited' → a genuine ACCOUNT block after a
+          // successful publish got the SHORT post-tier cooldown → re-launched too soon → kept getting re-hit). Priority checkpoint > account > post.
+          const _sevEB = await classifyRateLimit(page); // 'severe' | 'limit' | null
+          if (await checkVerification(page)) flag = 'needs_verification';
+          else if (_sevEB === 'severe') { flag = 'rate_limited'; rlKind = 'account'; }
+          else { flag = 'rate_limited'; rlKind = 'post'; }
           // The post is LIVE but its link-comment was never placed (we break before the comment step). QUEUE it so a
           // healthy in-group reserve completes it in Phase-3 — a post is NEVER left without its link (mirrors line ~2753).
           // Without this the comment was silently dropped even when a reserve was available (the markDelivered above
           // also excludes this group from the owed/re-post path, so nothing else would recover it).
           if ((post.comment && post.comment.trim()) || groupCommentImg) {
             const _cap = (post.caption || '').replace(/\s+/g, ' ').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().slice(0, 40);
-            commentQueue.push({ gid, groupName, postPermalink: null, postId: (basePost && basePost.id) || null, captionSnip: _cap, postCaption: (post.caption || '').slice(0, 220), comment: post.comment || '', commentImg: groupCommentImg || null, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), reason: 'emerging_block' });
+            addCommentTask({ gid, groupName, postPermalink: null, postId: (basePost && basePost.id) || null, captionSnip: _cap, postCaption: (post.caption || '').slice(0, 220), comment: post.comment || '', commentImg: groupCommentImg || null, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), reason: 'emerging_block' });
           }
           report(groupName, gid, 'posted', 'emerging block after publish — comment routed to a reserve (rescue)', 'skipped');
           break;
@@ -3057,21 +3785,14 @@ async function runAccount(o) {
         // Caption key (normalized 40-char) — the held-record match key AND the feed caption-match key below.
         const capSnip = (post.caption || '').replace(/\s+/g, ' ').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().slice(0, 40);
 
-        // FAST HELD-EXIT: a POST-SPECIFIC pending/review notice appeared at publish time → the post is HELD
-        // (Spam potentiel / pending approval) and will NOT be in the public feed. Skip the whole group reload +
-        // feed scan (≈40-56s of guaranteed-useless work) and route STRAIGHT to the moderator/held path. Works
-        // for ANY caption length — the old path's capSnip>=12 gate let short/image held posts fall through and
-        // burn the 60-180s comment delay + scan before giving up. The held record carries the comment so it is
-        // placed after approval. This is the single biggest "wasting time every run" fix for moderated groups.
-        if (pendingAtPublish) {
-          step('Post HELD for admin approval (pending notice at publish) — skipping the feed scan, routing to the moderator queue.');
-          pendingApproval++; markDelivered(gid); // the post DID reach this group (held for review) — don't let a reserve re-post it
-          consecPubTimeouts = 0; // a HELD post is a CONFIRMED publish (FB accepted it, just gated) — it must NOT count toward the silent-throttle streak
-          heldRecords.push({ postId: basePost.id || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip, postCaption: (post.caption || '').slice(0, 220), groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: null, source: 'pending_at_publish' });
-          report(groupName, gid, 'pending', 'awaiting admin approval (immediate signal)', 'skipped');
-          if (i < targetGroups.length - 1) await sleepInterruptible(settings.speedMode === 'instant' ? rand(500, 1800) : withFloor(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).group), softStop, 1000, isPaused, pauseHold); // INSTANT inter-group gap after a HELD post — trimmed 1–3s→0.5–1.8s to match the main gap above
-          continue;
-        }
+        // PENDING NOTICE → CONFIRM AGAINST THE FEED (never blind-hold on the toast alone). Facebook shows a
+        // TRANSIENT "your post might be reviewed" toast even for posts that then go PUBLIC — trusting it alone
+        // FALSE-HELD public posts and LOST their comment (operator confirmed: posts live in the group, no comment).
+        // So a pending notice NO LONGER short-circuits to held: `pendingAtPublish` forces the verify-reload below ON
+        // (its feed-find is the ground truth). If OUR post is LIVE in the feed → the notice was transient → comment
+        // normally; only a post CONFIRMED ABSENT from the feed after the reload is routed to the moderator/held queue
+        // (the HELD RESOLUTION just after the reload). Trade-off: a genuinely-held post now pays the ~4-16s reload
+        // (vs the old instant skip), but that beats silently losing a public post's comment.
 
         // GROUND TRUTH (non-held path): reload the group and find OUR post — right after publishing it isn't
         // in the feed DOM yet; after a reload it's at the TOP, so we confirm it's live AND grab its verified
@@ -3080,6 +3801,7 @@ async function runAccount(o) {
         let postPermalink = null;
         let expectedPostId = null; // OUR post's stable id — the trust anchor for commenting (CT-4)
         let _idFromNetwork = false; // id came from FB's publish response (not a caption-verified feed match) → Phase 2 MUST content-verify before commenting
+        let _ambiguousPresent = false; // the verify-reload found MULTIPLE same-caption posts (present but can't uniquely bind OURS) → NOT a confirmed-absent hold
         // A comment that follows means addFirstComment will reload the group ONCE, find OUR post
         // (caption+author wrong-post guarded) and comment — so a standalone verify-reload here would be a
         // redundant SECOND reload of the same feed. Only no-comment posts need this reload as their sole check.
@@ -3088,8 +3810,26 @@ async function runAccount(o) {
         // reload since it comments inline right after). The captured permalink lets Phase 2 navigate DIRECTLY to each
         // post (no per-comment feed re-scan) AND lets it PRE-LOAD the next post's page while commenting the current.
         const _captureForTwoPhase = wantComment && _twoPhase;
-        let feedConfirmed = wantComment && !_captureForTwoPhase; // a two-phase capture DOES do a real feed match below → it may set feedConfirmed true; otherwise unchanged.
-        if (_captureForTwoPhase && _netPost && _netPost.postId) {
+        let feedConfirmed = wantComment && !_captureForTwoPhase && !pendingAtPublish; // a two-phase capture / a pending-notice post DOES a real feed match below → it may set feedConfirmed true; a pending post must start FALSE so the HELD RESOLUTION can hold it if the feed-confirm fails.
+        // FINALIZE the link-capture (deferred from the publish click): the post-publish settle above already gave FB's
+        // STREAMED create-story response free wall-clock to finish downloading, so re-read now with a BOUNDED grace
+        // that EXITS the instant the gid-scoped id arrives. Happy path (already captured) → zero wait. Slow @defer
+        // body (the common case that was mislabelled "empty") → caught HERE, before the verify-reload navigation that
+        // would abort the in-flight body read. Genuinely-absent URL → still falls through to the guarded feed-scan.
+        if (_netCapture) {
+          // SPEED: once this account's capture has come up empty ≥2× in a row, its create-story URL simply isn't arriving
+          // (some accounts / image posts never expose a gid-scoped URL) — stop paying the full ~3s finalize wait. Phase 2's
+          // group-scoped feed-scan still targets OUR post regardless (the captured id only makes that scan id-strict, which
+          // is a no-op when it's empty anyway). Any single hit resets the streak → the full wait returns immediately.
+          if (!_netPost) { const _c2 = _capMiss >= 2 ? 3 : (isFastMode(settings) ? 20 : 28); for (let i = 0; i < _c2 && !_netCapture.get(); i++) await sleep(150); _netPost = _netCapture.get(); } // ~0.45s warmed-down, else ~3s/4.2s; exits early on a hit
+          const _cs = _netCapture.stats(); try { _netCapture.dispose(); } catch {} _netCapture = null; // value read into _netPost → dispose the listener now (nulled so re-arm / after-loop don't re-dispose)
+          _capMiss = _netPost ? 0 : _capMiss + 1; // track the consecutive-empty streak (per account) to warm the finalize wait down/up
+          if (_netPost) step(_twoPhase
+            ? `🔗 Captured the post's id from Facebook's publish response (id=${_netPost.postId}) — Phase 2 comments via the id-strict group feed-scan (direct permalink retired for identical-caption safety)`
+            : `🔗 Captured the post's link from Facebook's publish response (id=${_netPost.postId}) — commenting via the direct link (feed re-scan skipped)`);
+          else step(`link-capture empty (${_cs.ambiguous ? 'AMBIGUITY-REJECT: multiple same-group ids in the response' : _cs.sawCreate ? 'create-story seen but its gid-scoped URL did not arrive in time' : 'no create-story response seen'}) — using the guarded feed-scan`);
+        }
+        if (wantComment && _netPost && _netPost.postId && !pendingAtPublish) { // trusted gid-scoped id (any comment post, both phases) → comment via the direct link; a PENDING post skips this (its own permalink may be member-invisible if held) and takes the verify-reload/held path
           // FAST PATH — we already captured OUR post's link from Facebook's publish response, so the whole verify-
           // reload (feed goto + scroll + caption-match + hover-for-href) is UNNECESSARY: skip it. Phase 2 navigates
           // STRAIGHT to this permalink and re-verifies the post's caption+author on its own page before commenting
@@ -3099,8 +3839,10 @@ async function runAccount(o) {
           postPermalink = _netPost.url;
           _idFromNetwork = true;
           feedConfirmed = true; // FB confirmed the create + gave us the id — a genuine confirmed delivery
-          step(`Confirmed via the publish response (id=${expectedPostId}) — commenting via the direct link; skipped the feed re-scan`);
-        } else if (!wantComment || _captureForTwoPhase) {
+          step(_twoPhase
+            ? `Confirmed via the publish response (id=${expectedPostId}) — Phase 2 will place the comment via the id-strict group feed-scan`
+            : `Confirmed via the publish response (id=${expectedPostId}) — commenting via the direct link; skipped the feed re-scan`);
+        } else if (pendingAtPublish || !wantComment || (_captureForTwoPhase && !_skipInlineVerify)) {
         step(_captureForTwoPhase ? 'Verifying the post landed + capturing its link for the comment pass…' : 'Verifying the post landed (reloading the group)…');
         await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
         await page.waitForSelector('[aria-posinset], div[role="article"]', { timeout: 25000 }).catch(() => {});
@@ -3114,12 +3856,12 @@ async function runAccount(o) {
         // fallback. Tolerate "See more" truncation. Poll up to ~12s so a slow render isn't read as "gone".
         let find = null;
         // Our FB display name (normalized) — the capture binds the permalink of OUR post, not a same-caption stranger's.
-        const _capAuthor = String(account.fbDisplayName || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const _capAuthor = String(account.fbDisplayName || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 60); // slice(0,60) to MATCH authorOf's 60-char slice — else a >60-char display name never author-matches (a false hold / a refused R4 lone-match)
         const findDeadline = Date.now() + 16000;
         let _renderScrolls = 0;
         do {
           find = await evalTimed(page, (arg) => {
-            const { s, author } = arg;
+            const { s, author, wantId } = arg;
             const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
             const linkOf = (a) => { const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]'); return (l && /\/(posts|permalink)\//.test(l.href || '')) ? l.href.split('?')[0] : null; };
             const atobSafe = (x) => { try { return atob(x); } catch { return x || ''; } };
@@ -3131,7 +3873,7 @@ async function runAccount(o) {
               if (fb) { const raw = atobSafe(fb.getAttribute('data-feedback-id')); m = raw && raw.match(/(\d{8,})/); if (m) return m[1]; }
               m = (a.innerHTML || '').match(/"(?:post_id|story_fbid|top_level_post_id)":"?(\d{8,})/); return m ? m[1] : null;
             };
-            const arts = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 8)
+            const arts = Array.from(document.querySelectorAll('[aria-posinset], div[role="article"]')).slice(0, 15)
               .filter((a) => !/pinned|épingl|rögzít/.test((a.innerText || '').slice(0, 200).toLowerCase()));
             try { document.querySelectorAll('[data-zp-target]').forEach((e) => e.removeAttribute('data-zp-target')); } catch {}
             // Caption-match TOP-8, TOPMOST (newest) match wins (E-R7). Right after publishing OUR post
@@ -3145,17 +3887,27 @@ async function runAccount(o) {
             // there's exactly ONE and its author can't be read (unambiguous); otherwise return null → the
             // (author+ambiguity-checked) feed-scan fallback handles it. Never claim someone else's post.
             const authorOf = (a) => { const c = a.querySelector('h2 a, h3 a, h4 a, strong a, a strong, a[aria-label][href*="/user/"], a[aria-label][role="link"]'); return norm(c ? (c.getAttribute('aria-label') || c.textContent) : '').slice(0, 60); };
+            // ID-FIRST (wrong-post floor): FB's publish response gave us a TRUSTED gid-scoped id → find OUR post by that
+            // UNIQUE id, immune to the identical-caption OLD-duplicate confusion. Present → LIVE. Absent → our post is
+            // genuinely NOT in the public feed (HELD) → do NOT fall back to a caption match (it would be an OLD dup of
+            // ours). Only when there is NO trusted id (empty capture) do we fall through to the caption floor below.
+            if (wantId) {
+              for (let i = 0; i < arts.length; i++) { if (idOf(arts[i]) === wantId) { arts[i].setAttribute('data-zp-target', '1'); return { href: linkOf(arts[i]), postId: wantId, matched: true, pos: i }; } }
+              return { matched: false, absentById: true };
+            }
             if (s && s.length >= 12) {
               const caps = [];
               for (let i = 0; i < Math.min(8, arts.length); i++) { const a = arts[i]; if (norm(a.textContent).includes(s)) caps.push({ a, i, auth: authorOf(a) }); }
-              // SINGLE caption match → ours (unambiguous); MULTIPLE → bind only the one authored by us.
+              // PICKER PAIR (must match _scanFeedRaw ~1316): SINGLE caption match → ours; MULTIPLE own → REFUSE (accept a
+              // LONE own-match only) — never bind an OLD duplicate's permalink + feedConfirmed=true (the H2 wrong-post root).
               let pick = null;
-              if (caps.length === 1) pick = caps[0];
-              else if (caps.length > 1 && author) { const ours = caps.filter((c) => c.auth && c.auth === author); if (ours.length) pick = ours[0]; }
+              if (caps.length === 1 && (!author || !caps[0].auth || caps[0].auth === author)) pick = caps[0]; // R4: a LONE caption match is ours UNLESS its author is READABLE and DIFFERENT (a stranger's post) → refuse, wrong-post-safe. An UNREADABLE or UNKNOWN author still accepts (no coverage loss on a flaky render).
+              else if (caps.length > 1 && author) { const ours = caps.filter((c) => c.auth && c.auth === author); if (ours.length === 1) pick = ours[0]; }
               if (pick) { pick.a.setAttribute('data-zp-target', '1'); return { href: linkOf(pick.a), postId: idOf(pick.a), matched: true, pos: pick.i }; }
+              if (caps.length > 1) return { matched: false, ambiguous: true }; // same-caption post(s) present but can't uniquely bind OURS → NOT a confirmed-absent hold
             }
-            return null; // ambiguous / not-ours → don't bind a permalink; the feed fallback decides
-          }, { s: capSnip, author: _capAuthor }, 8000).catch(() => null);
+            return null; // no same-caption post in the window → truly not found; the comment step / held path decides
+          }, { s: capSnip, author: _capAuthor, wantId: (_netPost && _netPost.postId) || null }, 8000).catch(() => null);
           // If matched but the timestamp <a href> hasn't lazily rendered, hover it FROM NODE (synthetic
           // in-page events don't trigger FB's hover-render) to force the real href, then re-read.
           if (find && find.matched && !find.href) {
@@ -3166,12 +3918,19 @@ async function runAccount(o) {
                 const ts = await box.$('a[href*="/posts/"], a[href*="/permalink/"], abbr, time, a[role="link"]').catch(() => null);
                 if (ts) await ts.hover().catch(() => {}); else await box.hover().catch(() => {});
               } catch {}
-              await sleep(700);
-              const rh = await evalTimed(page, () => {
-                const a = document.querySelector('[data-zp-target="1"]'); if (!a) return null;
-                const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]');
-                return (l && /\/(posts|permalink)\//.test(l.href || '')) ? l.href.split('?')[0] : null;
-              }, null, 4000).catch(() => null);
+              // Early-exit poll for the lazily-rendered href (was a flat sleep(700) + one read): break the instant the
+              // href appears, but keep the SAME ~700ms ceiling (5 × ~150ms ≈ 750ms) so a genuinely slow lazy-render is
+              // still captured exactly as before. This is a BONUS permalink only — the caption+author match above ALREADY
+              // confirmed the post is LIVE, so a null result just falls back to postId reconstruction / the matched box.
+              let rh = null;
+              for (let _e = 0; _e < 5 && !rh; _e++) {
+                await sleep(150);
+                rh = await evalTimed(page, () => {
+                  const a = document.querySelector('[data-zp-target="1"]'); if (!a) return null;
+                  const l = a.querySelector('a[href*="/posts/"], a[href*="/permalink/"]');
+                  return (l && /\/(posts|permalink)\//.test(l.href || '')) ? l.href.split('?')[0] : null;
+                }, null, 4000).catch(() => null);
+              }
               if (rh) { find.href = rh; const m = rh.match(/\/(?:posts|permalink)\/(\d+)/); if (m) find.postId = m[1]; }
             }
           }
@@ -3195,13 +3954,17 @@ async function runAccount(o) {
           feedConfirmed = true; // our caption IS in the public feed → a genuine confirmed delivery
           step(`Confirmed LIVE — our post is in the feed (id=${expectedPostId || '?'}). Commenting on it directly.`);
         } else {
-          // pendingAtPublish was false (the FAST HELD-EXIT above already handled the held case). Post is
-          // confirmed submitted but not matched in the feed: short/image caption or slow feed. Do NOT borrow
-          // the newest post's link — it could be a STRANGER'S. The comment flow's id/caption-checked feed
-          // fallback finds OURS or skips; a delayed server-side hold (no notice) is caught by the comment
-          // 'notfound' path, which routes it to the moderator queue.
+          // Post confirmed submitted but NOT confirmed live. Sub-cases:
+          //  - ABSENT-BY-ID (find.absentById): a TRUSTED captured id was NOT in the feed window → genuinely HELD (a
+          //    caption match here would be an OLD duplicate) → HOLD below (records the comment), never comment on it.
+          //  - AMBIGUOUS (find.ambiguous): MULTIPLE same-caption posts present (no trusted id) → our post IS live (one
+          //    of them); can't safely pick → do NOT false-hold; the comment step / rescue refuses-or-skips (no guess).
+          //  - truly-not-found (short/image caption or slow feed) → HOLD below (records the comment) rather than let the
+          //    comment step guess on a possibly-OLD duplicate. Never borrow the newest post's link — could be a stranger.
           postPermalink = null;
-          step('Posted (publish confirmed) — caption not matched in feed yet; comment will use the id/caption-checked feed fallback');
+          if (find && find.ambiguous) { _ambiguousPresent = true; step('Posted (publish confirmed) — same-caption post(s) present but ambiguous; not binding — comment step / rescue decides'); }
+          else if (find && find.absentById) step('Posted (publish confirmed) — our post-id is NOT in the public feed → confirmed HELD (a caption match would be an OLD duplicate); holding with its comment');
+          else step('Posted (publish confirmed) — caption not matched in feed yet');
         }
         } else {
           // COMMENT path: standalone verify-reload SKIPPED (one reload total). addFirstComment reloads the
@@ -3211,9 +3974,46 @@ async function runAccount(o) {
           step('Posted (publish confirmed) — the comment step will reload once, find our post, and comment');
         }
 
+        // HELD RESOLUTION (replaces the old blind FAST HELD-EXIT): a pending/review notice appeared at publish AND
+        // the verify-reload above did NOT find OUR post public → it is genuinely HELD (Spam potentiel / pending
+        // approval). We reloaded precisely to distinguish this from FB's TRANSIENT "might be reviewed" toast (also
+        // shown for posts that DO go public). Hold ONLY when the feed-confirm actually failed — never on the toast
+        // alone. `feedConfirmed` is true here only if the reload's caption+author find matched OUR post (LIVE OVERRIDE).
+        if (pendingAtPublish && !feedConfirmed && !_ambiguousPresent && !_wallStop) { // hold ONLY on CONFIRMED-absent (and NOT when a rate/block wall was flagged → let _wallStop fall through to the stop-account handler below, belt-and-suspenders for a practically-impossible held+walled co-occurrence). Rest of note: (id-not-in-feed, or caption-not-found): NOT when a same-caption post is present-but-ambiguous (that defers to the comment step's floored/id picker, which REFUSES rather than guessing). A comment post held here keeps its comment (heldRecords) for post-approval — we must NOT let a confirmed-absent comment post reach addFirstComment, whose lone-caption match could be an OLD duplicate (the verified wrong-post).
+          step('Post HELD for admin approval (pending notice + NOT found public in the feed) — routing to the moderator queue.');
+          pendingApproval++; markDelivered(gid); // the post reached the group (held for review) — don't let a reserve re-post it
+          consecPubTimeouts = 0; consecPushback = 0; // a HELD post is a CONFIRMED publish (FB accepted it, just gated) — must NOT count toward the silent-throttle OR the unified mixed-failure streak
+          // P-0 (double-post fix, operator-approved): persist the gid-scoped create-story URL (if FB exposed it for this
+          // held post) so Phase-4's permalink-direct liveness check (repost.js) can reach the post even after FB AUTO-
+          // RELEASES it deep in the feed — instead of the 60-article feed scan missing it and re-posting a DUPLICATE.
+          // NULL-safe: no captured URL → null → prior behavior (feed-scan fallback), zero regression. Uses the ALLOWED
+          // gid-scoped URL capture (_netPost.url), NOT the banned story_fbid/post_id field. Diagnostic log = live P-0 signal.
+          const _heldPermalink = (_netPost && _netPost.url) || null;
+          step(_heldPermalink ? '🔗 Held post: captured its create-story URL — Phase-4 verifies liveness DIRECTLY (P-0: no duplicate re-post of an auto-released post)' : 'Held post: no create-story URL captured — Phase-4 falls back to the feed scan (P-0 inert here)');
+          addHeld({ postId: basePost.id || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip, postCaption: (post.caption || '').slice(0, 220), groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: _heldPermalink, source: 'pending_at_publish' });
+          report(groupName, gid, 'pending', 'awaiting admin approval (confirmed absent from feed)', 'skipped');
+          if (i < targetGroups.length - 1) {
+            const _cfgGap = settings.speedMode === 'instant' ? rand(100, 1000) : withFloor(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).group);
+            const _d = Math.max(_cfgGap, (typeof ipPostGate === 'function') ? ipPostGate(_cfgGap) : 0); // #2/#13 OPT-IN per-IP aggregate cap: reserve on the PROJECTED post instant (now+_cfgGap) so the shared per-IP clock reflects when THIS post lands, not the boundary — the returned wait is ≥ _cfgGap when active, else 0 (off/proxied)
+            await sleepInterruptible(_d, softStop, 1000, isPaused, pauseHold);
+          }
+          continue;
+        }
+
         // Success log — keep caption snippet for the renderer's auto-delete tracker.
-        step(feedConfirmed ? 'Posted successfully' : 'Posted (publish confirmed) — NOT yet feed-confirmed in this group; if the group holds posts for review it may be in "Spam potentiel" (a no-comment post has nothing to auto-detect it). Worth checking this group.');
+        step(feedConfirmed ? 'Posted successfully'
+           : wantComment ? 'Posted (publish confirmed) — the comment pass (Phase 2) will confirm it landed and route it to moderator approval if it\'s held'
+           : 'Posted (publish confirmed) — NOT yet feed-confirmed; a no-comment post has nothing to auto-detect a hold, so if this group reviews posts it may be in "Spam potentiel" — worth checking.');
         posted++; markDelivered(gid);
+        if (_wallStop) { // the post LANDED (confirmed by id/feed-rescan → counted + markDelivered above ⇒ NEVER re-posted), but Facebook then showed a rate/block wall → route this post's comment to a reserve and STOP the account.
+          const _k = _wallStop === 'blocked_account' ? 'account' : 'post';
+          step(_k === 'account' ? '🛑 Post landed, but Facebook then BLOCKED this account (red text) — stopping it (long cooldown); its comment + remaining groups go to reserves' : '🛑 Post landed, but Facebook then rate-limited the account (red text) — stopping it (pace too high); its comment + remaining groups go to reserves');
+          if ((post.comment && post.comment.trim()) || groupCommentImg) {
+            const _cap = (post.caption || '').replace(/\s+/g, ' ').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().slice(0, 40);
+            addCommentTask({ gid, groupName, postPermalink: postPermalink || null, postId: (basePost && basePost.id) || expectedPostId || null, captionSnip: _cap, postCaption: (post.caption || '').slice(0, 220), comment: post.comment || '', commentImg: groupCommentImg || null, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), reason: _wallStop });
+          }
+          noRetry = true; flag = 'rate_limited'; rlKind = _k; report(groupName, gid, 'posted', _k === 'account' ? 'account temporarily blocked' : 'posting rate-limited', ''); break;
+        }
 
         // First comment (often a link) — reload, find OUR post, comment in its box.
         // addFirstComment logs every stage itself (via the same step() logger). wantComment computed above
@@ -3226,7 +4026,12 @@ async function runAccount(o) {
           // ran the verify-reload), so Phase 2 navigates STRAIGHT to this post (and pre-loads it) instead of re-scanning
           // the feed. If the capture came up empty (short caption / slow feed) they're null → Phase 2 falls back to the
           // feed-scan for this one post, exactly as before.
-          _deferredComments.push({ gid, groupName, post, groupCommentImg, postPermalink, expectedPostId, capSnip, basePostId: (basePost && basePost.id) || null, idFromNetwork: _idFromNetwork });
+          _deferredComments.push({ gid, groupName, post, groupCommentImg, postPermalink, expectedPostId, capSnip, basePostId: (basePost && basePost.id) || null, idFromNetwork: _idFromNetwork, publishedAt: Date.now() }); // publishedAt anchors the post→link anti-spam floor in Phase 2 (see postLinkFloorOwed)
+          // v1.0.72 CRASH-DURABILITY: journal this deferred comment as a pending-comment obligation NOW — a hard-kill mid-Phase-2
+          // (before it's placed) would otherwise lose it (the post is markDelivered'd, so no re-post, but its link vanishes).
+          // The fold re-queues it for Phase-3 rescue on the next Start; addFirstComment is idempotent, so an already-placed one
+          // is a no-op. NOT added to commentQueue (Phase 2 still places it normally) — this is purely the crash safety net.
+          try { _jrnlObl('comment', { gid, groupName, postPermalink: postPermalink || null, postId: (basePost && basePost.id) || expectedPostId || null, captionSnip: capSnip, postCaption: (post.caption || '').slice(0, 220), comment: post.comment || '', commentImg: groupCommentImg || null, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), reason: 'deferred_crash' }); } catch {}
           commentResult = 'deferred';
           step('Post published — comment DEFERRED to the post-then-comment pass (Phase 2)');
         } else if (wantComment) {
@@ -3270,7 +4075,7 @@ async function runAccount(o) {
               await sleepInterruptible(gap, softStop, 500, isPaused, pauseHold);
             }
             cAttemptsActual++;
-            cres = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink, settings, expectedPostId, account.fbDisplayName);
+            cres = await addFirstComment(page, gid, post, groupCommentImg, step, postPermalink, settings, expectedPostId, account.fbDisplayName, false, _idFromNetwork); // preNavigated=false; forceContentVerify=_idFromNetwork so a single-phase NETWORK id is content-verified on the post's own page before commenting (never trust a network id blind)
           }
           commentResult = cres;
           // Did the comment actually land (or get submitted)? 'unconfirmed'/'not_visible' = Enter WAS
@@ -3279,6 +4084,15 @@ async function runAccount(o) {
           // 'blocked_*_landed' = the comment DID land but FB then walled the account — treat as LANDED (never
           // re-queue = never double-comment) while still cooling/stopping the account below.
           const _commentLanded = (cres === 'posted' || cres === 'unconfirmed' || cres === 'not_visible' || cres === 'none' || cres === 'blocked_account_landed' || cres === 'blocked_comment_landed');
+          // Feed the comment-side breaker. Uses commentOutcomeClass, NOT _commentLanded — see that helper for why the
+          // two must stay separate (_commentLanded means "Enter was pressed", which deliberately includes the
+          // provably-not-visible case; the breaker needs "a comment actually became VISIBLE"). 'unknown' neither
+          // increments nor resets, so real losses still accumulate across an unverifiable outcome.
+          {
+            const _cls = commentOutcomeClass(cres);
+            if (_cls === 'landed') { consecCommentFails = 0; anyCommentLanded = true; }
+            else if (_cls === 'lost') consecCommentFails++;
+          }
           if (cres === 'failed') step(`Comment: could not place the comment after ${cAttemptsActual} attempt(s) — left uncommented`);
           else if (cres === 'skipped') step('Comment: skipped (could not safely identify our post)');
           else if (cres === 'blocked_account' || cres === 'blocked_account_landed') {
@@ -3287,13 +4101,13 @@ async function runAccount(o) {
             step(cres === 'blocked_account_landed' ? '🛑 Comment landed, then Facebook blocked this account — stopping it (long cooldown); a reserve takes over (comment NOT re-queued)' : '🛑 Facebook temporarily blocked this account — stopping it (long cooldown); a reserve takes over its groups');
             flag = 'rate_limited'; rlKind = 'account'; noRetry = true;
           } else if (cres === 'blocked_comment' || cres === 'blocked_comment_landed') {
-            // COMMENT-ONLY limit: the account can still POST. Do NOT sideline it from posting — switch to
-            // comment-limited mode for the REST of this run: keep posting every group, and route each post's
-            // link-comment to a RESERVE (Phase-3 rescue). A pre-Enter blocked_comment IS queued below (non-landed);
-            // a blocked_comment_landed is NOT (the comment already landed — _commentLanded above excludes it).
-            commentLimited = true;
-            step(cres === 'blocked_comment_landed' ? '🛡️ Comment landed, then Facebook comment-limited this account — it KEEPS POSTING; later link-comments route to a reserve (this one NOT re-queued)' : '🛡️ Commenting rate-limited — account KEEPS POSTING; its link-comments are routed to a reserve this run');
-          }
+            // COMMENT limit → STOP THE ACCOUNT (operator policy): a comment-limit means the pace is too high, so
+            // continuing to post risks a deeper block. Stop now; the remaining groups' comments route to reserves.
+            // A pre-Enter blocked_comment IS queued below (non-landed); a *_landed is NOT (already placed → no double).
+            step(cres === 'blocked_comment_landed' ? '🛑 Comment landed, then Facebook comment-limited this account — stopping it; a reserve covers the rest (this one NOT re-queued)' : '🛑 Commenting rate-limited — stopping this account (pace too high); a reserve covers the rest');
+            flag = 'rate_limited'; rlKind = 'comment'; noRetry = true;
+          } else if (cres === 'blocked_login') { step('🛑 Logged out during the comment — stopping this account (re-login needed); a reserve covers the rest'); flag = 'needs_login'; noRetry = true; }
+          else if (cres === 'blocked_checkpoint') { step('🔐 Identity/checkpoint during the comment — stopping this account; a reserve covers the rest'); flag = 'needs_verification'; noRetry = true; }
           if (cres === 'notfound') {
             // Published but NEVER in the public feed after every retry → FB HELD it in "Spam potentiel".
             // A held post isn't public, so NO account (not even a healthy reserve) can comment on it — the
@@ -3302,18 +4116,18 @@ async function runAccount(o) {
             // public. (NOT the comment-rescue queue, which can't reach a non-public post.)
             posted = Math.max(0, posted - 1); pendingApproval++;
             step('Comment: ⚠️ post is HELD in "Spam potentiel" (published but not public) → routing to MODERATOR APPROVAL (a held post can\'t be commented by any account until it\'s approved)');
-            heldRecords.push({ postId: (basePost && basePost.id) || expectedPostId || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip || '', postCaption: (post.caption || '').slice(0, 220), groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: postPermalink || null, source: 'comment_notfound' });
+            addHeld({ postId: (basePost && basePost.id) || expectedPostId || null, gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: capSnip || '', postCaption: (post.caption || '').slice(0, 220), groupName, comment: post.comment || '', commentImg: groupCommentImg || null, postPermalink: postPermalink || null, source: 'comment_notfound' });
             report(groupName, gid, 'pending', 'held in Spam potentiel — awaiting moderator approval', 'skipped');
           } else if (!_commentLanded) {
             // The post is LIVE but its link-comment did not land. Queue it so a healthy reserve account
             // that is a member of this group places the comment later — a post is NEVER left without its
             // link. (postPermalink locates it directly; captionSnip is the feed-scan fallback.)
-            commentQueue.push({ gid, groupName, postPermalink: postPermalink || null, postId: (basePost && basePost.id) || expectedPostId || null, captionSnip: capSnip || '', postCaption: (post.caption || '').slice(0, 220), comment: post.comment || '', commentImg: groupCommentImg || null, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), reason: cres });
+            addCommentTask({ gid, groupName, postPermalink: postPermalink || null, postId: (basePost && basePost.id) || expectedPostId || null, captionSnip: capSnip || '', postCaption: (post.caption || '').slice(0, 220), comment: post.comment || '', commentImg: groupCommentImg || null, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), reason: cres });
             step('Comment: 📌 queued for rescue by a healthy account — this post will NOT be left without its link');
           }
-          if (cres === 'blocked_account' || cres === 'blocked_account_landed') {
-            report(groupName, gid, 'posted', 'account temporarily blocked', commentResult);
-            break; // FULL block → stop the account; comment-limit does NOT break (keeps posting, comments go to a reserve)
+          if (cres === 'blocked_account' || cres === 'blocked_account_landed' || cres === 'blocked_comment' || cres === 'blocked_comment_landed' || cres === 'blocked_login' || cres === 'blocked_checkpoint') {
+            report(groupName, gid, 'posted', cres.startsWith('blocked_account') ? 'account temporarily blocked' : cres.startsWith('blocked_comment') ? 'comment rate-limited' : cres === 'blocked_login' ? 'logged out' : 'checkpoint', commentResult);
+            break; // ANY limit (account/comment/login/checkpoint) → stop the account (operator policy); the non-landed comment was already queued to a reserve above
           }
         }
         // 'notfound' (held in Spam potentiel) already reported itself as 'pending' above — don't also
@@ -3358,7 +4172,8 @@ async function runAccount(o) {
       // Interruptible delay between groups (respects Stop + configurable groupDelay), jittered ±30%
       // so the cadence is never metronomic (a fixed gap is itself a bot signal).
       if (i < targetGroups.length - 1) {
-        const d = settings.speedMode === 'instant' ? rand(500, 1800) : withFloor(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).group); // T2: randomized inter-group gap. INSTANT trimmed 1–3s→0.5–1.8s (operator-requested; the next group already pre-loads during this, so it's pure anti-spam pacing — kept a 500ms floor + jitter so the cadence is never metronomic/sub-human on a single IP)
+        const _cfgGap = settings.speedMode === 'instant' ? rand(100, 1000) : withFloor(rangeMs(settings, 'groupDelayMin', 'groupDelayMax', 120, 300, 120) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).group); // T2: randomized inter-group gap. INSTANT 0.1–1s (operator-requested, was 0.5–1.8s; the next group already pre-loads during this gap, so it's pure anti-spam pacing — kept a ~100ms floor + jitter so it's never a literal-0 metronomic bot tell on a single IP. ⚠️ faster = more detectable; dial back up if blocks appear)
+        const d = Math.max(_cfgGap, (typeof ipPostGate === 'function') ? ipPostGate(_cfgGap) : 0); // #2/#13 OPT-IN per-IP aggregate cap: reserve on the PROJECTED post instant (now+_cfgGap) so the shared per-IP clock reflects when THIS post lands, not the boundary — the returned wait is ≥ _cfgGap when active, else 0 (off/proxied)
         if (d > 0) {
           step(`Wait ${d >= 60000 ? Math.round(d / 60000) + 'min' : Math.round(d / 1000) + 's'} before next group`);
           await sleepInterruptible(d, softStop, 1000, isPaused, pauseHold);
@@ -3378,7 +4193,9 @@ async function runAccount(o) {
         }
       }
     }
-    _closePrefetch(); // close any still-loading pre-fetch tabs (account finished/broke out of the loop)
+    if (_netCapture) { try { _netCapture.dispose(); } catch {} _netCapture = null; } // phase-1 end: dispose a link-capture left armed by a break/continue that skipped the finalize block (belt-and-braces — re-arm already cleans up per group)
+    if (_tabsWanted > 1) await _reapOrphans(); // phase-1 end: reap any FB popup / orphan before the pool resets
+    _endPostPhase(); // Note 1: keep the idle pool tabs so Phase 2 REUSES them (was _closePrefetch, which closed them → Phase 2 re-made from scratch). Non-two-phase / acct-down: they close with the browser at account end.
 
     // ===== PHASE 2 (two-phase / post-then-comment): every group now has its POST up — go back and place each
     // deferred first comment. SAFETY: every double-post trap already fired in Phase 1 (markDelivered at publish); a
@@ -3388,7 +4205,7 @@ async function runAccount(o) {
     // reserve rescue queue; notfound → held → moderator approval. Anything left unplaced routes to a reserve so a post
     // is NEVER left without its link.
     if (_twoPhase && _deferredComments.length) {
-      const routeToRescue = (dc, reason) => commentQueue.push({ gid: dc.gid, groupName: dc.groupName, postPermalink: dc.postPermalink || null, postId: dc.basePostId || dc.expectedPostId || null, captionSnip: dc.capSnip || '', postCaption: (dc.post.caption || '').slice(0, 220), comment: dc.post.comment || '', commentImg: dc.groupCommentImg || null, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), reason });
+      const routeToRescue = (dc, reason) => addCommentTask({ gid: dc.gid, groupName: dc.groupName, postPermalink: dc.postPermalink || null, postId: dc.basePostId || dc.expectedPostId || null, captionSnip: dc.capSnip || '', postCaption: (dc.post.caption || '').slice(0, 220), comment: dc.post.comment || '', commentImg: dc.groupCommentImg || null, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), reason });
       const acctDown = () => aborted || !browser || !browser.isConnected() || flag === 'rate_limited' || flag === 'needs_verification' || flag === 'needs_login' || flag === 'account_disabled' || flag === 'likely_blocked';
       if (acctDown()) {
         // The account fell over during the POST pass (block / checkpoint / dead browser) — it can't comment now, so
@@ -3407,12 +4224,12 @@ async function runAccount(o) {
         const _prefetchComment = (idx) => {
           if (_tabsWanted <= 1 || idx >= _deferredComments.length || _cpf.has(idx) || !browser || !browser.isConnected()) return;
           const pdc = _deferredComments[idx];
-          if (!pdc || !pdc.postPermalink) return; // no captured permalink → addFirstComment navigates it itself
+          if (!pdc || !pdc.gid) return; // pre-load THIS group's FEED (the permalink path is retired for identical-caption setups)
           _cpf.set(idx, (async () => {
             const e = await _acquireTab();
             if (!e) return null; // pool saturated → this comment navigates on the active tab (addFirstComment does its own goto)
             e.navs++;
-            const ok = await e.tab.goto(pdc.postPermalink, { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false);
+            const ok = await e.tab.goto('https://www.facebook.com/groups/' + pdc.gid + '?sorting_setting=CHRONOLOGICAL', { waitUntil: 'domcontentloaded', timeout: 90000 }).then(() => true).catch(() => false); // pre-load the group FEED — the group-scoped, id-strict feed-scan runs on it (addFirstComment skips its own feed goto when already on this group's feed)
             return { entry: e, ok };
           })().catch(() => null));
         };
@@ -3423,8 +4240,8 @@ async function runAccount(o) {
           if (isPaused && isPaused()) { if (watchdog) { clearTimeout(watchdog); watchdog = null; } if (waitIfPaused) await waitIfPaused(); armWatchdog(); if (shouldStop()) break; }
           const dc = _deferredComments[d];
           const cstep = createStepLogger(log, name, dc.groupName);
-          // Adopt the tab pre-loaded on THIS post's permalink (if any): rebind the CDP session to it, close the old tab
-          // (mirrors the posting-pass adopt). _preNav=true → addFirstComment skips its goto and comments on it directly.
+          // Adopt the tab pre-loaded on THIS group's FEED (if any): rebind the CDP session to it, release the old tab
+          // (mirrors the posting-pass adopt). _preNav=true → addFirstComment skips its own feed goto and scans the pre-loaded feed.
           let _preNav = false;
           if (_cpf.has(d)) {
             const pre = await _cpf.get(d); _cpf.delete(d);
@@ -3446,6 +4263,11 @@ async function runAccount(o) {
             const g = settings.speedMode === 'instant' ? rand(500, 1600) : withFloor(Math.round(rangeMs(settings, 'commentDelayMin', 'commentDelayMax', 60, 180, 30) * 0.4) * ((settings._behavior && settings._behavior.gapMult) || 1), antiSpamFloors(settings).comment); // INSTANT comment-to-comment cadence trimmed 0.8–2.5s→0.5–1.6s (link-drops are a touch more spam-sensitive than posts, so kept slightly above the post gap's floor)
             if (g > 0) await sleepInterruptible(g, softStop, 1000, isPaused, pauseHold);
           }
+          // POST→LINK anti-spam FLOOR (safe/fast): two-phase leans on natural aging between passes for the post→comment
+          // gap, but the ONLY / last-posted deferred comment aged just seconds — under safe/fast's load-bearing 30s floor
+          // (the exact post→instant-link spam pattern the floor exists to prevent). Guarantee each post→link gap ≥ the
+          // tier floor. A well-aged post (the common multi-group case) owes 0; max owes 0 (its small gaps are by design).
+          if (!softStop()) { const _owed = postLinkFloorOwed(settings, dc.publishedAt, Date.now()); if (_owed > 0) { cstep(`⏳ aging the post→link gap ${Math.round(_owed / 1000)}s (anti-spam floor before this deferred comment)`); await sleepInterruptible(_owed, softStop, 1000, isPaused, pauseHold); } }
           let cres = commentLimited ? 'comment_limited' : 'failed';
           if (commentLimited) cstep('Comment: account is comment-limited this run — routing this post\'s link-comment to a reserve');
           // Retry only on 'failed' (pre-Enter miss) — addFirstComment re-navigates each attempt and can NEVER
@@ -3456,30 +4278,55 @@ async function runAccount(o) {
               cstep(`Comment: retry ${cAttempt}/3 (waiting ${Math.round(gap / 1000)}s)`);
               await sleepInterruptible(gap, softStop, 500, isPaused, pauseHold);
             }
-            cres = await addFirstComment(page, dc.gid, dc.post, dc.groupCommentImg, cstep, dc.postPermalink, settings, dc.expectedPostId, account.fbDisplayName, _preNav && cAttempt === 1, dc.idFromNetwork); // pre-loaded tab only on the FIRST attempt; a retry lets addFirstComment re-navigate to the permalink. idFromNetwork → content-verify the post on its page before commenting (network id is a candidate)
+            cres = await addFirstComment(page, dc.gid, dc.post, dc.groupCommentImg, cstep, null, settings, dc.expectedPostId, account.fbDisplayName, _preNav && cAttempt === 1, dc.idFromNetwork); // RETIRED the permalink (identical captions + one account made it wrong-post-prone): pass permalink=null so Phase 2 comments via the GROUP-SCOPED, id-strict feed-scan. _preNav=true means the group FEED is pre-loaded (addFirstComment skips its feed goto only when already on THIS group's feed). expectedPostId still anchors the exact post when captured.
           }
           // 'blocked_*_landed' = the comment landed but FB then walled the account → treat as landed (do NOT route to
           // a reserve = no double-comment), while still stopping/cooling the account.
-          const landed = (cres === 'posted' || cres === 'unconfirmed' || cres === 'not_visible' || cres === 'none' || cres === 'blocked_account_landed' || cres === 'blocked_comment_landed');
+          const landed = (cres === 'posted' || cres === 'unconfirmed' || cres === 'not_visible' || cres === 'none' || cres === 'blocked_account_landed' || cres === 'blocked_comment_landed'); // ROUTING predicate ("was Enter pressed?") — deliberately generous so a maybe-placed comment is never re-queued (a double-comment). Do NOT use it for the breaker; that is commentOutcomeClass.
+          // Feed the comment-side breaker from Phase 2 as well. Without this the breaker was DEAD CODE in two-phase
+          // mode — it is written only from the inline branch, which two-phase never takes — so the operator's exact
+          // report ("keeps posting, never comments") reproduced here in its WORST form: the post pass publishes to
+          // EVERY group before the first comment is even attempted, so a suppressed account emits its whole batch
+          // link-less, every cycle. And because runAccount then returned {posted:N, flag:null}, the orchestrator scored
+          // it a CLEAN delivery and CLEARED rateLimitedUntil / rlStrikes / attnStrikes — actively rewarding it.
+          { const _c2 = commentOutcomeClass(cres); if (_c2 === 'landed') { consecCommentFails = 0; anyCommentLanded = true; } else if (_c2 === 'lost') consecCommentFails++; }
           if (cres === 'blocked_account') { flag = 'rate_limited'; rlKind = 'account'; noRetry = true; cstep('🛑 Facebook blocked this account during the comment pass — stopping it; the rest route to reserves'); routeToRescue(dc, 'blocked_account'); report(dc.groupName, dc.gid, 'posted', 'account temporarily blocked', cres); d++; break; }
           if (cres === 'blocked_account_landed') { flag = 'rate_limited'; rlKind = 'account'; noRetry = true; cstep('🛑 Comment landed, then Facebook blocked this account — stopping it; the rest route to reserves (this comment NOT re-queued)'); report(dc.groupName, dc.gid, 'posted', 'account temporarily blocked', cres); d++; break; }
-          if (cres === 'blocked_comment') { commentLimited = true; cstep('🛡️ Commenting rate-limited — this and the remaining comments route to reserves (account is done posting)'); routeToRescue(dc, 'blocked_comment'); report(dc.groupName, dc.gid, 'posted', '', cres); continue; }
-          if (cres === 'blocked_comment_landed') { commentLimited = true; cstep('🛡️ Comment landed, then Facebook comment-limited this account — later comments route to reserves (this one NOT re-queued)'); report(dc.groupName, dc.gid, 'posted', '', cres); continue; }
+          if (cres === 'blocked_comment') { flag = 'rate_limited'; rlKind = 'comment'; noRetry = true; cstep('🛑 Commenting rate-limited — stopping this account (pace too high); the rest route to reserves'); routeToRescue(dc, 'blocked_comment'); report(dc.groupName, dc.gid, 'posted', 'comment rate-limited', cres); d++; break; }
+          if (cres === 'blocked_comment_landed') { flag = 'rate_limited'; rlKind = 'comment'; noRetry = true; cstep('🛑 Comment landed, then Facebook comment-limited this account — stopping it; the rest route to reserves (this one NOT re-queued)'); report(dc.groupName, dc.gid, 'posted', 'comment rate-limited', cres); d++; break; }
+          if (cres === 'blocked_login') { flag = 'needs_login'; noRetry = true; cstep('🛑 Logged out during the comment pass — stopping this account; the rest route to reserves'); routeToRescue(dc, 'blocked_login'); report(dc.groupName, dc.gid, 'posted', 'logged out', cres); d++; break; }
+          if (cres === 'blocked_checkpoint') { flag = 'needs_verification'; noRetry = true; cstep('🔐 Checkpoint during the comment pass — stopping this account; the rest route to reserves'); routeToRescue(dc, 'blocked_checkpoint'); report(dc.groupName, dc.gid, 'posted', 'checkpoint', cres); d++; break; }
           if (cres === 'notfound') {
             // Published but never public after every retry → FB held it in "Spam potentiel". No account can comment a
             // non-public post — re-count it as PENDING and record it (with its comment) for MODERATOR approval.
             pendingApproval++; posted = Math.max(0, posted - 1);
-            heldRecords.push({ postId: dc.basePostId || dc.expectedPostId || null, gid: dc.gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: dc.capSnip || '', postCaption: (dc.post.caption || '').slice(0, 220), groupName: dc.groupName, comment: dc.post.comment || '', commentImg: dc.groupCommentImg || null, postPermalink: dc.postPermalink || null, source: 'comment_notfound' });
+            addHeld({ postId: dc.basePostId || dc.expectedPostId || null, gid: dc.gid, posterAccount: name, fbDisplayName: (account.fbDisplayName || '').trim(), captionSnip: dc.capSnip || '', postCaption: (dc.post.caption || '').slice(0, 220), groupName: dc.groupName, comment: dc.post.comment || '', commentImg: dc.groupCommentImg || null, postPermalink: dc.postPermalink || null, source: 'comment_notfound' });
             cstep('Comment: ⚠️ post is HELD in "Spam potentiel" (published but not public) → routing to MODERATOR APPROVAL');
             report(dc.groupName, dc.gid, 'pending', 'held in Spam potentiel — awaiting moderator approval', 'skipped');
             continue;
           }
-          if (!landed) { routeToRescue(dc, cres); cstep('Comment: 📌 queued for rescue by a healthy account — this post will NOT be left without its link'); report(dc.groupName, dc.gid, 'posted', '', cres); continue; }
-          cstep('Comment: placed');
-          report(dc.groupName, dc.gid, 'posted', '', cres); // update the group's comment status from 'deferred' to its real outcome (mirrors the inline path's final report)
+          if (!landed) { routeToRescue(dc, cres); cstep('Comment: 📌 queued for rescue by a healthy account — this post will NOT be left without its link'); report(dc.groupName, dc.gid, 'posted', '', cres); }
+          else { cstep('Comment: placed'); report(dc.groupName, dc.gid, 'posted', '', cres); } // update the group's comment status from 'deferred' to its real outcome (mirrors the inline path's final report)
+          // ACT on the streak. The posting loop has already closed by the time Phase 2 runs, so its loop-top check can
+          // never fire from here — the earliest this can stop the account is the NEXT cycle, and that only happens if we
+          // set a flag: otherwise runAccount returns {posted:N, flag:null}, which the orchestrator scores as a CLEAN
+          // delivery and uses to CLEAR rateLimitedUntil / rlStrikes / attnStrikes. So a comment-suppressed account did
+          // not merely go unpunished — it had its rest ladder wiped every cycle. Stop the pass and rest it instead: the
+          // remaining deferred comments route to rescue (below), which is strictly better than a dead account
+          // hand-placing them. Same transient/block split as the inline twin.
+          {
+            const _cfd2 = commentFailureDecision(consecCommentFails, anyCommentLanded);
+            if (_cfd2) {
+              noRetry = true;
+              if (_cfd2 === 'block') { flag = 'rate_limited'; rlKind = 'comment'; cstep('🛑 3 comment failures in a row and NOT ONE comment has landed this run — Facebook is suppressing this account\'s comments. Stopping the comment pass and resting it; the remaining comments route to rescue. Without this it would post its whole batch link-less again next cycle.'); }
+              else cstep('⚠️ 3 comment failures in a row, but this account DID land one earlier this run — treating as transient (FB hiccup). Stopping the comment pass this cycle; the remaining comments route to rescue.');
+              d++; break;
+            }
+          }
         }
         // Anything left unprocessed (Stop or a block broke the pass early) → rescue so no post is left without its link.
         for (; d < _deferredComments.length; d++) routeToRescue(_deferredComments[d], 'comment_pass_interrupted');
+        if (_tabsWanted > 1) await _reapOrphans(); // phase-2 end: reap any FB popup / orphan
         _closeCpf(); // close any still-loading prefetch comment tabs (pass finished or broke out early)
       }
     }
@@ -3491,7 +4338,15 @@ async function runAccount(o) {
       // problem. If we're OFFLINE, mark offline (the orchestrator HOLDS + re-runs next cycle, account untouched)
       // instead of 'likely_blocked' — which would wrongly drop it + trigger a needless reserve takeover / alert.
       if (typeof isOnline === 'function' && !(await isOnline())) offline = true;
-      else flag = 'likely_blocked';
+      else {
+        // D (false-bench guard — the d4 case): an account that has ALREADY delivered today is provably NOT blocked, so a
+        // single 0-posted cycle caused by transient single-IP composer/feed misses must NOT escalate to 'likely_blocked'
+        // (which drops the account, fires a "check this on Facebook" alert, and triggers a needless reserve takeover).
+        // FAILS SAFE toward FB: only suppress when there is POSITIVE evidence of health (it posted >0 today, read from the
+        // persisted daily count updated after each prior cycle); an account that has posted NOTHING today still benches.
+        if (deliveredToday()) log(`⚠️ [${name}] posted 0 this cycle (transient composer/feed misses) but it already delivered today — NOT flagging as blocked; it retries next cycle.`); // #7: shared probe (see deliveredToday helper)
+        else flag = 'likely_blocked';
+      }
     }
     // Persist refreshed cookies for next run — but ONLY if the session is still valid. If the run ended
     // on a logged-out/checkpoint wall (needs_login/needs_verification/account_disabled, or the jar lost
@@ -3533,7 +4388,11 @@ async function runAccount(o) {
   }
   // fullyPosted = the post landed in EVERY targeted group, none pending, no errors — only then is it
   // safe to auto-delete from the library (a partial publish must be kept). See orchestrator deal gate.
-  return { posted, errors, pendingApproval, noRetry, flag, rlKind, offline, heldRecords, commentQueue, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length && !droppedImage };
+  // commentLost / commentLanded: the comment-health signal the ORCHESTRATOR accumulates ACROSS cycles
+  // (acc.commentFails). consecCommentFails is a run-local, so an account with fewer than 3 groups can never reach the
+  // in-run threshold on its own — it just re-posts link-less every cycle forever. Persisting it is what makes the
+  // breaker reachable for a 2-group account.
+  return { posted, errors, pendingApproval, noRetry, flag, rlKind, offline, commentLost: consecCommentFails, commentLanded: anyCommentLanded, targetCount: targetGroups.length, heldRecords, commentQueue, fullyPosted: errors === 0 && pendingApproval === 0 && posted === targetGroups.length && !droppedImage };
 }
 
 // Cookie normalizer — consolidated into lib/store (SINGLE source, shared with main.js). Re-exported below so
@@ -3541,10 +4400,10 @@ async function runAccount(o) {
 const normalizeCookie = store.normalizeCookie;
 
 module.exports = {
-  runAccount, parseProxy, normalizeCookie, addFirstComment, killChromiumForProfile,
+  runAccount, parseProxy, normalizeCookie, addFirstComment, killChromiumForProfile, sweepOrphanTemps,
   // exported for diagnostics — use the EXACT worker logic
-  clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish, credentialLogin, moveMouseTo, behaviorFor,
+  clickFirst, openComposerByText, openComposer, focusEditable, humanType, dismissPopups, clickPostButton, waitForPublish, publishWaitCeilingMs, mixedPushbackDecision, commentFailureDecision, commentOutcomeClass, composerOpenAttempts, watchdogTickDecision, credentialLogin, moveMouseTo, behaviorFor,
   // exported for tests (no runtime effect)
-  jitter, rand, rangeMs, withFloor, ANTI_SPAM_MIN_GROUP_MS, ANTI_SPAM_MIN_COMMENT_MS, antiSpamFloors, isTurboMode, humanDelay, isFastMode, applyPace, varyLinks, retryAsync, downloadImage, isSafeImageUrl, proxyFormatHint, classifyProxyError, proxyErrorHint, classifyGroupError,
+  jitter, rand, rangeMs, withFloor, ANTI_SPAM_MIN_GROUP_MS, ANTI_SPAM_MIN_COMMENT_MS, antiSpamFloors, postLinkFloorOwed, humanDelay, isFastMode, applyPace, varyLinks, retryAsync, downloadImage, isSafeImageUrl, proxyFormatHint, classifyProxyError, proxyErrorHint, classifyGroupError,
   FB, isRateLimitText, isCheckpointText, isPendingText, isPostButtonLabel, isCommentBoxLabel,
 };

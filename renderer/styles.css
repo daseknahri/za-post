@@ -252,14 +252,21 @@
   background: rgba(21, 27, 48, 0.5);
   backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.05);
-  border-radius: 12px;
-  padding: 12px 14px;
-  transition: all 0.3s ease;
+  border-radius: 11px;
+  padding: 9px 11px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }
 
 .account-card:hover {
   border-color: rgba(52, 211, 153, 0.2);
   box-shadow: 0 0 20px rgba(52, 211, 153, 0.08);
+}
+
+/* While a dropdown/overflow menu is open, lift the whole card above its grid neighbours so the popover isn't hidden
+   under the next card (each card is its own stacking context because of backdrop-filter). */
+.account-card.menu-open {
+  z-index: 40;
+  position: relative;
 }
 
 .account-card .account-name {
@@ -305,13 +312,14 @@
 
 .account-card .account-actions {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
-  margin-top: 12px;
+  margin-top: 8px;
+  align-items: center;
 }
 
 .account-card .account-actions button {
-  padding: 6px 14px;
+  padding: 6px 11px;
   border-radius: 8px;
   font-size: 12px;
   cursor: pointer;
@@ -331,20 +339,20 @@
 .account-header {
   display: flex;
   align-items: flex-start;
-  gap: 14px;
-  margin-bottom: 14px;
+  gap: 10px;
+  margin-bottom: 8px;
 }
 
 .account-avatar {
-  width: 44px;
-  height: 44px;
-  min-width: 44px;
-  border-radius: 12px;
+  width: 34px;
+  height: 34px;
+  min-width: 34px;
+  border-radius: 10px;
   background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 18px;
+  font-size: 15px;
   font-weight: 700;
   color: #fff;
   flex-shrink: 0;
@@ -369,8 +377,8 @@
 
 /* ---------- Collapsible card section (proxy / fb-name) ---------- */
 .acc-section {
-  margin: 10px 0;
-  border-radius: 10px;
+  margin: 5px 0;
+  border-radius: 9px;
   background: rgba(15, 23, 42, 0.7);
   border: 1px solid rgba(255, 255, 255, 0.06);
   overflow: hidden;
@@ -402,6 +410,28 @@
   opacity: 0.7;
   flex-shrink: 0;
 }
+
+/* ---------- Compact accounts view (smallest cards — scan & bulk-select many) ---------- */
+body.accounts-compact #accounts-container .account-groups,
+body.accounts-compact #accounts-container .account-posting-method,
+body.accounts-compact #accounts-container .acc-section { display: none !important; }
+body.accounts-compact #accounts-container .account-card { padding: 6px 10px; }
+body.accounts-compact #accounts-container .account-header { margin-bottom: 4px; }
+body.accounts-compact #accounts-container .account-actions { margin-top: 6px; gap: 5px; }
+body.accounts-compact #accounts-container .account-actions button { padding: 5px 9px; font-size: 12px; }
+body.accounts-compact #accounts-container .acct-meta-2 { display: none; } /* hide last-checked / chrome-status meta in compact */
+body.accounts-compact #accounts-container .btn-label { display: none; } /* icon-only action buttons in compact (hover shows the tooltip) */
+body.accounts-compact #accounts-container .acct-pill-default { display: none; } /* hide the default Active/Primary pills in compact (only exceptions Excluded/Standby show) */
+
+/* ---------- Compact posts view (EXTRA small — dense grid, tiny thumbnail, no caption) ---------- */
+body.posts-compact #posts-container .post-card img,
+body.posts-compact #posts-container .post-image { height: 64px !important; object-fit: cover; }
+body.posts-compact #posts-container .post-content { padding: 5px 7px; }
+body.posts-compact #posts-container .post-caption { display: none !important; }
+body.posts-compact #posts-container .post-actions { padding: 5px 7px; }
+body.posts-compact #posts-container .post-textonly { min-height: 46px !important; padding: 8px !important; }
+body.posts-compact #posts-container .post-textonly span { font-size: 11px !important; margin-left: 6px !important; }
+body.posts-compact #posts-container .post-card { border-radius: 10px; }
 
 .acc-section-body {
   padding: 0 12px 12px;
