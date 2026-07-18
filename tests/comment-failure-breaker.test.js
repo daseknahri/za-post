@@ -166,3 +166,88 @@ test('[live] a healthy account is never touched by the persisted counter', () =>
   for (let i = 0; i < 10; i++) { if (true) acc.commentFails = 0; } // every cycle lands a comment
   assert.equal(acc.commentFails, 0, 'an account whose comments land never accumulates');
 });
+
+// ── REAL _recordAccountOutcome across cycles — the tests above SIMULATE the accumulator inline, so they passed while
+// the real code wiped the rest. These drive the actual orchestrator + store and would have caught the collision:
+// the comment breaker set rateLimitedUntil at :1587, then the "recovered → clear" branch at :1650 (a commentless
+// account still satisfies posted>0 && !flag) wiped it in the SAME store.update — leaving the account posting
+// commentless forever. Proven at runtime (8 cycles of lost comments → 0 surviving rests) before the fix.
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const store = require('../lib/store');
+const { Orchestrator } = require('../automation/orchestrator');
+
+// Drive N cycles of an account (with `groups` groups) through the REAL _recordAccountOutcome, skipping a cooling cycle
+// exactly as the live pre-launch gate does. Each posting cycle loses `lossesPerCycle` comments (a realistic all-fail
+// cycle is lossesPerCycle === groups). Returns {cyclesPosted, rested} — how many cycles posted before it actually rested.
+async function runCommentCycles(perCycle, n, groups = 2) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cbrk-'));
+  try {
+    store.init(tmp);
+    const assignedGroups = Array.from({ length: groups }, (_, i) => 'g' + (i + 1));
+    store.save({ posts: [], groups: [], accounts: [{ name: 'x', assignedGroups, enabled: true, status: 'logged_in', daily: {} }], settings: {}, proxies: [] });
+    const o = new Orchestrator(() => {}, {});
+    let cyclesPosted = 0, everRested = false;
+    for (let c = 0; c < n; c++) {
+      const cur = store.load().accounts.find((a) => a.name === 'x');
+      if ((Number(cur.rateLimitedUntil) || 0) > Date.now()) continue; // cooling → the pool skips it (no browser, no post)
+      await o._recordAccountOutcome('x', { posted: 1, pendingApproval: 0, errors: 0, flag: null, postedIds: [], dealtIds: [], ...perCycle }, { rateLimitCooldownHours: 4 });
+      cyclesPosted++;
+      if ((Number(store.load().accounts.find((a) => a.name === 'x').rateLimitedUntil) || 0) > Date.now()) everRested = true;
+    }
+    return { cyclesPosted, rested: everRested };
+  } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {} }
+}
+
+test('[live·real] a comment-dead account ACTUALLY rests — the breaker survives the recovered-clear (the bug)', async () => {
+  // Every cycle: posts fine, comment LOST. Before the fix rateLimitedUntil was set at :1587 then wiped at :1650 in the
+  // same write, so the account posted commentless forever. Now the rest survives and the pool skips it.
+  const r = await runCommentCycles({ commentLost: 1, commentLanded: false }, 8, 2);
+  assert.ok(r.rested, 'the account MUST actually rest once its comments stop landing — otherwise it posts commentless forever');
+});
+
+test('[live·real] group-aware threshold: a 2-group account rests after ONE fully-failed cycle (2 commentless, not 4)', async () => {
+  // The operator's fleet is 2-group accounts. A realistic all-fail cycle loses BOTH comments → commentFails hits the
+  // group-aware threshold (2) in ONE cycle, halving the pre-rest exposure vs the old flat 3 (which needed 2 cycles).
+  const r = await runCommentCycles({ commentLost: 2, commentLanded: false }, 8, 2);
+  assert.ok(r.rested, 'a 2-group account whose comments all fail must rest');
+  assert.equal(r.cyclesPosted, 1, 'it rests after ONE fully-failed cycle — 2 commentless posts, not 4');
+});
+
+test('[live·real] group-aware threshold: a wide (3-group) account keeps the original confidence (threshold 3)', async () => {
+  // Cap at 3: a wide account still needs 3 losses, so a single dropped comment among many never rests it.
+  const r1 = await runCommentCycles({ commentLost: 3, commentLanded: false }, 8, 3);
+  assert.equal(r1.cyclesPosted, 1, 'a 3-group all-fail cycle (3 losses) rests after one cycle');
+  const r2 = await runCommentCycles({ commentLost: 1, commentLanded: false }, 2, 5); // 1 loss/cycle × 2 cycles = 2 losses
+  assert.ok(!r2.rested, 'a 5-group account with only 2 accumulated losses stays UNDER threshold 3 — an isolated drop never rests a wide account');
+});
+
+test('[live·real] an UNCONFIRMED comment (max-mode, unknown) never rests a healthy account (no false positive)', async () => {
+  // In speedMode=max the confirm re-scan is skipped, so most comments are 'unconfirmed' → commentLost:0, commentLanded:false
+  // (neither a win nor a loss). Such an account is posting fine and MUST NOT be rested, or max mode would bench the fleet.
+  const r = await runCommentCycles({ commentLost: 0, commentLanded: false }, 10, 2);
+  assert.ok(!r.rested, 'an unconfirmed (unknown) comment outcome must never accumulate a rest');
+  assert.equal(r.cyclesPosted, 10, 'the account keeps working every cycle (nothing is actually failing)');
+});
+
+test('[live·real] comments recovering clears the rest — a healthy account is not stuck resting', async () => {
+  // Rest the account (2 lost cycles → trips), then feed a landed comment: rlStrikes/rateLimitedUntil must clear so a
+  // recovered account rejoins rather than ratcheting forever.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cbrk-'));
+  try {
+    store.init(tmp);
+    store.save({ posts: [], groups: [], accounts: [{ name: 'x', assignedGroups: ['g1', 'g2'], enabled: true, status: 'logged_in', daily: {} }], settings: {}, proxies: [] });
+    const o = new Orchestrator(() => {}, {});
+    const rec = (r) => o._recordAccountOutcome('x', { posted: 1, pendingApproval: 0, errors: 0, flag: null, postedIds: [], dealtIds: [], ...r }, { rateLimitCooldownHours: 4 });
+    await rec({ commentLost: 1, commentLanded: false });
+    await rec({ commentLost: 1, commentLanded: false });
+    await rec({ commentLost: 1, commentLanded: false }); // trips → rested
+    // force the cooldown into the past to simulate its expiry, then a clean (comments-landing) cycle
+    await store.update((d) => { const a = d.accounts.find((x) => x.name === 'x'); if (a) a.rateLimitedUntil = Date.now() - 1000; });
+    await rec({ commentLost: 0, commentLanded: true });
+    const acc = store.load().accounts.find((a) => a.name === 'x');
+    assert.equal(Number(acc.rateLimitedUntil) || 0, 0, 'a landed comment after the rest expires clears the cooldown');
+    assert.equal(Number(acc.rlStrikes) || 0, 0, 'and clears the strike ladder — the account is fully recovered');
+  } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {} }
+});

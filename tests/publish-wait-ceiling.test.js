@@ -35,18 +35,20 @@ test('publishWaitCeilingMs: tolerates a non-numeric streak (defensive → full c
 
 // #3: composer-open attempts — FULL (4) on a healthy account (a slow feed needs the retries); cut to 2 once FB is
 // already pushing the account back so it reaches backoff fast instead of idling ~30s on an unloadable group.
-test('composerOpenAttempts: healthy account (no pushback) gets the FULL retry budget', () => {
-  assert.equal(composerOpenAttempts(0), 4);
+test('composerOpenAttempts: healthy account (no pushback) gets 2 attempts (v1.0.138: trimmed 4→2)', () => {
+  // Measured over 3 live days: attempt 2 recovered 167 composers; attempts 3 & 4 recovered 3 & 0, while each burns a
+  // ~9s hard waitForSelector on a starved feed. So FULL is 2 — keep attempt 2 (the real recoveries), drop the dead wait.
+  assert.equal(composerOpenAttempts(0), 2);
 });
 
-test('composerOpenAttempts: once FB is pushing back (pushback>0), attempts are cut so the account bails fast', () => {
+test('composerOpenAttempts: once FB is pushing back (pushback>0), attempts stay at 2 so the account bails fast', () => {
   assert.equal(composerOpenAttempts(1), 2);
   assert.equal(composerOpenAttempts(3), 2);
 });
 
 test('composerOpenAttempts: always makes at least the first attempt, and tolerates a non-numeric count', () => {
   assert.ok(composerOpenAttempts(1) >= 1 && composerOpenAttempts(0) >= 1, 'never zero attempts');
-  assert.equal(composerOpenAttempts(undefined), 4, 'undefined → treated as 0 → full budget (never accidentally short)');
+  assert.equal(composerOpenAttempts(undefined), 2, 'undefined → treated as 0 → the (now 2-attempt) full budget');
 });
 
 // #5: the per-account watchdog no longer re-extends the full budget FOREVER on a live-but-stuck browser. It extends while

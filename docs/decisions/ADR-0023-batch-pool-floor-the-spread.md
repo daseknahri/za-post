@@ -1,6 +1,6 @@
 # ADR-0023: Batch/Pool — floor the spread, unbind the pool, earn the ledger
 
-- **Status:** Accepted (direction). Phases 1–4 approved; Phases 5–6 **evidence-gated and may correctly never ship.**
+- **Status:** Accepted (direction). **Phases 1–2 shipped v1.0.131** (see *Phase 1–2 as built* below — implementing them corrected three claims made here). Phases 3–4 approved; Phases 5–6 **evidence-gated and may correctly never ship.**
 - **Date:** 2026-07-17
 - **Deciders:** owner + engineering
 - **Relates to:** ADR-0019 (campaign plan frozen within a round), ADR-0020 (interchangeable account pool — superseded by this), ADR-0021 (**rejected** — owed ledger for unique/sequence), ADR-0022 (owed-ledger coherence)
@@ -46,6 +46,40 @@ There is also a deeper defect to *measure* before rewriting anything: Pass 2 pac
 - The partition property holds for **any** `Keff` (`idx % Keff === rank`; ranks `0..Keff-1` non-empty, the rest `[]`). Verified by execution over the live topology (P=30, globalMaxLen=8): K=4/5/6 → **30/30 covered, 0 dupes, 0 empty**.
 - **It lands with NO fingerprint change and NO Start Fresh.** `loopCampaign=true` is live and `orchestrator.js:3339` recomputes the plan **unconditionally** at each round boundary from live settings, never consulting `batchId`. With a 6–8 post slice at `cyclesPerDay=20`, the boundary arrives **every ~1–2 hours**. ADR-0019's freeze stays intact.
 
+## Phase 1–2 as built (v1.0.131) — three corrections to this ADR
+
+Implementing the phases refuted three things written above. Recorded here because the next reader will otherwise
+re-derive them the expensive way.
+
+1. **The dial is INERT below the natural `Keff` — and this ADR never says so.** `Keff` is already
+   `ceil(cPosts.length / globalMaxLen)`; the floor only raises it. On the live topology (P=30, `globalMaxLen`=8) the
+   natural `Keff` is **4**, so `campaignMinAgents` of 2, 3 or **4 does literally nothing** — un-benching all five
+   accounts needs **6**. The natural `Keff` was invisible to the operator, so the dial would read as broken and steer
+   them to **Start Fresh** = a whole-library re-burst. **That operator inference — not any code path — is the most
+   plausible re-burst route in Phase 1.** Mitigated by the mandatory `🪑 Campaign Plan seats` readout, which states
+   seats-per-cluster and echoes the dial. A dial you cannot see the effect of is a dial that gets misused.
+2. **The prize is smaller than "the bleeding wound" implies: the floor buys ZERO extra posts.** A cluster delivers its
+   post-set exactly once per round for **any** `Keff` — the floor redistributes the same work across more accounts, so
+   the cluster finishes in **fewer days** and then idles until the pace-setter catches up. Measured: at K=6/P=30 the
+   slices go `[8,8,7,7,0,0]` → `[5,5,5,5,5,5]`, i.e. the cluster spans **5 days instead of 8 — a ~+58% daily volume**
+   into its groups, on an IP whose anti-spam floors are already bypassed (`speedMode:'max'`, `dailyCap:0`). Open Risk
+   #1 below is therefore **sized, not settled**. The dial ships **default 0 (off)**; turning it on is an operator
+   decision that wants the live measurement first.
+3. **`clampSettings` has no key whitelist — the clamp is load-bearing, not hygiene.** An unknown key persists
+   **untouched**, so a hand-edited `data.json` or the HTTP API can land `campaignMinAgents:'garbage'` in Pass 2 →
+   `Keff` is `NaN` → `rank < NaN` is false for **every** rank → **every agent benched, the campaign delivers nothing.**
+   Both `clampSettings` and the engine re-clamp defensively; a test pins `garbage → today's behavior`.
+
+Two further notes for whoever does Phase 3+:
+
+- **Reloop timing is provably unchanged** by the floor: `globalMaxLen` is computed from **Pass 1** before Pass 2 runs,
+  and Pass 2 never touches the pace-setting cluster — so flooring can only ever *shorten* a slice. The reloop still
+  waits on the pace-setter. (The feared "floors make the round recycle faster → more re-bursts" does not happen.)
+- **The testing note below was imprecise about the mechanism.** The crash-fold is a *no-op on the healthy path*
+  (a clean commit leaves no journal survivors). The real amnesia is the **head of `_loop` re-reading disk every cycle
+  plus `start()`'s per-run flag resets** — which is why `tests/helpers/ncycle.js` drives N cycles through **one
+  `_loop` invocation**, not N `start()` calls. Same conclusion, different reason.
+
 ## Rejected (with reasons — do not re-tread)
 
 - **Big-bang pull-dispatch as Phase 1.** Rewrites a 3,900-line crown jewel that has produced a HIGH double-post on nearly every recent change — to fix five benched accounts, while adding zero throughput (pool bound at 3).
@@ -72,6 +106,6 @@ There is also a deeper defect to *measure* before rewriting anything: Pass 2 pac
 
 ## Open risks (need a live run to settle)
 
-- Whether flooring `Keff` re-introduces the burst that the spread was written to prevent — at `cyclesPerDay=20` the day-model is already broken, so this must be **measured**, not assumed.
+- Whether flooring `Keff` re-introduces the burst that the spread was written to prevent — at `cyclesPerDay=20` the day-model is already broken, so this must be **measured**, not assumed. **Update (v1.0.131): now sized — `campaignMinAgents=6` on the live topology compresses that cluster from 8 days to 5, ~+58% daily volume into its groups. Still not settled: whether those groups tolerate it. The dial is default-off pending that measurement.**
 - Whether the five benched accounts are healthy enough to add throughput, or merely add exposure on one IP.
 - Whether Phase 3's real ceiling is hardware, Facebook, or the IP.

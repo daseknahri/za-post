@@ -35,3 +35,17 @@ test('mixedPushbackDecision: tolerates a non-numeric count (defensive → treate
   assert.equal(mixedPushbackDecision(undefined, false), null);
   assert.equal(mixedPushbackDecision(null, true), null);
 });
+
+// ── composerOpenAttempts: how many composer-open tries before skipping (v1.0.138: trimmed 4→2) ────────
+// Measured over 3 live days: attempt 2 recovered 167 composers; attempts 3 & 4 recovered 3 & 0, while each terminal
+// attempt burns a ~9s hard waitForSelector on a starved feed (~18s of dead wait before the skip). So FULL is now 2.
+// Read-only pre-publish path (nothing clicked/submitted) → fewer attempts can NEVER double-post.
+const { composerOpenAttempts } = require('../automation/worker');
+test('composerOpenAttempts: healthy account gets 2 attempts (was 4) — keeps attempt 2, drops the ~0-recovery 3rd/4th', () => {
+  assert.equal(composerOpenAttempts(0), 2, 'no pushback → 2 attempts (attempt 1 + the one that does the real recoveries)');
+  assert.ok(composerOpenAttempts(0) >= 2, 'never fewer than 2 — attempt 2 does the bulk of composer recoveries');
+});
+test('composerOpenAttempts: a pushed-back account (pushback>=1) stays at 2 — reaches its backoff fast', () => {
+  assert.equal(composerOpenAttempts(1), 2);
+  assert.equal(composerOpenAttempts(5), 2);
+});

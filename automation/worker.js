@@ -1010,12 +1010,14 @@ function commentOutcomeClass(cres) {
   }
 }
 
-// #3 (time-waste): how many composer-open attempts to make. FULL (4) on a fresh/healthy account — a slow / hidden /
-// proxied feed legitimately needs the retries. But once FB is already pushing this account back (pushback>0), the feed
-// usually won't render at all, so 4 attempts just idle ~30s before the skip — cut to 2 so the account reaches its
-// backoff fast instead of hammering an unloadable group. The FIRST attempt is always made. This is a READ-ONLY
-// pre-publish path (nothing is clicked/submitted), so fewer attempts can NEVER cause a double-post.
-function composerOpenAttempts(pushback, fullAttempts = 4, throttledAttempts = 2) {
+// #3 (time-waste): how many composer-open attempts to make. Measured over 3 live days: attempt 2 recovered 167 composers,
+// but attempts 3 and 4 recovered only 3 and 0 — while EACH terminal attempt burns a hard 9s waitForSelector (~18s of dead
+// wait) on a fully-starved feed before the skip. So FULL is now 2 (keep attempt 2 — it does the bulk of the real
+// recoveries), not 4. A feed that fails all attempts yields a partition-guarded reserve takeover (a normal single post),
+// never a re-burst. Once FB is already pushing back (pushback>0) the feed usually won't render at all → stay at 2 so the
+// account reaches its backoff fast. The FIRST attempt is always made. READ-ONLY pre-publish path (nothing clicked/
+// submitted), so fewer attempts can NEVER cause a double-post and never touch the publish-confirm.
+function composerOpenAttempts(pushback, fullAttempts = 2, throttledAttempts = 2) {
   return (Number(pushback) || 0) >= 1 ? throttledAttempts : fullAttempts;
 }
 
@@ -3333,9 +3335,12 @@ async function runAccount(o) {
           }
           groupImages = vi;
           if (groupCommentImg) { const cv = await imageVary.varyImage(groupCommentImg, `${name}|${gid}|c|${groupCommentImg}|${runSalt}`); if (cv) { groupCommentImg = cv; tempImages.push(cv); _anyVaried = true; } }
-          // Truthful log: varyImage returns null for a format jimp can't read (notably WEBP) → the ORIGINAL uploads,
-          // identically to every group (image-dedup risk). Say so instead of a misleading "Image varied".
-          step(_anyVaried ? 'Image varied (unique hash for this group)' : '⚠️ Image NOT varied (jimp can\'t read this format, e.g. webp) — uploading the ORIGINAL, which is identical for every group (image-dedup risk). Use JPG/PNG for per-group variation.');
+          // Truthful log: varyImage returns null on ANY failure. Report the REAL reason (was hard-coded to blame "webp",
+          // which misdiagnosed the actual cause — the library is all JPEG; the failures were writeAsync errors on a
+          // near-full disk under heavy browser load). Only say "webp" after a magic-byte check; otherwise surface the
+          // real error so the operator fixes the right thing (free disk / fewer parallel browsers).
+          if (_anyVaried) step('Image varied (unique hash for this group)');
+          else { const _src = resolvedImages[0] || ''; const _why = imageVary.isWebp(_src) ? 'jimp can\'t read WEBP — convert the image to JPG/PNG' : `vary failed (likely low disk / heavy load: ${imageVary.lastVaryError() || 'unknown'}) — free space on the data drive or lower parallel browsers`; step(`⚠️ Image NOT varied (${_why}) — uploading the ORIGINAL, identical for every group (image-dedup risk).`); }
         }
 
         // CAPTION single-entry helper — declared at composer scope so BOTH the caption-first entry AND the post-image
@@ -3819,7 +3824,9 @@ async function runAccount(o) {
           if (!_netPost) { const _c2 = _capMiss >= 2 ? 3 : (isFastMode(settings) ? 20 : 28); for (let i = 0; i < _c2 && !_netCapture.get(); i++) await sleep(150); _netPost = _netCapture.get(); } // ~0.45s warmed-down, else ~3s/4.2s; exits early on a hit
           const _cs = _netCapture.stats(); try { _netCapture.dispose(); } catch {} _netCapture = null; // value read into _netPost → dispose the listener now (nulled so re-arm / after-loop don't re-dispose)
           _capMiss = _netPost ? 0 : _capMiss + 1; // track the consecutive-empty streak (per account) to warm the finalize wait down/up
-          if (_netPost) step(`🔗 Captured the post's link from Facebook's publish response (id=${_netPost.postId}) — commenting via the direct link (feed re-scan skipped)`);
+          if (_netPost) step(_twoPhase
+            ? `🔗 Captured the post's id from Facebook's publish response (id=${_netPost.postId}) — Phase 2 comments via the id-strict group feed-scan (direct permalink retired for identical-caption safety)`
+            : `🔗 Captured the post's link from Facebook's publish response (id=${_netPost.postId}) — commenting via the direct link (feed re-scan skipped)`);
           else step(`link-capture empty (${_cs.ambiguous ? 'AMBIGUITY-REJECT: multiple same-group ids in the response' : _cs.sawCreate ? 'create-story seen but its gid-scoped URL did not arrive in time' : 'no create-story response seen'}) — using the guarded feed-scan`);
         }
         if (wantComment && _netPost && _netPost.postId && !pendingAtPublish) { // trusted gid-scoped id (any comment post, both phases) → comment via the direct link; a PENDING post skips this (its own permalink may be member-invisible if held) and takes the verify-reload/held path
@@ -3832,7 +3839,9 @@ async function runAccount(o) {
           postPermalink = _netPost.url;
           _idFromNetwork = true;
           feedConfirmed = true; // FB confirmed the create + gave us the id — a genuine confirmed delivery
-          step(`Confirmed via the publish response (id=${expectedPostId}) — commenting via the direct link; skipped the feed re-scan`);
+          step(_twoPhase
+            ? `Confirmed via the publish response (id=${expectedPostId}) — Phase 2 will place the comment via the id-strict group feed-scan`
+            : `Confirmed via the publish response (id=${expectedPostId}) — commenting via the direct link; skipped the feed re-scan`);
         } else if (pendingAtPublish || !wantComment || (_captureForTwoPhase && !_skipInlineVerify)) {
         step(_captureForTwoPhase ? 'Verifying the post landed + capturing its link for the comment pass…' : 'Verifying the post landed (reloading the group)…');
         await page.goto(`https://www.facebook.com/groups/${gid}?sorting_setting=CHRONOLOGICAL`, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});

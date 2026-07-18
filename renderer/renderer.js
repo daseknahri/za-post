@@ -896,11 +896,23 @@ const LIVE_OPS_META = {
   error:              { c: '#f87171', bg: 'rgba(248,113,113,0.12)', label: 'ERROR' },
   rate_limited:       { c: '#fbbf24', bg: 'rgba(251,191,36,0.12)', label: 'RATE-LIMITED' },
   needs_login:        { c: '#f87171', bg: 'rgba(248,113,113,0.12)', label: 'NEEDS LOGIN' },
+  // Defensive only: the pool collapses the needs_verification FLAG into the needs_login STATE before the drop-flag
+  // branch, so this state is not currently emitted. Kept so it renders correctly if that collapse is ever relaxed.
   needs_verification: { c: '#f87171', bg: 'rgba(248,113,113,0.12)', label: 'VERIFY' },
+  // These two ARE emitted (the rest-and-cover branch sets state 'checkpoint' / 'not_logged_in') but had no entry, so
+  // they fell through to the `|| LIVE_OPS_META.queued` default and rendered a calm grey QUEUED — while the summary
+  // counted them under "need attention". The panel contradicted itself, on the two states that most need a human:
+  // an unnoticed checkpoint backs off exponentially to a 24h cap and quietly kills the account.
+  checkpoint:         { c: '#f87171', bg: 'rgba(248,113,113,0.12)', label: 'CHECKPOINT' },
+  not_logged_in:      { c: '#f87171', bg: 'rgba(248,113,113,0.12)', label: 'LOGGED OUT' },
   cooldown:           { c: '#fbbf24', bg: 'rgba(251,191,36,0.12)', label: 'COOLING DOWN' },
   capped:             { c: '#94a3b8', bg: 'rgba(148,163,184,0.10)', label: 'DAILY CAP' },
   off:                { c: '#6b7280', bg: 'rgba(107,114,128,0.10)', label: 'OFF' },
   skipped:            { c: '#94a3b8', bg: 'rgba(148,163,184,0.10)', label: 'SKIPPED' },
+  // IDLE = the engine had no work for it this cycle and said WHY (the row's action carries the reason). Deliberately
+  // NOT red/amber: a benched or quota-paced account is the planner working as designed, not a fault to chase. It is
+  // also not 'done' — that badge is what made a never-seated account read as finished.
+  idle:               { c: '#a5b4fc', bg: 'rgba(129,140,248,0.12)', label: 'IDLE' },
   account_disabled:   { c: '#f87171', bg: 'rgba(248,113,113,0.12)', label: 'DISABLED' },
   likely_blocked:     { c: '#f87171', bg: 'rgba(248,113,113,0.12)', label: 'BLOCKED' },
   proxy_invalid:      { c: '#f87171', bg: 'rgba(248,113,113,0.12)', label: 'PROXY BAD' },
@@ -919,7 +931,7 @@ function renderLiveOps(accounts) {
   }
   const counts = {};
   for (const a of accounts) counts[a.state] = (counts[a.state] || 0) + 1;
-  const rank = { running: 0, queued: 1, done: 2 }; // running first, queued next, done after, issues last
+  const rank = { running: 0, queued: 1, done: 2, idle: 3 }; // running first, queued next, done, idle-by-design, then real issues
   const sorted = accounts.slice().sort((a, b) =>
     ((rank[a.state] != null ? rank[a.state] : 3) - (rank[b.state] != null ? rank[b.state] : 3))
     || String(a.alias || a.name).localeCompare(String(b.alias || b.name)));
@@ -928,7 +940,12 @@ function renderLiveOps(accounts) {
     const role = a.role === 'reserve' ? '<span style="font-size:9px;color:#fbbf24;font-weight:700;margin-left:4px;flex-shrink:0;">RESV</span>' : '';
     const dot = `<span style="width:9px;height:9px;border-radius:50%;background:${m.c};flex-shrink:0;${m.pulse ? 'animation:lopulse 1.4s ease-in-out infinite;' : ''}"></span>`;
     const badge = `<span style="font-size:9px;font-weight:700;color:${m.c};background:${m.bg};border-radius:5px;padding:2px 6px;white-space:nowrap;flex-shrink:0;">${m.label}</span>`;
-    const action = a.action ? `<span style="font-size:11px;color:#94a3b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(a.action)}</span>` : '';
+    // title= uses escapeAttr, NOT escapeHtml. This is functional, not defensive: escapeHtml() routes through
+    // textContent→innerHTML and leaves double quotes LITERAL, and the idle reasons deliberately contain them
+    // (… Raise "Minimum active agents" (Settings) …) — inside title="…" the first inner quote closes the attribute and
+    // the remainder is parsed as junk attributes, so the tooltip breaks on exactly the rows that need it most. The row
+    // ellipsises the reason, so hover is the only place the full text is readable.
+    const action = a.action ? `<span title="${escapeAttr(a.action)}" style="font-size:11px;color:#94a3b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(a.action)}</span>` : '';
     const posted = a.posted ? `<span style="font-size:10px;color:#34d399;white-space:nowrap;flex-shrink:0;">✓${a.posted}</span>` : '';
     const ipChip = a.ip ? `<span title="exit IP — only different IPs run at the same time" style="font-size:9px;color:${a.ip === 'real IP' ? '#fb923c' : '#7dd3fc'};white-space:nowrap;flex-shrink:0;">🌐${escapeHtml(a.ip)}</span>` : '';
     return `<div style="display:flex;align-items:center;gap:8px;background:rgba(15,23,42,0.5);border-radius:8px;padding:6px 10px;">
@@ -942,9 +959,12 @@ function renderLiveOps(accounts) {
       </div>`;
   }).join('');
   if (summary) {
-    const r = counts.running || 0, q = counts.queued || 0, d = counts.done || 0;
-    const issues = accounts.length - r - q - d;
-    summary.textContent = `${r} running · ${d} done · ${q} queued${issues > 0 ? ` · ${issues} need attention` : ''} of ${accounts.length}`;
+    // 'idle' must be subtracted from `issues` as well. It is idle BY DESIGN (benched by the spread pass, pacing on its
+    // daily quota, held as this cycle's reserve) — counting it as "need attention" would send the operator hunting a
+    // fault that isn't there, which is the same misread that made a five-account bench look like a planner failure.
+    const r = counts.running || 0, q = counts.queued || 0, d = counts.done || 0, idl = counts.idle || 0;
+    const issues = accounts.length - r - q - d - idl;
+    summary.textContent = `${r} running · ${d} done · ${q} queued${idl > 0 ? ` · ${idl} idle` : ''}${issues > 0 ? ` · ${issues} need attention` : ''} of ${accounts.length}`;
   }
 }
 
@@ -999,6 +1019,11 @@ function drawCampaignPlan() {
     const _ogT = _allR.reduce((s, r) => s + (r.groupsTotal || 0), 0), _ogD = _allR.reduce((s, r) => s + (r.groupsDone || 0), 0);
     if (_ogT) bits.push(`<span style="color:${_ogD >= _ogT ? '#34d399' : '#818cf8'};font-weight:700;">${Math.round((_ogD / _ogT) * 100)}% of campaign done</span>`);
     bits.push(p.ongoing ? 'loops' : 'completes then stops');
+    // A pending edit means the plan BELOW is last round's shape, not the config's. Say so where the plan is read,
+    // because the alternative inference ("my edit was ignored") ends at Start Fresh = a whole-library re-burst.
+    // Calm blue, and it states the required action is NONE — an alarm here would push toward the very button that
+    // causes the damage.
+    if (p.frozen && p.frozen.pendingBatchId) bits.push('<span style="color:#60a5fa;">📝 edit pending — applies automatically at the next round</span>');
     overall.innerHTML = bits.join(' · ');
   }
   if (p.method === 'post-centric') { body.innerHTML = `<p class="text-xs text-gray-400 py-3">${escapeHtml(p.message)}</p>`; return; }
@@ -3102,7 +3127,7 @@ async function qsApplyAccountGroups(thenStart, order, extraSettings, summaryFn) 
     fireOrder: FIRE_ORDERS[qsState.fireOrder] ? qsState.fireOrder : 'batch', // launch order across batches
     workPattern: (WORK_PATTERNS[qsState.workPattern] && WORK_PATTERNS[qsState.workPattern].ready) ? qsState.workPattern : 'split', // persist so re-open restores it + a re-Apply keeps the right extra (shuffleCampaign)
     reserveAccounts: 0, maxCycles: 0,
-    parallelAccounts: Math.max(1, Math.min(20, qsProxyCount(fresh) || activeN || 1)), // = number of proxies (one per batch); else active count
+    parallelAccounts: Math.max(1, Math.min(20, qsProxyCount(fresh) || (fresh.settings && Number(fresh.settings.parallelAccounts)) || activeN || 1)), // proxies (one/batch) → else a MANUALLY-set Parallel accounts (Settings) is preserved → else active count. Was: always activeN, which silently reset the operator's chosen concurrency on every Quick Setup.
     groupsPerBlock: Math.max(1, qsState.groupsPerBlock || 4), accountsPerBatch: Math.max(1, qsState.accountsPerBatch || 1),
     moderationEnabled: !!qsState.moderationEnabled, moderationDryRun: !!qsState.moderationDryRun,
     repostEnabled: !qsState.moderationEnabled, // moderation OFF → a reserve RE-POSTS held posts to get them live (no admin); ON → the admin approves instead
@@ -3110,6 +3135,20 @@ async function qsApplyAccountGroups(thenStart, order, extraSettings, summaryFn) 
     ...qsAdvancedSettings(), // hideBrowser, warm-up, daily cap, cool-down, auto-delete, resume/launch/tunnel
     ...qsSpeedSettings(), // global speed (turbo/fast/normal/slow) — its timing ranges win
   };
+  // FULL-BATCH-DAILY is the DEFAULT for a campaign-plan Quick Setup: each account posts its whole batch-share in ONE
+  // daily run, then done — the volume the operator configured (posts in the batch), not a hidden dial. This FIXES the
+  // prior defect where QS wrote NEITHER cyclesPerDay nor postsPerCycle, so a wizard campaign silently delivered just
+  // 1 post/account/day regardless of batch size. Applied AFTER the spreads so it wins; computed from the fresh roster
+  // (assignedGroups/postSetId set in the loop above). Only for campaign-plan — daily-rotation/sequence keep their own
+  // per-post pacing. It writes the same safe preset the Settings-tab checkbox does (engine reads the derived values).
+  if (order === 'campaign-plan') {
+    const _slice = computeMaxSlice(fresh).maxSlice;
+    fresh.settings.fullBatchDaily = true;
+    fresh.settings.loopCampaign = false;      // deliver once, then done (no daily re-deal of the same library)
+    fresh.settings.completionMode = true;     // self-heal to 100%, then stop cleanly after the one run
+    fresh.settings.cyclesPerDay = _slice;     // = the whole batch share (the daily budget)
+    fresh.settings.postsPerCycle = _slice;    // = the whole batch share (deliver it all in one run)
+  }
   if (fresh.settings.loopCampaign) fresh.settings.autoDeletePosted = false; // never auto-delete a looping library (it would empty the list it re-posts)
   const excluded = ((appData && appData.accounts) || []).filter((a) => !a.isModerator && a.enabled === false).length;
   const mTag = qsState.moderationEnabled ? ` Moderator ${qsState.moderationDryRun ? '(dry-run)' : 'ON'}.` : '';
@@ -4325,10 +4364,15 @@ function loadSettings() {
   setValue('setting-daily-cap', S.dailyCap !== undefined ? S.dailyCap : 0);
   setValue('setting-reserve-accounts', S.reserveAccounts !== undefined ? S.reserveAccounts : 0);
   setValue('setting-reserve-max-jobs', S.reserveMaxJobsPerCycle !== undefined ? S.reserveMaxJobsPerCycle : 1);
+  setValue('setting-campaign-min-agents', S.campaignMinAgents !== undefined ? S.campaignMinAgents : 0);
+  setValue('setting-posts-per-cycle', S.postsPerCycle !== undefined ? S.postsPerCycle : 1);
+  setValue('setting-parallel-accounts', S.parallelAccounts !== undefined ? S.parallelAccounts : 3);
   setValue('setting-realip-max-concurrent', S.realIpMaxConcurrent !== undefined ? S.realIpMaxConcurrent : 3);
   setValue('setting-realip-post-gap', S.realIpMinPostGapSec !== undefined ? S.realIpMinPostGapSec : 15);
   setValue('setting-daily-post-time', S.dailyPostTime || '09:00');
   setValue('setting-cycles-per-day', S.cyclesPerDay !== undefined ? S.cyclesPerDay : 1);
+  setChecked('setting-full-batch-daily', S.fullBatchDaily === true); // preset: hides the two dials, derives volume from the batch
+  try { applyFullBatchDailyUI(); } catch {} // reflect the checkbox (hide dials + render the batch-volume preview)
   setValue('setting-tabs-per-browser', S.tabsPerBrowser !== undefined ? S.tabsPerBrowser : 1);
   setChecked('setting-post-then-comment', S.postThenComment === true); // two-phase: post all groups, then comment all
   setChecked('setting-capture-link-from-network', S.capturePostLinkFromNetwork === true); // grab the post link from FB's publish response (two-phase, faster)
@@ -4461,6 +4505,49 @@ if (typeof document !== 'undefined') {
   else initSettingsUI();
 }
 
+// FULL-BATCH-DAILY (renderer mirror of store.campaignMaxSlice — renderer has no require()). Clusters the enabled
+// campaign-plan accounts by sorted groups + post-set, computes each batch's per-account share ceil(pool/K), and returns
+// the LARGEST across batches (clamped 1..50). This is the single volume the preset writes into cyclesPerDay+postsPerCycle.
+function computeMaxSlice(data) {
+  const d = data || appData || {};
+  const posts = d.posts || [];
+  const acc = (d.accounts || []).filter((a) => a && a.enabled !== false && !a.isModerator && a.standby !== true
+    && (a.postingOrder || '') === 'campaign-plan' && (a.assignedGroups || []).length);
+  const clusters = new Map();
+  for (const a of acc) {
+    const sig = (a.assignedGroups || []).slice().sort().join('|') + '::' + (a.postSetId || '');
+    if (!clusters.has(sig)) clusters.set(sig, { accounts: [], setId: a.postSetId || null, groups: (a.assignedGroups || []).slice().sort() });
+    clusters.get(sig).accounts.push(a.name);
+  }
+  const batches = []; let maxSlice = 0, capped = false;
+  for (const [, c] of clusters) {
+    const pool = c.setId ? posts.filter((p) => (p.postSetId || null) === c.setId) : posts;
+    const K = Math.max(1, c.accounts.length);
+    const raw = Math.ceil(pool.length / K);
+    const slice = Math.max(1, Math.min(50, raw));
+    if (raw > 50) capped = true;
+    if (slice > maxSlice) maxSlice = slice;
+    batches.push({ groups: c.groups, accounts: c.accounts, posts: pool.length, slice, raw });
+  }
+  return { maxSlice: Math.max(1, maxSlice), batches, capped };
+}
+
+// Show/hide the two dials and render the batch-volume preview when full-batch-daily is toggled.
+function applyFullBatchDailyUI() {
+  const on = !!(document.getElementById('setting-full-batch-daily') || {}).checked;
+  const cyc = document.getElementById('fbd-cycles-row'), ppc = document.getElementById('fbd-ppc-row'), prev = document.getElementById('fbd-preview');
+  if (cyc) cyc.style.display = on ? 'none' : '';
+  if (ppc) ppc.style.display = on ? 'none' : '';
+  if (!prev) return;
+  if (!on) { prev.style.display = 'none'; prev.innerHTML = ''; return; }
+  const r = computeMaxSlice();
+  if (!r.batches.length) { prev.style.display = 'block'; prev.innerHTML = '<span style="color:#fbbf24;">No campaign batches yet — assign the same groups to a set of accounts, then add posts.</span>'; return; }
+  const rows = r.batches.map((b) => `<div style="color:#94a3b8;">• ${b.accounts.length} account(s) → <b style="color:#cbd5e1;">${b.slice}</b> post(s) each${b.raw > 50 ? ' <span style="color:#f87171;">(needs ' + b.raw + '/day — over the 50 max)</span>' : ''}</div>`).join('');
+  const warn = r.capped ? '<div style="color:#f87171;margin-top:4px;">⚠️ 50 posts/account/day is the max — add accounts to a batch or reduce its posts, or the extra spills to the next day.</div>' : '';
+  prev.style.display = 'block';
+  prev.innerHTML = `<div style="color:#a5b4fc;font-weight:600;margin-bottom:4px;">Each account posts its share once per day, then done:</div>${rows}${warn}`;
+}
+
 async function saveSettings() {
   // Blank/invalid numeric inputs parse to NaN; fall back to sane defaults so a stray
   // NaN can't, e.g., silently disable the inter-group delay and trigger rate-limits.
@@ -4471,6 +4558,13 @@ async function saveSettings() {
   const chk = (id, key) => { const el = document.getElementById(id); return el ? !!el.checked : !!S0[key]; };
   const intOr = (id, key, def) => { const el = document.getElementById(id); const v = el ? parseInt(el.value, 10) : NaN; return Number.isFinite(v) ? v : (S0[key] !== undefined ? S0[key] : def); };
   const valOr = (id, key, def) => { const el = document.getElementById(id); return el ? el.value : (S0[key] !== undefined ? S0[key] : def); };
+  // FULL-BATCH-DAILY preset. When ON, the two dials are hidden and DERIVED from the batch: cyclesPerDay=postsPerCycle=
+  // maxSlice (each account delivers its whole share in one daily run), loopCampaign=false + completionMode=true
+  // (deliver once, then done), scheduleMode=daily. This is exactly the multi-pull path the engine already runs safely —
+  // the flag is never read by the engine. When OFF, `_fbd` is false and every `_fbd ? … : <current>` below picks the
+  // current input read → the save is byte-identical to before.
+  const _fbd = chk('setting-full-batch-daily', 'fullBatchDaily');
+  const _slice = _fbd ? computeMaxSlice().maxSlice : null;
   const settings = {
     ...appData.settings, // preserve settings that have no form input
     commentWithImage: chk('setting-comment-with-image', 'commentWithImage'),
@@ -4485,11 +4579,17 @@ async function saveSettings() {
     dailyCap: intOr('setting-daily-cap', 'dailyCap', 0),
     reserveAccounts: intOr('setting-reserve-accounts', 'reserveAccounts', 0), // engine clamps 0..(posters-1); 0 = standby-only reserves
     reserveMaxJobsPerCycle: Math.max(1, Math.min(5, intOr('setting-reserve-max-jobs', 'reserveMaxJobsPerCycle', 1))), // #5: drops one reserve may cover per cycle
-    realIpMaxConcurrent: Math.max(1, Math.min(8, intOr('setting-realip-max-concurrent', 'realIpMaxConcurrent', 3))), // max concurrent browsers on one shared IP (speed vs ban); effective concurrency = min(parallelAccounts, this)
+    campaignMinAgents: Math.max(0, Math.min(100, intOr('setting-campaign-min-agents', 'campaignMinAgents', 0))), // ADR-0023 P1: floor the campaign spread pass's active-agent count per group-set (0 = off; engine clamps 0..100 too)
+    parallelAccounts: Math.max(1, Math.min(20, intOr('setting-parallel-accounts', 'parallelAccounts', 3))), // how many accounts run at once (browsers open together); effective = min(this, realIpMaxConcurrent per IP, RAM ceiling)
+    realIpMaxConcurrent: Math.max(1, Math.min(20, intOr('setting-realip-max-concurrent', 'realIpMaxConcurrent', 3))), // per-IP concurrency cap (raised 8→20; operator owns the ban trade); effective concurrency = min(parallelAccounts, this)
     realIpMinPostGapSec: Math.max(0, Math.min(3600, intOr('setting-realip-post-gap', 'realIpMinPostGapSec', 15))), // #2: per-IP aggregate post spacing (default 15s; 0=off) — bounds total posts/hr from one shared IP
-    scheduleMode: S0.scheduleMode || 'daily', // preserve the engine's actual mode (don't clobber 'continuous')
+    fullBatchDaily: _fbd, // UI-only preset flag (engine never reads it); persisted so the dials re-hide on reload
+    scheduleMode: _fbd ? 'daily' : (S0.scheduleMode || 'daily'), // preset forces daily; else preserve the engine's actual mode (don't clobber 'continuous')
+    loopCampaign: _fbd ? false : (S0.loopCampaign !== undefined ? S0.loopCampaign : false), // preset: deliver once, then done (no daily re-deal of the same library)
+    completionMode: _fbd ? true : (S0.completionMode !== undefined ? S0.completionMode : false), // preset: self-heal to 100% then stop cleanly after the one run
     dailyPostTime: valOr('setting-daily-post-time', 'dailyPostTime', '09:00') || '09:00',
-    cyclesPerDay: Math.max(1, Math.min(20, intOr('setting-cycles-per-day', 'cyclesPerDay', 1))), // cycles per run (engine clamps 1..20 too)
+    cyclesPerDay: _fbd ? _slice : Math.max(1, Math.min(50, intOr('setting-cycles-per-day', 'cyclesPerDay', 1))), // preset: = the whole batch share; else the per-account DAILY post budget (store.dailyPostQuota clamps to the same ceiling)
+    postsPerCycle: _fbd ? _slice : Math.max(1, Math.min(50, intOr('setting-posts-per-cycle', 'postsPerCycle', 1))), // preset: = the whole batch share (deliver it all in one run); else how many an agent walks back-to-back per cycle
     tabsPerBrowser: Math.max(1, Math.min(4, intOr('setting-tabs-per-browser', 'tabsPerBrowser', 1))), // paced multi-tab: pre-load the next group(s) while posting (1 = classic; engine clamps 1..4 too)
     postThenComment: chk('setting-post-then-comment', 'postThenComment'), // two-phase: post every group first, then comment all (absorbs the post→comment wait; posts land before any comment)
     capturePostLinkFromNetwork: chk('setting-capture-link-from-network', 'capturePostLinkFromNetwork'), // read OUR post's link from FB's publish response instead of feed-scanning for it (two-phase, faster; content-verified before commenting)

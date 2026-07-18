@@ -356,3 +356,329 @@ test('[#5] daily-rotation stops after ONE full library pass per day (never wraps
   o._perAccountRotation = { A: { lastPostId: 'P2', lastPostedDate: '2000-01-01', postsToday: 2, postsTodayDate: '2000-01-01' } };
   assert.deepEqual(o._postsForAccount(A, 0, false).map((p) => p.id), ['P1'], 'next day → wraps to P1 as designed (cross-day rotation is intended)');
 });
+
+// ─── ADR-0023 PHASE 1: campaignMinAgents (floor the spread) ──────────────────────────────────────────
+// Pass 2 paces a FAST group-set by benching some of its agents so it spans the SLOWEST set's day-count.
+// That is why healthy accounts sit idle for a whole round. campaignMinAgents floors how many agents the
+// fast set keeps active. It buys NO throughput (the set delivers the same posts either way) — it spreads
+// the same work over more accounts in fewer days. Every test below uses the :79 fixture's topology:
+// cluster X = 2 agents/g1 → 2 posts each = the pace-setter (globalMaxLen 2, skipped by Pass 2);
+// cluster Y = 4 agents/g2 → natural Keff = ceil(4/2) = 2, so 2 of its 4 agents are benched.
+const _spreadFixture = () => ({
+  posts: [1, 2, 3, 4].map((n) => ({ id: 'P' + n })),
+  agents: [agent('X0', ['g1']), agent('X1', ['g1']), agent('Y0', ['g2']), agent('Y1', ['g2']), agent('Y2', ['g2']), agent('Y3', ['g2'])],
+});
+const _yLens = (plan) => ['Y0', 'Y1', 'Y2', 'Y3'].map((n) => plan.agentLists[n].length).sort();
+const _withDial = (v) => { const o = mk(); const f = _spreadFixture(); o._data = { posts: f.posts, settings: { campaignMinAgents: v }, accounts: [] }; return { o, f }; };
+
+test('[ADR-0023 P1] campaignMinAgents floors Keff — at minAgents = K nobody is benched', () => {
+  const { o, f } = _withDial(4);
+  const plan = o._computeCampaignPlan(f.posts, f.agents, 0);
+  assert.deepEqual(_yLens(plan), [1, 1, 1, 1], 'all 4 agents of the fast set are seated (was [0,0,2,2] — 2 healthy accounts benched)');
+  // The whole point of the min(K,…) OUTER clamp: the set still delivers exactly its 4 posts, once each.
+  const delivered = ['Y0', 'Y1', 'Y2', 'Y3'].flatMap((n) => plan.agentLists[n]);
+  assert.deepEqual(delivered.slice().sort(), ['P1', 'P2', 'P3', 'P4'], 'coverage is exact — flooring redistributes work, it never duplicates it');
+  assert.equal(new Set(delivered).size, delivered.length, 'no post is handed to two agents in the same group-set (a double-post on one IP)');
+  // And the pace-setter is untouched: Pass 2 skips it (curLen >= globalMaxLen), so the floor can never speed up the slowest set.
+  assert.equal(plan.agentLists.X0.length, 2);
+  assert.equal(plan.agentLists.X1.length, 2);
+});
+
+test('[ADR-0023 P1] campaignMinAgents can NEVER invent a seat the cluster does not have', () => {
+  // Guards the clamp ORDER. max(1, minAgents, min(K, need)) would compute Keff=99 here, and `idx % 99 === rank`
+  // hands agent 0 exactly one post and every other agent nothing — silent under-delivery of the whole library.
+  const { o, f } = _withDial(99);
+  const plan = o._computeCampaignPlan(f.posts, f.agents, 0);
+  assert.deepEqual(_yLens(plan), [1, 1, 1, 1], 'Keff is capped at the cluster size (4), not the dial (99)');
+  assert.equal(Object.keys(plan.agentLists).length, 6, 'no phantom agents');
+  assert.deepEqual(['Y0', 'Y1', 'Y2', 'Y3'].flatMap((n) => plan.agentLists[n]).sort(), ['P1', 'P2', 'P3', 'P4'], 'still exactly the whole set, once each');
+});
+
+test('[ADR-0023 P1] campaignMinAgents does NOT reach the batchId fingerprint', () => {
+  // THE regression pin for ADR-0023's most expensive possible mistake. batchId is DURABLE and compared ACROSS
+  // VERSIONS: if the dial entered the fingerprint, every persisted plan would mismatch forever on upgrade —
+  // permanently disabling the parked-slice restore and firing the "campaign edited" notice unprovoked.
+  const f = _spreadFixture();
+  const ids = [undefined, 0, 4, 99].map((v) => {
+    const o = mk();
+    if (v !== undefined) o._data = { posts: f.posts, settings: { campaignMinAgents: v }, accounts: [] };
+    return o._computeCampaignPlan(f.posts, f.agents, 0).batchId;
+  });
+  assert.deepEqual(ids, ['174182176', '174182176', '174182176', '174182176'], 'the fingerprint is a function of posts+agents ONLY — never the dial');
+});
+
+test('[ADR-0023 P1] campaignMinAgents default/absent is a byte-identical no-op (and _data may be unset)', () => {
+  // _computeCampaignPlan is called directly by ~20 test call-sites on an orchestrator whose _data is NEVER set by
+  // the constructor. An unguarded this._data.settings read throws here. It is also the live contract: the dial must
+  // change nothing until the operator opts in.
+  const f = _spreadFixture();
+  const bare = mk()._computeCampaignPlan(f.posts, f.agents, 0); // no _data at all
+  assert.deepEqual(_yLens(bare), [0, 0, 2, 2], 'no _data → today’s spread, no crash');
+  const empty = _withDial(undefined); empty.o._data.settings = {};
+  assert.deepEqual(_yLens(empty.o._computeCampaignPlan(f.posts, f.agents, 0)), [0, 0, 2, 2], 'settings without the key → today’s spread');
+  assert.deepEqual(_yLens(_withDial(0).o._computeCampaignPlan(f.posts, f.agents, 0)), [0, 0, 2, 2], 'explicit 0 = off');
+});
+
+test('[ADR-0023 P1] campaignMinAgents garbage → off, never NaN-benches the whole fleet', () => {
+  // clampSettings has NO key whitelist, so an unknown key persists untouched: a hand-edited data.json or the HTTP
+  // API can land a string here. Number('garbage') is NaN → Keff NaN → `rank < NaN` is FALSE for every rank →
+  // EVERY agent gets [] → the campaign silently delivers nothing at all. The engine must not trust the store.
+  for (const junk of ['garbage', null, NaN, -4, {}]) {
+    const { o, f } = _withDial(junk);
+    const plan = o._computeCampaignPlan(f.posts, f.agents, 0);
+    assert.deepEqual(_yLens(plan), [0, 0, 2, 2], `campaignMinAgents=${JSON.stringify(junk)} → today’s behavior, NOT a fleet-wide bench`);
+    assert.ok(['Y0', 'Y1', 'Y2', 'Y3'].some((n) => plan.agentLists[n].length), 'at least one agent still posts');
+  }
+});
+
+test('[ADR-0023 P1] the partition property holds for EVERY floor value (coverage exact, zero dupes)', () => {
+  const f = _spreadFixture();
+  for (let dial = 0; dial <= 6; dial++) {
+    const { o } = _withDial(dial);
+    const plan = o._computeCampaignPlan(f.posts, f.agents, 0);
+    for (const cluster of [['X0', 'X1'], ['Y0', 'Y1', 'Y2', 'Y3']]) {
+      const got = cluster.flatMap((n) => plan.agentLists[n]);
+      assert.deepEqual(got.slice().sort(), ['P1', 'P2', 'P3', 'P4'], `dial=${dial}: cluster covers the library exactly once`);
+      assert.equal(new Set(got).size, got.length, `dial=${dial}: no duplicate (post,group) pair`);
+    }
+  }
+});
+
+test('[ADR-0023 P1] the benched subset ROTATES — across K rounds every agent takes a turn', () => {
+  // Pins the ":39-40" promise that no agent idles forever. Untested until now: a broken `shift` would silently
+  // bench the SAME accounts every round, which is indistinguishable from "5 accounts are dead" in the logs.
+  const f = _spreadFixture();
+  const seen = new Set();
+  for (let round = 0; round < 4; round++) {
+    const plan = mk()._computeCampaignPlan(f.posts, f.agents, round);
+    for (const n of ['Y0', 'Y1', 'Y2', 'Y3']) if (plan.agentLists[n].length) seen.add(n);
+  }
+  assert.deepEqual([...seen].sort(), ['Y0', 'Y1', 'Y2', 'Y3'], 'over 4 rounds every agent of the benched cluster posts at least once');
+});
+
+// ─── ADR-0023 PHASE 2(a): idle attribution ───────────────────────────────────────────────────────────
+// Five distinct causes reach the same `return []` in _postsForAccount, and the two operator-facing surfaces
+// used to guess between two of them. The headline defect: a BENCHED agent has an EMPTY slice, so
+// _campaignNextIdx returns {idx:0,len:0} and `idx >= len` is trivially true — the planning header reported it
+// as "✓ slice complete". An account that was never given work was reported as having finished its work. That
+// is why a 5-account bench was misread and mis-blamed. These tests pin each cause to its own label.
+test('[ADR-0023 P2] a BENCHED agent is NOT reported as "slice complete"', () => {
+  const { o, f } = _withDial(0);
+  o._campaignPlan = o._computeCampaignPlan(f.posts, f.agents, 0);
+  o._active = f.agents;
+  const benched = ['Y0', 'Y1', 'Y2', 'Y3'].find((n) => !o._campaignPlan.agentLists[n].length);
+  assert.ok(benched, 'fixture sanity: the spread pass benched someone');
+  const why = o._campaignIdleReason({ name: benched, postingOrder: 'campaign-plan' });
+  assert.match(why, /BENCHED/, 'the bench is named outright');
+  assert.doesNotMatch(why, /finished its slice/, 'THE BUG: it never had a slice to finish');
+  assert.match(why, /Minimum active agents/, 'and the operator is told which dial seats it');
+});
+
+test('[ADR-0023 P2] an EXHAUSTED slice is still reported as complete (the fix must not over-fire)', () => {
+  const { o, f } = _withDial(0);
+  o._data.settings.cyclesPerDay = 20;
+  o._campaignPlan = o._computeCampaignPlan(f.posts, f.agents, 0);
+  o._active = f.agents;
+  const worker = ['Y0', 'Y1', 'Y2', 'Y3'].find((n) => o._campaignPlan.agentLists[n].length);
+  const slice = o._campaignPlan.agentLists[worker];
+  o._perAccountRotation = { [worker]: { lastPostId: slice[slice.length - 1] } }; // pointer at the end = genuinely done
+  assert.match(o._campaignIdleReason({ name: worker, postingOrder: 'campaign-plan' }), /finished its slice/, 'a real completion still reads as complete');
+});
+
+test('[ADR-0023 P2] a PARKED slice is reported as parked, not complete', () => {
+  const { o, f } = _withDial(0);
+  o._campaignPlan = o._computeCampaignPlan(f.posts, f.agents, 0);
+  o._active = f.agents;
+  const worker = ['Y0', 'Y1', 'Y2', 'Y3'].find((n) => o._campaignPlan.agentLists[n].length);
+  // Park it exactly the way _reconcileCampaignPlan does when an agent leaves the campaign.
+  o._campaignPlan.parkedLists = { [worker]: o._campaignPlan.agentLists[worker] };
+  o._campaignPlan.agentLists[worker] = [];
+  assert.match(o._campaignIdleReason({ name: worker, postingOrder: 'campaign-plan' }), /PARKED/, 'a parked slice is a strand the operator can undo — not a completion');
+});
+
+test('[ADR-0023 P2] a reserve-HELD agent is not reported as benched', () => {
+  // Gate ORDER matters: an agent can be BOTH held in reserve this cycle AND hold a non-empty slice. Checking the
+  // slice first would blame the planner for what "Reserve accounts" did.
+  const { o, f } = _withDial(0);
+  o._campaignPlan = o._computeCampaignPlan(f.posts, f.agents, 0);
+  const worker = ['Y0', 'Y1', 'Y2', 'Y3'].find((n) => o._campaignPlan.agentLists[n].length);
+  o._active = f.agents.filter((a) => a.name !== worker); // held back this cycle
+  const why = o._campaignIdleReason({ name: worker, postingOrder: 'campaign-plan' });
+  assert.match(why, /held back/, 'the reserve hold is named');
+  assert.doesNotMatch(why, /BENCHED/, 'not blamed on the spread pass');
+});
+
+test('[ADR-0023 P2] _campaignIdleReason never spends the manual-run one-shot bypass', () => {
+  // _dailyQuotaBlocks CONSUMES the manual-Start bypass when claim=true. If a diagnostic spent it, the real pick
+  // would then be quota-blocked and the account would post NOTHING — a log line that silently costs a delivery.
+  const { o, f } = _withDial(0);
+  o._campaignPlan = o._computeCampaignPlan(f.posts, f.agents, 0);
+  o._active = f.agents;
+  const worker = ['Y0', 'Y1', 'Y2', 'Y3'].find((n) => o._campaignPlan.agentLists[n].length);
+  o._manualRun = true;
+  o._manualBypassUsed = new Set();
+  o._campaignIdleReason({ name: worker, postingOrder: 'campaign-plan' });
+  assert.equal(o._manualBypassUsed.size, 0, 'the diagnostic read state without moving it');
+});
+
+test('[ADR-0023 P2] the planning header no longer calls a benched agent "slice complete"', () => {
+  // The end-to-end surface: what the operator actually reads each cycle.
+  const { o, f } = _withDial(0);
+  o._campaignPlan = o._computeCampaignPlan(f.posts, f.agents, 0);
+  o._active = f.agents;
+  const benched = ['Y0', 'Y1', 'Y2', 'Y3'].find((n) => !o._campaignPlan.agentLists[n].length);
+  const line = `[${benched}] → ${o._campaignIdleReason({ name: benched, postingOrder: 'campaign-plan' }) || 'nothing to post'}`;
+  assert.doesNotMatch(line, /✓ slice complete/, 'the old lie is gone');
+  assert.match(line, /BENCHED/);
+});
+
+// ── the label must never recommend a remedy that provably cannot work ──────────────────────────────────
+test('[ADR-0023 P2] a cluster with MORE AGENTS THAN POSTS is not blamed on the spread pass', () => {
+  // A cluster can never seat more agents than it has posts (rank >= P gets nothing for ANY Keff), so the surplus is
+  // benched by ARITHMETIC and campaignMinAgents cannot seat them. The old text said "raise Minimum active agents" —
+  // which at the dial's own maximum reads "the floor is 100 — raise it". Advice that cannot work sends the operator
+  // to Start Fresh, i.e. a whole-library re-burst.
+  const o = mk();
+  const posts = [1, 2, 3].map((n) => ({ id: 'P' + n }));
+  const agents = [agent('A0', ['g1']), agent('A1', ['g1']), agent('A2', ['g1']), agent('A3', ['g1']), agent('A4', ['g1'])]; // 5 agents, 3 posts
+  o._data = { posts, settings: { campaignMinAgents: 100 }, accounts: [] }; // the dial at its clamp MAXIMUM
+  o._campaignPlan = o._computeCampaignPlan(posts, agents, 0);
+  o._active = agents;
+  const idle = ['A0', 'A1', 'A2', 'A3', 'A4'].find((n) => !o._campaignPlan.agentLists[n].length);
+  assert.ok(idle, 'fixture sanity: 5 agents cannot all hold one of 3 posts');
+  const why = o._campaignIdleReason({ name: idle, postingOrder: 'campaign-plan' });
+  assert.match(why, /more accounts than posts|only 3 post/, 'the real cause (a post shortage) is named');
+  assert.doesNotMatch(why, /Raise "Minimum active agents"/, 'and the dial is NOT offered as the fix — it cannot seat them');
+});
+
+test('[ADR-0023 P2] an empty post-set is named as such, not as a bench', () => {
+  const o = mk();
+  const posts = [{ id: 'P1', postSetId: 'setA' }];
+  const agents = [{ ...agent('B0', ['g1']), postSetId: 'setEMPTY' }, { ...agent('B1', ['g1']), postSetId: 'setEMPTY' }];
+  o._data = { posts, settings: {}, accounts: [] };
+  o._campaignPlan = o._computeCampaignPlan(posts, agents, 0);
+  o._active = agents;
+  assert.match(o._campaignIdleReason({ name: 'B0', postingOrder: 'campaign-plan' }), /NO posts/, 'an empty post-set is a misconfiguration, not a spread-pass bench');
+});
+
+test('[ADR-0023 P2] the anti-burst spacing floor is NOT reported as a spent daily quota', () => {
+  // _dailyQuotaBlocks says "blocked" for two unrelated reasons. At cyclesPerDay=20 with ONE post delivered a minute
+  // ago, the agent is inside the spacing floor — it has used 1 of 20, not "today's quota". Telling the operator the
+  // quota is spent points them at a dial that is not the cause.
+  const o = mk();
+  const posts = [1, 2, 3, 4].map((n) => ({ id: 'P' + n }));
+  const agents = [agent('A', ['g1']), agent('B', ['g1'])];
+  o._data = { posts, settings: { cyclesPerDay: 20, waitIntervalMin: 90 }, accounts: [] };
+  o._campaignPlan = o._computeCampaignPlan(posts, agents, 0);
+  o._active = agents;
+  const today = o._localDayKey();
+  o._perAccountRotation = { A: { postsToday: 1, postsTodayDate: today, lastPostedDate: today, lastPostedAt: Date.now() - 60 * 1000 } };
+  const why = o._campaignIdleReason({ name: 'A', postingOrder: 'campaign-plan' });
+  assert.match(why, /spacing floor/, 'the real cause is the spacing floor');
+  assert.doesNotMatch(why, /already used today's quota/, 'THE REGRESSION: 1 of 20 posts is not an exhausted quota');
+  // and a genuinely exhausted quota still reads as one
+  o._perAccountRotation = { A: { postsToday: 20, postsTodayDate: today, lastPostedDate: today, lastPostedAt: Date.now() - 60 * 60 * 1000 } };
+  assert.match(o._campaignIdleReason({ name: 'A', postingOrder: 'campaign-plan' }), /already used today's quota of 20/, 'a real quota exhaustion is still named');
+});
+
+test('[ADR-0023 P2] a manual-Start bypass is not mislabeled as a quota block', () => {
+  // The REAL pick (claim=true) consumes the one-shot. If the diagnostic then re-asks, it sees the bypass already spent
+  // and reports a quota block for a pick that was explicitly NOT quota-blocked. The caller must pass what it saw
+  // BEFORE the pick.
+  const o = mk();
+  const posts = [1, 2].map((n) => ({ id: 'P' + n }));
+  const agents = [agent('A', ['g1']), agent('B', ['g1'])];
+  o._data = { posts, settings: { cyclesPerDay: 1 }, accounts: [] };
+  o._campaignPlan = o._computeCampaignPlan(posts, agents, 0);
+  o._active = agents;
+  const today = o._localDayKey();
+  // A finished its slice AND posted today — the manual bypass is granted, so the pick is not quota-blocked; the real
+  // reason it returns [] is that the slice is done.
+  o._perAccountRotation = { A: { lastPostId: o._campaignPlan.agentLists.A[o._campaignPlan.agentLists.A.length - 1], postsToday: 1, postsTodayDate: today, lastPostedDate: today, lastPostedAt: Date.now() } };
+  o._manualRun = true;
+  o._manualBypassUsed = new Set(['A']); // already spent by the real pick, exactly as _runAccount leaves it
+  assert.match(o._campaignIdleReason({ name: 'A', postingOrder: 'campaign-plan' }, true), /finished its slice/, 'with the pre-pick bypass state passed in, the true cause survives');
+  assert.doesNotMatch(o._campaignIdleReason({ name: 'A', postingOrder: 'campaign-plan' }, true), /quota/, 'and the quota is not blamed for a pick that bypassed it');
+});
+
+// ── ADR-0023 P3: a BENCHED agent must still be able to discharge an owed obligation ───────────────────
+// The empty-slice guard sat ABOVE the owed block, so a benched agent could never reach its discharge path. Because a
+// benched agent is still a key of agentLists ([] assigned, not deleted), _campaignAllFinished's owed check then
+// returned false forever: the reloop never fires and the campaign stops dead, restart-durable. Dormant at K=1;
+// it arms the moment accounts are re-enabled into shared group-sets.
+const _wedgeFixture = () => {
+  const o = mk();
+  o._data = { posts: [{ id: 'P1' }, { id: 'P2' }], settings: { cyclesPerDay: 20 }, accounts: [], groups: [{ id: 'g1', groupId: 'G1' }, { id: 'g2', groupId: 'G2' }] };
+  o._campaignPlan = { batchId: 'b', agentLists: { A1: ['P1', 'P2'], A2: [] }, clusters: [{ groupKey: 'g1|g2::', agents: ['A1', 'A2'], totalPosts: 2, days: 2 }] };
+  o._perAccountRotation = { A1: { lastPostId: 'P2' }, A2: {} };
+  return o;
+};
+const _A2 = { name: 'A2', postingOrder: 'campaign-plan', postFilter: 'all', assignedGroups: ['g1', 'g2'] };
+
+test('[ADR-0023 P3] a BENCHED agent can still discharge an owed obligation (the permanent wedge)', () => {
+  const o = _wedgeFixture();
+  o._owed = { A2: { postId: 'P1', gids: ['G2'] } };
+  assert.deepEqual(o._campaignPlan.agentLists.A2, [], 'A2 must be benched for this test to mean anything');
+  const picked = o._postsForAccount(_A2, 0, true).map((p) => p.id);
+  assert.deepEqual(picked, ['P1'], 'a benched agent MUST still be able to finish the un-reached groups of a post it already partially delivered — otherwise its owed entry blocks _campaignAllFinished forever');
+});
+
+test('[ADR-0023 P3] a benched agent with a STALE owed drops it and self-heals (no wedge)', () => {
+  const o = _wedgeFixture();
+  o._owed = { A2: { postId: 'GONE', gids: ['G2'] } }; // post no longer in the library
+  const picked = o._postsForAccount(_A2, 0, true);
+  assert.deepEqual(picked, [], 'nothing to deliver');
+  assert.equal(o._owed.A2, undefined, 'the stale obligation must be DROPPED on a claim, else it wedges the reloop forever');
+  assert.equal(o._campaignAllFinished(), true, 'with the stale entry dropped the round can complete and reloop');
+});
+
+test('[ADR-0023 P3] a benched agent with NO owed is unchanged — and never spends the manual one-shot', () => {
+  const o = _wedgeFixture();
+  o._owed = {};
+  o._manualRun = true; o._manualBypassUsed = new Set();
+  assert.deepEqual(o._postsForAccount(_A2, 0, true), [], 'benched with nothing owed still idles');
+  assert.ok(!o._manualBypassUsed.has('A2'), 'the common benched path must not even reach the quota gate — spending its one-shot would make a later manual Start post nothing');
+});
+
+// ── ADR-0023 P3: the seats readout must not manufacture the very inference it exists to prevent ───────
+const _seatLogs = (plan, settings, data) => { const L = []; const o = mk(); o.log = (m) => L.push(String(m)); o._data = { posts: [], groups: [], accounts: [], settings: settings || {}, ...(data || {}) }; o._logPlanSeats(plan); return L; };
+const _noBenchPlan = { agentLists: { a1: ['P1', 'P2'] }, clusters: [{ groupKey: 'g1::', agents: ['a1'], totalPosts: 2, days: 2 }] };
+
+test('[ADR-0023 P3] no bench + dial off → the seats readout stays SILENT (a 1/1 ratio reads as a cap)', () => {
+  // "1/1 seat(s)" on a fleet with no bench invites: raise the dial → byte-identical plan → "it's broken" → Start
+  // Fresh → whole-library re-burst. That is the exact chain this readout was added to prevent.
+  assert.deepEqual(_seatLogs(_noBenchPlan, { campaignMinAgents: 0 }), [], 'nothing is sitting out and the dial is off — there is nothing truthful to report');
+});
+
+test('[ADR-0023 P3] dial SET but nothing to seat → say so (a silent dial is a dial that looks broken)', () => {
+  const L = _seatLogs(_noBenchPlan, { campaignMinAgents: 6 });
+  assert.equal(L.length, 1, 'an operator waiting for an effect must be told there is none');
+  assert.match(L[0], /nothing to seat|changes nothing/i);
+  assert.doesNotMatch(L[0], /1\/1 seat/, 'still no cap-like ratio');
+});
+
+test('[ADR-0023 P3] the seats dedupe key includes the dial — editing it always re-prints', () => {
+  // The dial was in the MESSAGE but not the KEY, so an edit that produced an identical plan (the inert case — the
+  // common one) printed NOTHING. The one readout that exists to show the dial's effect was silent exactly when the
+  // operator most needed an answer.
+  const o = mk(); const L = []; o.log = (m) => L.push(String(m));
+  o._data = { posts: [], groups: [], accounts: [], settings: { campaignMinAgents: 0 } };
+  o._logPlanSeats(_noBenchPlan);
+  o._data.settings.campaignMinAgents = 6;   // operator edits the dial; the plan is unchanged
+  o._logPlanSeats(_noBenchPlan);
+  assert.equal(L.length, 1, 'the dial change must produce a line even though the plan is identical');
+  assert.match(L[0], /set to 6/);
+});
+
+test('[ADR-0023 P3] the plan span is reported in CYCLES + real days, never "1 post/day"', () => {
+  // A 30-post slice at cyclesPerDay=20 burns in ~2 days, not 30. The Plan panel already says "cycle"; the log said
+  // "day(s)" — a 15x overstatement of how long the operator's groups are shielded from the whole library.
+  const o = mk();
+  o._data = { posts: [], groups: [], accounts: [], settings: { cyclesPerDay: 20, cycleGapMin: 2 } };
+  assert.equal(o._effectiveDailyPosts(), 20, 'cyclesPerDay binds when the spacing floor allows more');
+  assert.match(o._planSpanLabel(30), /30 cycle\(s\).*2 day\(s\)/, '30 cycles at 20/day is 2 days');
+  const o1 = mk();
+  o1._data = { posts: [], groups: [], accounts: [], settings: { cyclesPerDay: 1 } };
+  assert.equal(o1._effectiveDailyPosts(), 1, 'the classic 1/day model is unchanged');
+  assert.match(o1._planSpanLabel(30), /30 cycle\(s\).*30 day\(s\)/, 'at 1/day cycles and days coincide — old meaning preserved');
+});
