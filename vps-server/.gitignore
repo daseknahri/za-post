@@ -6,3 +6,5 @@ key-audit.log
 node_modules/
 *.log
 data/
+vps-server/signing-key.pem
+*.pem
