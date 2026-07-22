@@ -12,7 +12,39 @@
 //   GET  /api/keys                            -> the key store (admin: Authorization: Bearer <ADMIN_TOKEN>)
 
 const express = require('express');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const ks = require('./keystore');
+
+// ── LICENCE SIGNING KEY ──────────────────────────────────────────────────────────────────────────────────────────────
+// The client refuses any grant that is not signed by this key, so an unsigned server is a server that activates
+// nobody. Load it from LICENSE_SIGNING_KEY (base64 of the PKCS8 PEM) or ./signing-key.pem, and REFUSE TO BOOT if it
+// is missing: a server that will not start is loudly broken and gets noticed during deploy, whereas one that quietly
+// serves unsigned grants would look healthy while every customer drifted into lockout as their grace ran out.
+// Never auto-generate — the public half is compiled into shipped clients, so the pair must be fixed and deliberate.
+function loadSigningKey() {
+  const b64 = String(process.env.LICENSE_SIGNING_KEY || '').trim();
+  let pem = null;
+  if (b64) { try { pem = Buffer.from(b64, 'base64').toString('utf8'); } catch { pem = null; } }
+  if (!pem) { const f = path.join(__dirname, 'signing-key.pem'); if (fs.existsSync(f)) pem = fs.readFileSync(f, 'utf8'); }
+  if (!pem || !/BEGIN (PRIVATE|ED25519 PRIVATE) KEY/.test(pem)) {
+    console.error('\nFATAL: no licence signing key.\n  Set LICENSE_SIGNING_KEY (base64 of the PKCS8 PEM) or place signing-key.pem beside this file.\n  Generate a pair with:  node gen-signing-key.js\n  The PUBLIC half must match LICENSE_PUBKEY compiled into the client, or nobody can activate.\n');
+    process.exit(1);
+  }
+  try { return crypto.createPrivateKey(pem); }
+  catch (e) { console.error('\nFATAL: licence signing key is unreadable: ' + e.message + '\n'); process.exit(1); }
+}
+const SIGNING_KEY = loadSigningKey();
+
+// Mint a signed grant. The payload binds the licence to ONE machine and ONE moment; the client verifies the
+// signature over the encoded token, so no field inside it can be edited after the fact.
+function signGrant({ license, hwid, tier, expires, nonce }) {
+  const payload = { v: 1, key: String(license).toUpperCase(), hwid: String(hwid || ''), tier: tier || 'standard', iat: Date.now(), exp: Number(expires) || 0, nonce: String(nonce || '') };
+  const token = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const sig = crypto.sign(null, Buffer.from(token, 'utf8'), SIGNING_KEY).toString('base64');
+  return { token, sig };
+}
 
 const app = express();
 app.use(express.json({ limit: '64kb' }));
@@ -73,7 +105,15 @@ app.post('/api/validate', rateLimiter({ windowMs: 60000, max: 30, name: 'validat
   if (!rec) return res.json({ valid: false, message: 'Invalid license key' });
   if (rec.revoked) return res.json({ valid: false, revoked: true, message: 'This license has been revoked' });
   if (rec.expires && Date.now() > rec.expires) return res.json({ valid: false, message: 'License expired' });
-  const grant = () => ({ valid: true, message: 'OK', tier: rec.tier || 'standard', maxAccounts: rec.maxAccounts, maxGroups: rec.maxGroups, expires: rec.expires || 0 });
+  // Echo the client's nonce inside the signed token so this response cannot be replayed to activate a second
+  // install. Capped — it is opaque to us and only ever compared for equality.
+  const nonce = String((req.body && req.body.nonce) || '').trim().slice(0, 64);
+  const grant = () => ({
+    valid: true, message: 'OK', tier: rec.tier || 'standard', maxAccounts: rec.maxAccounts, maxGroups: rec.maxGroups, expires: rec.expires || 0,
+    // Sign against the BOUND machine, not merely the requesting one, so the token can never attest to a device the
+    // key store did not actually bind.
+    ...signGrant({ license, hwid: rec.hwid || hwid, tier: rec.tier, expires: rec.expires, nonce }),
+  });
   if (!rec.hwid) { rec.hwid = hwid; rec.activatedAt = Date.now(); ks.save(db); ks.audit('bind', license, 'hwid=' + hwid.slice(0, 8)); return res.json({ ...grant(), message: 'Activated' }); }
   if (hwid && rec.hwid !== hwid) return res.json({ valid: false, message: 'License is already active on another device' });
   rec.lastSeen = Date.now(); ks.save(db);

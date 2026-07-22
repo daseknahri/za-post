@@ -35,6 +35,10 @@ anyway, since it holds your sellable app source.
 - This makes `/data/keys.json` survive redeploys.
 
 ## Step 5 — Environment variables
+- **`LICENSE_SIGNING_KEY`** = base64 of the PKCS8 PEM private key (from `node gen-signing-key.js`).
+  **The server refuses to boot without it.** Clients from v1.0.253 on reject any grant that is not signed by
+  it, so an unsigned server activates nobody. Its public half is compiled into the client — replacing this
+  value locks out every already-shipped build, so set it once and never rotate it casually.
 - `OWNER_KEY` = your owner license key — seeded into the volume on first boot.
   (Kept in Coolify's env, not in Git, so the secret never gets published.)
 - `ADMIN_TOKEN` = a long secret (protects `GET /api/keys`).
@@ -49,13 +53,15 @@ anyway, since it holds your sellable app source.
 ## Step 7 — Deploy & verify
 Click **Deploy**. Then test (replace the URL with your domain/IP):
 ```bash
-# should return {"valid":true,"message":"Activated"} the first time (binds the test hwid)
+# Must return valid:true AND a "token" + "sig" pair. Without those two fields the server is running
+# unsigned, and every v1.0.253+ client will refuse it — check LICENSE_SIGNING_KEY before shipping.
 curl -X POST https://license.yourdomain.com/api/validate \
   -H "Content-Type: application/json" \
-  -d '{"license":"YOUR-OWNER-KEY","hwid":"test-machine-1"}'
+  -d '{"license":"YOUR-OWNER-KEY","hwid":"test-machine-1","nonce":"n1"}'
 
-# list keys (admin)
-curl "https://license.yourdomain.com/api/keys?admin=YOUR_ADMIN_TOKEN"
+# list keys (admin) — header only; the ?admin= query param was REMOVED (it leaked the token into
+# Nginx/Cloudflare access logs).
+curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" https://license.yourdomain.com/api/keys
 ```
 
 ## Step 8 — Point the desktop app at this server
